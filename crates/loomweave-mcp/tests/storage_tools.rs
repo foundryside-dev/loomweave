@@ -2,7 +2,10 @@
 
 use std::{
     fs,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use loomweave_core::{
@@ -10,6 +13,13 @@ use loomweave_core::{
     LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
     LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig, Recording,
     RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
+};
+use loomweave_federation::{
+    loomweave_port::publish_port,
+    loomweave_url::{
+        SOURCE_EPHEMERAL_PORT as LOOMWEAVE_SOURCE_EPHEMERAL_PORT,
+        SOURCE_NONE as LOOMWEAVE_SOURCE_NONE,
+    },
 };
 use loomweave_mcp::{
     DiagnosticsContext, LlmDiagnostics, McpToolPolicy, ServerState,
@@ -23,16 +33,16 @@ use loomweave_mcp::{
     list_tools,
 };
 use loomweave_storage::{
-    GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer, pragma, schema,
-    upsert_guidance_sheet, upsert_summary_cache,
+    GuidanceProposal, GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer,
+    pragma, schema, upsert_guidance_sheet, upsert_summary_cache,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
 fn open_project() -> (tempfile::TempDir, std::path::PathBuf) {
     let project = tempfile::tempdir().expect("temp project");
-    let loomweave_dir = project.path().join(".loomweave");
-    std::fs::create_dir(&loomweave_dir).expect("create .loomweave");
+    let loomweave_dir = project.path().join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).expect("create .loomweave");
     let db_path = loomweave_dir.join("loomweave.db");
     let mut conn = Connection::open(&db_path).expect("open sqlite");
     pragma::apply_write_pragmas(&conn).expect("write pragmas");
@@ -569,12 +579,42 @@ impl AnyInferredProvider {
         }
     }
 
-    fn new_slow(output_json: &str, delay_ms: u64) -> Self {
+    fn invocations(&self) -> Vec<LlmRequest> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Debug)]
+struct GatedInferredProvider {
+    invocations: Mutex<Vec<LlmRequest>>,
+    output_json: String,
+    started: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+impl GatedInferredProvider {
+    fn new(output_json: &str) -> Self {
         Self {
             invocations: Mutex::new(Vec::new()),
             output_json: output_json.to_owned(),
-            delay_ms,
+            started: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            release_notify: tokio::sync::Notify::new(),
         }
+    }
+
+    async fn wait_started(&self) {
+        while !self.started.load(Ordering::SeqCst) {
+            self.started_notify.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.release_notify.notify_waiters();
     }
 
     fn invocations(&self) -> Vec<LlmRequest> {
@@ -702,6 +742,44 @@ impl LlmProvider for AnyInferredProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl LlmProvider for GatedInferredProvider {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    async fn invoke(&self, request: LlmRequest) -> Result<LlmResponse, LlmProviderError> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.clone());
+        self.started.store(true, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+        self.release_notify.notified().await;
+        Ok(LlmResponse {
+            model_id: request.model_id,
+            output_json: self.output_json.clone(),
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 20,
+            total_tokens: 120,
+            cost_usd: 0.0,
+        })
+    }
+
+    fn estimate_tokens(&self, _request: &LlmRequest) -> u64 {
+        0
+    }
+
+    fn tier_to_model(&self, _tier: &str) -> Option<&str> {
+        None
+    }
+
+    fn caching_model(&self) -> CachingModel {
+        CachingModel::OpenAiChatCompletions
+    }
+}
+
 #[derive(Debug, Default)]
 struct FakeFiligreeClient {
     responses: Mutex<std::collections::HashMap<String, EntityAssociationsResponse>>,
@@ -716,6 +794,9 @@ struct FakeFiligreeClient {
     wardline_path_calls: Mutex<Vec<String>>,
     /// When true, `wardline_findings_for_path` returns an `HttpStatus` 503 error.
     wardline_error: Mutex<bool>,
+    /// When true, `issue_detail` returns an `HttpStatus` 503 error (the
+    /// dogfood-4 B9 degrade path: transport/auth failure mid-enrichment).
+    detail_error: Mutex<bool>,
     created_observations: Mutex<Vec<ObservationCreateRequest>>,
     observations: Mutex<std::collections::HashMap<String, ObservationRecord>>,
     dismissed_observations: Mutex<Vec<String>>,
@@ -734,6 +815,7 @@ impl FakeFiligreeClient {
         self.details.get_mut().unwrap().insert(
             issue_id.to_owned(),
             IssueDetail {
+                id: issue_id.to_owned(),
                 title: title.to_owned(),
                 status: status.to_owned(),
                 priority,
@@ -749,6 +831,11 @@ impl FakeFiligreeClient {
 
     fn with_wardline_error(mut self) -> Self {
         *self.wardline_error.get_mut().unwrap() = true;
+        self
+    }
+
+    fn with_detail_error(mut self) -> Self {
+        *self.detail_error.get_mut().unwrap() = true;
         self
     }
 
@@ -813,6 +900,16 @@ impl FiligreeLookup for FakeFiligreeClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(issue_id.to_owned());
+        if *self
+            .detail_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(FiligreeClientError::HttpStatus {
+                status: 503,
+                body: "detail route down".to_owned(),
+            });
+        }
         Ok(self
             .details
             .lock()
@@ -952,14 +1049,16 @@ fn tools_list_includes_subsystem_members() {
 
     assert_eq!(
         tool.description,
-        "List module entities assigned to a subsystem entity."
+        "List the module entities in a subsystem. Bounded: `limit` (default 50, max 100) + numeric-offset `cursor`."
     );
     assert_eq!(
         tool.input_schema,
         json!({
             "type": "object",
             "properties": {
-                "id": {"type": "string", "minLength": 1}
+                "id": {"type": "string", "minLength": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": ["string", "null"]}
             },
             "required": ["id"],
             "additionalProperties": false
@@ -1007,6 +1106,39 @@ async fn subsystem_members_returns_member_modules() {
             .as_str()
             .unwrap()
             .ends_with("demo.py")
+    );
+}
+
+#[tokio::test]
+async fn subsystem_members_redacts_briefing_blocked_member() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path());
+    drop(conn);
+    // The pkg.auth module's file carries a secret → its module entity is blocked.
+    mark_blocked(&db_path, "python:module:pkg.auth", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let members = envelope["result"]["members"].as_array().unwrap();
+    // Member count stays honest; the blocked module is a redacted stub.
+    assert_eq!(members.len(), 2, "{envelope}");
+    let blocked = members
+        .iter()
+        .find(|m| m["briefing_blocked"] == "secret_present")
+        .expect("blocked member present as a stub");
+    assert!(blocked["id"].is_null(), "{blocked}");
+    assert!(blocked["name"].is_null(), "{blocked}");
+    assert!(blocked["source_file_path"].is_null(), "{blocked}");
+    // The visible member is untouched; the blocked id never appears.
+    assert!(
+        members.iter().any(|m| m["id"] == "python:module:demo"),
+        "{envelope}"
+    );
+    assert!(
+        !envelope.to_string().contains("pkg.auth"),
+        "blocked member id leaked in subsystem_members: {envelope}"
     );
 }
 
@@ -1191,7 +1323,7 @@ async fn issues_for_reports_resolved_endpoint_and_result_kind() {
     // endpoint, and distinguishes reachable-but-empty (no_matches) from a
     // populated result (matched) — without the agent curling ports by hand.
     let (project, db_path) = open_project();
-    let filigree_dir = project.path().join(".filigree");
+    let filigree_dir = project.path().join(".weft").join("filigree");
     fs::create_dir_all(&filigree_dir).unwrap();
     fs::write(filigree_dir.join("ephemeral.port"), "8542").unwrap();
     let config = FiligreeConfig {
@@ -1201,11 +1333,12 @@ async fn issues_for_reports_resolved_endpoint_and_result_kind() {
     let diagnostics = DiagnosticsContext {
         llm: LlmDiagnostics {
             provider: "disabled".to_owned(),
+            enabled: false,
             live: false,
             allow_live_provider: false,
             cache_max_age_days: 180,
         },
-        filigree: resolve_filigree_url(&config, project.path()),
+        filigree: resolve_filigree_url(&config, project.path(), |_| None),
     };
 
     // Reachable but no associations for this entity -> no_matches.
@@ -2417,6 +2550,50 @@ async fn summary_preview_cost_disabled_llm_is_distinct_from_miss() {
     );
 }
 
+#[tokio::test]
+async fn status_surfaces_agree_on_allow_live_provider_when_half_configured() {
+    // agent-first-feedback §2.2: project_status_get and summary_preview_cost must
+    // report the SAME allow_live_provider for a half-configured state — a provider
+    // permitted by config (allow_live_provider: true) but with enabled=false, so
+    // no live provider is wired. Previously the two read paths disagreed (status
+    // read raw config → true; preview read the unwired provider → false).
+    let (project, db_path) = open_project();
+    let diagnostics = DiagnosticsContext {
+        llm: LlmDiagnostics {
+            provider: "disabled".to_owned(),
+            enabled: false,
+            live: false,
+            allow_live_provider: true, // configured-but-inert
+            cache_max_age_days: 180,
+        },
+        filigree: resolve_filigree_url(&FiligreeConfig::default(), project.path(), |_| None),
+    };
+    let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
+
+    let status = call_tool(&state, "project_status", json!({})).await;
+    let preview = call_tool(
+        &state,
+        "summary_preview_cost",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(status["result"]["llm"]["allow_live_provider"], true);
+    assert_eq!(
+        status["result"]["llm"]["allow_live_provider"],
+        preview["result"]["policy"]["allow_live_provider"],
+        "status surfaces disagree on allow_live_provider: status={status:?} preview={preview:?}"
+    );
+    // Both must also agree the live path is off, so a miss would not spend.
+    assert_eq!(status["result"]["llm"]["enabled"], false);
+    assert_eq!(preview["result"]["policy"]["enabled"], false);
+    assert_eq!(
+        status["result"]["llm"]["live"],
+        preview["result"]["policy"]["live"]
+    );
+    assert_eq!(preview["result"]["live_spend_would_occur"], false);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summary_expired_cache_row_is_refreshed_by_recording_provider() {
     let (project, db_path) = open_project();
@@ -3508,6 +3685,279 @@ async fn find_entity_kind_filter_returns_only_that_kind() {
     );
 }
 
+// ---- briefing_blocked identity gate (clarion-307668e2be) ----------------
+//
+// A secret-scan-blocked entity's identity (id, name, source_file_path, line
+// span) must not be disclosed by any discovery/structure MCP read — matching
+// the federation read API (ADR-034). Discovery surfaces emit a *stub* that
+// acknowledges existence with only the block reason; structure-fan-out surfaces
+// (neighborhood / orientation) *refuse* when the queried entity itself is
+// blocked. The blocked entity's qualname-bearing id must appear NOWHERE in the
+// response (it leaks the name even when name/path are nulled).
+
+/// Mark an already-seeded entity briefing-blocked by rewriting its `properties`.
+fn mark_blocked(db_path: &std::path::Path, id: &str, reason: &str) {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE entities SET properties = ?1 WHERE id = ?2",
+        params![json!({"briefing_blocked": reason}).to_string(), id],
+    )
+    .expect("mark entity blocked");
+}
+
+/// Assert an entity projection is a redacted stub: every identity field null,
+/// only the block reason present.
+fn assert_redacted_identity(entity: &Value, reason: &str) {
+    assert_eq!(entity["briefing_blocked"], reason, "stub reason: {entity}");
+    for field in [
+        "id",
+        "sei",
+        "kind",
+        "name",
+        "short_name",
+        "source_file_path",
+        "source_line_start",
+        "source_line_end",
+        "content_hash",
+    ] {
+        assert!(
+            entity.get(field).is_none_or(Value::is_null),
+            "identity field `{field}` must be withheld for a blocked entity: {entity}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn find_entity_redacts_briefing_blocked_identity() {
+    let (project, db_path) = open_project();
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    // `demo.mid` matches exactly one seeded id.
+    let resp = call_tool(
+        &state,
+        "find_entity",
+        json!({"pattern": "python:function:demo.mid", "limit": 10}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+
+    let entities = resp["result"]["entities"].as_array().unwrap();
+    let blocked: Vec<&Value> = entities
+        .iter()
+        .filter(|e| e["briefing_blocked"] == "secret_present")
+        .collect();
+    assert_eq!(blocked.len(), 1, "blocked entity still listed: {resp}");
+    assert_redacted_identity(blocked[0], "secret_present");
+    assert!(
+        !resp.to_string().contains("demo.mid"),
+        "blocked id leaked somewhere in find_entity response: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn entity_at_redacts_briefing_blocked_match_and_context() {
+    let (project, db_path) = open_project();
+    // demo.mid uniquely spans lines 4-5 (module also spans, but mid is innermost).
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 4})).await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_redacted_identity(&resp["result"]["entity"], "secret_present");
+
+    // The matched node in the containing stack is redacted; its ranges nulled.
+    let stack = resp["result"]["entity_context"]["containing_stack"]
+        .as_array()
+        .unwrap();
+    let matched_node = stack.last().expect("matched node present");
+    assert_eq!(matched_node["briefing_blocked"], "secret_present", "{resp}");
+    assert!(matched_node["id"].is_null(), "{resp}");
+    assert!(
+        resp["result"]["entity_context"]["ranges"]["source_line_start"].is_null(),
+        "matched ranges leak the blocked line span: {resp}"
+    );
+    assert!(
+        !resp.to_string().contains("demo.mid"),
+        "blocked id leaked in entity_at response: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn entity_at_redacts_blocked_alternative() {
+    let (project, db_path) = open_project();
+    // demo.target and demo.alt_target both span lines 7-8 (same-granularity
+    // overlap). entity_at(line 7) matches alt_target (id-sorted first) and lists
+    // target as a same-granularity *alternative* — which must be redacted when
+    // blocked (the `alternatives` block is a third projection in entity_context).
+    mark_blocked(&db_path, "python:function:demo.target", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 7})).await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let alternatives = resp["result"]["entity_context"]["alternatives"]
+        .as_array()
+        .unwrap();
+    let blocked = alternatives
+        .iter()
+        .find(|a| a["entity"]["briefing_blocked"] == "secret_present")
+        .expect("blocked alternative present as a stub");
+    assert_redacted_identity(&blocked["entity"], "secret_present");
+    assert!(
+        !resp.to_string().contains("demo.target"),
+        "blocked alternative id leaked in entity_at response: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_suggested_reads_omit_blocked_callee() {
+    let (project, db_path) = open_project();
+    // entry's first resolved callee is mid; block it. The suggested-reads drill
+    // into the first callee reads its id from the (now-redacted) packet, so the
+    // blocked id must not surface in suggested_next_reads.
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert!(
+        !resp["result"]["suggested_next_reads"]
+            .to_string()
+            .contains("demo.mid"),
+        "blocked callee id leaked in suggested_next_reads: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_redacts_blocked_neighbor_including_stored_to_id() {
+    let (project, db_path) = open_project();
+    // demo.entry calls demo.mid (resolved). Block the callee.
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+
+    let callees = resp["result"]["callees"].as_array().unwrap();
+    let blocked = callees
+        .iter()
+        .find(|c| c["entity"]["briefing_blocked"] == "secret_present")
+        .expect("blocked callee present as a stub");
+    assert_redacted_identity(&blocked["entity"], "secret_present");
+    assert!(
+        blocked["stored_to_id"].is_null(),
+        "stored_to_id leaks the blocked callee id: {blocked}"
+    );
+    assert!(
+        !resp.to_string().contains("demo.mid"),
+        "blocked id leaked in neighborhood response: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_refuses_structure_for_blocked_entity() {
+    let (project, db_path) = open_project();
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.mid"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["available"], false, "{resp}");
+    assert_eq!(
+        resp["result"]["briefing_blocked"], "secret_present",
+        "{resp}"
+    );
+    // No structure around the withheld entity, and its id never appears.
+    assert!(resp["result"]["callers"].is_null(), "{resp}");
+    assert!(resp["result"]["callees"].is_null(), "{resp}");
+    assert!(
+        !resp.to_string().contains("demo.mid"),
+        "blocked id leaked in neighborhood refusal: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_refuses_for_blocked_primary() {
+    let (project, db_path) = open_project();
+    mark_blocked(&db_path, "python:function:demo.entry", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["available"], false, "{resp}");
+    assert_eq!(
+        resp["result"]["briefing_blocked"], "secret_present",
+        "{resp}"
+    );
+    assert!(resp["result"]["primary_entity"].is_null(), "{resp}");
+    assert!(
+        !resp.to_string().contains("demo.entry"),
+        "blocked primary id leaked in orientation refusal: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_redacts_blocked_node_in_execution_paths() {
+    let (project, db_path) = open_project();
+    // demo.target is a leaf reached via entry -> mid -> target (resolved).
+    mark_blocked(&db_path, "python:function:demo.target", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+
+    // The blocked node is omitted from the node table...
+    let nodes = resp["result"]["execution_paths"]["nodes"]
+        .as_array()
+        .unwrap();
+    assert!(
+        nodes
+            .iter()
+            .all(|n| n["id"] != "python:function:demo.target"),
+        "blocked node leaked in execution_paths node table: {resp}"
+    );
+    // ...and replaced by the sentinel in the path arrays.
+    let paths = resp["result"]["execution_paths"]["paths"]
+        .as_array()
+        .unwrap();
+    let has_sentinel = paths.iter().any(|p| {
+        p.as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "[briefing-blocked]")
+    });
+    assert!(has_sentinel, "expected [briefing-blocked] sentinel: {resp}");
+    assert!(
+        !resp.to_string().contains("demo.target"),
+        "blocked id leaked somewhere in orientation pack: {resp}"
+    );
+}
+
 #[tokio::test]
 async fn subsystem_of_resolves_module_and_contained_function() {
     let (project, db_path) = open_project();
@@ -3778,10 +4228,13 @@ async fn attribute_receiver_call_is_excluded_at_resolved_but_attempted_at_inferr
     .await;
     assert_eq!(resolved["ok"], true);
     assert_eq!(resolved["result"]["callers"].as_array().unwrap().len(), 0);
+    // The live `ctx.dynamic` site both suffix-matches the target name and
+    // makes the project-wide unresolved blind spot real (clarion-df87b4f381).
     assert_eq!(
         resolved["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"])
+        json!(["attribute-receiver-calls", "unresolved-static-calls"])
     );
+    assert_eq!(resolved["result"]["unresolved_name_matches"], 1);
 
     // Inferred: LLM dispatch recovers the attribute-receiver caller, so nothing is
     // excluded — the empty-vs-complete distinction is honest, not wallpaper.
@@ -3944,23 +4397,36 @@ async fn callers_of_inferred_coalesces_concurrent_cold_requests() {
     drop(conn);
 
     let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
-    let provider = Arc::new(AnyInferredProvider::new_slow(
+    let provider = Arc::new(GatedInferredProvider::new(
         r#"{"edges":[{"site_key":"site-dynamic","target_id":"python:function:demo.dynamic","confidence":0.91,"rationale":"name match"}]}"#,
-        100,
     ));
-    let state = state_for_summary(
+    let state = Arc::new(state_for_summary(
         project.path(),
         &db_path,
         &writer,
         provider.clone(),
         llm_config(),
-    );
+    ));
     let args = json!({"id": "python:function:demo.dynamic", "confidence": "inferred"});
 
-    let (first, second) = tokio::join!(
-        call_tool(&state, "callers_of", args.clone()),
-        call_tool(&state, "callers_of", args),
-    );
+    let first_state = Arc::clone(&state);
+    let first_args = args.clone();
+    let first_handle =
+        tokio::spawn(async move { call_tool(&first_state, "callers_of", first_args).await });
+    provider.wait_started().await;
+
+    let (first, second) = {
+        let second_future = call_tool(&state, "callers_of", args);
+        tokio::pin!(second_future);
+        tokio::select! {
+            completed = &mut second_future => panic!("follower completed before leader released: {completed}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        provider.release();
+
+        let (first, second) = tokio::join!(first_handle, second_future);
+        (first.expect("leader callers_of task"), second)
+    };
 
     assert_eq!(first["ok"], true);
     assert_eq!(second["ok"], true);
@@ -4544,6 +5010,223 @@ async fn neighborhood_function_references_are_not_rolled_up() {
     );
 }
 
+// ── unresolved name-matched call-site honesty (clarion-df87b4f381) ────────────
+//
+// The store records statically-unbindable call sites in
+// `entity_unresolved_call_sites`; when any LIVE rows name-match the queried
+// target, an empty/short `callers` list is not a true negative. The navigation
+// surface must say so: an `unresolved_name_matches` count, the
+// `unresolved-static-calls` scope_excludes marker, and a `next_action` pointer
+// at the evidence tool (`entity_call_site_list role=callee`), which works in
+// the default read-only posture where `confidence=inferred` is policy-gated.
+
+#[tokio::test]
+async fn callers_of_counts_unresolved_name_matches_and_names_the_blind_spot() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // A bare-name unresolved site whose callee_expr equals the target's
+        // short name — the dominant unresolved cross-module call shape.
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_name_matches"], 1,
+        "{envelope}"
+    );
+    let excludes = envelope["result"]["scope_excludes"]
+        .as_array()
+        .expect("scope_excludes array");
+    assert!(
+        excludes.iter().any(|v| v == "unresolved-static-calls"),
+        "live unresolved sites must be declared as a blind spot: {envelope}"
+    );
+    assert!(
+        excludes.iter().any(|v| v == "attribute-receiver-calls"),
+        "{envelope}"
+    );
+    let next_action = envelope["result"]["next_action"]
+        .as_str()
+        .expect("next_action string when matches exist");
+    assert!(
+        next_action.contains("entity_call_site_list"),
+        "next_action must point at the evidence tool: {envelope}"
+    );
+    assert!(next_action.contains("callee"), "{envelope}");
+
+    // The shared vocabulary also covers calls-only path traversal.
+    let paths = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(paths["ok"], true, "{paths}");
+    assert!(
+        paths["result"]["scope_excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "unresolved-static-calls"),
+        "{paths}"
+    );
+
+    // call_sites SEARCHES the unresolved table (it returns unresolved_sites),
+    // so it must NOT declare the category as an unsearched blind spot.
+    let sites = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.target", "role": "callee"}),
+    )
+    .await;
+    assert_eq!(sites["ok"], true, "{sites}");
+    assert!(
+        !sites["result"]["scope_excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "unresolved-static-calls"),
+        "call_sites surfaces unresolved sites; the marker would be false: {sites}"
+    );
+    assert_eq!(
+        sites["result"]["unresolved_sites"][0]["callee_expr"], "target",
+        "{sites}"
+    );
+}
+
+#[tokio::test]
+async fn callers_of_without_unresolved_sites_reports_zero_matches_and_no_marker() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_name_matches"], 0,
+        "{envelope}"
+    );
+    assert!(
+        envelope["result"]["next_action"].is_null(),
+        "no matches -> no recovery pointer: {envelope}"
+    );
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!(["attribute-receiver-calls"]),
+        "an all-resolved project must not carry the unresolved marker: {envelope}"
+    );
+}
+
+#[tokio::test]
+async fn callers_of_ignores_stale_unresolved_rows_in_count_and_marker() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-stale", "target");
+        conn.execute(
+            "UPDATE entities SET content_hash = 'hash-after-body-change' \
+             WHERE id = 'python:function:demo.entry'",
+            [],
+        )
+        .expect("simulate a changed caller body");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_name_matches"], 0,
+        "stale rows (content-hash mismatch) are not evidence: {envelope}"
+    );
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!(["attribute-receiver-calls"]),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_and_orientation_carry_unresolved_name_matches() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let neighborhood = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+    assert_eq!(neighborhood["ok"], true, "{neighborhood}");
+    assert_eq!(
+        neighborhood["result"]["unresolved_name_matches"], 1,
+        "{neighborhood}"
+    );
+    assert!(
+        neighborhood["result"]["scope_excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "unresolved-static-calls"),
+        "{neighborhood}"
+    );
+    assert!(
+        neighborhood["result"]["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("entity_call_site_list"),
+        "{neighborhood}"
+    );
+
+    let pack = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.target"}),
+    )
+    .await;
+    assert_eq!(pack["ok"], true, "{pack}");
+    let neighbors = &pack["result"]["neighbors"];
+    assert_eq!(neighbors["unresolved_name_matches"], 1, "{pack}");
+    assert!(
+        neighbors["scope_excludes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "unresolved-static-calls"),
+        "{pack}"
+    );
+    assert!(
+        neighbors["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("entity_call_site_list"),
+        "{pack}"
+    );
+}
+
 #[tokio::test]
 async fn neighborhood_module_rollup_surfaces_external_reverse_import() {
     // Seed an external module symbol that references a symbol contained in
@@ -4813,12 +5496,159 @@ async fn project_status_reports_counts_latest_run_and_plugins() {
         result["db_path"]
             .as_str()
             .unwrap()
-            .ends_with(".loomweave/loomweave.db")
+            .ends_with(".weft/loomweave/loomweave.db")
     );
     assert_eq!(result["git_sha"], "abc123status");
     // A bare ServerState carries no diagnostics context.
     assert_eq!(result["llm"], Value::Null);
     assert_eq!(result["filigree"], Value::Null);
+}
+
+#[tokio::test]
+async fn project_status_emits_worktree_dirty_scope_note_on_every_path() {
+    // N5: `worktree_dirty` is a bare boolean an agent (and legis, which gates
+    // signing on it) reads as "git clean" on the false/null path. Emit a
+    // consumer-visible scope note on EVERY path so the field's meaning —
+    // un-indexed UNTRACKED source, not the git working-tree state — is readable
+    // WITHOUT reading loomweave source. Here the project is not a git work tree,
+    // so worktree_dirty is null, the path the note must still cover.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let note = envelope["result"]["worktree_dirty_note"]
+        .as_str()
+        .expect("worktree_dirty_note must be present on the null/false path");
+    // The note must disclose that the field is NOT the git working-tree state and
+    // that it is scoped to untracked source (modified tracked source surfaces via
+    // staleness), so a signing gate doesn't read false as "git clean".
+    let lower = note.to_lowercase();
+    assert!(lower.contains("untracked"), "note: {note}");
+    assert!(lower.contains("staleness"), "note: {note}");
+    assert!(
+        lower.contains("not"),
+        "note must disclose it's not git-clean: {note}"
+    );
+}
+
+#[tokio::test]
+async fn project_status_fresh_carries_staleness_note_caveat() {
+    // The named tool an agent reads directly must disclose what "fresh" omits —
+    // not only the session-start banner (clarion-26c7e52027). The seeded demo.py
+    // is older than a far-future run, so the verdict is Fresh.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-fresh",
+        "2099-01-01T00:00:00.000Z",
+        "completed",
+        Some("2099-01-01T00:00:00.000Z"),
+    );
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let result = call_tool(&state, "project_status", json!({})).await["result"].clone();
+    assert_eq!(
+        result["staleness"], "fresh",
+        "fixture must be fresh: {result}"
+    );
+    let note = result["staleness_note"]
+        .as_str()
+        .expect("a fresh verdict must carry a staleness_note");
+    assert!(
+        note.contains("loomweave analyze") && note.contains("index_diff_get"),
+        "staleness_note must name index_diff_get as the authoritative surface (C-12) \
+         and the re-analyze remedy: {note}"
+    );
+}
+
+#[tokio::test]
+async fn project_status_stale_note_defers_to_index_diff_by_name() {
+    // C-12 (weft-4165f1ed71): a stale verdict points at the authoritative
+    // surface for the per-signal detail. The seeded demo.py was just written
+    // (mtime ~now), so a past-dated run makes the source newer than the run →
+    // Stale, deterministically.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-1",
+        "2026-02-02T00:00:00.000Z",
+        "completed",
+        Some("2026-02-02T00:00:00.000Z"),
+    );
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let result = call_tool(&state, "project_status", json!({})).await["result"].clone();
+    assert_eq!(
+        result["staleness"], "stale",
+        "fixture must be stale: {result}"
+    );
+    let note = result["staleness_note"]
+        .as_str()
+        .expect("a stale verdict must defer to the authority by name");
+    assert!(
+        note.contains("index_diff_get"),
+        "stale note must name the authoritative surface: {note}"
+    );
+}
+
+#[tokio::test]
+async fn project_status_reports_stale_worktree_for_untracked_source() {
+    // The exact tool the dogfood report quoted (clarion-26c7e52027, ADR-045): a
+    // mtime-fresh index in a git work tree that has a brand-new untracked module.
+    // project_status_get must report staleness="stale_worktree" + worktree_dirty
+    // = true, not a misleading bare "fresh".
+    let (project, db_path) = open_project();
+
+    // Make the project a git repo and commit everything seeded so far, so only
+    // the new module below is untracked. Skip cleanly if git is unavailable.
+    let git = |args: &[&str]| -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(project.path())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !git(&["init", "-q"]) {
+        return;
+    }
+    let _ = git(&["config", "user.email", "t@t"]);
+    let _ = git(&["config", "user.name", "t"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-fresh",
+        "2099-01-01T00:00:00.000Z",
+        "completed",
+        Some("2099-01-01T00:00:00.000Z"),
+    );
+    drop(conn);
+    // Brand-new untracked Python module the index never saw.
+    std::fs::write(project.path().join("hub.py"), "y = 2\n").expect("write untracked module");
+
+    let state = state_for(project.path(), &db_path);
+    let result = call_tool(&state, "project_status", json!({})).await["result"].clone();
+    assert_eq!(
+        result["staleness"], "stale_worktree",
+        "untracked source must yield stale_worktree: {result}"
+    );
+    assert_eq!(
+        result["worktree_dirty"], true,
+        "worktree_dirty must be true: {result}"
+    );
+    assert!(
+        result["staleness_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("loomweave analyze")),
+        "stale_worktree must carry a re-analyze note: {result}"
+    );
 }
 
 #[tokio::test]
@@ -4923,10 +5753,10 @@ async fn project_status_skipped_run_keeps_prior_completed_index_visible() {
 
 #[tokio::test]
 async fn project_status_resolves_live_filigree_endpoint() {
-    // AC#3: the live ethereal port (.filigree/ephemeral.port) is reported as
+    // AC#3: the live ethereal port (.weft/filigree/ephemeral.port) is reported as
     // the resolution source, overriding the stale configured port.
     let (project, db_path) = open_project();
-    let filigree_dir = project.path().join(".filigree");
+    let filigree_dir = project.path().join(".weft").join("filigree");
     fs::create_dir_all(&filigree_dir).unwrap();
     fs::write(filigree_dir.join("ephemeral.port"), "8542").unwrap();
 
@@ -4937,11 +5767,12 @@ async fn project_status_resolves_live_filigree_endpoint() {
     let diagnostics = DiagnosticsContext {
         llm: LlmDiagnostics {
             provider: "disabled".to_owned(),
+            enabled: false,
             live: false,
             allow_live_provider: false,
             cache_max_age_days: 180,
         },
-        filigree: resolve_filigree_url(&config, project.path()),
+        filigree: resolve_filigree_url(&config, project.path(), |_| None),
     };
     let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
 
@@ -4968,11 +5799,12 @@ async fn project_status_filigree_falls_back_to_config_without_port_file() {
     let diagnostics = DiagnosticsContext {
         llm: LlmDiagnostics {
             provider: "openrouter".to_owned(),
+            enabled: true,
             live: true,
             allow_live_provider: true,
             cache_max_age_days: 7,
         },
-        filigree: resolve_filigree_url(&config, project.path()),
+        filigree: resolve_filigree_url(&config, project.path(), |_| None),
     };
     let state = state_for(project.path(), &db_path).with_diagnostics(diagnostics);
     let envelope = call_tool(&state, "project_status", json!({})).await;
@@ -4980,6 +5812,37 @@ async fn project_status_filigree_falls_back_to_config_without_port_file() {
     assert_eq!(filigree["resolved_url"], "http://127.0.0.1:8766");
     assert_eq!(filigree["resolution_source"], SOURCE_CONFIG);
     assert_eq!(envelope["result"]["llm"]["live"], true);
+}
+
+#[tokio::test]
+async fn project_status_reports_loomweave_read_api_published_port() {
+    // ADR-044: project_status surfaces the live read-API endpoint resolved from
+    // .weft/loomweave/ephemeral.port (the second in-repo consumer of the resolver,
+    // alongside doctor). No diagnostics context is needed — it resolves the
+    // file at query time from the project root.
+    let (project, db_path) = open_project();
+    publish_port(project.path(), 9412).unwrap();
+
+    let state = state_for(project.path(), &db_path);
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    let read_api = &envelope["result"]["loomweave_read_api"];
+    assert_eq!(read_api["resolved_url"], "http://127.0.0.1:9412");
+    assert_eq!(
+        read_api["resolution_source"],
+        LOOMWEAVE_SOURCE_EPHEMERAL_PORT
+    );
+}
+
+#[tokio::test]
+async fn project_status_loomweave_read_api_none_without_port_file() {
+    // No published port file → resolution_source is "none" and resolved_url is
+    // null (project_status has no static loomweave URL of its own).
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+    let envelope = call_tool(&state, "project_status", json!({})).await;
+    let read_api = &envelope["result"]["loomweave_read_api"];
+    assert_eq!(read_api["resolved_url"], Value::Null);
+    assert_eq!(read_api["resolution_source"], LOOMWEAVE_SOURCE_NONE);
 }
 
 // ---------------------------------------------------------------------------
@@ -5523,4 +6386,1598 @@ async fn issues_for_dotted_method_qualname_reconciles_end_to_end() {
     let items = section["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1, "one matched finding: {section}");
     assert_eq!(items[0]["rule_id"], "WLN-X");
+}
+
+// ---------------------------------------------------------------------------
+// Item 1 (clarion-d76e7f7267): id-taking tools accept a SEI and resolve it to
+// the SAME entity as the locator. Each test seeds the alive binding
+// loomweave:eid:demo-entry -> python:function:demo.entry, then asserts a call
+// keyed by the SEI matches a call keyed by the locator.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn callers_of_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.mid",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let by_locator = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.mid"}),
+    )
+    .await;
+    let by_sei = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(by_sei["ok"], true, "{by_sei}");
+    assert_eq!(
+        by_sei["result"]["callers"], by_locator["result"]["callers"],
+        "SEI-keyed callers must equal locator-keyed callers"
+    );
+    assert_eq!(
+        by_sei["result"]["callers"][0]["entity"]["id"],
+        "python:function:demo.entry"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let by_locator = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    let by_sei = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(by_sei["ok"], true, "{by_sei}");
+    assert_eq!(
+        by_sei["result"]["entity"]["id"],
+        "python:function:demo.entry"
+    );
+    assert_eq!(by_sei["result"]["callees"], by_locator["result"]["callees"]);
+}
+
+#[tokio::test]
+async fn summary_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    // No LLM configured: both resolve to the same entity and return the same
+    // llm-disabled envelope rather than EntityNotFound (the SEI was accepted).
+    let state =
+        state_for(project.path(), &db_path).with_tool_policy(McpToolPolicy::allow_write_tools());
+
+    let by_locator = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    let by_sei = call_tool(&state, "summary", json!({"id": "loomweave:eid:demo-entry"})).await;
+
+    assert_eq!(by_locator["error"]["code"], "llm-disabled", "{by_locator}");
+    assert_eq!(
+        by_sei["error"]["code"], "llm-disabled",
+        "a seeded SEI must resolve to the same llm-disabled outcome, not 404: {by_sei}"
+    );
+}
+
+#[tokio::test]
+async fn source_for_entity_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let by_locator = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    let by_sei = call_tool(
+        &state,
+        "source_for_entity",
+        json!({"id": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(by_sei["ok"], true, "{by_sei}");
+    assert_eq!(by_sei["result"], by_locator["result"]);
+}
+
+#[tokio::test]
+async fn call_sites_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    // The new existence gate (Landmine #3): call_sites had no gate, so a SEI
+    // would silently return empty. Assert SEI == locator here, and the
+    // orphan/unknown-SEI -> NotFound case in the dedicated test below.
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let by_locator = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+    let by_sei = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(
+        by_sei["ok"], true,
+        "SEI must resolve, not silent-empty: {by_sei}"
+    );
+    assert_eq!(by_sei["result"], by_locator["result"]);
+}
+
+#[tokio::test]
+async fn call_sites_unknown_sei_is_not_found_not_empty() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "call_sites",
+        json!({"id": "loomweave:eid:does-not-exist"}),
+    )
+    .await;
+
+    assert_eq!(
+        env["ok"], false,
+        "unknown SEI must be an error, not empty: {env}"
+    );
+    assert_eq!(env["error"]["code"], "not-found");
+}
+
+#[tokio::test]
+async fn id_taking_tool_rejects_orphaned_sei_as_entity_not_found() {
+    // A SEI that resolves to NotAlive (no binding seeded) must fail closed:
+    // resolve_entity_ref returns None -> EntityNotFound.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "loomweave:eid:orphaned-unknown"}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], false, "{env}");
+    assert_eq!(env["error"]["code"], "entity-not-found");
+    assert!(
+        env["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("loomweave:eid:orphaned-unknown"),
+        "EntityNotFound echoes the pasted SEI: {env}"
+    );
+}
+
+#[tokio::test]
+async fn find_entity_with_pasted_sei_returns_the_resolved_entity() {
+    // Item 1.E: a pasted SEI exact-resolves (was empty before — the SEI lives
+    // only in sei_bindings, never in any entities column).
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "find_entity",
+        json!({"pattern": "loomweave:eid:demo-entry"}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let entities = env["result"]["entities"]
+        .as_array()
+        .expect("entities array");
+    assert_eq!(
+        entities.len(),
+        1,
+        "pasted SEI exact-resolves to one row: {env}"
+    );
+    assert_eq!(entities[0]["id"], "python:function:demo.entry");
+}
+
+#[tokio::test]
+async fn find_entity_with_unknown_sei_returns_empty_not_error() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "find_entity",
+        json!({"pattern": "loomweave:eid:nope"}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(
+        env["result"]["entities"]
+            .as_array()
+            .expect("entities")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn propose_guidance_accepts_sei_but_stores_the_locator_in_match_rule() {
+    // Landmine #1: a SEI may be accepted, but the default match_rule and the
+    // proposal's entity_id MUST carry the resolved LOCATOR, not the raw SEI —
+    // otherwise the stored guidance silently becomes SEI-keyed.
+    let (project, db_path) = open_project();
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    let client = Arc::new(FakeFiligreeClient::default());
+    let state = state_for_filigree(project.path(), &db_path, client.clone());
+
+    let proposed = call_tool(
+        &state,
+        "propose_guidance",
+        json!({
+            "entity_id": "loomweave:eid:demo-entry",
+            "content": "Locator-keyed guidance even when proposed by SEI.",
+            "scope_level": "function"
+        }),
+    )
+    .await;
+
+    assert_eq!(proposed["ok"], true, "{proposed}");
+    let created = client.created_observations();
+    assert_eq!(created.len(), 1);
+    let proposal =
+        GuidanceProposal::from_observation_detail(&created[0].detail).expect("parse proposal");
+    assert_eq!(
+        proposal.entity_id, "python:function:demo.entry",
+        "proposal entity_id must be the resolved locator, not the SEI"
+    );
+    assert_eq!(
+        proposal.match_rules[0]["id"], "python:function:demo.entry",
+        "default match_rule id must be the locator, not the SEI: {:?}",
+        proposal.match_rules
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 3 (clarion-d76e7f7267): bounded graph relationship tools.
+//   * Single-relation (callers_of, subsystem_members): limit + cursor +
+//     next_cursor + explicit truncated.
+//   * Neighborhood: ONE per-bucket limit + a truncated MAP, NO cursor.
+// ---------------------------------------------------------------------------
+
+/// Seed `count` distinct functions that all call `python:function:demo.target`,
+/// so `callers_of(demo.target)` has a deterministic, paginable caller set.
+fn seed_extra_callers(db_path: &std::path::Path, count: usize) {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    let source_path: String = conn
+        .query_row(
+            "SELECT source_file_path FROM entities WHERE id = 'python:function:demo.target'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("target source path");
+    for i in 0..count {
+        let id = format!("python:function:demo.caller{i}");
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+                source_line_start, source_line_end, properties, content_hash, created_at, updated_at) \
+             VALUES (?1,'python','function',?1,?1,?2,1,2,'{}','hash','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+            params![id, source_path],
+        )
+        .expect("insert caller entity");
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, source_byte_start, source_byte_end) \
+             VALUES ('calls', ?1, 'python:function:demo.target', 'resolved', 10, 20)",
+            params![id],
+        )
+        .expect("insert calls edge");
+    }
+}
+
+#[tokio::test]
+async fn callers_of_paginates_with_limit_cursor_and_truncated() {
+    let (project, db_path) = open_project();
+    // demo.mid already calls demo.target (resolved). Add 2 more -> 3 callers.
+    seed_extra_callers(&db_path, 2);
+    let state = state_for(project.path(), &db_path);
+
+    let first = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target", "limit": 2}),
+    )
+    .await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["result"]["callers"].as_array().unwrap().len(), 2);
+    assert_eq!(first["result"]["next_cursor"], "2");
+    assert_eq!(
+        first["result"]["truncated"], true,
+        "first page of 3 with limit 2 must be truncated"
+    );
+
+    let second = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target", "limit": 2, "cursor": "2"}),
+    )
+    .await;
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["result"]["callers"].as_array().unwrap().len(), 1);
+    assert_eq!(second["result"]["next_cursor"], Value::Null);
+    assert_eq!(second["result"]["truncated"], false);
+}
+
+#[tokio::test]
+async fn subsystem_members_paginates_with_limit_cursor_and_truncated() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path()); // 2 members
+    drop(conn);
+    let state = state_for(project.path(), &db_path);
+
+    let first = call_tool(
+        &state,
+        "subsystem_members",
+        json!({"id": subsystem_id, "limit": 1}),
+    )
+    .await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["result"]["members"].as_array().unwrap().len(), 1);
+    assert_eq!(first["result"]["next_cursor"], "1");
+    assert_eq!(first["result"]["truncated"], true);
+
+    let second = call_tool(
+        &state,
+        "subsystem_members",
+        json!({"id": subsystem_id, "limit": 1, "cursor": "1"}),
+    )
+    .await;
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["result"]["members"].as_array().unwrap().len(), 1);
+    assert_eq!(second["result"]["next_cursor"], Value::Null);
+    assert_eq!(second["result"]["truncated"], false);
+}
+
+#[tokio::test]
+async fn neighborhood_caps_each_bucket_and_reports_a_truncated_map_with_no_cursor() {
+    let (project, db_path) = open_project();
+    // demo.target's callers: demo.mid plus 4 seeded -> 5 inbound callers.
+    seed_extra_callers(&db_path, 4);
+    let state = state_for(project.path(), &db_path);
+
+    let env = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target", "limit": 2}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    // The callers bucket is capped at the per-bucket limit and flagged truncated.
+    assert_eq!(
+        env["result"]["callers"].as_array().unwrap().len(),
+        2,
+        "callers bucket must be capped at limit: {env}"
+    );
+    assert_eq!(
+        env["result"]["truncated"]["callers"], true,
+        "the truncated MAP must flag the trimmed callers bucket: {env}"
+    );
+    // A bucket under the cap is NOT flagged truncated.
+    assert_eq!(env["result"]["truncated"]["imports_out"], false);
+    // The overview has NO cursor — one cursor cannot advance 7 buckets.
+    assert!(
+        env["result"].get("next_cursor").is_none(),
+        "neighborhood overview must NOT carry a cursor: {env}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// entity_relation_list (clarion-ae5b43ea40): the relation kinds
+// (inherits_from / decorates / implements / derives) were write-only — no MCP
+// read path served them. Direction semantics and the decorates anchor-file
+// inversion are pinned by ADR-051.
+// ---------------------------------------------------------------------------
+
+/// Seed a relation fixture on top of [`open_project`]'s graph: a class
+/// hierarchy in types.py and a decorated handler in app.py, with the
+/// `decorates` anchor living in the *decorated* side's file (ADR-051).
+fn seed_relation_fixture(project_root: &std::path::Path, db_path: &std::path::Path) {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    let types_path = project_root.join("types.py");
+    std::fs::write(
+        &types_path,
+        "class Base:\n    pass\n\nclass Child(Base):\n    pass\n\ndef wrap(fn):\n    return fn\n",
+    )
+    .expect("write types source");
+    let app_path = project_root.join("app.py");
+    std::fs::write(&app_path, "@wrap\ndef handler():\n    return 1\n").expect("write app source");
+
+    insert_file_entity(&conn, "core:file:types.py", &types_path);
+    insert_file_entity(&conn, "core:file:app.py", &app_path);
+    insert_entity(
+        &conn,
+        "python:module:types",
+        "module",
+        &types_path,
+        Some((1, 8)),
+        None,
+    );
+    insert_entity(
+        &conn,
+        "python:class:types.Base",
+        "class",
+        &types_path,
+        Some((1, 2)),
+        Some("python:module:types"),
+    );
+    insert_entity(
+        &conn,
+        "python:class:types.Child",
+        "class",
+        &types_path,
+        Some((4, 5)),
+        Some("python:module:types"),
+    );
+    insert_entity(
+        &conn,
+        "python:function:types.wrap",
+        "function",
+        &types_path,
+        Some((7, 8)),
+        Some("python:module:types"),
+    );
+    insert_entity(
+        &conn,
+        "python:module:app",
+        "module",
+        &app_path,
+        Some((1, 3)),
+        None,
+    );
+    insert_entity(
+        &conn,
+        "python:function:app.handler",
+        "function",
+        &app_path,
+        Some((1, 3)),
+        Some("python:module:app"),
+    );
+
+    // "class Child(Base):" — the `Base` token spans bytes 34..38 of types.py
+    // (line 4, byte column 12).
+    insert_relation_edge_row(
+        &conn,
+        "inherits_from",
+        "python:class:types.Child",
+        "python:class:types.Base",
+        "resolved",
+        None,
+        "core:file:types.py",
+        34,
+        38,
+    );
+    // "@wrap" — the `wrap` token spans bytes 1..5 of app.py (line 1, byte
+    // column 1). The anchor file is the DECORATED side's file.
+    insert_relation_edge_row(
+        &conn,
+        "decorates",
+        "python:function:types.wrap",
+        "python:function:app.handler",
+        "resolved",
+        None,
+        "core:file:app.py",
+        1,
+        5,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // a full anchored edge row IS this wide
+fn insert_relation_edge_row(
+    conn: &Connection,
+    kind: &str,
+    from_id: &str,
+    to_id: &str,
+    confidence: &str,
+    properties: Option<Value>,
+    source_file_id: &str,
+    byte_start: i64,
+    byte_end: i64,
+) {
+    conn.execute(
+        "INSERT INTO edges (
+            kind, from_id, to_id, confidence, properties, source_file_id,
+            source_byte_start, source_byte_end
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            kind,
+            from_id,
+            to_id,
+            confidence,
+            properties.map(|value| value.to_string()),
+            source_file_id,
+            byte_start,
+            byte_end,
+        ],
+    )
+    .expect("insert relation edge");
+}
+
+#[tokio::test]
+async fn relation_list_answers_directional_queries_with_anchor_evidence() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let state = state_for(project.path(), &db_path);
+
+    // "What subclasses Base" — a TO-side (direction=in) lookup on inherits_from.
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["entity"]["id"], "python:class:types.Base");
+    assert_eq!(resp["result"]["direction"], "in");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    let rel = &relations[0];
+    assert_eq!(rel["kind"], "inherits_from");
+    assert_eq!(rel["entity"]["id"], "python:class:types.Child");
+    assert_eq!(rel["edge_confidence"], "resolved");
+    assert_eq!(
+        rel["file"],
+        project.path().join("types.py").display().to_string()
+    );
+    assert_eq!(rel["line"], 4);
+    assert_eq!(rel["column"], 12);
+    assert_eq!(rel["line_text"], "class Child(Base):");
+    assert_eq!(rel["byte_start"], 34);
+    assert_eq!(rel["byte_end"], 38);
+    assert_eq!(resp["result"]["next_cursor"], Value::Null);
+    assert_eq!(resp["result"]["truncated"], false);
+
+    // "What does wrap decorate" — direction=out on the DECORATOR (ADR-051:
+    // decorates runs decorator → decorated). The anchor evidence must follow
+    // the edge's own file (app.py, the decorated side), not the queried
+    // entity's file.
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:types.wrap", "direction": "out"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    let rel = &relations[0];
+    assert_eq!(rel["kind"], "decorates");
+    assert_eq!(rel["entity"]["id"], "python:function:app.handler");
+    assert_eq!(
+        rel["file"],
+        project.path().join("app.py").display().to_string(),
+        "decorates anchor must come from the edge's file, not the decorator's: {rel}"
+    );
+    assert_eq!(rel["line"], 1);
+    assert_eq!(rel["column"], 1);
+    assert_eq!(rel["line_text"], "@wrap");
+
+    // "What decorates handler" — direction=in on the decorated entity.
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.handler", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    assert_eq!(relations[0]["kind"], "decorates");
+    assert_eq!(relations[0]["entity"]["id"], "python:function:types.wrap");
+
+    // The subclass side: direction=out on Child names its base.
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Child", "direction": "out"}),
+    )
+    .await;
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Base");
+}
+
+#[tokio::test]
+async fn relation_list_kind_filter_pagination_and_honest_empty() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:class:types.Other",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "inherits_from",
+            "python:class:types.Other",
+            "python:class:types.Base",
+            "resolved",
+            None,
+            "core:file:types.py",
+            34,
+            38,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    // limit=1 pages the two subclasses deterministically (Child before Other).
+    let first = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "limit": 1}),
+    )
+    .await;
+    assert_eq!(first["ok"], true, "{first}");
+    let relations = first["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{first}");
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Child");
+    assert_eq!(first["result"]["truncated"], true, "{first}");
+    assert_eq!(first["result"]["next_cursor"], "1", "{first}");
+
+    let second = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "limit": 1, "cursor": "1"}),
+    )
+    .await;
+    let relations = second["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{second}");
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Other");
+    assert_eq!(second["result"]["truncated"], false, "{second}");
+    assert_eq!(second["result"]["next_cursor"], Value::Null, "{second}");
+
+    // A kind filter that matches nothing is honest-empty, not an error.
+    let none = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "kind": "decorates"}),
+    )
+    .await;
+    assert_eq!(none["ok"], true, "{none}");
+    assert!(
+        none["result"]["relations"].as_array().unwrap().is_empty(),
+        "{none}"
+    );
+    assert_eq!(none["result"]["truncated"], false, "{none}");
+
+    // The kind filter narrows to the requested kind only.
+    let filtered = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "kind": "inherits_from"}),
+    )
+    .await;
+    let filtered_rows = filtered["result"]["relations"].as_array().unwrap();
+    assert_eq!(filtered_rows.len(), 2, "{filtered}");
+    assert!(
+        filtered_rows.iter().all(|r| r["kind"] == "inherits_from"),
+        "kind filter must narrow to the requested kind only: {filtered}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_confidence_gates_ambiguous_and_passes_candidates() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let app_path = project.path().join("app.py");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        // Candidates pass through only when they resolve to VISIBLE entities
+        // (relation_list_candidates_never_leak_blocked_ids), so the
+        // alternative candidate needs a real row.
+        insert_entity(
+            &conn,
+            "python:function:types.wrap_again",
+            "function",
+            &types_path,
+            Some((7, 8)),
+            Some("python:module:types"),
+        );
+        // An ambiguous decorates edge: the FROM side is the best-guess
+        // decorator and `candidates` are alternative FROM-side ids (ADR-051's
+        // inverted-candidates trap).
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            Some(json!({"candidates": [
+                "python:function:types.wrap",
+                "python:function:types.wrap_again"
+            ]})),
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    // Default confidence (resolved) excludes the ambiguous edge.
+    let resolved = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resolved["ok"], true, "{resolved}");
+    assert!(
+        resolved["result"]["relations"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "resolved tier must exclude ambiguous relation edges: {resolved}"
+    );
+
+    // Opting into ambiguous surfaces it, with the candidate ids passed through.
+    let ambiguous = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in", "confidence": "ambiguous"}),
+    )
+    .await;
+    let relations = ambiguous["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{ambiguous}");
+    assert_eq!(relations[0]["edge_confidence"], "ambiguous");
+    assert_eq!(
+        relations[0]["candidates"],
+        json!([
+            "python:function:types.wrap",
+            "python:function:types.wrap_again"
+        ]),
+        "{ambiguous}"
+    );
+    // Resolved entries carry no candidates.
+    let base = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert!(
+        base["result"]["relations"][0]["candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{base}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_resolves_sei_and_reports_unknown_id() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:types-base",
+        "python:class:types.Base",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "loomweave:eid:types-base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(
+        relations.len(),
+        1,
+        "SEI input must resolve to its locator: {resp}"
+    );
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Child");
+
+    let missing = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Ghost", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(missing["ok"], false, "{missing}");
+    assert_eq!(missing["error"]["code"], "entity-not-found", "{missing}");
+}
+
+#[tokio::test]
+async fn relation_list_refuses_structure_for_blocked_entity() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    mark_blocked(&db_path, "python:class:types.Base", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["available"], false, "{resp}");
+    assert_eq!(
+        resp["result"]["briefing_blocked"], "secret_present",
+        "{resp}"
+    );
+    assert!(resp["result"]["relations"].is_null(), "{resp}");
+    assert!(
+        !resp.to_string().contains("types.Base"),
+        "blocked id leaked in relation_list refusal: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_redacts_blocked_neighbor_and_blocked_anchor_file() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    // Block the subclass: querying Base must stub the neighbor AND withhold
+    // the line evidence (the line text contains the blocked declaration).
+    mark_blocked(&db_path, "python:class:types.Child", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    let rel = &relations[0];
+    assert_redacted_identity(&rel["entity"], "secret_present");
+    assert_eq!(rel["source_status"], "briefing_blocked", "{rel}");
+    assert!(rel["line"].is_null(), "{rel}");
+    assert_eq!(rel["line_text"], "", "{rel}");
+    assert!(
+        !resp.to_string().contains("types.Child"),
+        "blocked neighbor id leaked in relation_list response: {resp}"
+    );
+
+    // Blocking the anchor FILE entity withholds line evidence even when both
+    // endpoints are visible (the bytes behind the anchor are scanner-withheld).
+    mark_blocked(&db_path, "core:file:app.py", "secret_present");
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:types.wrap", "direction": "out"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let rel = &resp["result"]["relations"].as_array().unwrap()[0];
+    assert_eq!(rel["entity"]["id"], "python:function:app.handler", "{rel}");
+    assert_eq!(rel["source_status"], "briefing_blocked", "{rel}");
+    assert!(rel["line"].is_null(), "{rel}");
+    assert_eq!(rel["line_text"], "", "{rel}");
+}
+
+#[test]
+fn tools_list_includes_entity_relation_list() {
+    let tools = list_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "entity_relation_list")
+        .expect("entity_relation_list tool definition");
+    assert_eq!(
+        tool.input_schema,
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "direction": {"type": "string", "enum": ["in", "out"]},
+                "kind": {
+                    "type": "string",
+                    "enum": ["inherits_from", "decorates", "implements", "derives"]
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["resolved", "ambiguous", "inferred"],
+                    "default": "resolved"
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": ["string", "null"]}
+            },
+            "required": ["id", "direction"],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_lists_relation_buckets() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let state = state_for(project.path(), &db_path);
+
+    // A class with an inbound inherits_from: relations_in names the subclass,
+    // tagged with its kind; relations_out is honest-empty.
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:class:types.Base"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations_in = resp["result"]["relations_in"].as_array().unwrap();
+    assert_eq!(relations_in.len(), 1, "{resp}");
+    assert_eq!(relations_in[0]["kind"], "inherits_from");
+    assert_eq!(relations_in[0]["entity"]["id"], "python:class:types.Child");
+    assert_eq!(relations_in[0]["edge_confidence"], "resolved");
+    assert!(
+        resp["result"]["relations_out"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{resp}"
+    );
+    // The truncated map covers the new buckets.
+    assert_eq!(resp["result"]["truncated"]["relations_in"], false, "{resp}");
+    assert_eq!(
+        resp["result"]["truncated"]["relations_out"], false,
+        "{resp}"
+    );
+
+    // The decorator side: relations_out names what it decorates (ADR-051
+    // direction — the decorator is the FROM side).
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:types.wrap"}),
+    )
+    .await;
+    let relations_out = resp["result"]["relations_out"].as_array().unwrap();
+    assert_eq!(relations_out.len(), 1, "{resp}");
+    assert_eq!(relations_out[0]["kind"], "decorates");
+    assert_eq!(
+        relations_out[0]["entity"]["id"],
+        "python:function:app.handler"
+    );
+
+    // The per-bucket limit trims and flags relation buckets like any other.
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:class:types.Other",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "inherits_from",
+            "python:class:types.Other",
+            "python:class:types.Base",
+            "resolved",
+            None,
+            "core:file:types.py",
+            34,
+            38,
+        );
+    }
+    let resp = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:class:types.Base", "limit": 1}),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["relations_in"].as_array().unwrap().len(),
+        1,
+        "{resp}"
+    );
+    assert_eq!(resp["result"]["truncated"]["relations_in"], true, "{resp}");
+}
+
+#[tokio::test]
+async fn orientation_pack_includes_relation_neighbors() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:class:types.Base"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let neighbors = &resp["result"]["neighbors"];
+    let relations_in = neighbors["relations_in"].as_array().unwrap();
+    assert_eq!(relations_in.len(), 1, "{resp}");
+    assert_eq!(relations_in[0]["kind"], "inherits_from");
+    assert_eq!(relations_in[0]["entity"]["id"], "python:class:types.Child");
+    assert!(
+        neighbors["relations_out"].as_array().unwrap().is_empty(),
+        "{resp}"
+    );
+    // The omitted block reports the relation buckets alongside the others.
+    assert_eq!(resp["result"]["omitted"]["relations_in"], 0, "{resp}");
+    assert_eq!(resp["result"]["omitted"]["relations_out"], 0, "{resp}");
+}
+
+#[tokio::test]
+async fn relation_list_candidates_never_leak_blocked_ids() {
+    // An ambiguous edge's `candidates` carry raw entity ids, and the chosen
+    // FROM side conventionally appears in its own candidate list — so without
+    // filtering, a briefing-blocked neighbor's stubbed identity is recoverable
+    // verbatim from `candidates` on the same row (the entity_resolve surface
+    // collapses blocked candidates for exactly this reason).
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let app_path = project.path().join("app.py");
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            Some(json!({"candidates": [
+                "python:function:types.wrap",
+                "python:function:types.wrap_again"
+            ]})),
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    // Block the chosen from-side decorator; the alternative candidate id
+    // (wrap_again) has no entity row at all and must also not be disclosed
+    // as a visible "alternative" — only ids resolvable to VISIBLE entities
+    // may pass through.
+    mark_blocked(&db_path, "python:function:types.wrap", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in", "confidence": "ambiguous"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    assert_redacted_identity(&relations[0]["entity"], "secret_present");
+    assert!(
+        !resp.to_string().contains("types.wrap"),
+        "blocked id leaked through candidates (or anywhere else): {resp}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_visible_candidates_survive_blocked_sibling_filter() {
+    // The blocked-candidate filter must not throw away legitimate visible
+    // alternatives: with one blocked and one visible candidate, the visible
+    // id still passes through.
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        let app_path = project.path().join("app.py");
+        insert_entity(
+            &conn,
+            "python:function:types.wrap_again",
+            "function",
+            &types_path,
+            Some((7, 8)),
+            Some("python:module:types"),
+        );
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            Some(json!({"candidates": [
+                "python:function:types.wrap",
+                "python:function:types.wrap_again"
+            ]})),
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    mark_blocked(
+        &db_path,
+        "python:function:types.wrap_again",
+        "secret_present",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in", "confidence": "ambiguous"}),
+    )
+    .await;
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    // The visible chosen candidate passes; the blocked sibling is withheld.
+    assert_eq!(
+        relations[0]["candidates"],
+        json!(["python:function:types.wrap"]),
+        "{resp}"
+    );
+    assert!(
+        !resp.to_string().contains("wrap_again"),
+        "blocked candidate id leaked: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_redacts_line_text_for_drifted_anchor_file() {
+    // The anchor owner of a relation edge is the edge's core file row; when
+    // the on-disk file no longer matches that row's indexed content_hash, the
+    // tool must NOT serve newly modified, scanner-unvetted bytes (same guard
+    // call_sites pins for call anchors).
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    std::fs::write(
+        project.path().join("types.py"),
+        "API_KEY = \"sk-sentinel-never-disclose\"\n\nclass Base:\n    pass\n\nclass Child(Base):\n    pass\n",
+    )
+    .expect("rewrite types source");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let rel = &resp["result"]["relations"].as_array().unwrap()[0];
+    assert_eq!(rel["source_status"], "drifted", "{rel}");
+    assert!(rel["line"].is_null(), "{rel}");
+    assert_eq!(rel["line_text"], "", "{rel}");
+    assert!(
+        rel["drift"]["stored_content_hash"].is_string()
+            && rel["drift"]["current_content_hash"].is_string(),
+        "{rel}"
+    );
+    assert!(
+        !resp.to_string().contains("sk-sentinel-never-disclose"),
+        "drifted anchor served unvetted bytes: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_relation_buckets_gate_ambiguous_by_confidence() {
+    // The relations buckets honor the tool's confidence tier (the tool
+    // description promises "ambiguous and inferred ... are opt-in"); a
+    // regression in relation_neighbors' gate would mix ambiguous relation
+    // edges into default-resolved views.
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let app_path = project.path().join("app.py");
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            None,
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resolved = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:app.other"}),
+    )
+    .await;
+    assert!(
+        resolved["result"]["relations_in"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "default resolved tier must exclude the ambiguous relation edge: {resolved}"
+    );
+
+    let ambiguous = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:app.other", "confidence": "ambiguous"}),
+    )
+    .await;
+    let rel_in = ambiguous["result"]["relations_in"].as_array().unwrap();
+    assert_eq!(rel_in.len(), 1, "{ambiguous}");
+    assert_eq!(rel_in[0]["edge_confidence"], "ambiguous", "{ambiguous}");
+}
+
+#[tokio::test]
+async fn relation_list_survives_null_anchor_file_dangling_neighbor_and_overrun_cursor() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:class:types.Anchorless",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        // A relation edge with NO source_file_id (a pre-anchored-file row, or
+        // a partially failed analyze): evidence degrades to "unavailable",
+        // never a panic.
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, source_byte_start, source_byte_end)
+             VALUES ('inherits_from', 'python:class:types.Anchorless', 'python:class:types.Base', 'resolved', 60, 64)",
+            [],
+        )
+        .expect("insert anchorless relation edge");
+        // A dangling edge whose from-side entity row is gone: skipped, not
+        // served and not panicking. FKs forbid inserting it directly, so
+        // insert legally and delete the entity afterwards (foreign_keys
+        // defaults OFF on this raw test connection) — simulating the reader
+        // skew / corruption the handler's skip branch guards against.
+        insert_entity(
+            &conn,
+            "python:class:types.Vanished",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, source_byte_start, source_byte_end)
+             VALUES ('inherits_from', 'python:class:types.Vanished', 'python:class:types.Base', 'resolved', 70, 74)",
+            [],
+        )
+        .expect("insert soon-dangling relation edge");
+        conn.execute(
+            "DELETE FROM entities WHERE id = 'python:class:types.Vanished'",
+            [],
+        )
+        .expect("orphan the relation edge");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    // Child (anchored) + Anchorless (no file) survive; Vanished is skipped.
+    let ids: Vec<&str> = relations
+        .iter()
+        .map(|r| r["entity"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["python:class:types.Anchorless", "python:class:types.Child"],
+        "{resp}"
+    );
+    let anchorless = &relations[0];
+    assert_eq!(anchorless["source_status"], "unavailable", "{anchorless}");
+    assert!(anchorless["line"].is_null(), "{anchorless}");
+    assert!(anchorless["file"].is_null(), "{anchorless}");
+
+    // A cursor past the end yields an empty page, not an error.
+    let past_end = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base", "direction": "in", "cursor": "50"}),
+    )
+    .await;
+    assert_eq!(past_end["ok"], true, "{past_end}");
+    assert!(
+        past_end["result"]["relations"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{past_end}"
+    );
+    assert_eq!(past_end["result"]["truncated"], false, "{past_end}");
+    assert_eq!(past_end["result"]["next_cursor"], Value::Null, "{past_end}");
+}
+
+// ── C-12 (weft-4165f1ed71): one freshness oracle, both surfaces agree ─────────
+
+/// Set a file's or directory's mtime deterministically.
+fn set_path_mtime(path: &std::path::Path, when: std::time::SystemTime) {
+    std::fs::File::options()
+        .read(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+/// Reproduces the dogfood-4 B1 divergence (weft-4165f1ed71): at the same
+/// instant, `project_status_get` said `staleness: "stale"` while
+/// `index_diff_get` said `overall: "fresh"` on the SAME store. Driver: the
+/// status surface ran its own mtime/structural detector, which (a) watched the
+/// PARENT of every ingested path — and the lacuna project-anchor entity
+/// carries `source_file_path = <project root>`, putting the project root's
+/// parent (`/home/john`, churning constantly) in the watch set — and (b)
+/// treated a directory mtime as a file-modification signal. Convention C-12:
+/// each status question gets exactly ONE authoritative verdict surface
+/// (`index_diff_get`), and `project_status_get` must derive from the same code
+/// path. Both surfaces must answer "fresh" here.
+#[tokio::test]
+async fn project_status_and_index_diff_share_one_freshness_verdict() {
+    let outer = tempfile::tempdir().expect("outer dir");
+    let root = outer.path().join("proj");
+    let loomweave_dir = root.join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).expect("create store dir");
+    let db_path = loomweave_dir.join("loomweave.db");
+    let mut conn = Connection::open(&db_path).expect("open sqlite");
+    loomweave_storage::pragma::apply_write_pragmas(&conn).expect("pragmas");
+    loomweave_storage::schema::apply_migrations(&mut conn).expect("migrations");
+
+    // One real ingested source file, untouched since the analyze.
+    let source = root.join("demo.py");
+    std::fs::write(&source, "x = 1\n").expect("write source");
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            properties, created_at, updated_at) \
+         VALUES ('python:module:demo', 'python', 'module', 'demo', 'demo', ?1, '{}', \
+                 '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        params![source.to_str().unwrap()],
+    )
+    .expect("insert module entity");
+    // The lacuna shape: a synthetic project anchor whose source_file_path is
+    // the PROJECT ROOT DIRECTORY itself.
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            properties, created_at, updated_at) \
+         VALUES ('core:project:proj', 'core', 'project', 'proj', 'proj', ?1, \
+                 '{\"finding_anchor\": true}', \
+                 '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        params![root.to_str().unwrap()],
+    )
+    .expect("insert project anchor");
+    // Analyze completed 2026-03-01; every ingested path is older than that…
+    conn.execute(
+        "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+         VALUES ('run-1', '2026-03-01T00:00:00.000Z', '2026-03-01T00:00:00.000Z', \
+                 '{}', '{}', 'completed')",
+        [],
+    )
+    .expect("insert run");
+    drop(conn);
+
+    // 2026-02-01 (before the run) for the source file and the project root dir…
+    let before_run = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_769_904_000);
+    set_path_mtime(&source, before_run);
+    set_path_mtime(&root, before_run);
+    // …while the PARENT of the project root churns after the run (the
+    // /home/john situation). Outer tempdir mtime is "now" already; make it
+    // explicit and unambiguous.
+    set_path_mtime(outer.path(), std::time::SystemTime::now());
+
+    let state = state_for(&root, &db_path);
+    let status = call_tool(&state, "project_status", json!({})).await;
+    let diff = call_tool(&state, "index_diff", json!({})).await;
+
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(diff["ok"], true, "{diff}");
+    assert_eq!(
+        diff["result"]["overall"], "fresh",
+        "authoritative verdict: nothing indexed changed: {diff}"
+    );
+    assert_eq!(
+        status["result"]["staleness"], "fresh",
+        "project_status must derive from index_diff's verdict (C-12) — parent-dir \
+         churn and the project anchor's directory path are not staleness: {status}"
+    );
+}
+
+// ── B9 (weft-4a46553503): hydrated issue stub + honest enrichment degrade ────
+
+/// B9 failing-first: a matched row's `issue` stub must carry the issue's `id`
+/// alongside title/status — an agent acting on the row needs the id without
+/// re-deriving it from the sibling `issue_id` field or making a second
+/// filigree call.
+#[tokio::test]
+async fn issues_for_issue_stub_carries_id_title_and_status() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-fresh",
+                    "python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
+                )],
+            )
+            .with_detail("filigree-fresh", "Refresh tokens", "building", 1),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let issue = &envelope["result"]["matched"][0]["issue"];
+    assert_eq!(
+        issue["id"], "filigree-fresh",
+        "stub must carry the id: {envelope}"
+    );
+    assert_eq!(issue["title"], "Refresh tokens", "{envelope}");
+    assert_eq!(issue["status"], "building", "{envelope}");
+}
+
+/// B9 failing-first, degrade half: when the detail fetch fails (the dogfood-4
+/// observation — every issue came back `issue: null` with no explanation
+/// because the enrichment 401'd), the envelope must say so IN-BAND with a
+/// top-level marker, not leave the consumer staring at inexplicable nulls.
+#[tokio::test]
+async fn issues_for_discloses_detail_enrichment_degrade_in_band() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-fresh",
+                    "python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
+                )],
+            )
+            .with_detail("filigree-fresh", "Refresh tokens", "building", 1)
+            .with_detail_error(),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    // Degraded, not failed: the association result still lands…
+    assert_eq!(
+        envelope["result"]["matched"][0]["issue_id"],
+        "filigree-fresh"
+    );
+    assert_eq!(envelope["result"]["matched"][0]["issue"], Value::Null);
+    // …and the degrade is disclosed once, in-band.
+    let degraded = &envelope["result"]["issue_detail_unavailable"];
+    assert!(
+        degraded["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("503")),
+        "the marker must carry the enrichment failure reason: {envelope}"
+    );
+}
+
+/// The healthy path carries NO degrade marker (the marker must mean something).
+#[tokio::test]
+async fn issues_for_omits_degrade_marker_when_enrichment_succeeds() {
+    let (project, db_path) = open_project();
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_response(
+                "python:function:demo.entry",
+                vec![association(
+                    "filigree-fresh",
+                    "python:function:demo.entry",
+                    &expected_content_hash(project.path(), "python:function:demo.entry"),
+                )],
+            )
+            .with_detail("filigree-fresh", "Refresh tokens", "building", 1),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let envelope = call_tool(&state, "issues_for", json!({"id": "python:module:demo"})).await;
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert!(
+        envelope["result"].get("issue_detail_unavailable").is_none()
+            || envelope["result"]["issue_detail_unavailable"].is_null(),
+        "no degrade marker on the healthy path: {envelope}"
+    );
 }

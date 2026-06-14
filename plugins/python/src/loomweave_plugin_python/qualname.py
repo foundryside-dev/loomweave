@@ -19,9 +19,9 @@ the same bare Python ``__qualname__`` semantics that Wardline stores in its
 dotted module path elsewhere; ADR-018 requires cross-product joins to translate
 between those shapes instead of comparing strings directly.
 
-Sprint 1 covers ``FunctionDef`` and ``AsyncFunctionDef`` as emitted
-entities; ``ClassDef`` is recognised as a parent scope only (class
-entities are WP3-feature-complete scope).
+``FunctionDef``, ``AsyncFunctionDef``, and ``ClassDef`` are all emitted
+entities (class entities since WP3); every one of the three also acts as
+a parent scope for qualname reconstruction.
 """
 
 from __future__ import annotations

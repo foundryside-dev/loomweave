@@ -21,19 +21,19 @@ use loomweave_storage::{
     SummaryCacheEntry, SummaryCacheKey, WriterCmd, call_edges_from, call_edges_targeting,
     candidate_entities_for_unresolved_sites, entity_by_id, existing_entity_ids,
     guidance_sheet_is_expired, guidance_sheet_matches_entity, inferred_edge_cache_lookup,
-    list_guidance_sheets, summary_cache_lookup, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    list_guidance_sheets, resolve_entity_ref, summary_cache_lookup,
+    unresolved_call_sites_for_caller, unresolved_callers_for_target,
 };
 
 use crate::{
     BudgetReservation, EMPTY_GUIDANCE_FINGERPRINT, InferenceLlmState, InferredDispatchFailure,
     InferredDispatchOutcome, InferredDispatchStats, InferredInflightGuard, InferredRead,
     ParamError, ServerState, SummaryLlmState, SummaryRead, SummaryReady, briefing_block_reason,
-    entities_json, entity_json, inferred_records_from_result, inferred_usage_stats,
-    invoke_llm_provider, llm_usage_json, required_str, stale_semantic, storage_retryable,
-    structural_summary_json, summary_cache_expired, summary_read_error, summary_success_envelope,
-    summary_usage_stats, token_ceiling_envelope, tool_error_envelope, unresolved_sites_json,
-    verified_source_excerpt,
+    entities_json, entity_identity_json, entity_json, inferred_records_from_result,
+    inferred_usage_stats, invoke_llm_provider, llm_usage_json, required_str, stale_semantic,
+    storage_retryable, structural_summary_json, summary_cache_expired, summary_read_error,
+    summary_success_envelope, summary_usage_stats, token_ceiling_envelope, tool_error_envelope,
+    unresolved_sites_json, verified_source_excerpt,
 };
 
 fn composed_summary_guidance(
@@ -136,6 +136,23 @@ impl ServerState {
         }
 
         Ok(self.refresh_summary(*ready, summary_llm, now).await)
+    }
+
+    /// Resolve an id-or-SEI to its canonical `entities.id` locator via a single
+    /// reader call. Returns `Ok(None)` when nothing alive resolves. Used to
+    /// canonicalize a raw arg ONCE at the top of the `ensure_inferred_*`
+    /// pre-gated tools so both the inference pass and the reader key on the real
+    /// locator rather than re-resolving a SEI each time (clarion-d76e7f7267).
+    pub(crate) async fn resolve_to_locator(
+        &self,
+        id_or_sei: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let id_or_sei = id_or_sei.to_owned();
+        self.readers
+            .with_reader(move |conn| {
+                Ok(resolve_entity_ref(conn, &id_or_sei)?.map(|entity| entity.id))
+            })
+            .await
     }
 
     pub(crate) async fn ensure_inferred_for_target(
@@ -482,15 +499,20 @@ impl ServerState {
         let project_root = self.project_root.clone();
         self.readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(SummaryRead::EntityNotFound(entity_id));
                 };
                 if entity.kind == "subsystem" {
                     return Ok(SummaryRead::ScopeDeferred(entity_json(conn, &entity)));
                 }
                 if let Some(reason) = briefing_block_reason(&entity) {
+                    // Deliberate exception to the `entity_json` identity gate
+                    // (clarion-307668e2be): the caller named this exact id and
+                    // needs the remediation echo ("fix the secret at <path>"), so
+                    // build identity via the conn-free core that bypasses the
+                    // redaction. The caller cannot *discover* what it already named.
                     return Ok(SummaryRead::BriefingBlocked(
-                        entity_json(conn, &entity),
+                        entity_identity_json(&entity),
                         reason,
                     ));
                 }

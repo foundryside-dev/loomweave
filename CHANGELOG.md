@@ -12,6 +12,356 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Added
+
+- **Doctor stale-port health probing.** `loomweave doctor --json` now probes
+  `/health` when HTTP config resolves from `.weft/loomweave/ephemeral.port` and
+  reports stale persisted port metadata as an advisory warning.
+- **Instruction last-writer marker.** Installed instruction blocks now include
+  stable `loomweave:last-writer:loomweave install` metadata in the canonical
+  drift body so installer provenance participates in idempotency checks.
+- **Filigree EntityAssociation fixture coverage.** Added a canonical
+  EntityAssociation reverse-lookup fixture and parser coverage for
+  `loomweave_entity_id`, `content_hash_at_attach`, and attach metadata.
+- **MCP Wardline facet enrichment.** `entity_wardline_list` with
+  `has_findings` now reconciles Filigree-provided Wardline findings for
+  project-relative paths when the local findings table does not carry the
+  anchor.
+- **SEI oracle coverage guard.** Added a reference-test guard that keeps the SEI
+  oracle fixture scenarios and implemented conformance tests in sync.
+
+### Changed
+
+- **ADR-049 lockstep posture.** Documented ADR-049 as the versioned Rust-feature
+  dialect adopted by Loomweave and Wardline in lockstep, outside the clean-break
+  core API freeze set.
+
+### Fixed
+
+- **Storage coalescing flake stabilization.** Stabilized the cold inferred-call
+  coalescing test with a gated provider so follower requests wait behind the
+  leader instead of racing a timing delay.
+
+## [1.1.0rc5] — 2026-06-13
+
+Fifth 1.1 release candidate. This candidate adds agent-driveable LLM and
+semantic-search configuration (MCP tools + CLI verbs), an LLM lookup
+diagnostics log, and the Filigree minted-token auth rung, then remediates the
+findings of the adversarial review of that work (weft-ac59e8e730). No package
+is published for release candidates. (Cargo SemVer `1.1.0-rc5`; Python wheels
+normalise to PEP 440 `1.1.0rc5`.)
+
+### Added
+
+- **Config MCP tools.** Four new tools let an agent inspect and edit the
+  project's LLM and embedding posture: `llm_config_get` / `llm_config_set`
+  (provider, enabled, allow_live_provider, model pins, OpenRouter key env /
+  endpoint, and `serve.mcp.enable_write_tools`) and `semantic_config_get` /
+  `semantic_config_set` (provider, model, dimensions, endpoint, key env,
+  timeout, token ceiling). The two `*_config_set` tools deliberately **bypass
+  the read-only write-tool gate** (bootstrap exemption): the gate itself is one
+  of the settings they edit, so from a read-only session they can persistently
+  enable write tools and live (paid) LLM/embedding spend. This is by design and
+  is stated in the MCP server instructions and the `loomweave-workflow` skill.
+- **`loomweave config llm|semantic` CLI verbs.** `config llm status|set` and
+  `config semantic status|set` edit `loomweave.yaml` in place with validation,
+  and `config example --provider <p>` emits an annotated stub. Operator-facing
+  provider aliases are accepted everywhere providers are parsed
+  (`openrouter_api`/`open_router`, `codex_sidecar`/`codex`,
+  `claude_sidecar`/`claude_code`, and `openai`/`local`/`openai_local` for the
+  embedding providers).
+- **LLM lookup traffic log.** Every configured LLM lookup appends one JSONL
+  metadata record to `.weft/loomweave/diagnostics/llm-traffic.jsonl` (inside
+  Loomweave's member store dir; `store_dir` overrides move it too). The log is
+  metadata-only by guarantee — provider, purpose, prompt template id, model,
+  outcome, token usage, cost; never prompt text or model output — and is capped
+  at 10 MiB with rotation to `llm-traffic.jsonl.1`.
+- **Semantic-search configuration with honest degrade.** The
+  `semantic_search:` block (hosted `api` or loopback-only `local_openai`
+  provider) feeds `entity_semantic_search_list`; when it is enabled but the
+  provider cannot be constructed (missing live opt-in or API key), `serve`
+  warns about the inert embedding provider and the search degrades to
+  `not_enabled` instead of failing startup.
+
+### Fixed
+
+- **Filigree auth: minted federation token as the final resolution rung**
+  (dogfood-4 A5, weft-c7db813d9a). Token resolution was env-only, so the MCP
+  serve path — launched with an empty env in `.mcp.json` — 401'd on every
+  weft-gated read. The daemon's auto-minted
+  `<root>/.weft/filigree/federation_token` is now read after the
+  `WEFT_FEDERATION_TOKEN` / legacy `FILIGREE_API_TOKEN` env rungs across serve,
+  scan-results emit, clean-stale, and SARIF import.
+- **Review remediation (weft-ac59e8e730).** The adversarial review of the
+  config/diagnostics work above confirmed nine findings, fixed in this
+  candidate: the semantic loopback-trust gate no longer runs when
+  `semantic_search.enabled: false` (a disabled block with a stale non-loopback
+  endpoint had hard-failed `serve`/`config status` and blocked
+  `config semantic set --disable` itself); IPv6 loopback (`http://[::1]:…`)
+  endpoints are recognised; a diagnostics write failure no longer converts a
+  successful (paid-for) LLM call into an error; concurrent traffic-log appends
+  are serialized (no interleaved partial JSON lines) and colliding rotations no
+  longer fail calls; the traffic log moved from the legacy `.loomweave/` root
+  into `.weft/loomweave/` (C-9) with the installed store `.gitignore` covering
+  `diagnostics/`; the `llm_config_set`/`semantic_config_set` inputSchemas
+  declare real types and provider enums instead of bare `{}`; a committed
+  agent-harness debug log (`error.log`) was removed and guarded; and the README
+  MCP surface claim was corrected to 46 tools.
+
+## [1.1.0rc4] — 2026-06-11
+
+Fourth 1.1 release candidate. This candidate makes the Rust language plugin a
+first-party 1.x capability, expands the MCP read surface, finishes the Weft store
+cutover, and hardens plugin/analyze failure handling. No package is published for
+release candidates. (Cargo SemVer `1.1.0-rc4`; Python wheels normalise to PEP
+440 `1.1.0rc4`.)
+
+### Added
+
+- **First-party Rust language plugin.** The 1.1 line now includes
+  `loomweave-plugin-rust` alongside the Python plugin. The Rust plugin extracts
+  modules, structs, enums, traits, type aliases, consts, statics, macros, impls,
+  and functions, and emits `contains`, `imports`, `implements`, `calls`,
+  `derives`, and `references` edges. The distribution wheel installs a
+  discovery-glob-named `loomweave-plugin-rust` executable and its manifest under
+  `share/loomweave/plugins/rust/`, so colocated installs discover it
+  automatically.
+- **Rust-plugin hardening envelope (ADR-050).** The host now bounds plugin
+  lifecycle phases with handshake, per-file, and shutdown deadlines, and the
+  Rust plugin degrades hostile parse shapes instead of crashing the run:
+  excessive nesting emits `LMWV-RUST-DEPTH-LIMIT`, oversized files emit
+  `LMWV-RUST-FILE-TOO-LARGE`, and watchdog kills are no longer mislabeled as
+  OOM. The Rust plugin's address-space envelope is raised to the empirically
+  validated 512 MiB line for large real corpora.
+- **Relation-edge MCP read surface.** `entity_relation_list` exposes
+  `inherits_from`, `decorates`, `implements`, and `derives` edges directly, and
+  `entity_neighborhood_get` / `entity_orientation_pack_get` now include
+  direction-tagged relation buckets.
+- **Entity resolution and findings surfaces.** `entity_resolve` resolves all
+  entity kinds, SEI entries, Rust `::` paths, and plugin hints; the MCP surface
+  also gained whole-project finding browsing, `has_findings` filtering, stricter
+  finding-filter validation, and better unknown-kind hints.
+- **Duplicate-locator alarm.** `loomweave analyze` now emits
+  `LMWV-DUPLICATE-LOCATOR` at ERROR severity when two declarations collide on
+  one entity id, surfacing data-loss risks that SQLite upserts previously
+  absorbed silently.
+- **Python relation edges.** The Python plugin now emits `inherits_from` and
+  `decorates` edges under ontology 0.8.0, including pyright-backed tests for the
+  new relation kinds.
+- **Product ownership workspace.** `docs/product/` now records the current
+  state, roadmap, metrics, and first product decisions for the 1.1 release line.
+
+### Changed
+
+- **Project store moved `.loomweave/` → `.weft/loomweave/` (Weft store
+  consolidation, clean break; ADR-046).** All machine-written state — the index
+  DB, `config.json`, `.gitignore`, `embeddings.db`, `ephemeral.port`,
+  `instance_id`, locks, and per-run dirs — now lives under the shared
+  `.weft/<member>/` dotdir, routed through a single `loomweave_core::store`
+  helper. There is **no fallback read** of the old location: existing projects
+  must re-init (`loomweave install` then `loomweave analyze`) and may delete the
+  orphaned `.loomweave/`. An operator may relocate the store with a
+  member-private `[loomweave].store_dir` key in a project-root `weft.toml`
+  (read-only to Loomweave; a missing or malformed file falls back silently to
+  the default). Sibling resolution reads the consolidated `.weft/<sibling>/`
+  location **only** — Filigree's live port at `.weft/filigree/ephemeral.port`,
+  Wardline's trust-vocabulary descriptor at `.weft/wardline/vocabulary.yaml` —
+  with no fallback to the pre-consolidation `.<sibling>/` path. A sibling found
+  only on the legacy path folds to the fail-soft default (`source = "config"`
+  for Filigree, an absent descriptor for Wardline), making a mis-sequenced
+  cutover visible rather than a silent stale resolve. **Cutover ordering:**
+  Filigree migrates to `.weft/filigree/` → this build installs → downstream
+  re-init.
+
+- **`cargo nextest run --workspace` now always completes instead of hanging.** A
+  `slow-timeout` cap in `.config/nextest.toml` terminates any test that runs past
+  the bound and reports it as a timeout failure, so the literal CI test command
+  runs clean to a verdict even while the pre-existing emission tests
+  (clarion-1d405be546) hang. The cap does not fix that bug — it makes the suite
+  honestly red and fast rather than green-via-family-exclusion.
+
+- **Filigree federation token env var renamed to `WEFT_FEDERATION_TOKEN`.** The
+  `integrations.filigree.token_env` default (and the name stamped into
+  `loomweave.yaml` by `loomweave install`) is now `WEFT_FEDERATION_TOKEN` —
+  Weft-suite federation plumbing is named by the suite, not by the sibling
+  member. The legacy `FILIGREE_API_TOKEN` name is still honoured as a deprecated
+  fallback at token-resolution time, so an existing global export keeps working
+  during the transition. This does not affect `serve.http.token_env`
+  (inbound HTTP read-API bearer auth, default `WEFT_TOKEN`).
+- **MCP instructions now use the registered tool dialect.** The generated
+  `loomweave-workflow` skill, MCP `initialize` instructions, and CI drift guard
+  now name the registered `entity_*` tools rather than legacy aliases; the
+  server also trims its tools/list context footprint while keeping instructions
+  truncation-proof.
+- **Dormant `wardline.yaml` manifest ingest retired.** The unused CLI ingest
+  path was removed in favour of the durable Wardline descriptor and taint-fact
+  paths already documented in the Weft contracts.
+- **Rust qualname canonicalization amended.** ADR-049 now covers cfg-twin
+  methods, concrete generic arguments, impl self-type and trait paths,
+  `#[path]` module mounts, and unnamed `const _` skip-emission; the Rust plugin
+  applies the same rules and updates the conformance fixture.
+- **Release and install packaging moved toward colocated Python installs.** The
+  `loomweave` Python package scaffold depends on both language plugins, and the
+  Rust plugin has a separate maturin distribution shim so its discovery binary
+  can be shipped without polluting normal workspace builds.
+
+### Fixed
+
+- **Rust plugin collision families closed.** The Sprint-4 residual collisions
+  from self-type paths, trait paths, `#[path]` module mounts, and unnamed
+  `const _` items were fixed and re-swept to zero on the pinned QA corpora.
+- **Out-of-line Rust module trees now agree on parent/contains edges.** Host and
+  plugin behaviour now align for mounted module trees and cfg-twin module
+  shapes.
+- **Python hostile nesting now degrades cleanly.** Deep-nesting bombs in the
+  Python plugin produce a `too_complex` outcome instead of escaping
+  `RecursionError`.
+- **Duplicate Python qualnames are pinned to first-wins semantics.** ADR-052 and
+  dogfood/audit tests freeze the expected handling of repeated Python qualnames.
+- **Install no longer fails on symlinked instruction files.** Symlinked
+  `AGENTS.md` / `CLAUDE.md` cases degrade to warnings so install can complete.
+- **E2E scripts no longer mutate global Codex config.** The smoke harnesses now
+  force hermetic config paths instead of editing `~/.codex/config.toml`.
+- **Untrusted repository git config is no longer executed.** Source inspection
+  and rename-window logic use hardened git invocations that do not execute
+  repo-local config or attribute helpers.
+
+### Docs
+
+- Added the Rust analysis known-limitations page, Sprint-3 scale QA report,
+  Sprint-4 gold QA report, gold-v2 addendum, Rust qualname federation handoff
+  letters, and MCP/command-surface audit memo.
+- Refreshed the design ladder, operator getting-started flow, operator
+  guidance docs, ADR index, public static site, and Weft federation contracts
+  for the 1.1 release-candidate surface.
+
+## [1.1.0rc3] — 2026-06-06
+
+Third 1.1 release candidate. Hardens the Python plugin's pyright spawn path
+against transient resource pressure and corrects the plugin process-limit
+sandbox. No package is published for release candidates. (Cargo SemVer
+`1.1.0-rc3`; Python wheels normalise to PEP 440 `1.1.0rc3`.)
+
+### Fixed
+
+- **`loomweave doctor` now gates on tracked-index DB health (check
+  `.weft/loomweave.schema`).** The check previously only tested for file
+  existence; it now classifies four states: absent (warning — a legitimate
+  install-before-analyze intermediate, does not fail the gate); present but
+  unreadable / corrupt / wrong format (problem — fails the gate); present and
+  opens but `PRAGMA user_version` exceeds this build's schema version (problem —
+  reports the version numbers and names the newer-build cause); and healthy
+  (ok). Both the JSON and text paths report consistently so CI gates driven by
+  either surface see the same verdict. The check resolves the DB path via
+  `loomweave_core::store::db_path` so a `weft.toml` `[loomweave].store_dir`
+  override is honoured, and opens read-only so the health check never creates
+  or mutates the file.
+
+- **Transient pyright spawn failures no longer disable analysis for the whole
+  run.** A `subprocess.Popen` failure with a transient errno
+  (`EAGAIN`/`ENOMEM`/`EMFILE`/`ENFILE`) now skips only the current file and
+  retries a fresh spawn on the next one, instead of being treated as a permanent
+  install failure. A new `LMWV-PY-PYRIGHT-SPAWN-DEFERRED` finding is emitted once
+  per pressure episode, and a resettable soft-cap emits
+  `LMWV-PY-PYRIGHT-RESOURCE-EXHAUSTED` (giving up only under *sustained*
+  pressure); genuine defects (`ENOENT`/`EACCES`) still disable as before. Closes
+  the `[Errno 11] Resource temporarily unavailable` →
+  `LMWV-PY-PYRIGHT-INSTALL-FAILURE` failure seen analysing large projects.
+
+### Changed
+
+- **`RLIMIT_NPROC` is no longer applied to language-server plugins.** Because
+  `RLIMIT_NPROC` is enforced per real UID system-wide — not per plugin subtree —
+  any fixed ceiling is tripped by the operator's unrelated processes and
+  intermittently fails `pyright-langserver`'s `fork(2)` with `EAGAIN`. The host
+  now leaves `RLIMIT_NPROC` uncapped for plugins declaring the `pyright` runtime
+  capability (relying on `RLIMIT_AS` + crash-loop supervision) and retires the
+  `PYRIGHT_MAX_NPROC = 4096` constant. cgroup v2 `pids.max` is documented as the
+  future tool for true per-plugin process bounds (ADR-021, ADR-035).
+
+## [1.1.0rc2] — 2026-06-06
+
+Second 1.1 release candidate, rolling up dogfood-friction fixes and deferred
+v1.1 engineering items on top of rc1. No package is published for release
+candidates. (Cargo SemVer `1.1.0-rc2`; Python wheels normalise to PEP 440
+`1.1.0rc2`.)
+
+### Added
+
+- **Worktree-aware staleness (ADR-045).** `project_status_get`, the
+  `loomweave://context` resource, and the session-start banner now surface
+  `indexed_at_commit` + `worktree_dirty`, and a new `Staleness::StaleWorktree`
+  verdict fires when an otherwise-fresh index has untracked source on disk.
+  Detection uses a hardened, hash-free `git ls-files --others` scoped to ingested
+  source extensions (false-positive guard), proven filter-safe by test — closes
+  the "fresh lies about uncommitted code" friction (clarion-26c7e52027,
+  clarion-d9cf8bcfa9).
+
+### Changed
+
+- **`.loomweave/.gitignore` (ADR-005)** now also excludes `instance_id` and
+  `*.lock`, so `git add -A` no longer stages the per-project serve fingerprint or
+  the analyze advisory lock; ADR-005 documents the live-index commit hazard and
+  points at `loomweave db backup` (clarion-7381e6382d).
+- **WAL hygiene.** The storage writer-actor runs `PRAGMA wal_checkpoint(TRUNCATE)`
+  after each committed run, so the on-disk `loomweave.db` reflects committed state
+  while `serve` is alive instead of lagging behind a multi-MB WAL sidecar
+  (clarion-cdee445ed8).
+- **Release CI parity.** `release.yml` gains a macOS aarch64 `verify-macos` gate
+  (mirroring `ci.yml`) wired into the build/publish `needs` chain, closing the
+  gap where a macOS-only lint/test regression could reach the build jobs
+  (clarion-47d395e03c).
+
+### Removed
+
+- **Dead `entity_fts.content_text` column** dropped via migration 0009 — it was
+  never populated and never read (content search is served by the ADR-040
+  embeddings sidecar). `CURRENT_SCHEMA_VERSION` is now 9 (clarion-716449c371).
+
+### Docs
+
+- macOS Gatekeeper quarantine workaround added to `getting-started.md`
+  Troubleshooting (clarion-03dfa1f94d).
+- ADR-024 in-place migration-retirement guard activated: `published_build.txt`
+  backfilled to `v1.0.0` (first published build; 0001 byte-identical since), so
+  later schema changes must be additive migrations (clarion-b20448b3ac).
+
+## [1.1.0rc1] — 2026-06-06
+
+First 1.1 release candidate. No package is published for release candidates —
+the `1.1.0` package ships only at the final tag. (Cargo SemVer `1.1.0-rc1`;
+the Python wheels normalise to PEP 440 `1.1.0rc1`.)
+
+### Added
+
+- **Read-API ephemeral port publication (ADR-044).** `loomweave serve` binds a
+  per-project **deterministic** read-API port (blake3 over the canonical project
+  path, band `9400–10399`, disjoint from Filigree's `8400–9399`) with an
+  OS-assigned **ephemeral fallback** when that port is taken, and publishes the
+  *actually bound* port to `.loomweave/ephemeral.port` — a normative cross-product
+  file contract (port-only ASCII + optional trailing newline, atomic temp+rename,
+  **loopback-only**, removed on clean shutdown). This resolves the cross-project
+  `127.0.0.1:9111` bind collision so multiple projects can `serve` concurrently
+  without mis-targeting one another. New consume-time resolver
+  `resolve_loomweave_url` (precedence: explicit target > published file >
+  configured URL > none) is the reference reader; `doctor` and
+  `project_status_get` report the live published endpoint. The published file is
+  git-ignored.
+- **No-index degraded MCP mode.** `serve` on a project with no index no longer
+  exits 1 — it serves a degraded MCP stdio session that answers `initialize` and
+  chirps to run `loomweave install` + `loomweave analyze` from every tool call,
+  so the MCP client connects and is told how to recover.
+
+### Changed
+
+- **`serve.http.bind` is now optional** (`Option<SocketAddr>`). Unset — the new
+  default — auto-selects and publishes the per-project deterministic port; an
+  explicit value is honoured verbatim (no fallback). The installer no longer
+  stamps `serve.http.bind: 127.0.0.1:9111`, the integration bindings write the
+  per-project deterministic loomweave URL, and `install`/`doctor --fix` self-heal
+  the stale hard-coded `9111` stamp on existing projects.
+- Version bumped to `1.1.0rc1` across the Rust workspace and the Python plugin.
+
 ## [1.0.0] — Loomweave — 2026-06-05
 
 **This release renames the product and re-baselines its version.** What shipped

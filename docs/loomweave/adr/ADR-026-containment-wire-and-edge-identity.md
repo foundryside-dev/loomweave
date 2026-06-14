@@ -1,6 +1,6 @@
 # ADR-026: Containment Wire Shape and Edge Identity
 
-**Status**: Accepted; amended by [ADR-043](./ADR-043-edge-reanalysis-replacement.md)
+**Status**: Accepted; amended by [ADR-043](./ADR-043-edge-reanalysis-replacement.md); `inherits_from`/`decorates` direction and anchor reading specified by [ADR-051](./ADR-051-relation-edge-direction-and-anchor.md)
 **Date**: 2026-05-05
 **Deciders**: qacona@gmail.com
 **Context**: B.3 (Sprint 2 Tier B) introduces the first edge kind Loomweave has ever persisted (`contains`). Sprint-1 locked entity wire shape but explicitly deferred edge wire shape: the kickoff handoff at `docs/implementation/handoffs/2026-04-30-sprint-2-kickoff.md` §"Edge wire shape" states "B.3's first edge will define the protocol-level wire shape". Three coupled decisions arise — the wire envelope, the edge-row identity in storage, and the per-kind contract for `source_byte_start/end`. Locking them together prevents the four later edge kinds (`calls`, `imports`, `decorates`, `inherits_from`) from inheriting an under-specified precedent.
@@ -104,8 +104,11 @@ The `edges.source_byte_start` and `edges.source_byte_end` columns are nullable, 
 | `imports` | MUST be `Some` (the import statement location) |
 | `decorates` | MUST be `Some` (the decoration target location) |
 | `inherits_from` | MUST be `Some` (the base-class declaration in the class header) |
+| `references` | MUST be `Some` (the referencing path/type token) |
+| `implements` | MUST be `Some` (the implemented-trait path in the `impl` header) |
+| `derives` | MUST be `Some` (the derived-trait path token inside `#[derive(...)]`) |
 
-The structural / non-derivable distinction is the discriminator. `contains` and `in_subsystem` are facts about graph structure with no separate textual occurrence — the location of "module M contains function F" is identical to F's source range, already stored on the entity. `guides` and `emits_finding` are core-emitted edges connecting structural entities to guidance / findings; the guidance's or finding's own source citation lives elsewhere. `calls`, `imports`, `decorates`, `inherits_from` all have a specific token in the source code that IS the edge — the call site, the import statement, the `@decorator_name` line, the base-class identifier in `class X(Base):`.
+The structural / non-derivable distinction is the discriminator. `contains` and `in_subsystem` are facts about graph structure with no separate textual occurrence — the location of "module M contains function F" is identical to F's source range, already stored on the entity. `guides` and `emits_finding` are core-emitted edges connecting structural entities to guidance / findings; the guidance's or finding's own source citation lives elsewhere. `calls`, `imports`, `decorates`, `inherits_from` all have a specific token in the source code that IS the edge — the call site, the import statement, the `@decorator_name` line, the base-class identifier in `class X(Base):`. The three rows added after B.3 follow the same rule: the referencing token (`references`, Python B.5*), the trait path in `impl Tr for T` (`implements`, Rust Phase 1b), and the trait path inside the derive list (`derives`, Rust Phase 2, plan 2026-06-10) each ARE the edge's textual occurrence.
 
 The writer-actor enforces this invariant at insert time: an edge whose `kind` requires `Some` arrives with `None` (or vice versa) is rejected with `LMWV-INFRA-EDGE-SOURCE-RANGE-CONTRACT`. This converts the schema's permissiveness into a contract every consumer can rely on.
 

@@ -28,6 +28,11 @@ use time::{Date, Month, OffsetDateTime, macros::format_description};
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc};
 
 use loomweave_core::plugin::{ContentLengthCeiling, Frame, TransportError};
+use loomweave_federation::config::{
+    LlmConfigPatch, LlmProviderKind, McpConfig, ProviderSelection, SemanticConfigPatch,
+    SemanticProviderKind, select_provider_with_env, update_llm_config_file,
+    update_semantic_config_file,
+};
 use loomweave_storage::{
     CallEdgeMatch, EntityRow, InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey,
     InferredEdgeWriteStats, ReaderPool, ReferenceDirection, ReferenceEdgeMatch,
@@ -35,7 +40,9 @@ use loomweave_storage::{
     WriterCmd, call_edges_from, call_edges_targeting, containing_module_id,
     entity_briefing_block_reason, entity_by_id, import_edges_for_entity,
     inferred_edge_cache_key_id, module_reference_rollup, reference_edges_for_entity,
-    sei_for_locator, unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    relation_edges_for_entity, resolve_entity_ref, sei_for_locator,
+    unresolved_call_sites_for_caller, unresolved_caller_count_for_target,
+    unresolved_callers_for_target,
 };
 
 use crate::config::{LlmConfig, SemanticSearchConfig};
@@ -60,35 +67,50 @@ pub const LOOMWEAVE_WORKFLOW_SKILL: &str =
     include_str!("../assets/skills/loomweave-workflow/SKILL.md");
 
 /// Orientation text returned in the MCP `initialize` result's `instructions`
-/// field. The `Tools:` enumeration is derived from [`list_tools`] (the single
-/// source of truth) so it can never drift from the advertised tool set as tools
-/// are added or removed; the surrounding prose is static. Kept consistent with
-/// the loomweave-workflow skill.
-fn server_instructions() -> String {
-    let tool_names = list_tools()
+/// field. The `Tools:` enumeration is derived from [`list_tools_for_policy`]
+/// under the *active* policy (the single source of truth) so it can never
+/// advertise a tool the server will not actually register — the
+/// agent-first-feedback §2.5 bug, where the write tools were listed but absent
+/// from `tools/list` unless `serve.mcp.enable_write_tools: true`. Real clients
+/// truncate this blob (~2 KB observed), so the write-gate note comes FIRST and
+/// the tool enumeration — recoverable from `tools/list` — comes LAST
+/// (clarion-e65354898d). Kept consistent with the loomweave-workflow skill.
+fn server_instructions(policy: McpToolPolicy) -> String {
+    let tool_names = list_tools_for_policy(policy)
         .iter()
         .map(|tool| tool.name)
         .collect::<Vec<_>>()
         .join(", ");
+    let write_tools_note = if policy.enable_write_tools {
+        String::new()
+    } else {
+        // The bootstrap exemption is deliberate (PM ruling, weft-ac59e8e730):
+        // state it loudly so a read-only session knows these two tools can
+        // persistently enable writes and live LLM spend.
+        "\n\nWrite-gated unless `serve.mcp.enable_write_tools: true`: \
+`entity_summary_get`, `analyze_start`, `analyze_cancel`, `propose_guidance`, \
+`promote_guidance`. EXEMPT by design: `llm_config_set` and \
+`semantic_config_set` bypass this gate — from a read-only session they \
+persistently edit loomweave.yaml and can enable write tools and live (paid) \
+LLM spend; reconnect after changes."
+            .to_owned()
+    };
     format!(
-        "Loomweave is a code-archaeology server: it has pre-extracted this project \
-into a queryable map of entities (functions, classes, modules, files), the call \
-/ reference / import edges between them, and subsystem clusters. Ask Loomweave \
-instead of re-reading or grepping the tree.
+        "Loomweave is a code-archaeology server: this project is pre-extracted into \
+a queryable map of entities (functions, classes, modules, files), the call / \
+reference / import edges between them, relation edges (inherits_from / decorates \
+/ implements / derives), and subsystem clusters. Ask Loomweave instead of \
+re-reading or grepping the tree.{write_tools_note}
 
-Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}` (e.g. \
-`python:function:pkg.mod.func`); subsystems are `core:subsystem:{{hash}}`. You \
-almost never type IDs — get one from `entity_find` or `entity_at`, then copy it \
-verbatim into the next tool.
+Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}`; subsystems are \
+`core:subsystem:{{hash}}`. Get an id from `entity_find` or `entity_at` and copy \
+it verbatim; `entity_resolve` maps pasted qualnames, Rust `::` paths, and SEI \
+tokens to identity rows — never hand-construct an id.
 
-Tools: {tool_names}. `entity_callers_list` / `entity_neighborhood_get` / `entity_execution_path_list` \
-take a `confidence` tier (resolved | ambiguous | inferred; default resolved). \
-`project_status_get` reports index freshness, counts, LLM policy, and the resolved \
-Filigree endpoint.
+Deep dive: the `loomweave-workflow` skill/prompt. Live counts: the \
+`loomweave://context` resource.
 
-For the full workflow see the loomweave-workflow skill (installed by \
-`loomweave install --skills`), or read the `loomweave-workflow` prompt. Live \
-project counts and index freshness are in the `loomweave://context` resource."
+Tools: {tool_names}."
     )
 }
 
@@ -149,11 +171,24 @@ pub fn rename_old_to_new(name: &str) -> &str {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ToolMetadata {
+    // On the wire, false flags are omitted (absent ⇒ false): the flags exist
+    // for client permissioning, and serializing five booleans on every tool
+    // taxed every session's tools/list (clarion-e65354898d).
+    #[serde(skip_serializing_if = "is_false")]
     pub read_only: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub writes_local_state: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub writes_external_state: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub spawns_process: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub may_call_llm: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 impl ToolMetadata {
@@ -196,14 +231,17 @@ impl ToolMetadata {
 
 pub fn tool_metadata(name: &str) -> ToolMetadata {
     match name {
+        // The config-set pair shares the local-write flag shape with
+        // analyze_cancel/promote_guidance, but is gate-EXEMPT — see
+        // `is_bootstrap_config_tool` (weft-ac59e8e730).
+        "llm_config_set" | "semantic_config_set" | "analyze_cancel" | "promote_guidance" => {
+            ToolMetadata::write_tool(true, false, false, false)
+        }
         "entity_summary_get" => ToolMetadata::write_tool(true, false, false, true),
         "entity_callers_list" | "entity_neighborhood_get" | "entity_execution_path_list" => {
             ToolMetadata::conditional_llm()
         }
         "analyze_start" => ToolMetadata::write_tool(true, false, true, false),
-        "analyze_cancel" | "promote_guidance" => {
-            ToolMetadata::write_tool(true, false, false, false)
-        }
         "propose_guidance" => ToolMetadata::write_tool(false, true, false, false),
         _ => ToolMetadata::read_only(),
     }
@@ -231,12 +269,16 @@ impl McpToolPolicy {
 
     #[must_use]
     pub fn allows(self, name: &str) -> bool {
-        self.enable_write_tools || tool_metadata(name).read_only
+        self.enable_write_tools || tool_metadata(name).read_only || is_bootstrap_config_tool(name)
     }
 
     fn allows_arguments(self, name: &str, arguments: &serde_json::Map<String, Value>) -> bool {
         self.enable_write_tools || !tool_uses_conditional_inferred_dispatch(name, arguments)
     }
+}
+
+fn is_bootstrap_config_tool(name: &str) -> bool {
+    matches!(name, "llm_config_set" | "semantic_config_set")
 }
 
 fn tool_uses_conditional_inferred_dispatch(
@@ -267,17 +309,15 @@ impl Serialize for ToolDefinition {
     where
         S: serde::Serializer,
     {
+        // The permissioning flags ride ONLY in the grouped `metadata` object.
+        // They used to also be flattened at the top level — ~140 duplicated
+        // bytes per tool in every session's tools/list (clarion-e65354898d).
         let metadata = tool_metadata(self.name);
-        let mut state = serializer.serialize_struct("ToolDefinition", 9)?;
+        let mut state = serializer.serialize_struct("ToolDefinition", 4)?;
         state.serialize_field("name", self.name)?;
         state.serialize_field("description", self.description)?;
         state.serialize_field("inputSchema", &self.input_schema)?;
         state.serialize_field("metadata", &metadata)?;
-        state.serialize_field("read_only", &metadata.read_only)?;
-        state.serialize_field("writes_local_state", &metadata.writes_local_state)?;
-        state.serialize_field("writes_external_state", &metadata.writes_external_state)?;
-        state.serialize_field("spawns_process", &metadata.spawns_process)?;
-        state.serialize_field("may_call_llm", &metadata.may_call_llm)?;
         state.end()
     }
 }
@@ -289,7 +329,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "entity_at",
-            description: "Return the innermost Loomweave entity whose source range contains a file and line, plus an `entity_context` evidence block: match_reason (decorator_range / declaration / body_range / containing_range / no_match) explaining why the line matched, the module→entity containing stack, the matched entity's decl/body/decorator sub-ranges, any same-granularity ambiguity alternatives, and index freshness. Paths are normalized relative to the project root. A blank or comment line that only a module spans reports containing_range — never a fabricated exact match.",
+            description: "Innermost entity whose source range contains `file`+`line`, with an `entity_context` evidence block (match_reason, containing stack, sub-ranges, alternatives). A line only a module spans reports containing_range — never a fabricated exact match.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -302,7 +342,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_find",
-            description: "Search Loomweave entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results.",
+            description: "Search entities by name, id, summary, and docstring before grepping. Optional `kind`; paginated; scanner-blocked docstrings never match.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -317,12 +357,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_callers_list",
-            description: "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative.",
-            input_schema: id_confidence_schema(),
+            description: "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. Reports scope_excludes and unresolved_name_matches so empty results stay honest.",
+            input_schema: id_confidence_cursor_schema(),
         },
         ToolDefinition {
             name: "entity_execution_path_list",
-            description: "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls).",
+            description: "Bounded calls-only paths from an entity (`max_depth` default 3). Compact: deduplicated `nodes` table + `paths` as node-id arrays, longest-first; truncation reports edge-cap/path-cap. `scope_excludes` names unsearched blind spots (attribute-receiver / unresolved static calls) — empties are not proof.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -336,12 +376,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_summary_get",
-            description: "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries. If the LLM returns non-JSON the response degrades to a deterministic structural summary (kind: structural-fallback) built from the entity source, and that fallback is cached so a retry is a free cache hit rather than a re-billed failure.",
+            description: "On-demand cached LLM summary for one entity (leaf scope: module summaries do not aggregate members). Non-JSON LLM output degrades to a cached deterministic structural fallback, so a retry is a cache hit, not a re-billed failure.",
             input_schema: id_schema(),
         },
         ToolDefinition {
             name: "entity_issue_list",
-            description: "Return Filigree issues attached to this Loomweave entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Loomweave. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
+            description: "Filigree issues attached to an entity (optionally contained entities too), plus an enrich-only `wardline_findings` section. result_kind matched | no_matches | unavailable distinguishes empty-Filigree from unreachable-Filigree; `filigree_endpoint` shows which endpoint answered.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -354,22 +394,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_neighborhood_get",
-            description: "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives.",
+            description: "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit; reports scope_excludes and unresolved_name_matches.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
             name: "subsystem_member_list",
-            description: "List module entities assigned to a subsystem entity.",
-            input_schema: id_schema(),
+            description: "List the module entities in a subsystem. Bounded: `limit` (default 50, max 100) + numeric-offset `cursor`.",
+            input_schema: id_cursor_schema(),
         },
         ToolDefinition {
             name: "entity_subsystem_get",
-            description: "Return the subsystem an entity belongs to — the reverse of subsystem_members. Accepts any entity id: a module resolves directly, while a function/class resolves through its nearest containing module. Returns the subsystem id/name and the module the membership was resolved through, or a no-subsystem result when the entity has no subsystem-assigned module ancestor.",
+            description: "The subsystem an entity belongs to (reverse of subsystem_member_list). Any entity id (functions/classes resolve through their containing module); reports the via-module.",
             input_schema: id_schema(),
         },
         ToolDefinition {
             name: "project_status_get",
-            description: "Return deterministic Loomweave diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding/briefing-blocked counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call.",
+            description: "Deterministic diagnostics: repo root, db path, latest run, entity/edge/finding counts, index staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -377,13 +417,41 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "llm_config_get",
+            description: "Read LLM/provider/live and MCP write-tool config.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "llm_config_set",
+            description: "Update LLM/provider/live/write-tool config in loomweave.yaml; reconnect.",
+            input_schema: llm_config_set_schema(),
+        },
+        ToolDefinition {
+            name: "semantic_config_get",
+            description: "Read semantic-search config and sidecar diagnostics.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "semantic_config_set",
+            description: "Update semantic-search config in loomweave.yaml; rerun analyze.",
+            input_schema: semantic_config_set_schema(),
+        },
+        ToolDefinition {
             name: "entity_summary_preview_cost_get",
-            description: "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider.",
+            description: "Preview what entity_summary_get would cost BEFORE spending: cache_status (hit | expired | miss), real cost on a hit, an estimate on a miss, and live_spend_would_occur. A disabled LLM is reported distinctly from a cache miss. Never invokes the provider.",
             input_schema: id_schema(),
         },
         ToolDefinition {
             name: "entity_source_get",
-            description: "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `loomweave analyze`). context_lines defaults to 10.",
+            description: "An entity's exact indexed source span plus `context_lines` (default 10) of context, line-numbered and flagged in_entity. source_status reports ok | missing | no_range | no_source_path | binary | drifted (rerun analyze) instead of a misleading stale snippet.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -396,7 +464,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_call_site_list",
-            description: "Show the actual source sites behind calls/references edges, so an agent can see WHY Loomweave believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Loomweave could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call.",
+            description: "Show the source sites behind calls/references edges — the evidence for WHY an edge exists. role=caller (default) lists outgoing sites; role=callee lists incoming, INCLUDING `unresolved_sites` (static calls Loomweave could not bind — the recovery surface for suspicious empty caller lists). Bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -412,7 +480,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_orientation_pack_get",
-            description: "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable.",
+            description: "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -425,7 +493,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "analyze_start",
-            description: "Start a `loomweave analyze` run over this project in the background and return its run handle immediately — do not block on the (possibly many-minute) run. Re-indexes the source tree and refreshes entities/edges/subsystems. Returns run_id, status (`started`), and the progress-file path. Only one analyze may run per project at a time (a cross-process lock enforces it); a second start while one is active is rejected. Poll analyze_status for progress; analyze_cancel to stop. No arguments.",
+            description: "Start a background `loomweave analyze` run; returns run_id immediately (runs can take minutes). One run per project (cross-process lock). Poll analyze_status_get; stop via analyze_cancel. No arguments.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -434,7 +502,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "analyze_status_get",
-            description: "Report the live status of an analyze run started via analyze_start. status is one of queued (spawned, not yet recording) | running | completed | failed | cancelled | skipped_no_plugins. While running it exposes phase (discovering / analyzing / clustering), current_plugin, processed_files / total_files, current_file, the latest heartbeat_at, elapsed_seconds, and progress_observed (false when the heartbeat has gone stale — the run may be wedged). On a terminal status it carries the recorded run stats. Reads structured progress, never logs.",
+            description: "A run's live status: queued | running | completed | failed | cancelled | skipped_no_plugins, with phase, current plugin/file, processed/total files, heartbeat, and progress_observed=false when the heartbeat is stale (run may be wedged).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -446,7 +514,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "analyze_cancel",
-            description: "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index).",
+            description: "Cancel a running analyze: SIGKILLs the run's process group (plugin + pyright) and marks the run cancelled — never left dangling as running. Idempotent. Partial work already written is kept.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -458,7 +526,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "index_diff_get",
-            description: "Report what changed since the last analyze and whether this checkout is newer than the graph — so an agent need not hand-roll git + mtime freshness checks. Compares: analyzed_commit (the persisted commit analyzed by the latest completed run) vs current git HEAD when both are known, falling back to analyzed_at vs HEAD committer date when needed; indexed source files modified or now-missing since analyze; dirty working-tree files flagged when they touch an indexed path; and per-run aggregate plugin skip/drop counters. Git is read at query time, read-only, and fail-soft: a missing git binary or non-repo dir degrades to git.available=false with a reason rather than failing. overall is fresh | drift | unknown | never_analyzed; lists are bounded with an `omitted` block. entity-level add/remove/change diff is unavailable in v0.1 (only the current graph is retained). No LLM call.",
+            description: "Drift since the last analyze: analyzed commit vs git HEAD, indexed files modified/missing, dirty working-tree files touching indexed paths, plugin skip/drop counters. overall: fresh | drift | unknown | never_analyzed. Entity-level diff is unavailable in v0.1.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -469,7 +537,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_guidance_list",
-            description: "Return the guidance sheets applicable to one entity, composed at query time and ranked by scope_rank (project → subsystem → package → module → class → function), ties broken by authored_at then id. Read-only: this surfaces composed institutional knowledge; authoring (propose/promote) is a separate lifecycle. A sheet applies via an explicit `guides` edge OR a `match_rules` entry resolved against the entity (path glob / tag / kind / subsystem / entity). `wardline_group` rules are not evaluated here (the Wardline blob is opaque) and are reported in `notes`, never guessed. Expired sheets are excluded. Each sheet carries its `sei`. Bounded (limit/offset, page.total/truncated). Honest-empty when no sheet applies. No LLM call.",
+            description: "Guidance sheets applicable to an entity, scope-ranked (project → … → function). wardline_group rules are reported in `notes`, never guessed. Bounded; honest-empty when no sheet applies.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -483,7 +551,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "propose_guidance",
-            description: "Propose a guidance sheet for operator review by creating a Filigree observation. This is deliberately inert: it does not write a Loomweave guidance entity and cannot enter summaries until `promote_guidance` or `loomweave guidance promote` consumes the observation.",
+            description: "Propose a guidance sheet by creating a Filigree observation. Deliberately inert: nothing enters summaries until an operator promotes it (promote_guidance or the CLI).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -505,7 +573,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "promote_guidance",
-            description: "Promote a reviewed Filigree observation produced by `propose_guidance` into a local Loomweave guidance sheet. This operator action is the anti-poisoning boundary: only promoted observations become prompt-composed guidance.",
+            description: "Promote a reviewed Filigree observation from propose_guidance into a local guidance sheet. This operator action is the anti-poisoning boundary.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -517,7 +585,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_finding_list",
-            description: "Return findings anchored to one entity, optionally filtered by `filter.kind` (defect/fact/classification/metric/suggestion), `filter.severity` (INFO/WARN/ERROR/CRITICAL/NONE), and `filter.status` (open/acknowledged/suppressed/promoted_to_issue). The queried entity carries its `sei`; each finding's `related_entities` are raw locator ids (references, not the primary return). Bounded (limit/offset, page.total/truncated). An entity with no findings returns an empty list, not an error. No LLM call.",
+            description: "Findings anchored to one entity; filter by kind / severity / status (closed value sets — see the skill). Bounded (limit/offset, page block). No findings → empty list, not an error.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -540,27 +608,27 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_wardline_get",
-            description: "Return the Wardline metadata recorded for one entity (declared tier, groups, boundary contracts) returned VERBATIM — the `wardline_json` blob is opaque to Loomweave. result_kind is `present` when a taint fact exists, else `no_facts` with a missing-signal note: facts are populated via Filigree Flow-B (POST /api/wardline/taint-facts), so a locally-empty result is honest, not an error. The entity carries its `sei`. No LLM call.",
+            description: "The entity's Wardline taint metadata VERBATIM (the blob is opaque to Loomweave). result_kind present | no_facts with a missing-signal note — facts arrive via Filigree Flow-B, so a locally-empty result is honest.",
             input_schema: id_schema(),
         },
         ToolDefinition {
             name: "entity_tag_list",
-            description: "Return entities carrying a plugin-emitted categorisation `tag`, within an optional `scope` (an entity id → its descendants, OR a path glob like \"src/auth/**\"; omitted → whole project). Bounded (limit/offset, page.total/truncated; scope_truncated/scan_truncated flag cap hits). Entities carry their `sei`. Honest-empty with a missing-signal note when no entity in the current index carries the tag. No LLM call.",
+            description: "Entities carrying a categorisation `tag`, optional `scope` (entity id → descendants, or path glob). Bounded; honest-empty when no entity carries the tag.",
             input_schema: scope_facet_schema(&[("tag", true)]),
         },
         ToolDefinition {
             name: "entity_kind_list",
-            description: "Return entities of a plugin-declared `kind` (e.g. \"function\", \"class\", \"module\"), within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Bounded (limit/offset, page.total/truncated). Entities carry their `sei`. An unknown kind matches no rows. No LLM call.",
+            description: "Entities of a `kind` (function/class/module/…), optional `scope`. Bounded. An unknown kind matches no rows.",
             input_schema: scope_facet_schema(&[("kind", true)]),
         },
         ToolDefinition {
             name: "entity_wardline_list",
-            description: "Return entities carrying a Wardline taint fact, optionally filtered by `tier` and/or `group`, within an optional `scope` (entity id → descendants, OR path glob; omitted → whole project). The Wardline blob is opaque to Loomweave: tier/group filtering is best-effort against a top-level field on the blob and honest-empty when absent. Each entity carries its `wardline` blob verbatim plus its `sei`. Bounded (limit/offset, page.total/truncated). Facts are populated via Filigree Flow-B. No LLM call.",
-            input_schema: scope_facet_schema(&[("tier", false), ("group", false)]),
+            description: "Entities carrying Wardline taint facts, filtered by `tier`/`group` (best-effort against the opaque blob); `has_findings: true` filters to those also carrying findings. Bounded.",
+            input_schema: wardline_facet_schema(),
         },
         ToolDefinition {
             name: "module_circular_import_list",
-            description: "Return import cycles in the module import graph (`imports` edges) — each a strongly-connected component of size > 1 (or a self-import), members sorted. On-demand graph query (no analyze-time precompute). Edge-derived: default `confidence` is resolved (the tier is a ceiling — resolved → resolved only, inferred → all) and is echoed in the result. Optional `scope` (entity id → descendants, OR path glob) restricts to cycles whose members are all in scope. Bounded (limit/offset, page.total/truncated). Each member carries its `sei`. No LLM call.",
+            description: "Import cycles (SCCs over `imports` edges, plus self-imports), members sorted. Edge-derived: `confidence` is a ceiling (default resolved). Optional `scope`. Bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -574,7 +642,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_coupling_hotspot_list",
-            description: "Return entities ranked by coupling (distinct fan-in + fan-out over the edge graph), most-coupled first. On-demand graph query (no analyze-time precompute). Edge-derived: default `confidence` is resolved (a ceiling) and is echoed. Optional `scope` (entity id → descendants, OR path glob; omitted → whole project). Bounded (limit default 20, max 200; page.total/truncated). Each entity carries its `sei`. No LLM call.",
+            description: "Entities ranked by coupling (distinct fan-in + fan-out), most-coupled first. `confidence` is a ceiling (default resolved). Optional `scope`. Bounded (limit default 20).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -588,37 +656,37 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_entry_point_list",
-            description: "Return entities tagged as entry points, within an optional `scope` (entity id → descendants, OR path glob). Reads the `entry-point` categorisation tag. HONEST-EMPTY when no entity in the current index carries the tag, so an empty result means the signal is absent, NOT that there are no entry points. Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `entry-point`, optional `scope`. HONEST-EMPTY when the tag is not emitted — absence of signal, not absence of entry points. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_http_route_list",
-            description: "Return entities tagged as HTTP routes, within an optional `scope`. Reads the `http-route` categorisation tag. HONEST-EMPTY when route categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `http-route`, optional `scope`. Honest-empty when route categorisation is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_data_model_list",
-            description: "Return entities tagged as data models, within an optional `scope`. Reads the `data-model` categorisation tag. HONEST-EMPTY when data-model categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `data-model`, optional `scope`. Honest-empty when data-model categorisation is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_test_list",
-            description: "Return entities tagged as tests, within an optional `scope`. Reads the `test` categorisation tag. HONEST-EMPTY when test categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `test`, optional `scope`. Honest-empty when test categorisation is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_deprecation_list",
-            description: "Return entities tagged deprecated, within an optional `scope`. Reads the `deprecated` categorisation tag. HONEST-EMPTY when deprecation categorisation is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities tagged `deprecated`, optional `scope`. Honest-empty when deprecation categorisation is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_todo_list",
-            description: "Return entities carrying a TODO/FIXME marker, within an optional `scope`. Reads the `todo` categorisation tag. HONEST-EMPTY when TODO extraction is not emitted (missing-signal note). Bounded; SEI-carrying. No LLM call.",
+            description: "Entities carrying a TODO/FIXME marker, optional `scope`. Honest-empty when TODO extraction is not emitted. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_test_caller_list",
-            description: "Return the test entities that exercise an entity — its callers carrying the `test` categorisation tag. HONEST-EMPTY when test categorisation is not emitted, so an empty result is NOT a guarantee the entity is untested (a missing-signal note says so). Bounded; tests carry their `sei`. No LLM call.",
+            description: "The test-tagged callers of an entity. Honest-empty when test categorisation is not emitted — NOT a guarantee the entity is untested. Bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -632,22 +700,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_high_churn_list",
-            description: "Return entities ranked by git churn (`git_churn_count`) descending, within an optional `scope`. The analyze pipeline does not populate churn in v1.0, so this is HONEST-EMPTY in practice (missing-signal note); the query is real and lights up if churn is ever populated. Bounded; SEI-carrying. No LLM call.",
+            description: "Entities ranked by git churn, optional `scope`. v1.0 does not populate churn, so this is honest-empty in practice. Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_recent_change_list",
-            description: "Return entities changed since a timestamp (`since?`), within an optional `scope`. Loomweave does not index a per-entity git change timestamp in v1.0, so this is an HONEST NO-OP: it returns an empty set with a missing-signal note pointing at `index_diff` for repo-level freshness (HEAD vs last analyze). Never fabricates a change set. No LLM call.",
+            description: "Entities changed since `since`, optional `scope`. v1.0 indexes no per-entity change time, so this is an honest no-op with a note pointing at index_diff_get. Never fabricates.",
             input_schema: scope_page_schema(true),
         },
         ToolDefinition {
             name: "entity_dead_list",
-            description: "Return entities NOT reachable from the root set (entry points ∪ exported API ∪ tests ∪ HTTP routes ∪ CLI commands ∪ data models) over the call+import graph, within an optional `scope`. On-demand graph query (no analyze-time precompute). CONSERVATIVE (fails toward `live`): reachability counts ALL edge confidence tiers (resolved ∪ ambiguous ∪ inferred), dynamic-dispatch/reflection barrier tags force their entities live, and framework-magic kinds are excluded from candidacy — so it under-reports rather than over-reports. No `confidence` argument (a ceiling would only make more code look dead). HONEST SIGNAL-UNAVAILABLE: if the current index has no root categorisation tags, the tool returns zero candidates with a missing-signal note (NOT a flood of false positives, and NOT a guarantee there is no dead code). Heuristic results (LMWV-FACT-DEAD-CODE-CANDIDATE, confidence < 1) — never certain. Bounded; SEI-carrying. No LLM call.",
+            description: "Entities unreachable from roots, optional scope. Conservative heuristic; root classification depends on plugin-emitted tags/exports.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_semantic_search_list",
-            description: "Rank entities by semantic (embedding cosine) similarity to a `query` string, within an optional `scope`. OPT-IN: semantic search is OFF by default; when disabled or no embedding provider is configured the tool returns result_kind=`not_enabled` with a missing-signal note (never a faked or empty-as-complete result). When enabled it embeds the query and runs a bounded exact cosine scan over the git-ignored `.loomweave/embeddings.db` sidecar (built at analyze time), considering only embeddings whose content_hash matches the entity's current hash (stale vectors never surface). Bounded (limit default 20, max 100; page.total/truncated). Each result carries its `sei` and a `score`.",
+            description: "Rank entities by embedding similarity to `query`, optional `scope`; disabled returns not_enabled and stale vectors are hidden.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -657,6 +725,66 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "offset": {"type": "integer", "minimum": 0}
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "project_finding_list",
+            description: "List findings across the WHOLE project — no entity id needed. Each row carries its anchoring entity {id, sei, file, line} plus tool/rule/kind/severity/status. Same filters as entity_finding_list. Bounded.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "severity": {"type": "string"},
+                            "status": {"type": "string"}
+                        },
+                        "additionalProperties": false
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "entity_resolve",
+            description: "Batch-resolve pasted dotted qualnames, Rust `::` paths, or SEIs to entity candidates; reports resolved/unresolved/ambiguous.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "qualnames": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": 2000
+                    },
+                    "kind": {"type": "string", "minLength": 1},
+                    "plugin": {"type": "string", "minLength": 1}
+                },
+                "required": ["qualnames"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "entity_relation_list",
+            description: "List declared relation edges (inherits_from/decorates/implements/derives). Use direction=in for subclasses/decorated funcs/implementors.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "direction": {"type": "string", "enum": ["in", "out"]},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["inherits_from", "decorates", "implements", "derives"]
+                    },
+                    "confidence": confidence_schema(),
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "cursor": {"type": ["string", "null"]}
+                },
+                "required": ["id", "direction"],
                 "additionalProperties": false
             }),
         },
@@ -740,6 +868,17 @@ fn scope_facet_schema(facets: &[(&str, bool)]) -> Value {
     })
 }
 
+/// Input schema for `entity_wardline_list`: the faceted tier/group schema plus a
+/// `has_findings` boolean. Declared explicitly because the base schema sets
+/// `additionalProperties: false`, which would otherwise reject the param.
+fn wardline_facet_schema() -> Value {
+    let mut schema = scope_facet_schema(&[("tier", false), ("group", false)]);
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("has_findings".to_owned(), json!({"type": "boolean"}));
+    }
+    schema
+}
+
 fn confidence_schema() -> Value {
     json!({
         "type": "string",
@@ -759,12 +898,106 @@ fn id_schema() -> Value {
     })
 }
 
+/// `id` + `limit` + `cursor` — the single-relation bounded shape (id-only tools
+/// with no confidence param, e.g. `subsystem_member_list`). `cursor` is a
+/// numeric-offset string; null/absent starts at 0 (clarion-d76e7f7267).
+fn id_cursor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "cursor": {"type": ["string", "null"]}
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    })
+}
+
+fn llm_config_set_schema() -> Value {
+    // Typed to match the argument parser (`llm_config_patch_from_arguments`):
+    // every property is optional, but a present one must carry the right type
+    // — the bare `{}` schemas shipped in c475e90 declared nothing
+    // (weft-ac59e8e730). Enum values mirror `LlmProviderKind::parse`. No
+    // per-property descriptions: tools/list is a per-session context tax
+    // (clarion-e65354898d) and depth belongs in the loomweave-workflow skill.
+    json!({
+        "type": "object",
+        "properties": {
+            "enabled": {"type": "boolean"},
+            "provider": {
+                "type": "string",
+                "enum": [
+                    "openrouter", "open_router", "openrouter_api",
+                    "codex_cli", "codex", "codex_sidecar",
+                    "claude_cli", "claude_code", "claude_sidecar",
+                    "recording"
+                ]
+            },
+            "allow_live_provider": {"type": "boolean"},
+            "enable_write_tools": {"type": "boolean"},
+            "model_id": {"type": "string", "minLength": 1},
+            "codex_model": {"type": "string", "minLength": 1},
+            "claude_model": {"type": "string", "minLength": 1},
+            "openrouter_api_key_env": {"type": "string", "minLength": 1},
+            "openrouter_endpoint_url": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn semantic_config_set_schema() -> Value {
+    // Typed to match `semantic_config_patch_from_arguments`; enum values
+    // mirror `SemanticProviderKind::parse` (weft-ac59e8e730).
+    json!({
+        "type": "object",
+        "properties": {
+            "enabled": {"type": "boolean"},
+            "provider": {
+                "type": "string",
+                "enum": ["api", "openai", "openai_api", "local_openai", "local", "openai_local"]
+            },
+            "allow_live_provider": {"type": "boolean"},
+            "model_id": {"type": "string", "minLength": 1},
+            "dimensions": {"type": "integer", "minimum": 1},
+            "endpoint_url": {"type": "string", "minLength": 1},
+            "api_key_env": {"type": "string", "minLength": 1},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "session_token_ceiling": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
 fn id_confidence_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "id": {"type": "string", "minLength": 1},
-            "confidence": confidence_schema()
+            "confidence": confidence_schema(),
+            // For `entity_callers_list` this is a page size; for
+            // `entity_neighborhood_get` it is a PER-BUCKET cap (no cursor — see
+            // `id_confidence_cursor_schema` for the cursor-paginated single-
+            // relation variant). clarion-d76e7f7267.
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    })
+}
+
+/// `id` + `confidence` + `limit` + `cursor` — the single-relation cursor-
+/// paginated shape for `entity_callers_list`. Distinct from the neighborhood
+/// overview, which takes a per-bucket `limit` but NO cursor (one cursor cannot
+/// coherently advance nine heterogeneous buckets). clarion-d76e7f7267.
+fn id_confidence_cursor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "confidence": confidence_schema(),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "cursor": {"type": ["string", "null"]}
         },
         "required": ["id"],
         "additionalProperties": false
@@ -789,7 +1022,7 @@ pub fn handle_json_rpc(request: &Value) -> Option<Value> {
     };
 
     Some(match method {
-        "initialize" => result_response(&id, &initialize_result(false)),
+        "initialize" => result_response(&id, &initialize_result(false, McpToolPolicy::default())),
         "tools/list" => result_response(
             &id,
             &json!({"tools": list_tools_for_policy(McpToolPolicy::default())}),
@@ -801,6 +1034,112 @@ pub fn handle_json_rpc(request: &Value) -> Option<Value> {
         ),
         _ => error_response(&id, -32601, "method not found"),
     })
+}
+
+/// Actionable chirp for a project with no index. Mirrors the `SessionStart` hook
+/// wording (`hook.rs`) so the operator sees the same "install then analyze"
+/// sequence whether they read it from the shell or from an MCP client. Surfaced
+/// both in the degraded `initialize` instructions and from every degraded
+/// `tools/call` result.
+fn no_index_message(project_root: &Path) -> String {
+    let root = project_root.display();
+    format!(
+        "Loomweave has no index for this project yet \
+({root}/.weft/loomweave/loomweave.db is missing), so the structural graph has not been \
+built and every Loomweave tool is unavailable. Run `loomweave install --path {root}` \
+then `loomweave analyze {root}` in a terminal to extract the entity / edge graph, \
+then reconnect this MCP server."
+    )
+}
+
+/// Degraded-mode orientation for the `initialize` `instructions` field. Distinct
+/// from [`server_instructions`] (the healthy-index orientation) so the normal
+/// path — and its `server_instructions_enumerate_every_tool` guard — is
+/// untouched.
+fn server_instructions_no_index(project_root: &Path) -> String {
+    format!(
+        "⚠ NO INDEX. {}\n\nNormally Loomweave answers \"what calls X\", \"where is X \
+defined\", \"what subsystem is X in\" from a pre-extracted graph instead of grepping \
+the tree — but it needs an index first. `tools/list` still shows the surface; any tool \
+call returns this same instruction until the index exists.",
+        no_index_message(project_root)
+    )
+}
+
+/// The `initialize` result for the degraded no-index server. Advertises `tools`
+/// and `prompts` (the static `loomweave-workflow` prompt works without a DB) but
+/// not `resources` (the `loomweave://context` resource needs the index).
+fn initialize_result_no_index(project_root: &Path) -> Value {
+    json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": { "tools": {}, "prompts": {} },
+        "serverInfo": {
+            "name": "loomweave",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "instructions": server_instructions_no_index(project_root)
+    })
+}
+
+/// JSON-RPC dispatch for the degraded "no index" stdio server: the project has
+/// no `.weft/loomweave/loomweave.db`, so there is no graph to query. `initialize`
+/// succeeds (the client connects cleanly rather than seeing the server die) and
+/// `tools/call` returns the actionable chirp as a tool result with
+/// `isError: true` — the load-bearing channel, since not every client surfaces
+/// the `initialize` `instructions`. `tools/list` and the static
+/// `loomweave-workflow` prompt answer normally so the surface looks healthy.
+/// clarion-ac36f51c2b.
+#[must_use]
+pub fn handle_json_rpc_no_index(request: &Value, project_root: &Path) -> Option<Value> {
+    if is_json_rpc_notification(request) {
+        return None;
+    }
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return Some(error_response(&id, -32600, "invalid request"));
+    };
+
+    Some(match method {
+        "initialize" => result_response(&id, &initialize_result_no_index(project_root)),
+        "tools/list" => result_response(
+            &id,
+            &json!({"tools": list_tools_for_policy(McpToolPolicy::default())}),
+        ),
+        "tools/call" => result_response(
+            &id,
+            &json!({
+                "content": [
+                    { "type": "text", "text": no_index_message(project_root) }
+                ],
+                "isError": true
+            }),
+        ),
+        "prompts/list" => result_response(&id, &prompts_list()),
+        "prompts/get" => prompts_get(&id, request.get("params")),
+        _ => error_response(&id, -32601, "method not found"),
+    })
+}
+
+/// Serve a degraded MCP stdio session for a project with no index. Mirrors
+/// [`serve_stdio`] (synchronous — there are no storage-backed async tools to
+/// drive) but routes every request through [`handle_json_rpc_no_index`]. Used by
+/// `loomweave serve` when `.weft/loomweave/loomweave.db` is absent, so the client
+/// connects and is told to run analyze rather than watching the server exit.
+pub fn serve_stdio_no_index(
+    project_root: &Path,
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl std::io::Write,
+) -> Result<(), McpError> {
+    loop {
+        let Some(frame) = read_stdio_frame(reader)? else {
+            return Ok(());
+        };
+        let framing = frame.framing;
+        let request: Value = serde_json::from_slice(&frame.body)?;
+        if let Some(response) = handle_json_rpc_no_index(&request, project_root) {
+            write_stdio_response(writer, &encode_response_frame(&response)?, framing)?;
+        }
+    }
 }
 
 /// Deterministic, non-storage diagnostics threaded in at server construction so
@@ -821,9 +1160,12 @@ pub struct LlmDiagnostics {
     /// Provider label, e.g. `"openrouter"`, `"codex_cli"`, `"recording"`, or
     /// `"disabled"` when no provider is wired.
     pub provider: String,
-    /// A live provider is wired and summaries will dispatch to it.
+    /// Whether LLM summaries are enabled at all (`llm.enabled`, configured).
+    pub enabled: bool,
+    /// A live provider is wired and summaries will dispatch to it (effective).
     pub live: bool,
-    /// Whether config permits a live provider at all (`llm.allow_live_provider`).
+    /// Whether config permits a live provider at all (`llm.allow_live_provider`,
+    /// configured).
     pub allow_live_provider: bool,
     /// Summary-cache freshness horizon in days (`llm.cache_max_age_days`).
     pub cache_max_age_days: u32,
@@ -851,6 +1193,11 @@ pub struct ServerState {
     /// Launcher for `analyze_start` to spawn. `None` → `current_exe()`; tests
     /// inject a stub via [`ServerState::with_analyze_command`].
     analyze_program: Option<PathBuf>,
+    /// Config file the active `serve` was launched with, forwarded as
+    /// `--config` to an `analyze_start`-spawned analyze so the child parses the
+    /// same configuration (review #12). `None` → the child uses its default
+    /// config discovery (serve was started without an explicit `--config`).
+    analyze_config_path: Option<PathBuf>,
 }
 
 impl ServerState {
@@ -874,6 +1221,7 @@ impl ServerState {
             cancelled_requests: Arc::new(AsyncMutex::new(BTreeSet::new())),
             cancellation_notify: Arc::new(Notify::new()),
             analyze_program: None,
+            analyze_config_path: None,
         }
     }
 
@@ -883,6 +1231,15 @@ impl ServerState {
     #[must_use]
     pub fn with_analyze_command(mut self, program: PathBuf) -> Self {
         self.analyze_program = Some(program);
+        self
+    }
+
+    /// Forward `serve`'s `--config` path to `analyze_start`-spawned analyze runs
+    /// so the child parses the same configuration (review #12). Call only when
+    /// serve was launched with an explicit, on-disk config file.
+    #[must_use]
+    pub fn with_analyze_config(mut self, config_path: PathBuf) -> Self {
+        self.analyze_config_path = Some(config_path);
         self
     }
 
@@ -964,6 +1321,149 @@ impl ServerState {
         self
     }
 
+    async fn tool_llm_config_get(
+        &self,
+        _arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let path = self.config_file_path();
+        let active_write_tools = self.tool_policy.enable_write_tools;
+        let read = tokio::task::spawn_blocking(move || read_llm_config_status(&path)).await;
+        match read {
+            Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
+                status,
+                active_write_tools,
+                false,
+            ))),
+            Ok(Err(err)) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::Internal,
+                &format!("read LLM config task failed: {err}"),
+                true,
+            )),
+        }
+    }
+
+    #[allow(clippy::similar_names)] // path/patch are both the precise domain terms
+    async fn tool_llm_config_set(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let patch = llm_config_patch_from_arguments(arguments)?;
+        if llm_config_patch_is_empty(&patch) {
+            return Err(ParamError::new("no LLM config changes requested"));
+        }
+        let path = self.config_file_path();
+        let active_write_tools = self.tool_policy.enable_write_tools;
+        let write = tokio::task::spawn_blocking(move || {
+            let result = update_llm_config_file(&path, &patch)?;
+            Ok::<_, loomweave_federation::config::ConfigError>(llm_config_status_json(
+                &path,
+                result.created,
+                &result.config,
+            ))
+        })
+        .await;
+        match write {
+            Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
+                status,
+                active_write_tools,
+                true,
+            ))),
+            Ok(Err(err)) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::Internal,
+                &format!("write LLM config task failed: {err}"),
+                true,
+            )),
+        }
+    }
+
+    async fn tool_semantic_config_get(
+        &self,
+        _arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let path = self.config_file_path();
+        let project_root = self.project_root.clone();
+        let active_write_tools = self.tool_policy.enable_write_tools;
+        let read =
+            tokio::task::spawn_blocking(move || read_semantic_config_status(&path, &project_root))
+                .await;
+        match read {
+            Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
+                status,
+                active_write_tools,
+                false,
+            ))),
+            Ok(Err(err)) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::Internal,
+                &format!("read semantic config task failed: {err}"),
+                true,
+            )),
+        }
+    }
+
+    #[allow(clippy::similar_names)] // path/patch are both the precise domain terms
+    async fn tool_semantic_config_set(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let patch = semantic_config_patch_from_arguments(arguments)?;
+        if semantic_config_patch_is_empty(&patch) {
+            return Err(ParamError::new(
+                "no semantic search config changes requested",
+            ));
+        }
+        let path = self.config_file_path();
+        let project_root = self.project_root.clone();
+        let active_write_tools = self.tool_policy.enable_write_tools;
+        let write = tokio::task::spawn_blocking(move || {
+            let result = update_semantic_config_file(&path, &patch)?;
+            Ok::<_, loomweave_federation::config::ConfigError>(semantic_config_status_json(
+                &path,
+                &project_root,
+                result.created,
+                &result.config,
+            ))
+        })
+        .await;
+        match write {
+            Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
+                status,
+                active_write_tools,
+                true,
+            ))),
+            Ok(Err(err)) => Ok(tool_error_envelope(
+                McpErrorCode::StorageError,
+                &err.to_string(),
+                false,
+            )),
+            Err(err) => Ok(tool_error_envelope(
+                McpErrorCode::Internal,
+                &format!("write semantic config task failed: {err}"),
+                true,
+            )),
+        }
+    }
+
+    fn config_file_path(&self) -> PathBuf {
+        self.analyze_config_path
+            .clone()
+            .unwrap_or_else(|| self.project_root.join("loomweave.yaml"))
+    }
+
     pub async fn handle_json_rpc(&self, request: &Value) -> Option<Value> {
         if is_json_rpc_notification(request) {
             self.handle_json_rpc_notification(request).await;
@@ -980,7 +1480,7 @@ impl ServerState {
 
         let dispatch = async {
             match method {
-                "initialize" => result_response(&id, &initialize_result(true)),
+                "initialize" => result_response(&id, &initialize_result(true, self.tool_policy)),
                 "tools/list" => result_response(
                     &id,
                     &json!({"tools": list_tools_for_policy(self.tool_policy)}),
@@ -1144,6 +1644,22 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
+            "llm_config_get" => match self.tool_llm_config_get(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "llm_config_set" => match self.tool_llm_config_set(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "semantic_config_get" => match self.tool_semantic_config_get(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "semantic_config_set" => match self.tool_semantic_config_set(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
             "entity_summary_preview_cost_get" => {
                 match self.tool_summary_preview_cost(arguments).await {
                     Ok(value) => value,
@@ -1265,6 +1781,18 @@ impl ServerState {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
+            "project_finding_list" => match self.tool_project_findings(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "entity_resolve" => match self.tool_entity_resolve(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "entity_relation_list" => match self.tool_relation_list(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
             _ => unreachable!("known tools checked above"),
         };
 
@@ -1343,17 +1871,16 @@ impl ServerState {
             .get("expires")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let match_rules = arguments
-            .get("match_rules")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_else(|| vec![json!({"type": "entity", "id": entity_id})]);
-
         let project_root = self.project_root.clone();
+        // Accept an id-or-SEI and resolve to the canonical locator FIRST
+        // (clarion-d76e7f7267). The default match_rule and the proposal's
+        // `entity_id` MUST carry the resolved `entity.id` (a locator), not the
+        // raw arg — otherwise a pasted SEI silently makes the stored guidance
+        // SEI-keyed instead of locator-keyed (a persisted-data-shape drift).
         let entity_lookup_id = entity_id.clone();
         let entity = match self
             .readers
-            .with_reader(move |conn| entity_by_id(conn, &entity_lookup_id))
+            .with_reader(move |conn| resolve_entity_ref(conn, &entity_lookup_id))
             .await
         {
             Ok(Some(entity)) => entity,
@@ -1373,8 +1900,15 @@ impl ServerState {
             }
         };
 
+        let resolved_id = entity.id.clone();
+        let match_rules = arguments
+            .get("match_rules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![json!({"type": "entity", "id": resolved_id})]);
+
         let proposal = GuidanceProposal {
-            entity_id: entity_id.clone(),
+            entity_id: entity.id.clone(),
             content,
             scope_level,
             match_rules,
@@ -1506,7 +2040,7 @@ impl ServerState {
             }
         };
 
-        let db_path = self.project_root.join(".loomweave").join("loomweave.db");
+        let db_path = loomweave_core::store::db_path(&self.project_root);
         let project_root = self.project_root.clone();
         let sheet_id = promoted.id.clone();
         let write_result =
@@ -1810,17 +2344,32 @@ impl IssuesForAccumulator {
         ids
     }
 
-    /// Attach an `issue` field (title/status/priority) to every matched and
-    /// drifted entry. The value is the fetched [`IssueDetail`] when available,
-    /// else `null` — a stable shape that signals "enrichment attempted, no
-    /// detail" without forcing the consumer to probe for a missing key.
+    /// Attach an `issue` field (id/title/status/priority — the hydrated stub,
+    /// weft-4a46553503) to every matched and drifted entry. The value is the
+    /// fetched [`IssueDetail`] when available, else `null` — a stable shape
+    /// that signals "enrichment attempted, no detail" without forcing the
+    /// consumer to probe for a missing key. The stub's `id` is backfilled from
+    /// the entry's own `issue_id` when the detail route omitted it (an older
+    /// server), so a present stub ALWAYS carries the complete tuple.
     fn apply_issue_details(&mut self, details: &HashMap<String, Option<IssueDetail>>) {
         for entry in self.matched.iter_mut().chain(self.drifted.iter_mut()) {
-            let issue_value = entry
+            let issue_id = entry
                 .get("issue_id")
                 .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let issue_value = issue_id
+                .as_deref()
                 .and_then(|id| details.get(id))
                 .and_then(Option::as_ref)
+                .map(|detail| {
+                    let mut detail = detail.clone();
+                    if detail.id.is_empty()
+                        && let Some(id) = issue_id.as_deref()
+                    {
+                        id.clone_into(&mut detail.id);
+                    }
+                    detail
+                })
                 .and_then(|detail| serde_json::to_value(detail).ok())
                 .unwrap_or(Value::Null);
             if let Some(object) = entry.as_object_mut() {
@@ -2409,7 +2958,7 @@ fn should_spawn_stateful_stdio_request(request: &Value) -> bool {
 /// so it passes `stateful = false`; [`ServerState::handle_json_rpc`] serves the
 /// full surface and passes `stateful = true`. The `instructions` field is static
 /// orientation guidance (not a capability) and is included in both.
-fn initialize_result(stateful: bool) -> Value {
+fn initialize_result(stateful: bool, policy: McpToolPolicy) -> Value {
     let capabilities = if stateful {
         json!({ "tools": {}, "prompts": {}, "resources": {} })
     } else {
@@ -2422,7 +2971,7 @@ fn initialize_result(stateful: bool) -> Value {
             "name": "loomweave",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": server_instructions()
+        "instructions": server_instructions(policy)
     })
 }
 
@@ -2606,6 +3155,21 @@ fn optional_usize(
         .map_err(|_| ParamError::new(&format!("{field} is too large")))
 }
 
+/// Parse the numeric-offset `cursor` argument shared by the bounded single-
+/// relation tools (mirrors `tool_find_entity`'s cursor handling). Null/absent
+/// starts at offset 0; a non-numeric string is a param error (clarion-d76e7f7267).
+fn parse_cursor_offset(
+    arguments: &serde_json::Map<String, Value>,
+) -> std::result::Result<usize, ParamError> {
+    match arguments.get("cursor") {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::String(cursor)) => cursor
+            .parse::<usize>()
+            .map_err(|_| ParamError::new("cursor must be a numeric offset")),
+        _ => Err(ParamError::new("cursor must be a string or null")),
+    }
+}
+
 fn optional_bool(
     arguments: &serde_json::Map<String, Value>,
     field: &str,
@@ -2617,6 +3181,293 @@ fn optional_bool(
         .as_bool()
         .map(Some)
         .ok_or_else(|| ParamError::new(&format!("{field} must be a boolean")))
+}
+
+fn optional_non_empty_string(
+    arguments: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Option<String>, ParamError> {
+    let Some(value) = arguments.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) else {
+        return Err(ParamError::new(&format!(
+            "{field} must be a non-empty string"
+        )));
+    };
+    Ok(Some(value.to_owned()))
+}
+
+fn optional_u64(
+    arguments: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Option<u64>, ParamError> {
+    let Some(value) = arguments.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| ParamError::new(&format!("{field} must be a non-negative integer")))
+}
+
+fn llm_config_patch_from_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> std::result::Result<LlmConfigPatch, ParamError> {
+    let provider = optional_non_empty_string(arguments, "provider")?
+        .as_deref()
+        .map(LlmProviderKind::parse)
+        .transpose()
+        .map_err(|err| ParamError::new(&err.to_string()))?;
+    Ok(LlmConfigPatch {
+        enabled: optional_bool(arguments, "enabled")?,
+        provider,
+        allow_live_provider: optional_bool(arguments, "allow_live_provider")?,
+        enable_write_tools: optional_bool(arguments, "enable_write_tools")?,
+        model_id: optional_non_empty_string(arguments, "model_id")?,
+        codex_model: optional_non_empty_string(arguments, "codex_model")?,
+        claude_model: optional_non_empty_string(arguments, "claude_model")?,
+        openrouter_api_key_env: optional_non_empty_string(arguments, "openrouter_api_key_env")?,
+        openrouter_endpoint_url: optional_non_empty_string(arguments, "openrouter_endpoint_url")?,
+    })
+}
+
+fn semantic_config_patch_from_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> std::result::Result<SemanticConfigPatch, ParamError> {
+    let provider = optional_non_empty_string(arguments, "provider")?
+        .as_deref()
+        .map(SemanticProviderKind::parse)
+        .transpose()
+        .map_err(|err| ParamError::new(&err.to_string()))?;
+    Ok(SemanticConfigPatch {
+        enabled: optional_bool(arguments, "enabled")?,
+        provider,
+        allow_live_provider: optional_bool(arguments, "allow_live_provider")?,
+        model_id: optional_non_empty_string(arguments, "model_id")?,
+        dimensions: optional_usize(arguments, "dimensions")?,
+        endpoint_url: optional_non_empty_string(arguments, "endpoint_url")?,
+        api_key_env: optional_non_empty_string(arguments, "api_key_env")?,
+        timeout_seconds: optional_u64(arguments, "timeout_seconds")?,
+        session_token_ceiling: optional_u64(arguments, "session_token_ceiling")?,
+    })
+}
+
+fn llm_config_patch_is_empty(patch: &LlmConfigPatch) -> bool {
+    patch.enabled.is_none()
+        && patch.provider.is_none()
+        && patch.allow_live_provider.is_none()
+        && patch.enable_write_tools.is_none()
+        && patch.model_id.is_none()
+        && patch.codex_model.is_none()
+        && patch.claude_model.is_none()
+        && patch.openrouter_api_key_env.is_none()
+        && patch.openrouter_endpoint_url.is_none()
+}
+
+fn semantic_config_patch_is_empty(patch: &SemanticConfigPatch) -> bool {
+    patch.enabled.is_none()
+        && patch.provider.is_none()
+        && patch.allow_live_provider.is_none()
+        && patch.model_id.is_none()
+        && patch.dimensions.is_none()
+        && patch.endpoint_url.is_none()
+        && patch.api_key_env.is_none()
+        && patch.timeout_seconds.is_none()
+        && patch.session_token_ceiling.is_none()
+}
+
+fn read_llm_config_status(
+    path: &Path,
+) -> std::result::Result<Value, loomweave_federation::config::ConfigError> {
+    if path.exists() {
+        let config = McpConfig::from_path(path)?;
+        Ok(llm_config_status_json(path, false, &config))
+    } else {
+        Ok(llm_config_status_json(path, true, &McpConfig::default()))
+    }
+}
+
+fn llm_config_status_json(path: &Path, created_or_absent: bool, config: &McpConfig) -> Value {
+    let selection = select_provider_with_env(config, |name| std::env::var(name).ok());
+    let (live, selection_error) = match &selection {
+        Ok(
+            ProviderSelection::OpenRouter { .. }
+            | ProviderSelection::CodexCli
+            | ProviderSelection::ClaudeCli,
+        ) => (true, Value::Null),
+        Ok(ProviderSelection::Disabled | ProviderSelection::Recording) => (false, Value::Null),
+        Err(err) => (false, Value::String(err.to_string())),
+    };
+    json!({
+        "config_path": path.display().to_string(),
+        "config_absent": created_or_absent && !path.exists(),
+        "created": created_or_absent && path.exists(),
+        "llm": {
+            "enabled": config.llm.enabled,
+            "provider": config.llm.provider.as_str(),
+            "allow_live_provider": config.llm.allow_live_provider,
+            "effective_model": config.llm.effective_model_label(),
+            "live": live,
+            "selection_error": selection_error,
+            "warnings": config.llm_warnings(),
+        },
+        "serve": {
+            "mcp": {
+                "enable_write_tools": config.serve.mcp.enable_write_tools,
+            }
+        }
+    })
+}
+
+fn read_semantic_config_status(
+    path: &Path,
+    project_root: &Path,
+) -> std::result::Result<Value, loomweave_federation::config::ConfigError> {
+    if path.exists() {
+        let config = McpConfig::from_path(path)?;
+        Ok(semantic_config_status_json(
+            path,
+            project_root,
+            false,
+            &config,
+        ))
+    } else {
+        Ok(semantic_config_status_json(
+            path,
+            project_root,
+            true,
+            &McpConfig::default(),
+        ))
+    }
+}
+
+fn semantic_config_status_json(
+    path: &Path,
+    project_root: &Path,
+    created_or_absent: bool,
+    config: &McpConfig,
+) -> Value {
+    let semantic = &config.semantic_search;
+    let sidecar_path = project_root.join(".weft/loomweave/embeddings.db");
+    let sidecar_count = semantic_sidecar_count(&sidecar_path);
+    let has_key = std::env::var(&semantic.api_key_env)
+        .ok()
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let provider_error = semantic_provider_error(semantic, has_key).map(Value::String);
+    let provider_available = semantic.enabled && provider_error.is_none();
+    let vector_count = sidecar_count.as_ref().ok().and_then(|value| *value);
+    json!({
+        "config_path": path.display().to_string(),
+        "config_absent": created_or_absent && !path.exists(),
+        "created": created_or_absent && path.exists(),
+        "semantic_search": {
+            "enabled": semantic.enabled,
+            "provider": semantic.provider.as_str(),
+            "allow_live_provider": semantic.allow_live_provider,
+            "endpoint_url": semantic.endpoint_url,
+            "model_id": semantic.model_id,
+            "dimensions": semantic.dimensions,
+            "api_key_env": semantic.api_key_env,
+            "api_key_present": has_key,
+            "timeout_seconds": semantic.timeout_seconds,
+            "session_token_ceiling": semantic.session_token_ceiling,
+            "provider_available": provider_available,
+            "provider_error": provider_error.unwrap_or(Value::Null),
+            "next_action": semantic_next_action(semantic, has_key, vector_count),
+        },
+        "embeddings_sidecar": {
+            "path": sidecar_path.display().to_string(),
+            "present": sidecar_path.exists(),
+            "vector_count": vector_count,
+            "error": sidecar_count.err(),
+        }
+    })
+}
+
+fn semantic_provider_error(semantic: &SemanticSearchConfig, has_key: bool) -> Option<String> {
+    if !semantic.enabled {
+        return Some("semantic_search.enabled is false".to_owned());
+    }
+    match semantic.provider {
+        SemanticProviderKind::Api if !semantic.allow_live_provider => {
+            Some("hosted API provider requires allow_live_provider=true".to_owned())
+        }
+        SemanticProviderKind::Api if !has_key => Some(format!(
+            "hosted API provider requires non-empty ${}",
+            semantic.api_key_env
+        )),
+        SemanticProviderKind::LocalOpenAi => semantic
+            .validate_endpoint_trust()
+            .err()
+            .map(|err| err.to_string()),
+        SemanticProviderKind::Api => None,
+    }
+}
+
+fn semantic_next_action(
+    semantic: &SemanticSearchConfig,
+    has_key: bool,
+    vector_count: Option<i64>,
+) -> String {
+    if !semantic.enabled {
+        return "enable semantic search, then run `loomweave analyze`".to_owned();
+    }
+    match semantic.provider {
+        SemanticProviderKind::Api if !semantic.allow_live_provider => {
+            return "set semantic_search.allow_live_provider=true for hosted API calls".to_owned();
+        }
+        SemanticProviderKind::Api if !has_key => {
+            return format!("export ${} before analyzing", semantic.api_key_env);
+        }
+        SemanticProviderKind::LocalOpenAi if vector_count.unwrap_or(0) == 0 => {
+            return format!(
+                "start the local embeddings server at {}, then run `loomweave analyze`",
+                semantic.endpoint_url
+            );
+        }
+        _ => {}
+    }
+    if vector_count.unwrap_or(0) == 0 {
+        "run `loomweave analyze` to populate semantic embeddings".to_owned()
+    } else {
+        "reconnect/restart `loomweave serve` after config changes".to_owned()
+    }
+}
+
+fn semantic_sidecar_count(path: &Path) -> std::result::Result<Option<i64>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(path).map_err(|err| err.to_string())?;
+    conn.query_row("SELECT COUNT(*) FROM entity_embeddings", [], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(|err| err.to_string())
+}
+
+fn with_active_session_policy(
+    mut status: Value,
+    active_write_tools: bool,
+    restart_required: bool,
+) -> Value {
+    if let Some(object) = status.as_object_mut() {
+        object.insert(
+            "active_session".to_owned(),
+            json!({
+                "enable_write_tools": active_write_tools,
+                "restart_required": restart_required,
+                "note": if restart_required {
+                    "reconnect/restart loomweave serve for provider and write-tool policy changes to load"
+                } else {
+                    "active session state"
+                }
+            }),
+        );
+    }
+    status
 }
 
 fn optional_confidence(
@@ -2641,11 +3492,56 @@ fn optional_confidence(
 /// The static resolver cannot bind a call made through an attribute receiver
 /// (e.g. `ctx.orchestrator.resume()`); only `inferred` (LLM) dispatch attempts
 /// those, so `resolved`/`ambiguous` queries exclude them and `inferred` does not.
+///
+/// This is the base vocabulary, used directly by `entity_call_site_list`, which
+/// SEARCHES the unresolved-call-site table (returning `unresolved_sites`
+/// evidence rows) and so must not declare it as an unsearched blind spot.
+/// Navigation tools use [`navigation_scope_excludes`].
 fn call_graph_scope_excludes(confidence: EdgeConfidence) -> Vec<&'static str> {
     match confidence {
         EdgeConfidence::Resolved | EdgeConfidence::Ambiguous => vec!["attribute-receiver-calls"],
         EdgeConfidence::Inferred => Vec::new(),
     }
+}
+
+/// Scope excludes for the caller-navigation surface (`entity_callers_list`,
+/// `entity_neighborhood_get`, `entity_execution_path_list`, the orientation
+/// pack). Unlike `entity_call_site_list`, these read only resolved/ambiguous
+/// `calls` edges — when the project holds live unresolved call sites, that
+/// whole category is an unsearched blind spot and must be named, or an empty
+/// callers list reads as a confident true negative (clarion-df87b4f381).
+/// `inferred` stays empty: its dispatch pass attempts the unresolved category.
+pub(crate) fn navigation_scope_excludes(
+    confidence: EdgeConfidence,
+    live_unresolved_sites: bool,
+) -> Vec<&'static str> {
+    let mut excludes = call_graph_scope_excludes(confidence);
+    if live_unresolved_sites && confidence != EdgeConfidence::Inferred {
+        excludes.push("unresolved-static-calls");
+    }
+    excludes
+}
+
+/// The `unresolved_name_matches` count + `next_action` recovery pointer for a
+/// caller-navigation result: how many live unresolved call sites name-match
+/// `target`, and where to see them. The pointer names `entity_call_site_list`
+/// because it works in the default read-only posture, where `confidence=
+/// inferred` is rejected by the MCP tool policy (clarion-df87b4f381).
+pub(crate) fn unresolved_match_fields(
+    conn: &rusqlite::Connection,
+    target: &EntityRow,
+) -> Result<(i64, Value), StorageError> {
+    let count = unresolved_caller_count_for_target(conn, target)?;
+    let next_action = if count > 0 {
+        json!(format!(
+            "{count} unresolved call site(s) name-match this entity and are NOT in `callers`; \
+             list them with entity_call_site_list id={id} role=callee",
+            id = target.id
+        ))
+    } else {
+        Value::Null
+    };
+    Ok((count, next_action))
 }
 
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
@@ -2789,6 +3685,17 @@ fn success_envelope_with_stats(result: Value, stats_delta: Value) -> Value {
 
 fn tool_error_envelope(code: McpErrorCode, message: &str, retryable: bool) -> Value {
     tool_error_envelope_with_diagnostics(code, message, retryable, json!({}), Vec::new())
+}
+
+/// `EntityNotFound` envelope echoing the caller's original input string. Used by
+/// the id-or-SEI canonicalize-at-top path so an unresolvable SEI reports the
+/// exact token the caller pasted (clarion-d76e7f7267).
+fn entity_not_found_envelope(requested_id: &str) -> Value {
+    tool_error_envelope(
+        McpErrorCode::EntityNotFound,
+        &format!("entity {requested_id} was not found"),
+        false,
+    )
 }
 
 fn tool_error_envelope_with_diagnostics(
@@ -2989,7 +3896,7 @@ fn wardline_section_for_entity(
     }
 }
 
-fn project_relative_lookup_path(
+pub(crate) fn project_relative_lookup_path(
     project_root: &Path,
     source_file_path: &str,
 ) -> Result<String, String> {
@@ -3201,11 +4108,7 @@ fn summary_scope_deferred(entity_json: &Value) -> Value {
 }
 
 fn summary_briefing_blocked(entity_json: &Value, reason: &str) -> Value {
-    let remediation = if reason == "unscanned_source" {
-        "Entity source file was not covered by the pre-ingest secret scan. Re-run with scanner coverage for that path or fix the plugin source path before requesting a summary."
-    } else {
-        "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .loomweave/secrets-baseline.yaml. See ADR-013."
-    };
+    let remediation = briefing_block_remediation(reason);
     let entity_id = entity_json
         .get("id")
         .and_then(Value::as_str)
@@ -3271,6 +4174,17 @@ fn entity_identity_json(entity: &EntityRow) -> Value {
 /// to JSON `null` on a pre-SEI database or an orphaned/unbound locator — the
 /// lookup must never fail the tool call.
 fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
+    // A secret-scan-blocked entity (ADR-013) must not have its identity disclosed
+    // by a discovery/structure MCP read — matching the federation read API, whose
+    // BRIEFING_BLOCKED response omits id/name/path/hash (ADR-034). This is the
+    // single choke point: every list/structure surface projects entities (and
+    // their caller/callee/reference/import neighbors) through here
+    // (clarion-307668e2be). The deliberate exception — `summary`, which echoes a
+    // caller-named entity's identity + remediation — builds identity via
+    // `entity_identity_json` instead, bypassing this gate.
+    if let Some(reason) = briefing_block_reason(entity) {
+        return blocked_entity_stub(&reason);
+    }
     let mut value = entity_identity_json(entity);
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -3279,6 +4193,55 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
         );
     }
     value
+}
+
+/// The identity projection of a briefing-blocked entity (ADR-013 secret scan).
+///
+/// Every identity field is withheld — only the block reason remains — so a
+/// discovery/structure MCP read acknowledges the entity exists without
+/// disclosing its name, path, or line span. Mirrors the federation read API,
+/// whose `BRIEFING_BLOCKED` response omits the same fields (ADR-034). The
+/// qualname-bearing `id` is nulled too: the locator itself encodes the name.
+fn blocked_entity_stub(reason: &str) -> Value {
+    json!({
+        "id": Value::Null,
+        "sei": Value::Null,
+        "kind": Value::Null,
+        "name": Value::Null,
+        "short_name": Value::Null,
+        "source_file_path": Value::Null,
+        "source_line_start": Value::Null,
+        "source_line_end": Value::Null,
+        "content_hash": Value::Null,
+        "briefing_blocked": reason,
+    })
+}
+
+/// Placeholder substituted for a briefing-blocked entity's id in execution-path
+/// arrays. Distinct blocked nodes collapse to this one token (uncorrelatable by
+/// design — the accepted price of withholding identity, clarion-307668e2be).
+const BRIEFING_BLOCKED_PATH_SENTINEL: &str = "[briefing-blocked]";
+
+/// Operator-facing remediation for a briefing block, by reason. Shared by every
+/// refusal envelope (summary / neighborhood / orientation) so the "fix the
+/// secret" guidance stays consistent.
+fn briefing_block_remediation(reason: &str) -> &'static str {
+    if reason == "unscanned_source" {
+        "Entity source file was not covered by the pre-ingest secret scan. Re-run with scanner coverage for that path or fix the plugin source path before requesting a summary."
+    } else {
+        "File flagged by pre-ingest secret scan. Fix the secret or whitelist via .weft/loomweave/secrets-baseline.yaml. See ADR-013."
+    }
+}
+
+/// Refusal envelope for a structure-fan-out read (`neighborhood`,
+/// `orientation`) whose queried entity is itself briefing-blocked. Withholds the
+/// structure *around* the withheld entity (ADR-034) and discloses no identity.
+fn blocked_entity_refusal(reason: &str) -> Value {
+    success_envelope(json!({
+        "available": false,
+        "briefing_blocked": reason,
+        "remediation": briefing_block_remediation(reason),
+    }))
 }
 
 fn entity_properties_json(entity: &EntityRow) -> Value {
@@ -3361,6 +4324,21 @@ fn span_len(entity: &EntityRow) -> Option<i64> {
 /// Compact entity descriptor for the containing stack — enough to orient
 /// without the full `entity_json` payload.
 fn stack_entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
+    // A blocked entity in the containing stack (the matched node, or a blocked
+    // ancestor module) is redacted to a stub — same identity-withholding as
+    // `entity_json` (clarion-307668e2be).
+    if let Some(reason) = briefing_block_reason(entity) {
+        return json!({
+            "id": Value::Null,
+            "sei": Value::Null,
+            "kind": Value::Null,
+            "short_name": Value::Null,
+            "name": Value::Null,
+            "source_line_start": Value::Null,
+            "source_line_end": Value::Null,
+            "briefing_blocked": reason,
+        });
+    }
     // REQ-C-04: a containing-stack ancestor is sometimes the ONLY place an
     // entity appears in the response, so it carries its `sei` (the durable
     // binding key) — not just the mutable `id`/locator. Graceful-degrade null.
@@ -3414,15 +4392,29 @@ fn entity_context_json(
         .collect();
     containing_stack.push(stack_entity_json(conn, matched));
 
-    let def = DefinitionSpan::from_entity(matched);
-    let ranges = json!({
-        "source_line_start": matched.source_line_start,
-        "source_line_end": matched.source_line_end,
-        "decl_line": def.decl_line,
-        "body_line_start": def.body_line_start,
-        "decorator_line_start": def.decorator_line_start,
-        "decorator_line_end": def.decorator_line_end,
-    });
+    // A blocked matched entity withholds its line span too — the ranges block
+    // would otherwise disclose exactly what the block hides (clarion-307668e2be).
+    let ranges = if let Some(reason) = briefing_block_reason(matched) {
+        json!({
+            "source_line_start": Value::Null,
+            "source_line_end": Value::Null,
+            "decl_line": Value::Null,
+            "body_line_start": Value::Null,
+            "decorator_line_start": Value::Null,
+            "decorator_line_end": Value::Null,
+            "briefing_blocked": reason,
+        })
+    } else {
+        let def = DefinitionSpan::from_entity(matched);
+        json!({
+            "source_line_start": matched.source_line_start,
+            "source_line_end": matched.source_line_end,
+            "decl_line": def.decl_line,
+            "body_line_start": def.body_line_start,
+            "decorator_line_start": def.decorator_line_start,
+            "decorator_line_end": def.decorator_line_end,
+        })
+    };
 
     // Ambiguity: other candidates sharing the winner's span length are genuine
     // same-granularity overlaps. Strictly larger spans are the nesting stack
@@ -3489,6 +4481,10 @@ struct OrientationCore {
     sei_populated: bool,
     neighbors_omitted: serde_json::Map<String, Value>,
     paths_truncation_reason: Option<String>,
+    /// Set when the resolved primary entity is briefing-blocked: the pack is
+    /// refused (no identity, no surrounding structure) rather than built
+    /// (clarion-307668e2be).
+    briefing_blocked: Option<String>,
 }
 
 /// Sort a neighbor list by entity id (stable, deterministic) and cap it,
@@ -4343,7 +5339,14 @@ fn current_source_content_hash(
     file_bytes: &[u8],
     source: Option<&str>,
 ) -> Option<String> {
-    if is_plugin_file_scope_entity(entity) {
+    // A core `file` catalog row hashes its whole contents (analyze's
+    // `whole_file_hash`), same as a plugin file-scope entity. Relation-edge
+    // anchors resolve their owner from the edge's `source_file_id`, so drift
+    // must be detectable on file rows too. Gated on core ownership, not the
+    // kind name alone — a plugin-owned "file" kind makes no whole-file-hash
+    // promise.
+    if (entity.plugin_id == "core" && entity.kind == "file") || is_plugin_file_scope_entity(entity)
+    {
         return Some(blake3::hash(file_bytes).to_hex().to_string());
     }
     let source = source?;
@@ -4573,12 +5576,19 @@ fn callee_json(
     edge: &CallEdgeMatch,
 ) -> Result<Option<Value>, StorageError> {
     Ok(entity_by_id(conn, &edge.to_id)?.map(|entity| {
+        // `stored_to_id` echoes the callee's raw id, which leaks the qualname of
+        // a blocked callee even when `entity_json` redacts it (clarion-307668e2be).
+        let stored_to_id = if briefing_block_reason(&entity).is_some() {
+            Value::Null
+        } else {
+            json!(edge.stored_to_id)
+        };
         json!({
             "entity": entity_json(conn, &entity),
             "edge_confidence": edge.confidence.as_str(),
             "source_byte_start": edge.source_byte_start,
             "source_byte_end": edge.source_byte_end,
-            "stored_to_id": edge.stored_to_id
+            "stored_to_id": stored_to_id
         })
     }))
 }
@@ -4612,11 +5622,31 @@ fn compact_execution_paths(
             node_ids.insert(id.clone());
         }
     }
-    let nodes = node_ids
-        .iter()
-        .filter_map(|id| entity_by_id(conn, id).transpose())
-        .map(|row| row.map(|entity| compact_node_json(conn, &entity)))
-        .collect::<Result<Vec<_>, StorageError>>()?;
+    // A briefing-blocked node is omitted from the node table (its id IS its
+    // qualname, so it cannot be projected) and its occurrences in the path
+    // arrays are replaced with a sentinel. The path keeps its shape — a flow
+    // *through* withheld territory — without disclosing which entity
+    // (clarion-307668e2be).
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    let mut nodes = Vec::new();
+    for id in &node_ids {
+        if let Some(entity) = entity_by_id(conn, id)? {
+            if briefing_block_reason(&entity).is_some() {
+                blocked.insert(id.clone());
+            } else {
+                nodes.push(compact_node_json(conn, &entity));
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        for path in &mut paths {
+            for id in path.iter_mut() {
+                if blocked.contains(id) {
+                    BRIEFING_BLOCKED_PATH_SENTINEL.clone_into(id);
+                }
+            }
+        }
+    }
     Ok(CompactPaths {
         nodes,
         paths,
@@ -4665,6 +5695,41 @@ fn reference_neighbors(
         conn,
         reference_edges_for_entity(conn, entity_id, direction)?,
     )
+}
+
+/// Kind-tagged relation neighbors (`inherits_from` / `decorates` /
+/// `implements` / `derives`) for `neighborhood` / `orientation_pack`
+/// (clarion-ae5b43ea40). Same entry shape as the references buckets plus the
+/// edge `kind`; the cursor-paginated set with anchor evidence is the dedicated
+/// `entity_relation_list` tool. Honors the confidence tier (relations are
+/// resolved|ambiguous only — stronger claims than `references`, so the
+/// resolved default excludes ambiguous rows rather than mixing them in).
+fn relation_neighbors(
+    conn: &rusqlite::Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+    confidence: EdgeConfidence,
+) -> Result<Vec<Value>, StorageError> {
+    let mut neighbors = Vec::new();
+    for edge in relation_edges_for_entity(conn, entity_id, direction, None)? {
+        if edge.confidence > confidence {
+            continue;
+        }
+        let neighbor_id = match direction {
+            ReferenceDirection::In => &edge.from_id,
+            ReferenceDirection::Out => &edge.to_id,
+        };
+        if let Some(entity) = entity_by_id(conn, neighbor_id)? {
+            neighbors.push(json!({
+                "kind": edge.kind,
+                "entity": entity_json(conn, &entity),
+                "edge_confidence": edge.confidence.as_str(),
+                "source_byte_start": edge.source_byte_start,
+                "source_byte_end": edge.source_byte_end
+            }));
+        }
+    }
+    Ok(neighbors)
 }
 
 /// `imports`-edge neighbors for a module entity (clarion-79d0ff6e14). Direction
@@ -4823,137 +5888,422 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        InferenceLlmState, InferredRead, McpToolPolicy, ServerState, config::LlmConfig, list_tools,
+        InferenceLlmState, InferredRead, McpToolPolicy, RENAME_MAP, ServerState, config::LlmConfig,
+        list_tools,
     };
+    use loomweave_federation::config::{LlmProviderKind, SemanticProviderKind};
+
+    /// tools/list is loaded into EVERY consuming session, so its size is a
+    /// per-session context tax (clarion-e65354898d). Budget: each description
+    /// ≤ 350 chars (what it answers, key args, one honesty caveat — depth
+    /// belongs in the loomweave-workflow skill, fetched once on demand), and
+    /// the serialized catalogue ≤ 23 KB (~5.5k tokens at the observed ~4.2
+    /// bytes/token; the pre-budget baseline was 46 KB / ~11k tokens). The
+    /// budget was raised 22 → 23 KB for weft-ac59e8e730: the two config-set
+    /// tools' inputSchemas were bare `{}` per property, and declaring real
+    /// types/enums for the surface that can enable writes and live LLM spend
+    /// is worth ~0.7 KB.
+    #[test]
+    fn tools_list_fits_the_context_budget() {
+        let tools = list_tools();
+        for tool in &tools {
+            let len = tool.description.chars().count();
+            assert!(
+                len <= 350,
+                "description for {} is {len} chars (budget 350) — move the depth \
+                 into the loomweave-workflow skill",
+                tool.name
+            );
+        }
+        let serialized = serde_json::to_string(&tools).expect("serialize tools");
+        assert!(
+            serialized.len() <= 23_000,
+            "serialized tools/list is {} bytes (budget 23000 ≈ 5.5k tokens)",
+            serialized.len()
+        );
+    }
+
+    /// The `initialize.instructions` blob is truncated by real clients
+    /// (observed live: Claude Code cut it mid-sentence around ~2 KB), so the
+    /// write-gating note must come EARLY and the whole blob must stay small
+    /// (clarion-e65354898d).
+    #[test]
+    fn server_instructions_fit_truncating_clients() {
+        let instructions = super::server_instructions(McpToolPolicy::read_only());
+        assert!(
+            instructions.len() <= 2_000,
+            "instructions are {} bytes; budget 2000",
+            instructions.len()
+        );
+        let gate = instructions
+            .find("rite-gated")
+            .expect("write-gating note present in read-only posture");
+        assert!(
+            gate <= 700,
+            "write-gating note starts at byte {gate}; it must sit in the first \
+             700 bytes to survive client truncation"
+        );
+    }
+
+    /// SKILL.md must speak the registered tool dialect (clarion-888434f3ce).
+    ///
+    /// The skill is the canonical onboarding doc (embedded asset, served via
+    /// `prompts/get`, installed by `loomweave install --skills`). An MCP client
+    /// exposes only the names in `tools/list`; the `RENAME_MAP` shim rescues
+    /// raw JSON-RPC callers but NOT `mcp__loomweave__<old-name>` clients, so a
+    /// skill teaching retired names burns failed calls. Three invariants:
+    /// no retired alias appears as a backticked token, every
+    /// `mcp__loomweave__<name>` mention is registered (or the `*` wildcard),
+    /// and every registered tool is documented somewhere in the skill.
+    #[test]
+    fn skill_md_speaks_the_registered_tool_dialect() {
+        let skill = include_str!("../assets/skills/loomweave-workflow/SKILL.md");
+        let registered: std::collections::BTreeSet<&str> =
+            list_tools().iter().map(|tool| tool.name).collect();
+
+        for &(old, new) in RENAME_MAP {
+            if old == new {
+                continue;
+            }
+            assert!(
+                !skill.contains(&format!("`{old}`")),
+                "SKILL.md teaches retired tool name `{old}` — the registered name is `{new}`"
+            );
+            assert!(
+                !skill.contains(&format!("mcp__loomweave__{old}")),
+                "SKILL.md claims mcp__loomweave__{old} exists — clients expose mcp__loomweave__{new}"
+            );
+        }
+
+        for (idx, _) in skill.match_indices("mcp__loomweave__") {
+            let rest = &skill[idx + "mcp__loomweave__".len()..];
+            if rest.starts_with('*') {
+                continue; // the documented wildcard form
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            assert!(
+                registered.contains(name.as_str()),
+                "SKILL.md mentions mcp__loomweave__{name}, which is not in tools/list"
+            );
+        }
+
+        for name in &registered {
+            assert!(
+                skill.contains(&format!("`{name}`")),
+                "registered tool `{name}` is undocumented in SKILL.md — document it \
+                 (or its containing table row) so the skill covers the live catalogue"
+            );
+        }
+    }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // exhaustively pins all 46 tool docstrings by design
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 39);
+        assert_eq!(tools.len(), 46);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
-            "Return the innermost Loomweave entity whose source range contains a file and line, plus an `entity_context` evidence block: match_reason (decorator_range / declaration / body_range / containing_range / no_match) explaining why the line matched, the module→entity containing stack, the matched entity's decl/body/decorator sub-ranges, any same-granularity ambiguity alternatives, and index freshness. Paths are normalized relative to the project root. A blank or comment line that only a module spans reports containing_range — never a fabricated exact match."
+            "Innermost entity whose source range contains `file`+`line`, with an `entity_context` evidence block (match_reason, containing stack, sub-ranges, alternatives). A line only a module spans reports containing_range — never a fabricated exact match."
         );
         assert_eq!(tools[1].name, "entity_find");
         assert_eq!(
             tools[1].description,
-            "Search Loomweave entities by id, name, short name, and summary text stored on entity rows. Results are paginated and ranked by FTS match where possible. This does not traverse the graph and does not search on-demand summary_cache entries. Pass an optional `kind` (e.g. \"subsystem\", \"function\", \"class\", \"module\") to return only entities of that kind — the way to locate a subsystem without visually filtering results."
+            "Search entities by name, id, summary, and docstring before grepping. Optional `kind`; paginated; scanner-blocked docstrings never match."
         );
         assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
             tools[2].description,
-            "Return entities that call the given entity. Default confidence is resolved, so ambiguous static candidates and LLM-inferred edges are excluded unless explicitly requested. Ambiguous edges expand all candidates; inferred edges may trigger bounded LLM dispatch. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls) so an empty callers list is never read as a guaranteed true negative."
+            "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. Reports scope_excludes and unresolved_name_matches so empty results stay honest."
         );
         assert_eq!(tools[3].name, "entity_execution_path_list");
         assert_eq!(
             tools[3].description,
-            "Return bounded calls-only execution paths starting at an entity. Default confidence is resolved. max_depth defaults to 3. Results are compact: a deduplicated nodes table plus paths as arrays of node ids (under a root), ranked longest-first. Traversal stops at the server edge cap and the response is capped at a maximum number of ranked paths; truncated/truncation_reason report edge-cap or path-cap when either trims. The result carries scope_excludes naming static blind spots not searched (e.g. attribute-receiver-calls)."
+            "Bounded calls-only paths from an entity (`max_depth` default 3). Compact: deduplicated `nodes` table + `paths` as node-id arrays, longest-first; truncation reports edge-cap/path-cap. `scope_excludes` names unsearched blind spots (attribute-receiver / unresolved static calls) — empties are not proof."
         );
         assert_eq!(tools[4].name, "entity_summary_get");
         assert_eq!(
             tools[4].description,
-            "Return an on-demand cached summary for one entity. In v0.1 this is leaf scope only: module summaries describe the module docstring and top-level members, not an aggregation of contained function/class summaries. If the LLM returns non-JSON the response degrades to a deterministic structural summary (kind: structural-fallback) built from the entity source, and that fallback is cached so a retry is a free cache hit rather than a re-billed failure."
+            "On-demand cached LLM summary for one entity (leaf scope: module summaries do not aggregate members). Non-JSON LLM output degrades to a cached deterministic structural fallback, so a retry is a cache hit, not a re-billed failure."
         );
         assert_eq!(tools[5].name, "entity_issue_list");
         assert_eq!(
             tools[5].description,
-            "Return Filigree issues attached to this Loomweave entity, optionally including issues attached to contained entities. Filigree is an enrichment source; if unavailable, the tool returns an unavailable envelope instead of failing Loomweave. The result carries a result_kind (matched | no_matches | unavailable) so a reachable-but-empty Filigree is distinct from an unreachable one, and a filigree_endpoint block (configured vs resolved URL + resolution_source) so you can see which endpoint — e.g. a live ethereal port — the answer came from. Each matched/drifted entry carries an `issue` object with the issue's title, status, and priority (fetched once per distinct issue, no N+1); `issue` is null when the issue-detail route is unavailable, so the match still resolves without a second hop into Filigree. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
+            "Filigree issues attached to an entity (optionally contained entities too), plus an enrich-only `wardline_findings` section. result_kind matched | no_matches | unavailable distinguishes empty-Filigree from unreachable-Filigree; `filigree_endpoint` shows which endpoint answered."
         );
         assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
-            "Return the one-hop Loomweave neighborhood around an entity: callers, callees, container, contained entities, references, and imports (imports_in = who imports this module, imports_out = what it imports; module-to-module). Default confidence is resolved; ambiguous and inferred calls are opt-in. References and imports are not execution flow. When the entity is a module, references_in/references_out are rolled up over the symbols it contains (references_rolled_up=true) — each neighbor carries a `via` naming the contained symbol the edge touches, so \"who imports this module/contract\" is answered at module altitude rather than reading empty. On references_in each rolled-up neighbor also carries `importer_module` — the importing symbol's containing module — so reverse-import names importing modules, not just symbols. The result carries scope_excludes naming blind spots not searched (e.g. attribute-receiver-calls) so empty sections are never read as guaranteed true negatives."
+            "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit; reports scope_excludes and unresolved_name_matches."
         );
         assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(
             tools[7].description,
-            "List module entities assigned to a subsystem entity."
+            "List the module entities in a subsystem. Bounded: `limit` (default 50, max 100) + numeric-offset `cursor`."
         );
         assert_eq!(tools[8].name, "entity_subsystem_get");
         assert_eq!(
             tools[8].description,
-            "Return the subsystem an entity belongs to — the reverse of subsystem_members. Accepts any entity id: a module resolves directly, while a function/class resolves through its nearest containing module. Returns the subsystem id/name and the module the membership was resolved through, or a no-subsystem result when the entity has no subsystem-assigned module ancestor."
+            "The subsystem an entity belongs to (reverse of subsystem_member_list). Any entity id (functions/classes resolve through their containing module); reports the via-module."
         );
         assert_eq!(tools[9].name, "project_status_get");
         assert_eq!(
             tools[9].description,
-            "Return deterministic Loomweave diagnostics: repo root, db path, latest run (id/status/started/completed), entity/subsystem/edge/finding/briefing-blocked counts, index staleness, per-plugin entity counts from the current index, LLM policy (provider/live/cache), and the resolved Filigree endpoint (configured vs resolved URL + resolution source). Answers \"is the graph fresh, plugin-less, LLM-live, Filigree-reachable?\" without shelling out. No LLM call."
+            "Deterministic diagnostics: repo root, db path, latest run, entity/edge/finding counts, index staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint."
         );
-        assert_eq!(tools[10].name, "entity_summary_preview_cost_get");
+        assert_eq!(tools[10].name, "llm_config_get");
         assert_eq!(
             tools[10].description,
-            "Preview what calling summary(id) would cost BEFORE spending. Reports cache_status (hit | expired | miss), the cached row's real tokens/cost/age on a hit, an input-token estimate on a miss, the configured model, the LLM policy (provider/live/allow_live_provider/cache horizon), and live_spend_would_occur — true only when no fresh cache row exists AND a live provider is wired. A disabled/unconfigured LLM is reported distinctly from a cache miss. Never invokes the LLM provider."
+            "Read LLM/provider/live and MCP write-tool config."
         );
-        assert_eq!(tools[11].name, "entity_source_get");
+        assert_eq!(tools[11].name, "llm_config_set");
         assert_eq!(
             tools[11].description,
-            "Return the exact indexed source span for one entity (its source_line_start..source_line_end, which includes any decorators/signature/docstring the plugin captured) plus a bounded window of surrounding context, as line-numbered lines each flagged in_entity true/false. No LLM call. Lets an agent read and trust the entity without shelling out. source_status reports `ok`, or — instead of a misleading stale snippet — `missing` (file gone), `no_range`/`no_source_path` (entity has no anchor), `binary` (non-UTF-8), or `drifted` (the file no longer matches the indexed content_hash; rerun `loomweave analyze`). context_lines defaults to 10."
+            "Update LLM/provider/live/write-tool config in loomweave.yaml; reconnect."
         );
-        assert_eq!(tools[12].name, "entity_call_site_list");
+        assert_eq!(tools[12].name, "semantic_config_get");
         assert_eq!(
             tools[12].description,
-            "Show the actual source sites behind calls/references edges, so an agent can see WHY Loomweave believes an edge exists rather than trusting it blind. role=caller (default) returns this entity's outgoing sites (what it calls/references); role=callee returns incoming sites (who calls/references it). Each site carries the file path, 1-based line, byte column, the source line text, edge kind, confidence, and a resolution of resolved | ambiguous (with candidate ids) | unresolved (a static call Loomweave could not bind, kept separate so it is never mixed with resolved evidence). Filter by edge kind (`calls`/`references`) and by a best-effort production/test path heuristic (`all`/`production`/`test`; path partitioning is not indexed — the heuristic matches conventional test paths). Output is bounded; truncated flags when the site cap trims. No LLM call."
+            "Read semantic-search config and sidecar diagnostics."
         );
-        assert_eq!(tools[13].name, "entity_orientation_pack_get");
+        assert_eq!(tools[13].name, "semantic_config_set");
         assert_eq!(
             tools[13].description,
-            "Assemble one deterministic orientation packet for a code location — the replacement for hand-composing find_entity + entity_at + source reads + neighborhood + issues_for + freshness on every question. Resolve EITHER by `entity` id OR by `file`+`line` (exactly one form). The packet bundles: the primary entity, the entity_context evidence (match_reason / containing stack / decl-body-decorator ranges — so a decorator-line query is explained, not guessed), a compact source-span summary, one-hop neighbors (callers, callees, container, contained, references, imports — for a module, references_in/out are rolled up over contained symbols with references_rolled_up=true), compact resolved execution paths, related Filigree issues, index/Filigree/LLM health, warnings, and suggested next reads. No LLM summary is invoked. Every list is bounded; an `omitted` block reports per-section truncation counts and `degraded` sections name surfaces that were unavailable (e.g. Filigree down) so an empty section is never read as a guaranteed negative. Includes a `wardline_findings` section (enrich-only) reconciling Wardline findings to the entity by qualname; `result_kind` is matched|no_matches|unavailable."
+            "Update semantic-search config in loomweave.yaml; rerun analyze."
         );
-        assert_eq!(tools[14].name, "analyze_start");
+        assert_eq!(tools[14].name, "entity_summary_preview_cost_get");
         assert_eq!(
             tools[14].description,
-            "Start a `loomweave analyze` run over this project in the background and return its run handle immediately — do not block on the (possibly many-minute) run. Re-indexes the source tree and refreshes entities/edges/subsystems. Returns run_id, status (`started`), and the progress-file path. Only one analyze may run per project at a time (a cross-process lock enforces it); a second start while one is active is rejected. Poll analyze_status for progress; analyze_cancel to stop. No arguments."
+            "Preview what entity_summary_get would cost BEFORE spending: cache_status (hit | expired | miss), real cost on a hit, an estimate on a miss, and live_spend_would_occur. A disabled LLM is reported distinctly from a cache miss. Never invokes the provider."
         );
-        assert_eq!(tools[15].name, "analyze_status_get");
+        assert_eq!(tools[15].name, "entity_source_get");
         assert_eq!(
             tools[15].description,
-            "Report the live status of an analyze run started via analyze_start. status is one of queued (spawned, not yet recording) | running | completed | failed | cancelled | skipped_no_plugins. While running it exposes phase (discovering / analyzing / clustering), current_plugin, processed_files / total_files, current_file, the latest heartbeat_at, elapsed_seconds, and progress_observed (false when the heartbeat has gone stale — the run may be wedged). On a terminal status it carries the recorded run stats. Reads structured progress, never logs."
+            "An entity's exact indexed source span plus `context_lines` (default 10) of context, line-numbered and flagged in_entity. source_status reports ok | missing | no_range | no_source_path | binary | drifted (rerun analyze) instead of a misleading stale snippet."
         );
-        assert_eq!(tools[16].name, "analyze_cancel");
+        assert_eq!(tools[16].name, "entity_call_site_list");
         assert_eq!(
             tools[16].description,
-            "Cancel a running analyze. SIGKILLs the run's whole process group — terminating the language plugin and its pyright-langserver child — then marks the run terminal (status `cancelled`) so it is never left dangling as `running`. Idempotent: cancelling an already-terminal run reports its current state. Partial work already written is kept (cancel discards in-flight work, not the index)."
+            "Show the source sites behind calls/references edges — the evidence for WHY an edge exists. role=caller (default) lists outgoing sites; role=callee lists incoming, INCLUDING `unresolved_sites` (static calls Loomweave could not bind — the recovery surface for suspicious empty caller lists). Bounded."
         );
-        assert_eq!(tools[17].name, "index_diff_get");
-        assert_eq!(tools[18].name, "entity_guidance_list");
-        assert_eq!(tools[19].name, "propose_guidance");
-        assert_eq!(tools[20].name, "promote_guidance");
-        assert_eq!(tools[21].name, "entity_finding_list");
-        assert_eq!(tools[22].name, "entity_wardline_get");
-        assert_eq!(tools[23].name, "entity_tag_list");
-        assert_eq!(tools[24].name, "entity_kind_list");
-        assert_eq!(tools[25].name, "entity_wardline_list");
-        assert_eq!(tools[26].name, "module_circular_import_list");
-        assert_eq!(tools[27].name, "entity_coupling_hotspot_list");
-        assert_eq!(tools[28].name, "entity_entry_point_list");
-        assert_eq!(tools[29].name, "entity_http_route_list");
-        assert_eq!(tools[30].name, "entity_data_model_list");
-        assert_eq!(tools[31].name, "entity_test_list");
-        assert_eq!(tools[32].name, "entity_deprecation_list");
-        assert_eq!(tools[33].name, "entity_todo_list");
-        assert_eq!(tools[34].name, "entity_test_caller_list");
-        assert_eq!(tools[35].name, "entity_high_churn_list");
-        assert_eq!(tools[36].name, "entity_recent_change_list");
-        assert_eq!(tools[37].name, "entity_dead_list");
-        assert_eq!(tools[38].name, "entity_semantic_search_list");
+        assert_eq!(tools[17].name, "entity_orientation_pack_get");
+        assert_eq!(
+            tools[17].description,
+            "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest."
+        );
+        assert_eq!(tools[18].name, "analyze_start");
+        assert_eq!(
+            tools[18].description,
+            "Start a background `loomweave analyze` run; returns run_id immediately (runs can take minutes). One run per project (cross-process lock). Poll analyze_status_get; stop via analyze_cancel. No arguments."
+        );
+        assert_eq!(tools[19].name, "analyze_status_get");
+        assert_eq!(
+            tools[19].description,
+            "A run's live status: queued | running | completed | failed | cancelled | skipped_no_plugins, with phase, current plugin/file, processed/total files, heartbeat, and progress_observed=false when the heartbeat is stale (run may be wedged)."
+        );
+        assert_eq!(tools[20].name, "analyze_cancel");
+        assert_eq!(
+            tools[20].description,
+            "Cancel a running analyze: SIGKILLs the run's process group (plugin + pyright) and marks the run cancelled — never left dangling as running. Idempotent. Partial work already written is kept."
+        );
+        assert_eq!(tools[21].name, "index_diff_get");
+        assert_eq!(tools[22].name, "entity_guidance_list");
+        assert_eq!(tools[23].name, "propose_guidance");
+        assert_eq!(tools[24].name, "promote_guidance");
+        assert_eq!(tools[25].name, "entity_finding_list");
+        assert_eq!(tools[26].name, "entity_wardline_get");
+        assert_eq!(tools[27].name, "entity_tag_list");
+        assert_eq!(tools[28].name, "entity_kind_list");
+        assert_eq!(tools[29].name, "entity_wardline_list");
+        assert_eq!(tools[30].name, "module_circular_import_list");
+        assert_eq!(tools[31].name, "entity_coupling_hotspot_list");
+        assert_eq!(tools[32].name, "entity_entry_point_list");
+        assert_eq!(tools[33].name, "entity_http_route_list");
+        assert_eq!(tools[34].name, "entity_data_model_list");
+        assert_eq!(tools[35].name, "entity_test_list");
+        assert_eq!(tools[36].name, "entity_deprecation_list");
+        assert_eq!(tools[37].name, "entity_todo_list");
+        assert_eq!(tools[38].name, "entity_test_caller_list");
+        assert_eq!(tools[39].name, "entity_high_churn_list");
+        assert_eq!(tools[40].name, "entity_recent_change_list");
+        assert_eq!(tools[41].name, "entity_dead_list");
+        assert_eq!(tools[42].name, "entity_semantic_search_list");
+        assert_eq!(tools[43].name, "project_finding_list");
+        assert_eq!(tools[44].name, "entity_resolve");
+        assert_eq!(tools[45].name, "entity_relation_list");
+    }
+
+    #[test]
+    fn config_set_tool_schemas_declare_types_for_every_property() {
+        // weft-ac59e8e730: the bootstrap config tools shipped with every
+        // inputSchema property as a bare `{}`, declaring nothing. Pin that
+        // each property is typed, and that the provider enums track the
+        // parsers' accepted alias sets.
+        for tool_name in ["llm_config_set", "semantic_config_set"] {
+            let tools = list_tools();
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} registered"));
+            let properties = tool.input_schema["properties"]
+                .as_object()
+                .expect("schema properties object");
+            assert!(!properties.is_empty());
+            for (property, schema) in properties {
+                assert!(
+                    schema["type"].is_string(),
+                    "{tool_name}.{property} schema must declare a type, got: {schema}"
+                );
+            }
+            let provider_enum = properties["provider"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{tool_name}.provider must enumerate accepted values"));
+            for value in provider_enum {
+                let value = value.as_str().expect("enum entries are strings");
+                let parsed = match tool_name {
+                    "llm_config_set" => LlmProviderKind::parse(value).map(|_| ()),
+                    _ => SemanticProviderKind::parse(value).map(|_| ()),
+                };
+                parsed.unwrap_or_else(|err| {
+                    panic!("{tool_name}.provider enum value {value:?} is not parseable: {err}")
+                });
+            }
+        }
     }
 
     #[test]
     fn server_instructions_enumerate_every_tool() {
         // Single-source guard (clarion-71f0d6c3dd): the `instructions` tool list
-        // is derived from list_tools(), so every advertised tool must appear in
-        // it. If a tool is added/removed and this drifts, the instructions would
-        // otherwise silently misdescribe the surface.
-        let instructions = super::server_instructions();
-        for tool in super::list_tools() {
+        // is derived from list_tools_for_policy under the active policy, so every
+        // tool the server actually registers must appear in it — and a write-gated
+        // tool must NOT appear when the gate is off (agent-first-feedback §2.5).
+        use super::McpToolPolicy;
+
+        // With write tools enabled, every tool is advertised.
+        let all = super::server_instructions(McpToolPolicy::allow_write_tools());
+        for tool in super::list_tools_for_policy(McpToolPolicy::allow_write_tools()) {
             assert!(
-                instructions.contains(tool.name),
-                "instructions omit tool {:?}; instructions were:\n{instructions}",
+                all.contains(tool.name),
+                "instructions omit registered tool {:?}; instructions were:\n{all}",
                 tool.name
             );
         }
+
+        // Under the default read-only policy, the advertised list matches the
+        // registered list exactly — gated write tools are absent from the list
+        // but named in the gate note.
+        let read_only = super::server_instructions(McpToolPolicy::default());
+        let registered = super::list_tools_for_policy(McpToolPolicy::default());
+        for tool in &registered {
+            assert!(
+                read_only.contains(tool.name),
+                "instructions omit registered tool {:?}; instructions were:\n{read_only}",
+                tool.name
+            );
+        }
+        assert!(
+            registered.len() < super::list_tools().len(),
+            "default policy should gate at least one write tool"
+        );
+        // The gate note names the write tools and how to enable them.
+        assert!(read_only.contains("enable_write_tools"), "{read_only}");
+        assert!(read_only.contains("entity_summary_get"), "{read_only}");
+        // The deliberate bootstrap exemption (PM ruling, weft-ac59e8e730) must
+        // be stated loudly: a read-only session can persistently enable writes
+        // and live LLM spend through these two tools.
+        assert!(read_only.contains("EXEMPT"), "{read_only}");
+        assert!(read_only.contains("llm_config_set"), "{read_only}");
+        assert!(read_only.contains("semantic_config_set"), "{read_only}");
+    }
+
+    #[test]
+    fn no_index_initialize_chirps_install_and_analyze() {
+        let root = std::path::Path::new("/tmp/demo");
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
+        let response =
+            super::handle_json_rpc_no_index(&request, root).expect("initialize yields a response");
+        assert_eq!(
+            response["result"]["protocolVersion"],
+            super::MCP_PROTOCOL_VERSION
+        );
+        assert_eq!(response["result"]["serverInfo"]["name"], "loomweave");
+        assert!(response["result"]["capabilities"]["tools"].is_object());
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("instructions present");
+        // Both halves of the canonical hook sequence, plus the project path.
+        assert!(
+            instructions.contains("loomweave install --path /tmp/demo"),
+            "instructions: {instructions}"
+        );
+        assert!(
+            instructions.contains("loomweave analyze /tmp/demo"),
+            "instructions: {instructions}"
+        );
+    }
+
+    #[test]
+    fn no_index_tools_call_returns_actionable_is_error() {
+        let root = std::path::Path::new("/tmp/demo");
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "entity_find", "arguments": {"query": "foo"}}
+        });
+        let response = super::handle_json_rpc_no_index(&request, root).expect("response");
+        // isError is the load-bearing chirp channel — fires the moment the agent
+        // touches any tool, regardless of whether the client surfaced instructions.
+        assert_eq!(response["result"]["isError"], serde_json::json!(true));
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            text.contains("loomweave analyze /tmp/demo"),
+            "tool chirp text: {text}"
+        );
+    }
+
+    #[test]
+    fn no_index_tools_list_still_advertises_tools() {
+        let root = std::path::Path::new("/tmp/demo");
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"});
+        let response = super::handle_json_rpc_no_index(&request, root).expect("response");
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        assert!(
+            !tools.is_empty(),
+            "degraded tools/list should still advertise the surface"
+        );
+    }
+
+    #[test]
+    fn no_index_ignores_notifications() {
+        let root = std::path::Path::new("/tmp/demo");
+        // The client sends notifications/initialized right after initialize; it
+        // has no id and must draw no response.
+        let request = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        assert!(super::handle_json_rpc_no_index(&request, root).is_none());
+    }
+
+    #[test]
+    fn serve_stdio_no_index_round_trips_initialize_over_json_line() {
+        let root = std::path::Path::new("/tmp/demo");
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+        let mut reader = std::io::BufReader::new(&input[..]);
+        let mut output = Vec::new();
+        super::serve_stdio_no_index(root, &mut reader, &mut output).expect("degraded serve");
+        let response: serde_json::Value = serde_json::from_slice(&output).expect("framed json");
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("instructions present");
+        assert!(
+            instructions.contains("loomweave analyze /tmp/demo"),
+            "instructions: {instructions}"
+        );
     }
 
     #[test]
@@ -5276,8 +6626,16 @@ mod tests {
         assert!(!tool_names.contains(&"propose_guidance"));
         assert!(!tool_names.contains(&"promote_guidance"));
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
-        assert_eq!(response["result"]["tools"][0]["read_only"], true);
-        assert_eq!(response["result"]["tools"][0]["writes_local_state"], false);
+        assert_eq!(
+            response["result"]["tools"][0]["metadata"]["read_only"],
+            true
+        );
+        // False flags are omitted on the wire (absent ⇒ false).
+        assert!(
+            response["result"]["tools"][0]["metadata"]
+                .get("writes_local_state")
+                .is_none()
+        );
         assert!(
             tool_names.contains(&"subsystem_member_list"),
             "read-only list should include subsystem_member_list: {tool_names:?}"
@@ -5312,6 +6670,10 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect();
         assert!(names.contains(&"entity_at"));
+        assert!(names.contains(&"llm_config_get"));
+        assert!(names.contains(&"llm_config_set"));
+        assert!(names.contains(&"semantic_config_get"));
+        assert!(names.contains(&"semantic_config_set"));
         assert!(!names.contains(&"analyze_start"));
         assert!(!names.contains(&"entity_summary_get"));
 
@@ -5331,6 +6693,127 @@ mod tests {
                 .unwrap()
                 .contains("tool disabled by MCP tool policy")
         );
+    }
+
+    #[tokio::test]
+    async fn llm_config_set_bootstraps_provider_and_write_tools_under_read_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loomweave.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::read_only());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "llm-config-set",
+                "method": "tools/call",
+                "params": {
+                    "name": "llm_config_set",
+                    "arguments": {
+                        "enabled": true,
+                        "provider": "codex_sidecar",
+                        "allow_live_provider": true,
+                        "enable_write_tools": true,
+                        "codex_model": "gpt-5-codex"
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call response");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true, "{envelope}");
+        assert_eq!(envelope["result"]["llm"]["provider"], "codex_cli");
+        assert_eq!(
+            envelope["result"]["serve"]["mcp"]["enable_write_tools"],
+            true
+        );
+        assert_eq!(
+            envelope["result"]["active_session"]["enable_write_tools"], false,
+            "the current server policy should not mutate mid-session"
+        );
+        assert_eq!(
+            envelope["result"]["active_session"]["restart_required"],
+            true
+        );
+
+        let saved =
+            loomweave_federation::config::McpConfig::from_path(&dir.path().join("loomweave.yaml"))
+                .unwrap();
+        assert!(saved.llm.enabled);
+        assert!(saved.llm.allow_live_provider);
+        assert_eq!(
+            saved.llm.provider,
+            loomweave_federation::config::LlmProviderKind::CodexCli
+        );
+        assert_eq!(saved.llm.codex_cli.model.as_deref(), Some("gpt-5-codex"));
+        assert!(saved.serve.mcp.enable_write_tools);
+    }
+
+    #[tokio::test]
+    async fn semantic_config_set_bootstraps_local_embeddings_under_read_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loomweave.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::read_only());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "semantic-config-set",
+                "method": "tools/call",
+                "params": {
+                    "name": "semantic_config_set",
+                    "arguments": {
+                        "enabled": true,
+                        "provider": "local_openai",
+                        "endpoint_url": "http://127.0.0.1:11434/v1",
+                        "model_id": "nomic-embed-text",
+                        "dimensions": 768
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call response");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true, "{envelope}");
+        assert_eq!(
+            envelope["result"]["semantic_search"]["provider"],
+            "local_openai"
+        );
+        assert_eq!(
+            envelope["result"]["semantic_search"]["provider_available"],
+            true
+        );
+        assert_eq!(
+            envelope["result"]["active_session"]["restart_required"],
+            true
+        );
+
+        let saved =
+            loomweave_federation::config::McpConfig::from_path(&dir.path().join("loomweave.yaml"))
+                .unwrap();
+        assert!(saved.semantic_search.enabled);
+        assert_eq!(
+            saved.semantic_search.provider,
+            loomweave_federation::config::SemanticProviderKind::LocalOpenAi
+        );
+        assert_eq!(saved.semantic_search.dimensions, 768);
     }
 
     #[tokio::test]
@@ -5360,9 +6843,10 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "analyze_start")
             .expect("analyze_start advertised when write tools enabled");
-        assert_eq!(analyze["read_only"], false);
-        assert_eq!(analyze["writes_local_state"], true);
-        assert_eq!(analyze["spawns_process"], true);
+        // False flags are omitted on the wire (absent ⇒ false).
+        assert!(analyze["metadata"].get("read_only").is_none());
+        assert_eq!(analyze["metadata"]["writes_local_state"], true);
+        assert_eq!(analyze["metadata"]["spawns_process"], true);
         assert!(tools.iter().any(|tool| tool["name"] == "propose_guidance"));
     }
 

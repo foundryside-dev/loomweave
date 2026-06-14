@@ -7,7 +7,7 @@
 //!   `busy_timeout=5000` + `wal_autocheckpoint=1000` + `foreign_keys=ON`).
 //!   The `application_id=0x4C4D5756` ("LMWV") and `user_version` PRAGMAs
 //!   close gap STO-02 from `docs/implementation/v1.0-tag-cut/gap-register.md`:
-//!   they give `.loomweave/loomweave.db` a self-identifying on-disk header so
+//!   they give `.weft/loomweave/loomweave.db` a self-identifying on-disk header so
 //!   `file(1)` / `sqlite3 .dbinfo` / a future migration runner can refuse
 //!   foreign or forward-incompatible files.
 //! - **Override surface**: **recompile-only.** None of these PRAGMAs are

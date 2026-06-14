@@ -22,6 +22,10 @@ LOOMWEAVE_BIN="$REPO_ROOT/target/release/loomweave"
 DEMO_DIR="$(mktemp -d -t loomweave-wp5-demo-XXXXXX)"
 PLUGIN_DIR="$(mktemp -d -t loomweave-wp5-plugin-XXXXXX)"
 trap 'rm -rf "$DEMO_DIR" "$PLUGIN_DIR"' EXIT
+# Hermetic install (clarion-c5e3cc2818): `loomweave install` registers a
+# Codex MCP entry in ~/.codex/config.toml unless this override points it
+# at a scratch-local file. Never mutate the operator's real config.
+export LOOMWEAVE_CODEX_CONFIG="$DEMO_DIR/codex-config.toml"
 
 cat > "$PLUGIN_DIR/loomweave-plugin-secretfixture" <<'PY'
 #!/usr/bin/python3
@@ -98,7 +102,7 @@ printf "aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n" > "$DEMO_DIR/.env"
 
 PATH="$PLUGIN_DIR" "$LOOMWEAVE_BIN" analyze "$DEMO_DIR"
 
-DB="$DEMO_DIR/.loomweave/loomweave.db"
+DB="$DEMO_DIR/.weft/loomweave/loomweave.db"
 BLOCKED=$(sqlite3 "$DB" "select count(*) from entities where json_extract(properties, '\$.briefing_blocked') = 'secret_present';")
 [ "$BLOCKED" = "3" ] || fail "expected three briefing_blocked secret_present entities (core file + plugin source entity + dotenv anchor), got $BLOCKED"
 
@@ -122,7 +126,7 @@ trap 'rm -rf "$DEMO_DIR" "$PLUGIN_DIR" "$BASELINE_DIR" "$OVERRIDE_DIR" "$MALFORM
 "$LOOMWEAVE_BIN" install --path "$BASELINE_DIR"
 printf "aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n" > "$BASELINE_DIR/leaky.sec"
 HASHED_SECRET=$(printf 'AKIAIOSFODNN7EXAMPLE' | sha1sum | awk '{print $1}')
-cat > "$BASELINE_DIR/.loomweave/secrets-baseline.yaml" <<YAML
+cat > "$BASELINE_DIR/.weft/loomweave/secrets-baseline.yaml" <<YAML
 version: "1.0"
 results:
   "leaky.sec":
@@ -133,7 +137,7 @@ results:
       justification: "Documented public AWS example key, not a credential."
 YAML
 PATH="$PLUGIN_DIR" "$LOOMWEAVE_BIN" analyze "$BASELINE_DIR"
-BDB="$BASELINE_DIR/.loomweave/loomweave.db"
+BDB="$BASELINE_DIR/.weft/loomweave/loomweave.db"
 B_BLOCKED=$(sqlite3 "$BDB" "select count(*) from entities where json_extract(properties, '\$.briefing_blocked') = 'secret_present';")
 [ "$B_BLOCKED" = "0" ] || fail "baseline-suppressed: expected 0 blocked entities, got $B_BLOCKED"
 B_SECRET=$(sqlite3 "$BDB" "select count(*) from findings where rule_id = 'LMWV-SEC-SECRET-DETECTED';")
@@ -153,7 +157,7 @@ PATH="$PLUGIN_DIR" "$LOOMWEAVE_BIN" analyze \
     --allow-unredacted-secrets \
     --confirm-allow-unredacted-secrets=yes-i-understand \
     "$OVERRIDE_DIR"
-ODB="$OVERRIDE_DIR/.loomweave/loomweave.db"
+ODB="$OVERRIDE_DIR/.weft/loomweave/loomweave.db"
 O_BLOCKED=$(sqlite3 "$ODB" "select count(*) from entities where json_extract(properties, '\$.briefing_blocked') = 'secret_present';")
 [ "$O_BLOCKED" = "0" ] || fail "override: expected 0 blocked entities, got $O_BLOCKED"
 O_SECRET=$(sqlite3 "$ODB" "select count(*) from findings where rule_id = 'LMWV-SEC-SECRET-DETECTED';")
@@ -171,13 +175,13 @@ log "scenario: malformed baseline aborts analyze before BeginRun (exit 78)"
 MALFORMED_DIR="$(mktemp -d -t loomweave-wp5-malformed-XXXXXX)"
 "$LOOMWEAVE_BIN" install --path "$MALFORMED_DIR"
 printf "harmless = 'nothing'\n" > "$MALFORMED_DIR/clean.sec"
-printf "not: valid: yaml: [\n" > "$MALFORMED_DIR/.loomweave/secrets-baseline.yaml"
+printf "not: valid: yaml: [\n" > "$MALFORMED_DIR/.weft/loomweave/secrets-baseline.yaml"
 set +e
 PATH="$PLUGIN_DIR" "$LOOMWEAVE_BIN" analyze "$MALFORMED_DIR" 2>/dev/null
 MALFORMED_EXIT=$?
 set -e
 [ "$MALFORMED_EXIT" -ne 0 ] || fail "malformed baseline: expected non-zero exit, got $MALFORMED_EXIT"
-MDB="$MALFORMED_DIR/.loomweave/loomweave.db"
+MDB="$MALFORMED_DIR/.weft/loomweave/loomweave.db"
 M_RUNS=$(sqlite3 "$MDB" "select count(*) from runs;")
 [ "$M_RUNS" = "0" ] || fail "malformed baseline must abort BEFORE BeginRun; got $M_RUNS run rows"
 log "PASS: malformed baseline aborts with non-zero exit and no runs row"
@@ -195,11 +199,11 @@ trap 'rm -rf "$DEMO_DIR" "$PLUGIN_DIR" "$BASELINE_DIR" "$OVERRIDE_DIR" "$MALFORM
 printf "aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n" > "$RETRY_DIR/leaky.sec"
 # First run blocks (no baseline yet).
 PATH="$PLUGIN_DIR" "$LOOMWEAVE_BIN" analyze "$RETRY_DIR"
-RDB="$RETRY_DIR/.loomweave/loomweave.db"
+RDB="$RETRY_DIR/.weft/loomweave/loomweave.db"
 R_BLOCKED_BEFORE=$(sqlite3 "$RDB" "select count(*) from entities where json_extract(properties, '\$.briefing_blocked') = 'secret_present';")
 [ "$R_BLOCKED_BEFORE" = "2" ] || fail "retry: first run must block the source file entity and plugin entity, got $R_BLOCKED_BEFORE"
 # Operator commits a baseline acknowledging the example key.
-cat > "$RETRY_DIR/.loomweave/secrets-baseline.yaml" <<YAML
+cat > "$RETRY_DIR/.weft/loomweave/secrets-baseline.yaml" <<YAML
 version: "1.0"
 results:
   "leaky.sec":

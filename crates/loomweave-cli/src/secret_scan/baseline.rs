@@ -13,7 +13,7 @@ const BASELINE_NO_JUSTIFICATION: &str = "LMWV-INFRA-SECRET-BASELINE-NO-JUSTIFICA
 const BASELINE_MATCH: &str = "LMWV-INFRA-SECRET-BASELINE-MATCH";
 
 pub(super) fn load_for_scan(project_root: &Path) -> Result<(Baseline, Vec<PendingFinding>)> {
-    let path = project_root.join(".loomweave/secrets-baseline.yaml");
+    let path = loomweave_core::store::store_dir(project_root).join("secrets-baseline.yaml");
     match loomweave_scanner::load_baseline(&path) {
         Ok(baseline) => Ok((baseline, Vec::new())),
         Err(BaselineError::MissingJustifications { entries }) => Ok((
@@ -31,6 +31,7 @@ pub(super) fn load_for_scan(project_root: &Path) -> Result<(Baseline, Vec<Pendin
                         entry.file.display(),
                         entry.line
                     ),
+                    site: format!("{}:{}", entry.file.display(), entry.line),
                     evidence: json!({"file_path": entry.file, "line_number": entry.line}),
                 })
                 .collect(),
@@ -41,4 +42,8 @@ pub(super) fn load_for_scan(project_root: &Path) -> Result<(Baseline, Vec<Pendin
 
 pub(super) fn baseline_match_rule_id() -> &'static str {
     BASELINE_MATCH
+}
+
+pub(super) fn baseline_no_justification_rule_id() -> &'static str {
+    BASELINE_NO_JUSTIFICATION
 }

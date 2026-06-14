@@ -36,6 +36,21 @@ const SECRET_OVERRIDE_ALLOWED: &str = "LMWV-SEC-UNREDACTED-SECRETS-ALLOWED";
 const OVERRIDE_UNCONFIRMED: &str = "LMWV-INFRA-SECRET-OVERRIDE-UNCONFIRMED";
 const CONFIRM_TOKEN: &str = "yes-i-understand";
 
+/// Every rule the pre-ingest secret scan emits. The scan is a FULL pass on
+/// every run (all source files + sidecars, before the incremental skip
+/// partition), so a completed run re-emits the entire current detection set —
+/// which makes these rules safe for the rule-scoped stale sweep on incremental
+/// runs (weft-7256739b31): a row of one of these rules at a prior `run_id`
+/// means "scanned this run, no longer detected", never "not looked at".
+pub(crate) fn per_run_swept_rule_ids() -> [&'static str; 4] {
+    [
+        findings::SECRET_DETECTED,
+        baseline::baseline_match_rule_id(),
+        baseline::baseline_no_justification_rule_id(),
+        SECRET_OVERRIDE_ALLOWED,
+    ]
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SecretScanOptions {
     pub(crate) override_policy: OverridePolicy,
@@ -187,6 +202,18 @@ impl SecretScanOutcome {
         anchors::remember_finding_anchors(self, entities);
     }
 
+    /// Seed a finding anchor for an incrementally-SKIPPED file from its
+    /// already-committed entity row (weft-4165f1ed71). A skipped file is never
+    /// dispatched, so [`Self::remember_finding_anchors`] never sees its
+    /// entities — without this seed, `ensure_finding_anchors` would mint a
+    /// core `file` anchor and the anchor-keyed finding id would flip,
+    /// duplicating the finding (the reason the secret carve-out used to force
+    /// re-analysis of one file forever). `or_insert`: a registration from this
+    /// run's own batches always wins.
+    pub(crate) fn seed_finding_anchor(&mut self, file: PathBuf, entity_id: String) {
+        self.finding_anchors.entry(file).or_insert(entity_id);
+    }
+
     pub(crate) async fn persist_findings(
         &mut self,
         writer: &Writer,
@@ -257,6 +284,12 @@ pub(crate) fn pre_ingest(
                 entry.file_path.display(),
                 entry.entry.line_number
             ),
+            site: format!(
+                "{}:{}:{}",
+                entry.file_path.display(),
+                entry.entry.line_number,
+                entry.entry.rule_type.as_str()
+            ),
             evidence: json!({
                 "file_path": entry.file_path,
                 "line_number": entry.entry.line_number,
@@ -316,6 +349,10 @@ pub(crate) fn pre_ingest(
                 "Operator allowed unredacted secrets in {}",
                 display_relative(project_root, file)
             ),
+            // File-level fact: the override applies to the whole file, so the
+            // site is the file itself (the per-detection audit lives in the
+            // sibling `LMWV-SEC-SECRET-DETECTED` rows).
+            site: file.display().to_string(),
             evidence: json!({
                 "file_path": display_relative(project_root, file),
                 "override_used": true,

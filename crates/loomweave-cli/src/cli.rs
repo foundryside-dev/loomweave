@@ -3,7 +3,22 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "loomweave", version, about = "Loomweave code-archaeology tool")]
+#[command(
+    name = "loomweave",
+    version,
+    about = "Loomweave code-archaeology tool",
+    long_about = "Loomweave extracts a queryable graph from a codebase and serves it to \
+consult-mode agents over MCP.\n\n\
+Typical flow: `loomweave install` (set up .weft/loomweave/ + agent assets), `loomweave \
+analyze` (build the index), `loomweave serve` (run the MCP server).\n\n\
+LLM-backed entity summaries are OFF by default. To enable them set \
+`llm_policy.enabled: true` + `allow_live_provider: true` in loomweave.yaml and supply \
+the provider credential (e.g. OPENROUTER_API_KEY), or point at a coding-agent CLI \
+(claude_sidecar / codex_sidecar, canonical claude_cli / codex_cli). Run \
+`loomweave config example` to print an annotated config \
+and `loomweave config check` to see the effective LLM state; `loomweave doctor` \
+validates the install and the config."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -11,15 +26,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Initialise .loomweave/ and install agent-orientation assets.
+    /// Initialise .weft/loomweave/ and install agent-orientation assets.
     ///
-    /// Bare `loomweave install` does everything: .loomweave/ init, Claude Code MCP,
-    /// Codex MCP, Claude/Codex skills, and hooks. If .loomweave/ already exists,
+    /// Bare `loomweave install` does everything: .weft/loomweave/ init, Claude Code MCP,
+    /// Codex MCP, Claude/Codex skills, and hooks. If .weft/loomweave/ already exists,
     /// init is skipped and the other components are applied idempotently.
     /// Component flags install only the named components without touching
-    /// .loomweave/. `--all` is equivalent to a bare install.
+    /// .weft/loomweave/. `--all` is equivalent to a bare install.
     Install {
-        /// Overwrite an existing .loomweave/ directory.
+        /// Overwrite an existing .weft/loomweave/ directory.
         #[arg(long)]
         force: bool,
 
@@ -52,16 +67,27 @@ pub enum Command {
         #[arg(long)]
         hooks: bool,
 
-        /// Do everything: .loomweave/ init + MCP config + skills + hooks.
+        /// Inject the Loomweave agent-orientation block into CLAUDE.md and
+        /// AGENTS.md (touching only Loomweave's own marker span).
+        #[arg(long)]
+        instructions: bool,
+
+        /// Do everything: .weft/loomweave/ init + MCP config + skills + hooks +
+        /// instructions.
         #[arg(long)]
         all: bool,
     },
 
     /// Run an analysis pass: walk the source tree, dispatch discovered plugins
-    /// to extract entities/edges, and persist results to `.loomweave/loomweave.db`.
+    /// to extract entities/edges, and persist results to `.weft/loomweave/loomweave.db`.
     /// Re-runs are idempotent (UPSERT on `entities.id`). If no plugins are on
-    /// `$PATH`, exits 0 with a WARN and status `skipped_no_plugins` — see
-    /// `docs/operator/getting-started.md` Troubleshooting.
+    /// `$PATH`, exits 0 with a WARN and status `skipped_no_plugins` — see the
+    /// Troubleshooting guide at
+    /// <https://github.com/foundryside-dev/loomweave/blob/main/docs/operator/getting-started.md>.
+    ///
+    /// To commit the index as a versioned artifact while `serve` may be running,
+    /// take a consistent online copy with `loomweave db backup` rather than
+    /// `git add`-ing the live file (whose pending WAL is not committable).
     Analyze {
         /// Path to analyse (default: current directory).
         #[arg(default_value = ".")]
@@ -138,8 +164,20 @@ pub enum Command {
     },
 
     /// Run the MCP stdio server.
+    ///
+    /// Serves the code graph to MCP clients. The `entity_summary_get` tool needs
+    /// a live LLM provider, which is OFF by default: set `llm_policy.enabled: true`
+    /// and `allow_live_provider: true` in loomweave.yaml and supply the provider
+    /// credential (`OPENROUTER_API_KEY` for the default `openrouter` provider), or
+    /// switch `llm_policy.provider` to `claude_cli` / `codex_cli` for a locally
+    /// authenticated coding-agent CLI. Without that, summaries are cache-only.
+    /// Write-capable tools (`entity_summary_get`, `analyze_start`,
+    /// `analyze_cancel`, `propose_guidance`, `promote_guidance`) require
+    /// `serve.mcp.enable_write_tools: true`. The effective LLM posture is logged
+    /// to stderr at startup; run `loomweave config check` to inspect it ahead of
+    /// time.
     Serve {
-        /// Project directory containing .loomweave/loomweave.db.
+        /// Project directory containing .weft/loomweave/loomweave.db.
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
@@ -166,6 +204,15 @@ pub enum Command {
     Guidance {
         #[command(subcommand)]
         command: GuidanceCommand,
+    },
+
+    /// Inspect `loomweave.yaml`: print an annotated example, or validate the
+    /// file and report the effective LLM provider state. The installed binary
+    /// ships no docs, so this is the in-tool way to discover the config schema
+    /// and see why live summaries are (or are not) enabled.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
 
     /// Verify (and optionally repair) the installed agent-orientation surfaces:
@@ -203,7 +250,7 @@ pub enum DoctorOutputFormat {
 
 #[derive(Subcommand)]
 pub enum DbCommand {
-    /// Take a consistent, WAL-safe online backup of `.loomweave/loomweave.db`.
+    /// Take a consistent, WAL-safe online backup of `.weft/loomweave/loomweave.db`.
     ///
     /// Unlike `cp`, this captures outstanding WAL frames into a standalone
     /// single-file copy, so it is safe to run during a live `loomweave analyze`.
@@ -211,13 +258,209 @@ pub enum DbCommand {
         /// Destination file for the backup copy.
         output: PathBuf,
 
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
         /// Overwrite the output file if it already exists.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Checkpoint the WAL into `.weft/loomweave/loomweave.db` and truncate it,
+    /// so the on-disk file is a clean point-in-time artifact (Weft C-2).
+    ///
+    /// `analyze` already TRUNCATE-checkpoints at each committed run boundary;
+    /// this is the on-demand companion for after a `serve` session, whose
+    /// summary writes can grow the WAL between the PASSIVE `wal_autocheckpoint`
+    /// cadence and a backup / demo / snapshot.
+    Checkpoint {
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Print an annotated example `loomweave.yaml` to stdout — the same content
+    /// `loomweave install` writes, generated so it always matches the current
+    /// config schema. Redirect it to `loomweave.yaml` and edit.
+    Example {
+        /// Pre-select the active LLM provider block in the example
+        /// (`openrouter`/`openrouter_api`, `codex_cli`/`codex_sidecar`, or
+        /// `claude_cli`/`claude_sidecar`). Defaults to the stub's `openrouter`.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+    },
+
+    /// Parse and validate `loomweave.yaml`, then print the effective LLM state
+    /// (provider, enabled, live, model) and any warnings — the in-tool answer to
+    /// "why are my summaries cache-only?". Exits non-zero if the file fails to
+    /// parse or validate, so it works as a CI / pre-commit gate.
+    Check {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml` if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Read or update LLM and MCP write-tool settings in `loomweave.yaml`.
+    Llm {
+        #[command(subcommand)]
+        command: LlmConfigCommand,
+    },
+
+    /// Read or update semantic-search embedding settings in `loomweave.yaml`.
+    Semantic {
+        #[command(subcommand)]
+        command: SemanticConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LlmConfigCommand {
+    /// Print the effective LLM and MCP write-tool config.
+    Status {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml` if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Update `loomweave.yaml` LLM and MCP write-tool settings.
+    Set {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml`).
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Enable LLM summaries.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+
+        /// Disable LLM summaries.
+        #[arg(long)]
+        disable: bool,
+
+        /// Permit live provider calls.
+        #[arg(long, conflicts_with = "disallow_live")]
+        allow_live: bool,
+
+        /// Forbid live provider calls; summaries become cache-only.
+        #[arg(long)]
+        disallow_live: bool,
+
+        /// Enable write-capable MCP tools such as `entity_summary_get` and `analyze_start`.
+        #[arg(long, conflicts_with = "disable_write_tools")]
+        enable_write_tools: bool,
+
+        /// Disable write-capable MCP tools.
+        #[arg(long)]
+        disable_write_tools: bool,
+
+        /// Select provider: `openrouter`/`openrouter_api`, `codex_cli`/`codex_sidecar`,
+        /// `claude_cli`/`claude_sidecar`.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+
+        /// `OpenRouter` model id (`llm_policy.model_id`).
+        #[arg(long, value_name = "MODEL")]
+        model_id: Option<String>,
+
+        /// Pin the Codex sidecar model (`llm_policy.codex_cli.model`).
+        #[arg(long, value_name = "MODEL")]
+        codex_model: Option<String>,
+
+        /// Pin the Claude sidecar model (`llm_policy.claude_cli.model`).
+        #[arg(long, value_name = "MODEL")]
+        claude_model: Option<String>,
+
+        /// Env var containing the `OpenRouter` API key.
+        #[arg(long, value_name = "ENV")]
+        openrouter_api_key_env: Option<String>,
+
+        /// OpenRouter-compatible endpoint URL.
+        #[arg(long, value_name = "URL")]
+        openrouter_endpoint_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SemanticConfigCommand {
+    /// Print the effective semantic-search embedding config.
+    Status {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml` if present).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Update `loomweave.yaml` semantic-search embedding settings.
+    Set {
+        /// Project directory containing loomweave.yaml (default: current).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        /// Path to loomweave.yaml (default: `<path>/loomweave.yaml`).
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Enable semantic search embedding generation.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+
+        /// Disable semantic search embedding generation.
+        #[arg(long)]
+        disable: bool,
+
+        /// Select provider: `api`/`openai_api` or `local_openai`/`local`.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+
+        /// Permit hosted live embedding provider calls.
+        #[arg(long, conflicts_with = "disallow_live")]
+        allow_live: bool,
+
+        /// Forbid hosted live embedding provider calls.
+        #[arg(long)]
+        disallow_live: bool,
+
+        /// Embedding model id.
+        #[arg(long, value_name = "MODEL")]
+        model_id: Option<String>,
+
+        /// Embedding vector dimensionality.
+        #[arg(long)]
+        dimensions: Option<usize>,
+
+        /// OpenAI-compatible endpoint base URL; `/embeddings` is appended.
+        #[arg(long, value_name = "URL")]
+        endpoint_url: Option<String>,
+
+        /// Env var containing an API key, when the endpoint requires one.
+        #[arg(long, value_name = "ENV")]
+        api_key_env: Option<String>,
+
+        /// HTTP timeout in seconds.
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
+
+        /// Per-session embedding token ceiling.
+        #[arg(long)]
+        session_token_ceiling: Option<u64>,
     },
 }
 
@@ -230,7 +473,7 @@ pub enum GuidanceCommand {
     /// `entity:<entity-id>`. Content comes from `--content`, else stdin (when
     /// piped) or `$EDITOR`/`$VISUAL`.
     Create {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
 
@@ -267,7 +510,7 @@ pub enum GuidanceCommand {
     /// Edit a sheet's content in `$EDITOR`/`$VISUAL` (other properties, including
     /// `authored_at` and provenance, are preserved).
     Edit {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// The guidance sheet id (`core:guidance:<slug>`).
@@ -276,7 +519,7 @@ pub enum GuidanceCommand {
 
     /// Print a guidance sheet (human-readable).
     Show {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// The guidance sheet id.
@@ -290,7 +533,7 @@ pub enum GuidanceCommand {
     /// filter (including `--for-entity`). Without any of them, behaves as the
     /// plain list.
     List {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// Only list sheets whose `match_rules` apply to this entity id.
@@ -313,7 +556,7 @@ pub enum GuidanceCommand {
 
     /// Delete a guidance sheet.
     Delete {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// The guidance sheet id.
@@ -324,7 +567,7 @@ pub enum GuidanceCommand {
     /// guidance sheet. The observation must have been produced by MCP
     /// `propose_guidance`; arbitrary observations are rejected.
     Promote {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// Path to loomweave.yaml (default: project-root/loomweave.yaml if present).
@@ -339,7 +582,7 @@ pub enum GuidanceCommand {
     /// (REQ-GUIDANCE-06). Output is byte-stable across runs on identical DB
     /// state. The target directory is created if absent.
     Export {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// Directory to write the exported sheet files into. Export does NOT
@@ -356,7 +599,7 @@ pub enum GuidanceCommand {
     /// untouched (never a destructive mirror). A malformed `*.json` aborts the
     /// import naming the offending file (a dropped sheet is silent data loss).
     Import {
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
         /// Directory of exported sheet files to import.
@@ -368,7 +611,7 @@ pub enum GuidanceCommand {
 pub enum HookCommand {
     /// Print a project snapshot and re-sync the skill pack on drift.
     SessionStart {
-        /// Project directory containing .loomweave/loomweave.db.
+        /// Project directory containing .weft/loomweave/loomweave.db.
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
@@ -386,7 +629,7 @@ pub enum SarifCommand {
         #[arg(long)]
         scan_source: Option<String>,
 
-        /// Project directory containing .loomweave/loomweave.db (default: current).
+        /// Project directory containing .weft/loomweave/loomweave.db (default: current).
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },

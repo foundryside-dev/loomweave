@@ -1,6 +1,6 @@
 //! Read-side query helpers used by the MCP navigation surface.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -119,6 +119,26 @@ pub struct UnresolvedCallSiteRow {
 pub struct ReferenceEdgeMatch {
     pub neighbor_id: String,
     pub confidence: EdgeConfidence,
+    pub source_file_id: Option<String>,
+    pub source_byte_start: Option<i64>,
+    pub source_byte_end: Option<i64>,
+}
+
+/// One relation edge (`inherits_from`, `decorates`, `implements`, `derives`)
+/// touching an entity. Both endpoints are kept because relation direction is
+/// semantic, not positional (ADR-051): `decorates` runs decorator → decorated,
+/// so its anchor lives in the *to*-side file and its ambiguous `candidates`
+/// are alternative *from*-side entities — a consumer that assumed the
+/// `references` shape would read it backwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationEdgeMatch {
+    pub kind: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub confidence: EdgeConfidence,
+    /// Alternative endpoint ids from an ambiguous edge's
+    /// `properties.candidates`, sorted; empty for resolved edges.
+    pub candidates: Vec<String>,
     pub source_file_id: Option<String>,
     pub source_byte_start: Option<i64>,
     pub source_byte_end: Option<i64>,
@@ -293,6 +313,54 @@ pub fn entity_by_id(conn: &Connection, entity_id: &str) -> Result<Option<EntityR
     let sql = format!("SELECT {ENTITY_COLUMNS} FROM entities WHERE id = ?1");
     conn.query_row(&sql, params![entity_id], map_entity_row)
         .optional()
+        .map_err(StorageError::from)
+}
+
+/// Resolve an id-or-SEI to its entity row. A `loomweave:eid:`-prefixed input
+/// is routed through the SEI binding (SEI -> alive `current_locator` ->
+/// `entities.id`); anything else is a plain locator lookup. Returns `None` when
+/// the SEI is unknown/orphaned/superseded OR the locator has no entity row.
+///
+/// Mirrors [`entity_by_id`]'s signature exactly so a call site is a one-token
+/// swap. This is the single resolution definition shared by the MCP read tools
+/// that must accept either a raw locator or a Stable Entity Identity token.
+pub fn resolve_entity_ref(conn: &Connection, id_or_sei: &str) -> Result<Option<EntityRow>> {
+    if crate::sei::is_reserved_sei(id_or_sei) {
+        match crate::sei::resolve_sei(conn, id_or_sei)? {
+            crate::sei::SeiLookupResult::Alive(rec) => match rec.current_locator {
+                Some(locator) => entity_by_id(conn, &locator),
+                None => Ok(None),
+            },
+            crate::sei::SeiLookupResult::NotAlive { .. } => Ok(None),
+        }
+    } else {
+        entity_by_id(conn, id_or_sei)
+    }
+}
+
+/// Total number of entity rows in the graph — every kind, **including**
+/// subsystems. Uses the same `SELECT COUNT(*) FROM entities` the MCP snapshot
+/// (`project_status`) reports, so the two surfaces always agree.
+pub fn entity_total(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
+        .map_err(StorageError::from)
+}
+
+/// Number of subsystem entities (`kind = 'subsystem'`) — the breakdown
+/// `project_status` annotates alongside the entity total.
+pub fn subsystem_total(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(StorageError::from)
+}
+
+/// Total number of edge rows in the graph, matching `project_status`'s
+/// `SELECT COUNT(*) FROM edges`.
+pub fn edge_total(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
         .map_err(StorageError::from)
 }
 
@@ -695,6 +763,21 @@ pub fn find_entities(
     offset: usize,
     kind: Option<&str>,
 ) -> Result<Vec<EntityRow>> {
+    // A pasted SEI (`loomweave:eid:...`) is exact-resolve, not fuzzy substring:
+    // the SEI lives only in `sei_bindings.sei`, never in any `entities` column,
+    // so the LIKE/FTS recall below would find NOTHING. Short-circuit to
+    // `resolve_entity_ref` so a pasted SEI resolves to its 1 alive entity row,
+    // honoring offset/limit paging so `tool_find_entity`'s cursor logic stays
+    // consistent. Strictly additive — no SEI ever matched the recall paths
+    // before (clarion-d76e7f7267). A partial SEI hex prefix is not a meaningful
+    // search, so only a fully-reserved token short-circuits.
+    if crate::sei::is_reserved_sei(pattern.trim()) {
+        return Ok(resolve_entity_ref(conn, pattern.trim())?
+            .into_iter()
+            .skip(offset)
+            .take(limit.clamp(1, 100))
+            .collect());
+    }
     if pattern.trim().is_empty() {
         return Err(StorageError::InvalidQuery(
             "entity search pattern must not be blank".to_owned(),
@@ -712,54 +795,117 @@ pub fn find_entities(
         ));
     }
     let limit = limit.clamp(1, 100);
-    let limit_i64 = i64::try_from(limit)
-        .map_err(|_| StorageError::InvalidQuery("entity search limit is too large".to_owned()))?;
-    let offset_i64 = i64::try_from(offset)
-        .map_err(|_| StorageError::InvalidQuery("entity search offset is too large".to_owned()))?;
-    if is_fts_safe(pattern) {
-        let kind_clause = if kind.is_some() {
-            "AND e.kind = ?4 "
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT e.{columns} \
-             FROM entity_fts f \
-             JOIN entities e ON e.id = f.entity_id \
-             WHERE entity_fts MATCH ?1 {kind_clause}\
-             ORDER BY bm25(entity_fts), e.id \
-             LIMIT ?2 OFFSET ?3",
-            columns = ENTITY_COLUMNS.replace(", ", ", e.")
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = match kind {
-            Some(kind) => stmt.query_map(
-                params![pattern, limit_i64, offset_i64, kind],
-                map_entity_row,
-            )?,
-            None => stmt.query_map(params![pattern, limit_i64, offset_i64], map_entity_row)?,
-        };
-        return rows
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(StorageError::from);
-    }
+    // We materialise `offset + limit` rows from each recall path, merge them
+    // FTS-first, then page in Rust. `offset + limit` is the smallest prefix of
+    // the merged stream that can contain this page, so both sources fetch at
+    // OFFSET 0 up to this cap and pagination happens after the merge.
+    let fetch_cap = offset.saturating_add(limit);
 
+    // Two complementary recall paths, merged:
+    //
+    // 1. FTS (only when the pattern is FTS-safe): stemmed, bm25-ranked matches
+    //    over name / short_name / summary. Good ranking, but it matches whole
+    //    stemmed tokens, not substrings — so the query `library` never reaches
+    //    the class `LibraryService` (token `libraryservice`), and a concept word
+    //    that lives only in docstring prose is invisible.
+    // 2. LIKE substring over id / name / short_name / summary AND the
+    //    secret-guarded docstring. This is the grep-equivalent content recall the
+    //    discovery surface promises (weft-b7ce301e92): it catches identifier
+    //    substrings FTS cannot and surfaces concept words from docstring prose,
+    //    with no dependency on the opt-in embeddings sidecar (ADR-040).
+    //
+    // The merge keeps FTS hits first (preserving bm25 rank) and appends LIKE-only
+    // hits in id order, deduped by id. Each source is capped at `fetch_cap` and
+    // `limit` is clamped to <=100, so the merged prefix is bounded and exact for
+    // any page.
+    let fts_rows = if is_fts_safe(pattern) {
+        fts_match_entities(conn, pattern, fetch_cap, kind)?
+    } else {
+        Vec::new()
+    };
+    let like_rows = like_match_entities(conn, pattern, fetch_cap, kind)?;
+
+    let mut seen = std::collections::HashSet::with_capacity(fts_rows.len() + like_rows.len());
+    let mut merged = Vec::with_capacity(fts_rows.len() + like_rows.len());
+    for row in fts_rows.into_iter().chain(like_rows) {
+        if seen.insert(row.id.clone()) {
+            merged.push(row);
+        }
+    }
+    Ok(merged.into_iter().skip(offset).take(limit).collect())
+}
+
+/// FTS-safe, bm25-ranked matches over `name` / `short_name` / `summary_text`,
+/// capped at `fetch_cap` (always OFFSET 0 — [`find_entities`] pages after the
+/// merge). The caller guarantees `pattern` satisfies [`is_fts_safe`].
+fn fts_match_entities(
+    conn: &Connection,
+    pattern: &str,
+    fetch_cap: usize,
+    kind: Option<&str>,
+) -> Result<Vec<EntityRow>> {
+    let cap_i64 = i64::try_from(fetch_cap)
+        .map_err(|_| StorageError::InvalidQuery("entity search limit is too large".to_owned()))?;
+    let kind_clause = if kind.is_some() {
+        "AND e.kind = ?3 "
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT e.{columns} \
+         FROM entity_fts f \
+         JOIN entities e ON e.id = f.entity_id \
+         WHERE entity_fts MATCH ?1 {kind_clause}\
+         ORDER BY bm25(entity_fts), e.id \
+         LIMIT ?2",
+        columns = ENTITY_COLUMNS.replace(", ", ", e.")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = match kind {
+        Some(kind) => stmt.query_map(params![pattern, cap_i64, kind], map_entity_row)?,
+        None => stmt.query_map(params![pattern, cap_i64], map_entity_row)?,
+    };
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+/// Substring (LIKE) matches over `id` / `name` / `short_name` / `summary` plus
+/// the `briefing_blocked`-guarded docstring, capped at `fetch_cap` (OFFSET 0).
+///
+/// The docstring clause is gated on `briefing_blocked IS NULL`: a secret-bearing
+/// docstring withheld by the pre-ingest scanner (ADR-013) must never become
+/// matchable, or searching for a leaked secret would resurface the very entity
+/// the block exists to hide. (Identity exposure of blocked entities on these
+/// read surfaces is a separate, tracked gap — clarion-307668e2be; this content
+/// clause deliberately does not widen it. `id`/`name`/`short_name`/`summary`
+/// matching is unchanged from the prior behaviour.)
+fn like_match_entities(
+    conn: &Connection,
+    pattern: &str,
+    fetch_cap: usize,
+    kind: Option<&str>,
+) -> Result<Vec<EntityRow>> {
+    let cap_i64 = i64::try_from(fetch_cap)
+        .map_err(|_| StorageError::InvalidQuery("entity search limit is too large".to_owned()))?;
     let like = format!("%{}%", escape_like(pattern));
-    let kind_clause = if kind.is_some() { "AND kind = ?4 " } else { "" };
+    let kind_clause = if kind.is_some() { "AND kind = ?3 " } else { "" };
     let sql = format!(
         "SELECT {ENTITY_COLUMNS} \
          FROM entities \
          WHERE (id LIKE ?1 ESCAPE '\\' \
             OR name LIKE ?1 ESCAPE '\\' \
             OR short_name LIKE ?1 ESCAPE '\\' \
-            OR COALESCE(summary, '') LIKE ?1 ESCAPE '\\') {kind_clause}\
+            OR COALESCE(summary, '') LIKE ?1 ESCAPE '\\' \
+            OR (json_extract(properties, '$.briefing_blocked') IS NULL \
+                AND COALESCE(json_extract(properties, '$.docstring'), '') LIKE ?1 ESCAPE '\\')) \
+            {kind_clause}\
          ORDER BY id \
-         LIMIT ?2 OFFSET ?3"
+         LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = match kind {
-        Some(kind) => stmt.query_map(params![like, limit_i64, offset_i64, kind], map_entity_row)?,
-        None => stmt.query_map(params![like, limit_i64, offset_i64], map_entity_row)?,
+        Some(kind) => stmt.query_map(params![like, cap_i64, kind], map_entity_row)?,
+        None => stmt.query_map(params![like, cap_i64], map_entity_row)?,
     };
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
@@ -804,6 +950,140 @@ pub fn entities_by_kind(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![kind, limit], map_entity_row)?;
     collect_capped(rows, scan_cap)
+}
+
+/// The distinct entity kinds present in the index, ordered. Kinds are
+/// plugin-owned (ADR-003/ADR-022) — an open set with no central registry — so
+/// the only honest enumeration is what the `entities` table actually holds.
+/// Feeds the kind-facet's unknown-kind hint (clarion-c137d73ebf).
+pub fn known_entity_kinds(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT kind FROM entities ORDER BY kind")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The preferred secret-finding anchor entity per source file, from the
+/// already-committed `entities` rows (weft-4165f1ed71, the analyze fixed
+/// point). When the incremental skip leaves a secret-bearing file
+/// un-dispatched, its pre-ingest scan finding must still anchor to the SAME
+/// entity the analysed run anchored to — otherwise the anchor (and the
+/// anchor-keyed finding id) flips to the core `file` entity and a duplicate
+/// row is minted. Preference order mirrors the in-run anchor registration
+/// (`remember_finding_anchors`): a `module`-kind entity first, then any
+/// non-core plugin entity, then the core `file` entity; ties break on the
+/// smaller id for determinism. Returns `{ source_file_path -> entity_id }`.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn preferred_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_file_path, id, kind, plugin_id FROM entities \
+         WHERE source_file_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let rank = |kind: &str, plugin_id: &str| -> u8 {
+        if kind == "module" {
+            0
+        } else if plugin_id != "core" {
+            1
+        } else {
+            2
+        }
+    };
+    let mut best: HashMap<String, (u8, String)> = HashMap::new();
+    for row in rows {
+        let (path, id, kind, plugin_id) = row.map_err(StorageError::from)?;
+        let row_rank = rank(&kind, &plugin_id);
+        match best.get(&path) {
+            Some((held_rank, held_id))
+                if (*held_rank, held_id.as_str()) <= (row_rank, id.as_str()) => {}
+            _ => {
+                best.insert(path, (row_rank, id));
+            }
+        }
+    }
+    Ok(best.into_iter().map(|(path, (_, id))| (path, id)).collect())
+}
+
+/// The actual secret-finding anchor entity per source file, read straight from
+/// the persisted `findings` rows (weft-4165f1ed71, L1 regression repair). This
+/// is the ground-truth companion to [`preferred_finding_anchor_by_file`]: where
+/// that helper *re-derives* the anchor with a module/plugin/core ranking
+/// heuristic that must stay byte-for-byte in lockstep with the in-run
+/// `remember_finding_anchors` registration, this reads the `entity_id` the prior
+/// run actually keyed its finding to. The two diverge when a source file owns
+/// two same-rank candidates (Rust inline `mod` blocks: the file module and an
+/// inline submodule share one `source_file_path`, both rank 0) — the heuristic
+/// breaks ties on smallest-id while `remember_finding_anchors` breaks them on
+/// emission order, so the re-derived anchor (and the anchor-keyed finding id)
+/// flips on the first incremental skip and mints the exact duplicate row the
+/// fix targets. Reading the stored row removes the lockstep requirement
+/// entirely. Returns `{ source_file_path -> entity_id }` keyed by the anchor
+/// entity's own `source_file_path` (the secret scan anchors a finding to an
+/// entity whose source file is the scanned file).
+///
+/// Only the secret-scan rule (`LMWV-SEC-SECRET-DETECTED`) is consulted: that is
+/// the only finding family the pre-ingest scan re-anchors on a skip. A file with
+/// no prior secret finding row is simply absent here — there is nothing to
+/// duplicate, so the caller falls back to the heuristic for first-time anchors.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn stored_secret_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT e.source_file_path, f.entity_id \
+         FROM findings f \
+         JOIN entities e ON e.id = f.entity_id \
+         WHERE f.rule_id = ?1 AND e.source_file_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params!["LMWV-SEC-SECRET-DETECTED"], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out: HashMap<String, String> = HashMap::new();
+    for row in rows {
+        let (path, entity_id) = row.map_err(StorageError::from)?;
+        // A file should have a single secret-finding anchor (all that file's
+        // findings share it). If a legacy DB somehow holds two, keep the
+        // smaller id deterministically so the result never depends on row order.
+        match out.get(&path) {
+            Some(held) if held.as_str() <= entity_id.as_str() => {}
+            _ => {
+                out.insert(path, entity_id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The distinct categorisation tags this index actually holds, ordered. The
+/// truth source for the tag facets' honest-empty hint (weft-7256739b31): an
+/// empty-tag response derives its "what IS here" message from this list
+/// instead of a hand-maintained claim about what plugins emit.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn known_entity_tags(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT tag FROM entity_tags ORDER BY tag")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// Faceted catalog query: entities carrying `tag` (any plugin's
@@ -981,6 +1261,47 @@ pub fn unresolved_call_sites_for_caller(
         .map_err(StorageError::from)
 }
 
+/// Unbounded COUNT of the rows [`unresolved_callers_for_target`] would match:
+/// live (content-hash-current) unresolved call sites whose `callee_expr`
+/// name-matches `target`. Powers the `unresolved_name_matches` honesty field
+/// on the caller-navigation surface (clarion-df87b4f381) — the count must be
+/// the true magnitude, not a page length.
+pub fn unresolved_caller_count_for_target(conn: &Connection, target: &EntityRow) -> Result<i64> {
+    let target_short = target
+        .short_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(&target.short_name);
+    let suffix = format!("%.{}", escape_like(target_short));
+    conn.query_row(
+        "SELECT COUNT(*) \
+         FROM entity_unresolved_call_sites u \
+         JOIN entities caller ON caller.id = u.caller_entity_id \
+         WHERE caller.content_hash = u.caller_content_hash \
+           AND (u.callee_expr = ?1 \
+             OR u.callee_expr = ?2 \
+             OR u.callee_expr LIKE ?3 ESCAPE '\\')",
+        params![target_short, target.name, suffix],
+        |row| row.get(0),
+    )
+    .map_err(StorageError::from)
+}
+
+/// True when the project holds ANY live unresolved call site (stale rows whose
+/// caller body changed are excluded, matching every other consumer). Drives the
+/// data-dependent `unresolved-static-calls` `scope_excludes` marker.
+pub fn live_unresolved_call_sites_exist(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS( \
+            SELECT 1 FROM entity_unresolved_call_sites u \
+            JOIN entities caller ON caller.id = u.caller_entity_id \
+            WHERE caller.content_hash = u.caller_content_hash)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(StorageError::from)
+}
+
 pub fn unresolved_callers_for_target(
     conn: &Connection,
     target: &EntityRow,
@@ -1039,6 +1360,69 @@ pub fn import_edges_for_entity(
     direction: ReferenceDirection,
 ) -> Result<Vec<ReferenceEdgeMatch>> {
     directed_edges_for_entity(conn, entity_id, direction, "imports")
+}
+
+/// The relation edge kinds — semantic type-level claims (subclassing,
+/// decoration, trait implementation, derive expansion) as opposed to
+/// occurrence kinds (`calls`/`references`/`imports`). Alphabetical, matching
+/// the `ORDER BY kind` of [`relation_edges_for_entity`].
+pub const RELATION_EDGE_KINDS: &[&str] = &["decorates", "derives", "implements", "inherits_from"];
+
+/// Relation edges touching `entity_id` in the given direction, optionally
+/// narrowed to one kind. Direction is positional (`In` = stored `to_id`,
+/// `Out` = stored `from_id`); what a direction *means* varies per kind
+/// (ADR-051) — "what subclasses X" is `In` on `inherits_from`, while "what
+/// does X decorate" is `Out` on `decorates`. A `kind` outside
+/// [`RELATION_EDGE_KINDS`] matches nothing. Results are ordered by
+/// (kind, neighbor, anchor) for determinism.
+pub fn relation_edges_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    direction: ReferenceDirection,
+    kind: Option<&str>,
+) -> Result<Vec<RelationEdgeMatch>> {
+    let sql = match direction {
+        ReferenceDirection::In => {
+            "SELECT kind, from_id, to_id, confidence, properties, source_file_id, \
+                    source_byte_start, source_byte_end \
+             FROM edges \
+             WHERE kind IN ('decorates', 'derives', 'implements', 'inherits_from') \
+               AND to_id = ?1 \
+             ORDER BY kind, from_id, source_byte_start, source_byte_end"
+        }
+        ReferenceDirection::Out => {
+            "SELECT kind, from_id, to_id, confidence, properties, source_file_id, \
+                    source_byte_start, source_byte_end \
+             FROM edges \
+             WHERE kind IN ('decorates', 'derives', 'implements', 'inherits_from') \
+               AND from_id = ?1 \
+             ORDER BY kind, to_id, source_byte_start, source_byte_end"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![entity_id], map_relation_edge_match)?;
+    let mut matches = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)?;
+    if let Some(kind) = kind {
+        matches.retain(|m| m.kind == kind);
+    }
+    Ok(matches)
+}
+
+fn map_relation_edge_match(row: &Row<'_>) -> rusqlite::Result<RelationEdgeMatch> {
+    let raw_confidence: String = row.get(3)?;
+    let properties: Option<String> = row.get(4)?;
+    Ok(RelationEdgeMatch {
+        kind: row.get(0)?,
+        from_id: row.get(1)?,
+        to_id: row.get(2)?,
+        confidence: parse_confidence(&raw_confidence)?,
+        candidates: candidate_ids(properties.as_deref()).into_iter().collect(),
+        source_file_id: row.get(5)?,
+        source_byte_start: row.get(6)?,
+        source_byte_end: row.get(7)?,
+    })
 }
 
 fn directed_edges_for_entity(
@@ -1385,6 +1769,82 @@ pub fn candidate_entities_for_unresolved_sites(
         }
     }
     Ok(out)
+}
+
+/// The terminal identifier of an unresolved call site's `callee_expr`, or
+/// `None` if the expression has no usable name.
+///
+/// The Rust plugin records three `callee_expr` shapes (see
+/// `loomweave-plugin-rust/src/calls.rs`): a method call `x.foo()` stores
+/// `".foo"`, an unresolved path call `a::b::f()` / `Type::assoc()` stores the
+/// `::`-joined path (`"a::b::f"` / `"Type::assoc"`), and any other call form
+/// stores `"<expr>()"`. The leaf is the segment after the last `.` **or** `::`
+/// — `foo`, `f`, `assoc` respectively. Crucially this splits on `::` as well as
+/// `.`, so the Rust associated-function form (`Type::assoc`) yields `assoc`;
+/// the older `.`-only leaf extraction (`candidate_entities_for_expr`,
+/// `unresolved_callers_for_target`) misses it. A leaf that is not a bare
+/// identifier (`<expr>()`, empty) returns `None`.
+fn unresolved_callee_leaf(callee_expr: &str) -> Option<String> {
+    let leaf = callee_expr
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(callee_expr)
+        .trim();
+    if leaf.is_empty() || !leaf.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(leaf.to_owned())
+}
+
+/// The set of entity ids that are a *plausible target* of at least one
+/// persisted unresolved call site — i.e. an entity whose `short_name` matches
+/// the terminal identifier of some unresolved `callee_expr`.
+///
+/// This is the dead-code consumer's fail-toward-live suppression input. The
+/// Rust call resolver cannot resolve method calls (`x.foo()`) or associated /
+/// constructor calls (`Type::assoc()`) without type inference, so a function
+/// reachable *only* through such a call has no incoming `calls` edge and would
+/// be flagged dead by pure static reachability — a false positive. Treating it
+/// as live when its name matches an unresolved site keeps the dead-code tool
+/// honest (it under-reports rather than over-reports). The match is coarse
+/// (terminal-name only, so an unrelated `x.foo()` shields a genuinely-dead
+/// `foo`) — but coarse in the safe direction.
+///
+/// Only sites whose caller is still content-current count (the same
+/// `caller.content_hash = u.caller_content_hash` staleness filter as
+/// [`unresolved_callers_for_target`]). Language-agnostic: a plugin whose
+/// resolver leaves no unresolved sites (e.g. the pyright-backed Python plugin)
+/// contributes an empty set and the suppression is a no-op.
+pub fn entities_targeted_by_unresolved_call_sites(conn: &Connection) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT u.callee_expr \
+         FROM entity_unresolved_call_sites u \
+         JOIN entities caller ON caller.id = u.caller_entity_id \
+         WHERE caller.content_hash = u.caller_content_hash",
+    )?;
+    let exprs = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut leaves: BTreeSet<String> = BTreeSet::new();
+    for expr in exprs {
+        if let Some(leaf) = unresolved_callee_leaf(&expr?) {
+            leaves.insert(leaf);
+        }
+    }
+    if leaves.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut stmt = conn.prepare("SELECT id, short_name FROM entities")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut targeted: BTreeSet<String> = BTreeSet::new();
+    for row in rows {
+        let (id, short_name) = row?;
+        if leaves.contains(&short_name) {
+            targeted.insert(id);
+        }
+    }
+    Ok(targeted)
 }
 
 pub fn contained_entity_ids(

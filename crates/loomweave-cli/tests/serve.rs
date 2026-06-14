@@ -232,7 +232,7 @@ fn serve_http_responses_match_federation_fixture_contracts() {
         .assert()
         .success();
     fs::write(
-        dir.path().join(".loomweave/instance_id"),
+        dir.path().join(".weft/loomweave/instance_id"),
         format!("{STABLE_INSTANCE_ID}\n"),
     )
     .expect("seed stable instance ID");
@@ -490,7 +490,7 @@ fn seed_renamed_function_dossier(project_root: &Path) -> String {
     let new_locator = "python:function:mod.process_v2";
     let old_locator = "python:function:mod.process";
     let ts = "2026-06-02T00:00:00.000Z";
-    let db_path = project_root.join(".loomweave/loomweave.db");
+    let db_path = project_root.join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
 
     conn.execute(
@@ -771,7 +771,7 @@ fn serve_http_files_storage_failure_returns_closed_error_without_raw_detail() {
         .expect("canonical source path")
         .display()
         .to_string();
-    let db_path = dir.path().join(".loomweave/loomweave.db");
+    let db_path = dir.path().join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
         "INSERT INTO entities (
@@ -833,7 +833,7 @@ fn serve_http_capabilities_and_mcp_stdio_coexist() {
         .assert()
         .success();
     fs::write(
-        dir.path().join(".loomweave/instance_id"),
+        dir.path().join(".weft/loomweave/instance_id"),
         format!("{STABLE_INSTANCE_ID}\n"),
     )
     .expect("seed stable instance ID");
@@ -909,7 +909,7 @@ fn serve_http_capabilities_reuses_persisted_instance_id_across_restarts() {
         .env("PATH", "")
         .assert()
         .success();
-    let instance_id_path = dir.path().join(".loomweave/instance_id");
+    let instance_id_path = dir.path().join(".weft/loomweave/instance_id");
 
     let first_bind = free_loopback_bind();
     write_http_config(dir.path(), &first_bind);
@@ -961,7 +961,7 @@ fn serve_http_capabilities_returns_new_instance_id_after_rotation() {
         .env("PATH", "")
         .assert()
         .success();
-    let instance_id_path = dir.path().join(".loomweave/instance_id");
+    let instance_id_path = dir.path().join(".weft/loomweave/instance_id");
 
     let first_bind = free_loopback_bind();
     write_http_config(dir.path(), &first_bind);
@@ -1023,7 +1023,7 @@ fn serve_http_capabilities_creates_instance_id_with_private_unix_mode() {
         .expect("HTTP /api/v1/_capabilities response");
     stop_serve(&mut child);
 
-    let instance_id_path = dir.path().join(".loomweave/instance_id");
+    let instance_id_path = dir.path().join(".weft/loomweave/instance_id");
     assert_eq!(
         fs::read_to_string(&instance_id_path)
             .expect("read persisted instance_id")
@@ -1047,7 +1047,7 @@ fn serve_http_capabilities_repairs_existing_instance_id_mode() {
         .env("PATH", "")
         .assert()
         .success();
-    let instance_id_path = dir.path().join(".loomweave/instance_id");
+    let instance_id_path = dir.path().join(".weft/loomweave/instance_id");
     let seeded_id = "9bd7234e-6d44-4a38-9ae4-76f912a10221";
     fs::write(&instance_id_path, format!("{seeded_id}\n")).expect("seed instance ID");
     fs::set_permissions(&instance_id_path, fs::Permissions::from_mode(0o644))
@@ -1078,8 +1078,11 @@ fn serve_rejects_invalid_instance_id_before_serving_http() {
         .env("PATH", "")
         .assert()
         .success();
-    fs::write(dir.path().join(".loomweave/instance_id"), "not-a-uuid\n")
-        .expect("write invalid instance ID");
+    fs::write(
+        dir.path().join(".weft/loomweave/instance_id"),
+        "not-a-uuid\n",
+    )
+    .expect("write invalid instance ID");
     let bind = free_loopback_bind();
     write_http_config(dir.path(), &bind);
 
@@ -1644,7 +1647,7 @@ fn serve_wires_recording_llm_provider_and_writer_for_cached_summary_touches() {
         .success();
     let source_path = dir.path().join("demo.py");
     fs::write(&source_path, "def entry():\n    return 1\n").expect("write source");
-    let db_path = dir.path().join(".loomweave/loomweave.db");
+    let db_path = dir.path().join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
         "INSERT INTO entities (
@@ -1821,6 +1824,7 @@ printf '%s' '{{"purpose":"via codex serve","behavior":"served through fake Codex
             .expect("read Codex prompt log")
             .contains("Prompt contract: loomweave-agent-provider-v1")
     );
+    assert_llm_traffic_log_metadata_only(dir.path(), "codex_cli", 31, 9);
 }
 
 #[test]
@@ -1914,6 +1918,39 @@ printf '%s\n' '{{"type":"result","subtype":"success","structured_output":{{"purp
             .expect("read Claude prompt log")
             .contains("Loomweave's local Claude Code LLM provider")
     );
+    assert_llm_traffic_log_metadata_only(dir.path(), "claude_cli", 33, 12);
+}
+
+fn assert_llm_traffic_log_metadata_only(
+    project_root: &Path,
+    provider: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+) {
+    // C-9: the diagnostics log lives under Loomweave's own .weft/loomweave/
+    // store subtree, never a legacy .loomweave/ root (weft-ac59e8e730).
+    let log_path = project_root.join(".weft/loomweave/diagnostics/llm-traffic.jsonl");
+    assert!(
+        !project_root.join(".loomweave").exists(),
+        "serve must not create a legacy .loomweave/ store dir"
+    );
+    let log = fs::read_to_string(&log_path)
+        .unwrap_or_else(|err| panic!("read LLM traffic log {}: {err}", log_path.display()));
+    assert!(
+        !log.contains("Prompt contract:")
+            && !log.contains("Source excerpt:")
+            && !log.contains("via codex serve")
+            && !log.contains("via claude serve"),
+        "LLM traffic log must contain lookup metadata only, not prompt/output contents: {log}"
+    );
+    let event: serde_json::Value = serde_json::from_str(log.trim()).expect("traffic log JSON");
+    assert_eq!(event["schema"], "loomweave.llm.lookup.v1");
+    assert_eq!(event["provider"], provider);
+    assert_eq!(event["purpose"], "Summary");
+    assert_eq!(event["prompt_id"], "leaf-v1");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["usage"]["input_tokens"], input_tokens);
+    assert_eq!(event["usage"]["cached_input_tokens"], cached_input_tokens);
 }
 
 fn make_executable(path: &Path) {
@@ -1927,7 +1964,7 @@ fn seed_summary_entity(project_root: &Path) {
     let source_path = project_root.join("demo.py");
     fs::write(&source_path, source).expect("write source");
     let content_hash = line_range_content_hash(source, 1, 2);
-    let db_path = project_root.join(".loomweave/loomweave.db");
+    let db_path = project_root.join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
         "INSERT INTO entities (
@@ -2464,7 +2501,7 @@ fn seed_file_entity(project_root: &Path) -> (String, String, String) {
         .to_string();
     let content_hash = "hash-demo-file".to_owned();
     let file_id = "core:file:demo.py".to_owned();
-    let db_path = project_root.join(".loomweave/loomweave.db");
+    let db_path = project_root.join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
         "INSERT INTO entities (
@@ -2489,7 +2526,7 @@ fn seed_custom_language_file_entity(project_root: &Path) {
         .expect("canonical source path")
         .display()
         .to_string();
-    let db_path = project_root.join(".loomweave/loomweave.db");
+    let db_path = project_root.join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
         "INSERT INTO entities (
@@ -2513,7 +2550,7 @@ fn seed_briefing_blocked_file_entity(project_root: &Path) {
         .expect("canonical blocked path")
         .display()
         .to_string();
-    let db_path = project_root.join(".loomweave/loomweave.db");
+    let db_path = project_root.join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
         "INSERT INTO entities (
@@ -2540,7 +2577,7 @@ fn seed_storage_failure_file_entity(project_root: &Path) {
         .expect("canonical source path")
         .display()
         .to_string();
-    let db_path = project_root.join(".loomweave/loomweave.db");
+    let db_path = project_root.join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
         "INSERT INTO entities (

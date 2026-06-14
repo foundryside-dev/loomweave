@@ -42,7 +42,7 @@ Two candidates existed. UDS (a) has the additional property of removing the TCP 
 - **Client side**: sibling tools (Wardline, local agents) connect via UDS using `hyper-unix-connector` or equivalent. Endpoint URL convention: the CLI and config accept `unix:///absolute/path/to/.loomweave/socket`; the local fully-qualified path is used in sibling config rather than a pseudo-URL.
 - **Auth by filesystem**: mode 0600 + owner-match means only the owning UID can connect. Shared-Docker and shared-dev-host scenarios (T-02's original concern) are closed because a different UID cannot open the socket at all.
 - **CAP_NET_BIND_SERVICE equivalent**: there is no TCP listener. DNS rebinding (T-05) is structurally inapplicable. `Host:` / `Origin:` checks are unnecessary.
-- **Discovery**: `<project_root>/.loomweave/socket` is the canonical path; `loomweave serve` documents it at startup. Sibling tools read `<project_root>/.loomweave/config.json`'s `serve.socket_path` for explicit discovery.
+- **Discovery (historical)**: `<project_root>/.loomweave/socket` was the canonical path; `loomweave serve` documented it at startup. Current ADR-014-era HTTP discovery no longer uses a `.loomweave/config.json` socket stub.
 
 ### Fallback — TCP + Bearer token (`serve.auth: token`)
 

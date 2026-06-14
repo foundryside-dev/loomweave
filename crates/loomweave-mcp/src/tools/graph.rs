@@ -12,9 +12,11 @@ use loomweave_core::{EdgeConfidence, McpErrorCode};
 use serde_json::{Value, json};
 
 use loomweave_storage::{
-    ReferenceDirection, StorageError, ancestor_chain, call_edges_from, call_edges_targeting,
-    child_entity_ids, entities_containing_line, entity_by_id, find_entities, normalize_source_path,
-    subsystem_members, subsystem_of_entity,
+    EntityVisibility, RELATION_EDGE_KINDS, ReferenceDirection, StorageError, ancestor_chain,
+    call_edges_from, call_edges_targeting, child_entity_ids, entities_containing_line,
+    entity_by_id, entity_visibility, find_entities, live_unresolved_call_sites_exist,
+    normalize_source_path, relation_edges_for_entity, resolve_entity_ref, subsystem_members,
+    subsystem_of_entity,
 };
 
 use crate::filigree::IssueDetail;
@@ -22,12 +24,14 @@ use crate::filigree::IssueDetail;
 use crate::{
     CallSiteKind, CallSiteRole, InferredDispatchStats, IssuesForAccumulator, ParamError, PathScope,
     PathTraversal, ServerState, build_call_sites, call_graph_scope_excludes, callee_json,
-    caller_json, compact_execution_paths, entity_context_json, entity_json, entity_properties_json,
-    envelope_from_storage_result, flatten_storage_envelope_result, import_neighbors,
-    issues_unavailable, optional_bool, optional_confidence, optional_usize, path_truncation_reason,
-    reference_neighbors_for, required_i64, required_str, storage_retryable, success_envelope,
-    success_envelope_with_stats, success_envelope_with_truncation,
-    success_envelope_with_truncation_and_stats, tool_error_envelope, wardline_section_for_entity,
+    caller_json, compact_execution_paths, entity_context_json, entity_json,
+    entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
+    flatten_storage_envelope_result, import_neighbors, issues_unavailable,
+    navigation_scope_excludes, optional_bool, optional_confidence, optional_usize,
+    parse_cursor_offset, path_truncation_reason, reference_neighbors_for, relation_neighbors,
+    required_i64, required_str, storage_retryable, success_envelope, success_envelope_with_stats,
+    success_envelope_with_truncation, success_envelope_with_truncation_and_stats,
+    tool_error_envelope, unresolved_match_fields, wardline_section_for_entity,
     wardline_unavailable,
 };
 
@@ -136,8 +140,28 @@ impl ServerState {
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let entity_id = required_str(arguments, "id")?.to_owned();
+        let requested_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
+        // Bounded single-relation shape (clarion-d76e7f7267): limit (default 50,
+        // clamp 1..=100) + numeric-offset cursor; emit next_cursor + truncated.
+        let limit = optional_usize(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 100);
+        let offset = parse_cursor_offset(arguments)?;
+        // Canonicalize the id-or-SEI to its locator ONCE, before the
+        // `ensure_inferred_*` pre-gate, so the inference pass and the reader both
+        // key on the real `entities.id` (clarion-d76e7f7267).
+        let entity_id = match self.resolve_to_locator(&requested_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(entity_not_found_envelope(&requested_id)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
         let stats_delta = if confidence == EdgeConfidence::Inferred {
             match self.ensure_inferred_for_target(&entity_id).await {
                 Ok(stats) => stats.to_json(),
@@ -149,21 +173,33 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                if entity_by_id(conn, &entity_id)?.is_none() {
-                    return Ok(tool_error_envelope(
-                        McpErrorCode::EntityNotFound,
-                        &format!("entity {entity_id} was not found"),
-                        false,
-                    ));
-                }
-                let callers = call_edges_targeting(conn, &entity_id, confidence)?
+                let mut callers = call_edges_targeting(conn, &entity_id, confidence)?
                     .into_iter()
                     .filter_map(|edge| caller_json(conn, &edge).transpose())
                     .collect::<Result<Vec<_>, StorageError>>()?;
+                // Slice the materialised Vec at the MCP layer (the storage helper
+                // takes no LIMIT/OFFSET). `offset` past the end yields an empty
+                // page; `has_more` drives next_cursor + the explicit truncated.
+                let total = callers.len();
+                let page: Vec<_> = callers.drain(..).skip(offset).take(limit).collect();
+                let has_more = offset.saturating_add(limit) < total;
+                let next_cursor = has_more.then(|| (offset + limit).to_string());
+                // Honesty fields (clarion-df87b4f381): name-matched unresolved
+                // call sites are NOT in `callers`; say how many exist and where
+                // to see them, and name the blind spot in scope_excludes.
+                let (unresolved_name_matches, next_action) = match entity_by_id(conn, &entity_id)? {
+                    Some(target) => unresolved_match_fields(conn, &target)?,
+                    None => (0, Value::Null),
+                };
+                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
                 Ok(success_envelope_with_stats(
                     json!({
-                        "callers": callers,
-                        "scope_excludes": call_graph_scope_excludes(confidence),
+                        "callers": page,
+                        "next_cursor": next_cursor,
+                        "truncated": has_more,
+                        "unresolved_name_matches": unresolved_name_matches,
+                        "next_action": next_action,
+                        "scope_excludes": navigation_scope_excludes(confidence, live_unresolved),
                     }),
                     stats_delta,
                 ))
@@ -176,11 +212,25 @@ impl ServerState {
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let entity_id = required_str(arguments, "id")?.to_owned();
+        let requested_id = required_str(arguments, "id")?.to_owned();
         let max_depth = optional_usize(arguments, "max_depth")?
             .unwrap_or(3)
             .clamp(1, 8);
         let confidence = optional_confidence(arguments)?;
+        // Canonicalize id-or-SEI to its locator ONCE, before the inferred-branch
+        // dispatch (which runs its own `ensure_inferred_*` pass) and the reader,
+        // so all downstream traversal keys on the real id (clarion-d76e7f7267).
+        let entity_id = match self.resolve_to_locator(&requested_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(entity_not_found_envelope(&requested_id)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
         if confidence == EdgeConfidence::Inferred {
             return Ok(self.inferred_execution_paths(entity_id, max_depth).await);
         }
@@ -189,26 +239,20 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                if entity_by_id(conn, &entity_id)?.is_none() {
-                    return Ok(tool_error_envelope(
-                        McpErrorCode::EntityNotFound,
-                        &format!("entity {entity_id} was not found"),
-                        false,
-                    ));
-                }
                 let mut traversal = PathTraversal::new(edge_cap);
                 let mut path = vec![entity_id.clone()];
                 traversal.walk(conn, &entity_id, &mut path, max_depth, confidence)?;
                 let edge_truncated = traversal.truncated;
                 let edge_count_visited = traversal.edge_count_visited;
                 let compact = compact_execution_paths(conn, traversal.paths, path_cap)?;
+                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
                 Ok(success_envelope_with_truncation(
                     json!({
                         "root": entity_id,
                         "nodes": compact.nodes,
                         "paths": compact.paths,
                         "edge_count_visited": edge_count_visited,
-                        "scope_excludes": call_graph_scope_excludes(confidence),
+                        "scope_excludes": navigation_scope_excludes(confidence, live_unresolved),
                     }),
                     path_truncation_reason(edge_truncated, compact.path_cap_truncated),
                 ))
@@ -327,8 +371,28 @@ impl ServerState {
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let entity_id = required_str(arguments, "id")?.to_owned();
+        let requested_id = required_str(arguments, "id")?.to_owned();
         let confidence = optional_confidence(arguments)?;
+        // Per-bucket cap (clarion-d76e7f7267): ONE `limit` (default 50, clamp
+        // 1..=100) bounds EACH of the nine list buckets independently. NO
+        // cursor — one cursor cannot coherently advance nine heterogeneous
+        // buckets; an agent paginates a specific relation via its dedicated tool.
+        let limit = optional_usize(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 100);
+        // Canonicalize id-or-SEI to its locator ONCE, before both
+        // `ensure_inferred_*` pre-gates and the reader (clarion-d76e7f7267).
+        let entity_id = match self.resolve_to_locator(&requested_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(entity_not_found_envelope(&requested_id)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
         if confidence == EdgeConfidence::Inferred {
             if let Err(err) = self.ensure_inferred_for_target(&entity_id).await {
                 return Ok(err.to_envelope());
@@ -347,11 +411,18 @@ impl ServerState {
                         false,
                     ));
                 };
-                let inbound_callers = call_edges_targeting(conn, &entity_id, confidence)?
+                // Refuse to fan out structure around a briefing-blocked entity
+                // (clarion-307668e2be) — withholding the surrounding graph is the
+                // federation posture (ADR-034). A blocked entity that appears as a
+                // *neighbor* of a visible entity is stubbed, not refused.
+                if let Some(reason) = crate::briefing_block_reason(&entity) {
+                    return Ok(crate::blocked_entity_refusal(&reason));
+                }
+                let mut inbound_callers = call_edges_targeting(conn, &entity_id, confidence)?
                     .into_iter()
                     .filter_map(|edge| caller_json(conn, &edge).transpose())
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let outbound_calls = call_edges_from(conn, &entity_id, confidence)?
+                let mut outbound_calls = call_edges_from(conn, &entity_id, confidence)?
                     .into_iter()
                     .filter_map(|edge| callee_json(conn, &edge).transpose())
                     .collect::<Result<Vec<_>, StorageError>>()?;
@@ -362,18 +433,46 @@ impl ServerState {
                     .transpose()?
                     .as_ref()
                     .map(|e| entity_json(conn, e));
-                let contained_entities = child_entity_ids(conn, &entity_id)?
+                let mut contained_entities = child_entity_ids(conn, &entity_id)?
                     .iter()
                     .filter_map(|child_id| entity_by_id(conn, child_id).transpose())
                     .map(|row| row.map(|entity| entity_json(conn, &entity)))
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                let (references_in, references_rolled_up) =
+                let (mut references_in, references_rolled_up) =
                     reference_neighbors_for(conn, &entity, ReferenceDirection::In)?;
-                let (references_out, _) =
+                let (mut references_out, _) =
                     reference_neighbors_for(conn, &entity, ReferenceDirection::Out)?;
-                let imports_in = import_neighbors(conn, &entity_id, ReferenceDirection::In)?;
-                let imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
-                let scope_excludes = call_graph_scope_excludes(confidence);
+                let mut imports_in = import_neighbors(conn, &entity_id, ReferenceDirection::In)?;
+                let mut imports_out = import_neighbors(conn, &entity_id, ReferenceDirection::Out)?;
+                let mut relations_in =
+                    relation_neighbors(conn, &entity_id, ReferenceDirection::In, confidence)?;
+                let mut relations_out =
+                    relation_neighbors(conn, &entity_id, ReferenceDirection::Out, confidence)?;
+                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
+                let scope_excludes = navigation_scope_excludes(confidence, live_unresolved);
+                // Honesty fields for the `callers` bucket (clarion-df87b4f381).
+                let (unresolved_name_matches, next_action) =
+                    unresolved_match_fields(conn, &entity)?;
+                // Bound EACH bucket independently and record whether it was
+                // trimmed in the sibling `truncated` map. A trimmed bucket directs
+                // the agent to the dedicated single-relation tool for the full
+                // cursor-paginated set (clarion-d76e7f7267).
+                let truncate_bucket = |bucket: &mut Vec<Value>| -> bool {
+                    let trimmed = bucket.len() > limit;
+                    bucket.truncate(limit);
+                    trimmed
+                };
+                let truncated = json!({
+                    "callers": truncate_bucket(&mut inbound_callers),
+                    "callees": truncate_bucket(&mut outbound_calls),
+                    "contained": truncate_bucket(&mut contained_entities),
+                    "references_in": truncate_bucket(&mut references_in),
+                    "references_out": truncate_bucket(&mut references_out),
+                    "imports_in": truncate_bucket(&mut imports_in),
+                    "imports_out": truncate_bucket(&mut imports_out),
+                    "relations_in": truncate_bucket(&mut relations_in),
+                    "relations_out": truncate_bucket(&mut relations_out),
+                });
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
                     "callers": inbound_callers,
@@ -389,6 +488,15 @@ impl ServerState {
                     "references_rolled_up": references_rolled_up,
                     "imports_in": imports_in,
                     "imports_out": imports_out,
+                    // Kind-tagged relation edges (inherits_from / decorates /
+                    // implements / derives, ADR-051). relations_in on a class
+                    // answers "what subclasses this"; relations_out on a
+                    // decorator answers "what does this decorate".
+                    "relations_in": relations_in,
+                    "relations_out": relations_out,
+                    "truncated": truncated,
+                    "unresolved_name_matches": unresolved_name_matches,
+                    "next_action": next_action,
                     "scope_excludes": scope_excludes,
                 })))
             })
@@ -406,7 +514,7 @@ impl ServerState {
         // Surface the same configured-vs-resolved Filigree endpoint block that
         // `project_status` reports, so an agent can see WHICH endpoint a result
         // came from (e.g. an ethereal port resolved from
-        // `.filigree/ephemeral.port`) instead of curling ports by hand. Null on
+        // `.weft/filigree/ephemeral.port`) instead of curling ports by hand. Null on
         // storage-only servers built without a diagnostics context.
         let endpoint = self.filigree_diagnostics_json();
         let Some(client) = self.filigree_client.clone() else {
@@ -495,9 +603,13 @@ impl ServerState {
         let detail_ids = accumulator.enrichable_issue_ids();
         let mut details: HashMap<String, Option<IssueDetail>> = HashMap::new();
         let mut detail_requests_total = 0_usize;
-        let mut route_down = false;
+        // `Some(reason)` once the first transport/HTTP failure trips the
+        // degrade; carried into the envelope as an in-band marker
+        // (weft-4a46553503 / dogfood-4 B9: enrichment 401'd and every issue
+        // silently came back null — the consumer needs the WHY in-band).
+        let mut detail_route_down: Option<String> = None;
         for issue_id in detail_ids {
-            if route_down {
+            if detail_route_down.is_some() {
                 details.insert(issue_id, None);
                 continue;
             }
@@ -512,12 +624,12 @@ impl ServerState {
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(error = %err, "loomweave issues_for detail fetch failed; degrading to issue-id-only");
-                    route_down = true;
+                    detail_route_down = Some(err.to_string());
                     details.insert(issue_id, None);
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "loomweave issues_for detail task failed; degrading to issue-id-only");
-                    route_down = true;
+                    detail_route_down = Some(format!("detail task failed: {err}"));
                     details.insert(issue_id, None);
                 }
             }
@@ -529,6 +641,22 @@ impl ServerState {
             detail_requests_total,
             &endpoint,
         );
+        // Honest degrade (C-10): when the detail enrichment died mid-flight,
+        // say so once, in-band — `issue: null` rows are otherwise
+        // indistinguishable from "issue genuinely absent at the route".
+        if let Some(reason) = detail_route_down
+            && let Some(result) = envelope.get_mut("result").and_then(Value::as_object_mut)
+        {
+            result.insert(
+                "issue_detail_unavailable".to_owned(),
+                json!({
+                    "reason": reason,
+                    "note": "the issue-detail enrichment failed mid-call, so `issue` is null \
+                             on the affected rows; `issue_id` remains authoritative — retry \
+                             or query Filigree directly for title/status",
+                }),
+            );
+        }
         // Flow B: attach Wardline findings reconciled to the requested entity.
         if let Some(entity) = read.entities.iter().find(|e| e.id == requested_id) {
             let client = client.clone();
@@ -552,10 +680,16 @@ impl ServerState {
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
         let subsystem_id = required_str(arguments, "id")?.to_owned();
+        // Bounded single-relation shape (clarion-d76e7f7267): a subsystem can
+        // hold hundreds of modules. limit (default 50, clamp 1..=100) + cursor.
+        let limit = optional_usize(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 100);
+        let offset = parse_cursor_offset(arguments)?;
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(subsystem) = entity_by_id(conn, &subsystem_id)? else {
+                let Some(subsystem) = resolve_entity_ref(conn, &subsystem_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {subsystem_id} was not found"),
@@ -569,16 +703,40 @@ impl ServerState {
                         false,
                     ));
                 }
-                let members = subsystem_members(conn, &subsystem.id)?
+                // Slice the members Vec at the MCP layer (the storage helper takes
+                // no LIMIT/OFFSET) before projecting, so paging bounds the work.
+                let all_members = subsystem_members(conn, &subsystem.id)?;
+                let total = all_members.len();
+                let has_more = offset.saturating_add(limit) < total;
+                let next_cursor = has_more.then(|| (offset + limit).to_string());
+                // Members are projected with their own compact shape (not
+                // `entity_json`), so the briefing-blocked gate is applied here via
+                // `entity_visibility` — a blocked member module (its file carries a
+                // secret) is redacted to withhold its id/name/path
+                // (clarion-307668e2be).
+                let members = all_members
                     .iter()
+                    .skip(offset)
+                    .take(limit)
                     .map(|member| {
-                        json!({
-                            "id": member.id,
-                            "name": member.name,
-                            "source_file_path": member.source_file_path
-                        })
+                        if let EntityVisibility::Blocked(reason) =
+                            entity_visibility(conn, &member.id)?
+                        {
+                            Ok(json!({
+                                "id": Value::Null,
+                                "name": Value::Null,
+                                "source_file_path": Value::Null,
+                                "briefing_blocked": reason
+                            }))
+                        } else {
+                            Ok(json!({
+                                "id": member.id,
+                                "name": member.name,
+                                "source_file_path": member.source_file_path
+                            }))
+                        }
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, StorageError>>()?;
                 Ok(success_envelope(json!({
                     "subsystem": {
                         "id": subsystem.id,
@@ -586,7 +744,9 @@ impl ServerState {
                         "short_name": subsystem.short_name,
                         "properties": entity_properties_json(&subsystem)
                     },
-                    "members": members
+                    "members": members,
+                    "next_cursor": next_cursor,
+                    "truncated": has_more
                 })))
             })
             .await;
@@ -601,7 +761,7 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
@@ -629,6 +789,173 @@ impl ServerState {
                         "properties": entity_properties_json(s)
                     })),
                     "via_module_id": found.via_module_id
+                })))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
+
+    /// `entity_relation_list` (clarion-ae5b43ea40): the dedicated read surface
+    /// for the relation edge kinds (`inherits_from` / `decorates` /
+    /// `implements` / `derives`), previously write-only. The neighborhood /
+    /// orientation `relations_in`/`relations_out` buckets serve the same edges
+    /// kind-tagged; this tool is the cursor-paginated set WITH anchor evidence.
+    ///
+    /// Direction is positional over the stored edge; ADR-051 pins what that
+    /// means per kind. The anchor evidence resolves through the edge's OWN
+    /// `source_file_id` (never inferred from an endpoint): which side's file
+    /// holds the anchor varies per kind — `decorates` anchors in the TO
+    /// (decorated) side's file, every other kind in the FROM side's — so the
+    /// edge's stored file is the only kind-agnostic truth.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn tool_relation_list(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        let requested_id = required_str(arguments, "id")?.to_owned();
+        let direction = match arguments.get("direction") {
+            Some(Value::String(s)) if s == "in" => ReferenceDirection::In,
+            Some(Value::String(s)) if s == "out" => ReferenceDirection::Out,
+            _ => return Err(ParamError::new("direction must be \"in\" or \"out\"")),
+        };
+        let kind = match arguments.get("kind") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if RELATION_EDGE_KINDS.contains(&s.as_str()) => Some(s.clone()),
+            _ => {
+                return Err(ParamError::new(
+                    "kind must be one of \"inherits_from\", \"decorates\", \"implements\", \"derives\"",
+                ));
+            }
+        };
+        // Relation edges are resolved|ambiguous only (ADR-028/ADR-051): the
+        // inferred tier is accepted for parameter parity but adds nothing and
+        // must never trigger the `ensure_inferred_*` LLM dispatch.
+        let confidence = optional_confidence(arguments)?;
+        let limit = optional_usize(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 100);
+        let offset = parse_cursor_offset(arguments)?;
+        let entity_id = match self.resolve_to_locator(&requested_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(entity_not_found_envelope(&requested_id)),
+            Err(err) => {
+                return Ok(tool_error_envelope(
+                    McpErrorCode::StorageError,
+                    &err.to_string(),
+                    storage_retryable(&err),
+                ));
+            }
+        };
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                    return Ok(entity_not_found_envelope(&entity_id));
+                };
+                // Refuse to fan out structure around a briefing-blocked entity
+                // (same posture as neighborhood, ADR-034).
+                if let Some(reason) = crate::briefing_block_reason(&entity) {
+                    return Ok(crate::blocked_entity_refusal(&reason));
+                }
+                let edges: Vec<_> =
+                    relation_edges_for_entity(conn, &entity.id, direction, kind.as_deref())?
+                        .into_iter()
+                        .filter(|edge| edge.confidence <= confidence)
+                        .collect();
+                let total = edges.len();
+                let has_more = offset.saturating_add(limit) < total;
+                let next_cursor = has_more.then(|| (offset + limit).to_string());
+                let mut owner_meta: HashMap<String, crate::OwnerMeta> = HashMap::new();
+                let mut file_content: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+                // Memoized candidate visibility: candidate ids are raw
+                // qualname-encoding locators, so a briefing-blocked candidate
+                // would hand back exactly the identity the neighbor stub
+                // withholds. Only ids resolving to VISIBLE entities pass
+                // (entity_resolve collapses blocked candidates for the same
+                // reason); a lookup error fails closed.
+                let mut candidate_visible: HashMap<String, bool> = HashMap::new();
+                let mut relations = Vec::new();
+                for edge in edges.into_iter().skip(offset).take(limit) {
+                    let neighbor_id = match direction {
+                        ReferenceDirection::In => &edge.from_id,
+                        ReferenceDirection::Out => &edge.to_id,
+                    };
+                    let Some(neighbor) = entity_by_id(conn, neighbor_id)? else {
+                        continue;
+                    };
+                    // A blocked NEIGHBOR is stubbed by entity_json; the anchor
+                    // evidence (file, line text — which contains the blocked
+                    // declaration) must be withheld with it.
+                    let neighbor_blocked = crate::briefing_block_reason(&neighbor).is_some();
+                    let (file, anchor, byte_start, byte_end) = if neighbor_blocked {
+                        (
+                            Value::Null,
+                            crate::AnchorLine::redacted("briefing_blocked", true, Value::Null),
+                            Value::Null,
+                            Value::Null,
+                        )
+                    } else {
+                        // The anchor owner is the edge's own source-file row.
+                        let missing_owner = crate::OwnerMeta::missing();
+                        let owner = match edge.source_file_id.as_deref() {
+                            Some(file_id) => crate::resolve_owner(conn, &mut owner_meta, file_id)?,
+                            None => &missing_owner,
+                        };
+                        let anchor =
+                            crate::anchor_line(&mut file_content, owner, edge.source_byte_start);
+                        let file = if anchor.briefing_blocked {
+                            Value::Null
+                        } else {
+                            json!(owner.path.as_deref())
+                        };
+                        (
+                            file,
+                            anchor,
+                            json!(edge.source_byte_start),
+                            json!(edge.source_byte_end),
+                        )
+                    };
+                    let candidates: Vec<&String> = edge
+                        .candidates
+                        .iter()
+                        .filter(|cid| {
+                            *candidate_visible.entry((*cid).clone()).or_insert_with(|| {
+                                matches!(
+                                    entity_visibility(conn, cid),
+                                    Ok(EntityVisibility::Visible)
+                                )
+                            })
+                        })
+                        .collect();
+                    relations.push(json!({
+                        "kind": edge.kind,
+                        "entity": entity_json(conn, &neighbor),
+                        "edge_confidence": edge.confidence.as_str(),
+                        "candidates": candidates,
+                        "file": file,
+                        "line": anchor.line,
+                        "column": anchor.column,
+                        "line_text": anchor.line_text,
+                        "source_status": anchor.source_status,
+                        "briefing_blocked": anchor.briefing_blocked,
+                        "drift": anchor.drift,
+                        "byte_start": byte_start,
+                        "byte_end": byte_end,
+                    }));
+                }
+                Ok(success_envelope(json!({
+                    "entity": entity_json(conn, &entity),
+                    "direction": match direction {
+                        ReferenceDirection::In => "in",
+                        ReferenceDirection::Out => "out",
+                    },
+                    "filters": {
+                        "kind": kind,
+                        "confidence": confidence.as_str(),
+                    },
+                    "relations": relations,
+                    "next_cursor": next_cursor,
+                    "truncated": has_more,
                 })))
             })
             .await;
@@ -667,7 +994,14 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                build_call_sites(conn, &entity_id, role, kind, confidence, path)
+                // ADD an existence gate (clarion-d76e7f7267): `build_call_sites`
+                // takes a raw locator with no gate, so a pasted SEI would silently
+                // return EMPTY instead of EntityNotFound. Resolve the id-or-SEI to
+                // its locator first, then thread the canonical id into the builder.
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
+                    return Ok(None);
+                };
+                build_call_sites(conn, &entity.id, role, kind, confidence, path)
             })
             .await;
         match result {

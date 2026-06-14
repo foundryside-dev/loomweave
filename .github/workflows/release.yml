@@ -36,147 +36,40 @@ permissions:
   contents: read
 
 jobs:
-  verify:
-    # Pre-release gate: must mirror ci.yml so a broken commit cannot reach the
-    # build/publish jobs. Duplicated rather than refactored into a reusable
-    # workflow on the eve of 1.0; that refactor is post-release scope.
-    name: Verify (pre-release gates)
+  # Release-only precondition: a real release (tag push) must point at a commit
+  # on main. A workflow_dispatch dry-run may run from any branch (it can only
+  # ever publish to TestPyPI — see the publish-* job `if`), so this is gated on
+  # event_name == 'push'. Kept here, not in verify.yml: it is a release policy
+  # check, not a CI gate, so it does not belong in the shared workflow. On a
+  # dispatch run it is skipped, which leaves dependent build jobs unblocked
+  # (a skipped `needs` does not fail dependents). clarion-c9f62eec7d.
+  assert-on-main:
+    name: Assert tagged commit is on main
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
 
       - name: Assert tagged commit is on main
-        # Only gates real releases (tag pushes). A workflow_dispatch dry-run can
-        # publish solely to TestPyPI (see publish-* job `if`), so it is allowed
-        # to run from any branch — letting the publish workflow itself be
-        # iterated/validated before it is merged to main.
-        if: github.event_name == 'push'
         run: |
           git fetch origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || \
             { echo "::error::tag does not point to a commit on main"; exit 1; }
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          key: release-verify
-
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-        with:
-          python-version: "3.11"
-
-      - name: cache pyright runtime
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-        with:
-          path: ~/.cache/pyright-python/
-          key: pyright-python-1.1.409-${{ runner.os }}
-
-      - name: rust fmt
-        run: cargo fmt --all -- --check
-
-      - name: migration retirement guard
-        run: |
-          python scripts/check-migration-retirement.py --self-test
-          python scripts/check-migration-retirement.py
-
-      - name: cross-workspace version lockstep
-        run: python scripts/check-workspace-version-lockstep.py
-
-      - name: pyright pin lockstep
-        run: |
-          python scripts/check-pyright-pin-lockstep.py --self-test
-          python scripts/check-pyright-pin-lockstep.py
-
-      - name: wardline version bounds
-        run: |
-          python scripts/check-wardline-version-bounds.py --self-test
-          python scripts/check-wardline-version-bounds.py
-
-      - name: entity-cap ADR/code lockstep
-        run: |
-          python scripts/check-entity-cap-lockstep.py --self-test
-          python scripts/check-entity-cap-lockstep.py
-
-      - name: rust clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: install cargo-nextest
-        uses: taiki-e/install-action@e310bff3ef77234d477d6bb655da153a5c49d1db
-
-      - name: rust build workspace bins
-        run: cargo build --workspace --bins
-
-      - name: rust nextest
-        run: cargo nextest run --workspace --all-features --no-tests=pass
-
-      - name: rust doc
-        run: cargo doc --workspace --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-      - name: install cargo-deny
-        uses: taiki-e/install-action@2e721ffcfc34740897fc3130e2dd782b1c136896
-
-      - name: cargo deny
-        run: cargo deny check
-
-      - name: check Python ontology version lockstep
-        run: |
-          python scripts/check-python-ontology-version.py --self-test
-          python scripts/check-python-ontology-version.py
-
-      - name: install uv
-        run: python -m pip install uv==0.10.2
-
-      - name: sync plugin (locked dev extras)
-        run: uv sync --project plugins/python --locked --extra dev
-
-      - name: audit locked Python dependencies
-        run: |
-          uv export --project plugins/python --locked --extra dev --no-emit-project \
-            --format requirements.txt \
-            --output-file /tmp/loomweave-python-dev-requirements.txt
-          uv run --project plugins/python --extra dev pip-audit \
-            -r /tmp/loomweave-python-dev-requirements.txt
-
-      - name: check B.4*/B.5 performance gates
-        run: uv run --project plugins/python --extra dev python scripts/check-b4-gate-result.py --run-b5-smoke
-
-      - name: ruff check
-        run: uv run --project plugins/python --extra dev ruff check plugins/python
-
-      - name: ruff format check
-        run: uv run --project plugins/python --extra dev ruff format --check plugins/python
-
-      - name: mypy
-        run: uv run --project plugins/python --extra dev mypy --strict plugins/python
-
-      - name: pytest
-        run: uv run --project plugins/python --extra dev pytest plugins/python
-
-      - name: install sqlite3 cli
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3
-
-      - name: walking skeleton (end-to-end)
-        run: bash tests/e2e/sprint_1_walking_skeleton.sh
-
-      - name: WP5 secret scanner smoke
-        run: CARGO_BUILD=0 bash tests/e2e/wp5_secret_scan.sh
-
-      - name: Sprint 2 MCP surface
-        run: CARGO_BUILD=0 bash tests/e2e/sprint_2_mcp_surface.sh
-
-      - name: Phase 3 subsystems
-        run: CARGO_BUILD=0 bash tests/e2e/phase3_subsystems.sh
+  # The full pre-release gate set (Linux + macOS, Rust + Python + e2e). This is
+  # the SAME reusable workflow ci.yml calls, so the pre-release gate can no
+  # longer drift from CI — it is identical by construction. Replaces the
+  # previously-duplicated `verify` + `verify-macos` jobs (V11-CI-01,
+  # clarion-c9f62eec7d). A broken commit still cannot reach build/publish: the
+  # build jobs `needs` this job, which fails if any inner gate fails.
+  verify:
+    name: Verify (pre-release gates)
+    uses: ./.github/workflows/verify.yml
 
   build-rust:
-    needs: [verify]
+    needs: [verify, assert-on-main]
     name: Build loomweave (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -242,7 +135,7 @@ jobs:
           retention-days: 7
 
   build-wheels:
-    needs: [verify]
+    needs: [verify, assert-on-main]
     name: Build loomweave wheel (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     # maturin bin-wheels for PyPI. Matrix mirrors `build-rust` (Linux x86_64 +
@@ -293,7 +186,7 @@ jobs:
           retention-days: 7
 
   build-plugin:
-    needs: [verify]
+    needs: [verify, assert-on-main]
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
@@ -466,7 +359,7 @@ jobs:
           # whose `sign-blob` requires a bundle and breaks the
           # --output-signature/--output-certificate flow ("create bundle file:
           # open :"). v2.5.2 is the version that signed the last good release
-          # (Clarion v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
+          # (Loomweave v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
           # separate follow-up.
           cosign-release: 'v2.5.2'
 
@@ -586,7 +479,7 @@ jobs:
           # whose `sign-blob` requires a bundle and breaks the
           # --output-signature/--output-certificate flow ("create bundle file:
           # open :"). v2.5.2 is the version that signed the last good release
-          # (Clarion v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
+          # (Loomweave v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
           # separate follow-up.
           cosign-release: 'v2.5.2'
 

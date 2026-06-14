@@ -176,7 +176,7 @@ fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
 
     // Cleanup guard: if writing the staged files fails, remove the staging dir
     // before bubbling the error so we don't leak a `.loomweave-workflow.tmp-*`
-    // sibling. Matches the partial-state-cleanup precedent on the `.loomweave/`
+    // sibling. Matches the partial-state-cleanup precedent on the `.weft/loomweave/`
     // path in install.rs. The original error is preserved.
     if let Err(err) = write_staged_pack(&staging, fingerprint) {
         let _ = fs::remove_dir_all(&staging);

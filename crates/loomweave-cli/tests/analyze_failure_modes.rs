@@ -479,7 +479,7 @@ fn analyze_defers_cross_file_edges_until_target_entity_batch_arrives() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -557,7 +557,7 @@ fn analyze_promotes_run_to_hard_failed_when_writer_actor_fails_mid_run() {
         "stderr should mention failure; got: {stderr}"
     );
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
 
     // (1) Run row marked failed.
     let (run_status, run_stats_raw): (String, String) = conn
@@ -659,7 +659,7 @@ fn analyze_persists_completed_file_batches_when_plugin_later_crashes() {
         .assert()
         .failure();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (run_status, run_stats_raw): (String, String) = conn
         .query_row(
             "SELECT status, stats FROM runs ORDER BY started_at DESC LIMIT 1",

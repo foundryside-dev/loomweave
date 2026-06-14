@@ -2,7 +2,7 @@
 
 Loomweave Phase 3 runs after plugin entity and edge extraction. It reads the
 persisted module dependency graph, clusters modules, and writes subsystem
-entities plus `in_subsystem` edges back into `.loomweave/loomweave.db`.
+entities plus `in_subsystem` edges back into `.weft/loomweave/loomweave.db`.
 
 ## Configuration
 

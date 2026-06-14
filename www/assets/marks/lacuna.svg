@@ -1,0 +1,7 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lacuna (demonstration specimen)">
+  
+  <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M19 6 H25 A1 1 0 0 1 26 7 V25 A1 1 0 0 1 25 26 H7 A1 1 0 0 1 6 25 V7 A1 1 0 0 1 7 6 H13" stroke-dasharray="2.6 3"></path>
+  </g>
+  <rect x="13.4" y="13.4" width="5.2" height="5.2" rx="1" fill="currentColor"></rect>
+</svg>

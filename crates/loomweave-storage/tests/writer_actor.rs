@@ -1391,6 +1391,111 @@ async fn insert_finding_is_idempotent_on_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_stale_findings_retires_only_unreproduced_open_unlinked_rows() {
+    // ADR-048 / clarion-87c1eba2bd: the command round-trips through the
+    // query-time-write path (no active run) and returns the deleted count. Two
+    // findings are written under run-1; run-2 re-emits only one (so its run_id
+    // refreshes to run-2). Sweeping at run-2 must retire exactly the finding
+    // run-2 stopped reproducing and leave the reproduced one.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let finding = |id: &str, run_id: &str| FindingRecord {
+        id: id.to_owned(),
+        tool: "loomweave".to_owned(),
+        tool_version: "1.0.0".to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: "LMWV-TEST-RULE".to_owned(),
+        kind: "defect".to_owned(),
+        severity: "WARN".to_owned(),
+        confidence: None,
+        confidence_basis: None,
+        entity_id: "python:module:demo".to_owned(),
+        related_entities_json: "[]".to_owned(),
+        message: "m".to_owned(),
+        evidence_json: "[]".to_owned(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+
+    // run-1: both findings present.
+    begin_demo_run(&tx, "run-1").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_module_entity("python:module:demo")),
+        ack,
+    })
+    .await
+    .unwrap();
+    for id in ["core:finding:reproduced", "core:finding:vanished"] {
+        send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+            finding: Box::new(finding(id, "run-1")),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-1".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // run-2 (fresh): re-emit only `reproduced` — its run_id upserts to run-2.
+    begin_demo_run(&tx, "run-2").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+        finding: Box::new(finding("core:finding:reproduced", "run-2")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-2".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // Sweep at run-2: query-time write, no active run.
+    let deleted = send::<usize>(&tx, |ack| WriterCmd::SweepStaleFindings {
+        current_run_id: "run-2".into(),
+        ack,
+    })
+    .await
+    .expect("sweep command must round-trip without an active run");
+    assert_eq!(deleted, 1, "exactly the un-reproduced finding is retired");
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let surviving: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM findings ORDER BY id").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        surviving,
+        ["core:finding:reproduced"],
+        "the reproduced finding survives; the vanished one is swept"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn entity_source_file_id_rejects_non_source_anchor_entity() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);
@@ -3268,5 +3373,180 @@ async fn channel_close_with_open_run_self_heals_to_failed() {
     assert_eq!(
         entity_count, 0,
         "pending insert must be rolled back when channel closes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_run_truncates_wal_while_writer_still_alive() {
+    // clarion-cdee445ed8: ADR-005 commits `.weft/loomweave/loomweave.db`, so a finished
+    // analyze must leave the on-disk file a whole, committable snapshot WITHOUT
+    // waiting for the process to exit. `CommitRun` now issues an explicit
+    // `wal_checkpoint(TRUNCATE)`. We assert the WAL is reset to 0 bytes with the
+    // writer STILL ALIVE — proving it is the post-commit checkpoint, not SQLite's
+    // last-connection-close cleanup (which would only fire after the drop below).
+    //
+    // Scope note: `CommitRun` is reached only at the end of an analyze run, never
+    // by serve's summary-write path, so there is no per-write checkpoint cost. And
+    // while a long-lived serve holds reader connections open the TRUNCATE is
+    // best-effort (a reader can hold it back, harmlessly); `loomweave db backup`
+    // remains the way to capture a consistent committable copy mid-serve.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let wal_path = dir.path().join("loomweave.db-wal");
+
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+    begin_demo_run(&tx, "run-wal").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-wal".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    // Writer is STILL ALIVE here (tx/writer not dropped): the only thing that
+    // could have emptied the WAL is the explicit post-CommitRun checkpoint.
+    let wal_after_commit = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+    assert_eq!(
+        wal_after_commit, 0,
+        "CommitRun must TRUNCATE-checkpoint the WAL to 0 bytes while the writer is \
+         still alive, so the committed loomweave.db is whole on disk; got {wal_after_commit}"
+    );
+
+    // Clean shutdown still succeeds (and the actor task joins without error).
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+    let wal_after_shutdown = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+    assert_eq!(
+        wal_after_shutdown, 0,
+        "WAL must remain truncated after shutdown; got {wal_after_shutdown}"
+    );
+}
+
+fn make_derives_edge(from_id: &str, to_id: &str, confidence: EdgeConfidence) -> EdgeRecord {
+    EdgeRecord {
+        kind: "derives".to_owned(),
+        from_id: from_id.to_owned(),
+        to_id: to_id.to_owned(),
+        confidence,
+        properties_json: None,
+        source_file_id: None,
+        source_byte_start: Some(3),
+        source_byte_end: Some(9),
+    }
+}
+
+/// `derives` is the 10th ontology kind (Phase 2, plan 2026-06-10): anchored,
+/// scan-time resolved/ambiguous, same contract as `implements`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_derives_resolved_confidence_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-derives-resolved").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_derives_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Resolved,
+        )),
+        ack,
+    })
+    .await
+    .expect("derives is an ontology-defined anchored kind; writer must accept it");
+
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-derives-resolved".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let pool = ReaderPool::open(&path, 1).unwrap();
+    let count: i64 = pool
+        .with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE kind = 'derives'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+/// `derives` is anchored: scan-time inferred confidence must be rejected,
+/// exactly like calls/references/imports/implements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchored_derives_inferred_confidence_rejected_at_scan_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-derives-inferred").await;
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    let err = send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_derives_edge(
+            "python:function:demo.caller",
+            "python:function:demo.callee",
+            EdgeConfidence::Inferred,
+        )),
+        ack,
+    })
+    .await
+    .expect_err("scan-time inferred derives edge must be rejected");
+    assert!(
+        format!("{err:?}").contains("LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT"),
+        "expected LMWV-INFRA-EDGE-CONFIDENCE-CONTRACT in error; got {err:?}"
+    );
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+/// Lockstep: every edge kind the Rust plugin manifest declares must be a kind
+/// the writer accepts (the Python-plugin analogue lives above).
+#[test]
+fn rust_plugin_edge_kinds_are_accepted_by_writer_contract() {
+    let manifest =
+        loomweave_core::parse_manifest(include_bytes!("../../loomweave-plugin-rust/plugin.toml"))
+            .expect("production Rust plugin manifest should parse");
+    let writer_kinds: std::collections::BTreeSet<&'static str> =
+        loomweave_storage::known_scan_time_edge_kinds().collect();
+    let missing: Vec<&str> = manifest
+        .ontology
+        .edge_kinds
+        .iter()
+        .map(String::as_str)
+        .filter(|kind| !writer_kinds.contains(kind))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "Rust plugin declares edge kind(s) the writer rejects: {missing:?}; \
+         writer accepts {writer_kinds:?}"
     );
 }

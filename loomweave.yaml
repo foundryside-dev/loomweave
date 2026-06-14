@@ -1,10 +1,10 @@
 integrations:
   filigree:
     actor: loomweave-mcp
-    base_url: http://127.0.0.1:8542
+    base_url: http://127.0.0.1:8629
     enabled: true
     timeout_seconds: 5
-    token_env: FILIGREE_API_TOKEN
+    token_env: WEFT_FEDERATION_TOKEN
 llm_policy:
   allow_live_provider: false
   cache_max_age_days: 180
@@ -36,7 +36,6 @@ llm_policy:
   session_token_ceiling: 1000000
 serve:
   http:
-    bind: 127.0.0.1:9111
     enabled: true
     wardline_taint_write: true
 version: 1

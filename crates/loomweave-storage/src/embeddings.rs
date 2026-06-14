@@ -1,8 +1,8 @@
-//! Git-ignored embeddings sidecar (`.loomweave/embeddings.db`) for `WS5b` semantic
-//! search (ADR-040).
+//! Git-ignored embeddings sidecar (`.weft/loomweave/embeddings.db`) for `WS5b`
+//! semantic search (ADR-040).
 //!
 //! Embeddings are large and rebuildable, so they must **not** bloat the
-//! committed `.loomweave/loomweave.db` (ADR-005). They live in a separate `SQLite`
+//! committed `.weft/loomweave/loomweave.db` (ADR-005). They live in a separate `SQLite`
 //! file, keyed by `(entity_id, content_hash, model_id)` so they invalidate on
 //! content change exactly like the summary cache. Because the file is a private,
 //! rebuildable cache (git-ignored), it carries its own self-contained schema
@@ -51,10 +51,10 @@ pub struct EmbeddingStore {
     conn: Connection,
 }
 
-/// The conventional sidecar path for a project: `<root>/.loomweave/embeddings.db`.
+/// The conventional sidecar path for a project: `<root>/.weft/loomweave/embeddings.db`.
 #[must_use]
 pub fn embeddings_db_path(project_root: &Path) -> PathBuf {
-    project_root.join(".loomweave").join("embeddings.db")
+    loomweave_core::store::store_dir(project_root).join("embeddings.db")
 }
 
 impl EmbeddingStore {
@@ -67,8 +67,8 @@ impl EmbeddingStore {
         Ok(Self { conn })
     }
 
-    /// Open the conventional `<root>/.loomweave/embeddings.db` sidecar.
-    pub fn open_in_loomweave_dir(project_root: &Path) -> Result<Self> {
+    /// Open the conventional `<root>/.weft/loomweave/embeddings.db` sidecar.
+    pub fn open_in_store_dir(project_root: &Path) -> Result<Self> {
         Self::open(&embeddings_db_path(project_root))
     }
 

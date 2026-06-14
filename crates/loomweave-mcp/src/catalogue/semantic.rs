@@ -4,7 +4,7 @@
 //! or no provider is configured, the tool returns an explicit "not enabled"
 //! result — never a faked or empty-as-if-complete answer. When enabled it embeds
 //! the query, runs a **bounded exact cosine scan** over the git-ignored sidecar
-//! (`.loomweave/embeddings.db`), and returns ranked, SEI-carrying entities. Only
+//! (`.weft/loomweave/embeddings.db`), and returns ranked, SEI-carrying entities. Only
 //! embeddings whose `content_hash` matches the entity's current hash are
 //! considered, so stale vectors never surface (freshness, like the summary
 //! cache).
@@ -54,7 +54,9 @@ impl ServerState {
                 "signal": missing_signal(
                     "semantic_search",
                     "semantic search is not enabled (semantic_search.enabled=false) or no embedding \
-                     provider is configured; enable it and run analyze to build embeddings",
+                     provider is configured; enable it and run analyze to build embeddings. For \
+                     keyword discovery without embeddings, use entity_find — it matches name, \
+                     summary, and docstring content by substring (no opt-in required)",
                 ),
             })));
         };

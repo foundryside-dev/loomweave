@@ -10,6 +10,7 @@ mod hooks_settings;
 mod http_read;
 mod install;
 mod instance;
+mod instructions;
 mod integration_bindings;
 mod mcp_registration;
 mod run_lifecycle;
@@ -19,7 +20,6 @@ mod sei_git;
 mod serve;
 mod skill_pack;
 mod stats;
-mod wardline_guidance;
 
 use anyhow::Result;
 use clap::Parser;
@@ -42,6 +42,7 @@ fn main() -> Result<()> {
             skills,
             codex_skills,
             hooks,
+            instructions,
             all,
         } => {
             let mut components = Vec::new();
@@ -59,6 +60,9 @@ fn main() -> Result<()> {
             }
             if hooks {
                 components.push(install::InstallComponent::Hooks);
+            }
+            if instructions {
+                components.push(install::InstallComponent::Instructions);
             }
             install::run(
                 &path,
@@ -118,8 +122,10 @@ fn main() -> Result<()> {
                 path,
                 force,
             } => db::backup(&path, &output, force),
+            cli::DbCommand::Checkpoint { path } => db::checkpoint(&path),
         },
         cli::Command::Guidance { command } => guidance::run(command),
+        cli::Command::Config { command } => config::run(command),
         cli::Command::Doctor { path, fix, format } => {
             // doctor prints its own report; map an unhealthy result to a
             // non-zero exit so it can gate CI / pre-commit. The Result<()> arm

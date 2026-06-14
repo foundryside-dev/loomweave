@@ -19,3 +19,12 @@ repos:
         args: [--strict, --config-file=plugins/python/pyproject.toml, plugins/python]
         additional_dependencies:
           - pytest>=8.0
+  - repo: local
+    hooks:
+      - id: wardline-scan
+        name: wardline scan
+        entry: wardline scan
+        language: system
+        types: [python]
+        pass_filenames: false
+

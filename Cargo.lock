@@ -1057,7 +1057,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "loomweave-analysis"
-version = "1.0.0"
+version = "1.1.0-rc5"
 dependencies = [
  "anyhow",
  "serde",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "loomweave-cli"
-version = "1.0.0"
+version = "1.1.0-rc5"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1106,9 +1106,10 @@ dependencies = [
 
 [[package]]
 name = "loomweave-core"
-version = "1.0.0"
+version = "1.1.0-rc5"
 dependencies = [
  "async-trait",
+ "fs2",
  "nix",
  "reqwest",
  "serde",
@@ -1123,8 +1124,9 @@ dependencies = [
 
 [[package]]
 name = "loomweave-federation"
-version = "1.0.0"
+version = "1.1.0-rc5"
 dependencies = [
+ "blake3",
  "loomweave-core",
  "reqwest",
  "serde",
@@ -1136,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "loomweave-mcp"
-version = "1.0.0"
+version = "1.1.0-rc5"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1159,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "loomweave-plugin-fixture"
-version = "1.0.0"
+version = "1.1.0-rc5"
 dependencies = [
  "loomweave-core",
  "nix",
@@ -1167,8 +1169,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "loomweave-plugin-rust"
+version = "1.1.0-rc5"
+dependencies = [
+ "loomweave-core",
+ "proc-macro2",
+ "quote",
+ "rusqlite",
+ "serde_json",
+ "syn",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "loomweave-scanner"
-version = "1.0.0"
+version = "1.1.0-rc5"
 dependencies = [
  "regex",
  "serde",
@@ -1180,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "loomweave-storage"
-version = "1.0.0"
+version = "1.1.0-rc5"
 dependencies = [
  "blake3",
  "deadpool-sqlite",

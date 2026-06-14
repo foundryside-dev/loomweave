@@ -17,10 +17,13 @@ pub fn run_import(file: &Path, scan_source_opt: Option<String>, project_path: &P
     // Load MCP config
     let mcp_config = crate::analyze::load_mcp_config(&project_root, None);
 
-    // Build Filigree HTTP client
-    let client = FiligreeHttpClient::from_config(&mcp_config.integrations.filigree, |name| {
-        std::env::var(name).ok()
-    })
+    // Build Filigree HTTP client (project root in: token resolution falls back to
+    // the daemon's auto-minted .weft/filigree/federation_token, dogfood-4 A5)
+    let client = FiligreeHttpClient::from_config_with_project_root(
+        &mcp_config.integrations.filigree,
+        |name| std::env::var(name).ok(),
+        Some(&project_root),
+    )
     .context("build Filigree HTTP client")?
     .ok_or_else(|| anyhow!("Filigree integration is disabled in loomweave.yaml"))?;
 

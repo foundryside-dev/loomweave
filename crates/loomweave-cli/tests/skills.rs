@@ -37,10 +37,10 @@ fn install_skills_writes_claude_pack_without_initialising_loomweave_dir() {
             .exists(),
         "--skills should not install Codex skills under .agents"
     );
-    // --skills MUST NOT init .loomweave/.
+    // --skills MUST NOT init .weft/loomweave/.
     assert!(
-        !dir.path().join(".loomweave").exists(),
-        "--skills should not create .loomweave/"
+        !dir.path().join(".weft/loomweave").exists(),
+        "--skills should not create .weft/loomweave/"
     );
 }
 
@@ -66,8 +66,28 @@ fn install_codex_skills_writes_agents_pack_without_initialising_loomweave_dir() 
         "Codex skill not installed under .agents"
     );
     assert!(
-        !dir.path().join(".loomweave").exists(),
-        "--codex-skills should not create .loomweave/"
+        !dir.path().join(".weft/loomweave").exists(),
+        "--codex-skills should not create .weft/loomweave/"
+    );
+}
+
+#[test]
+fn repo_installed_skill_copy_matches_embedded_template() {
+    // The repo's own `.agents/skills/` copy is tracked, and `loomweave install`
+    // overwrites it from the embedded template on every run. If the two drift
+    // (someone edits the installed copy without updating the asset, or vice
+    // versa), each reinstall silently reverts the doc change — so pin them.
+    let template = include_str!("../../loomweave-mcp/assets/skills/loomweave-workflow/SKILL.md");
+    let repo_copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.agents/skills/loomweave-workflow/SKILL.md");
+    let body = fs::read_to_string(&repo_copy).expect("repo .agents skill copy");
+    assert_eq!(
+        body,
+        template,
+        "{} has drifted from the embedded template at \
+         crates/loomweave-mcp/assets/skills/loomweave-workflow/SKILL.md — \
+         edit the asset (the canonical source) and re-run `loomweave install`",
+        repo_copy.display()
     );
 }
 
@@ -124,7 +144,7 @@ fn install_hooks_merges_session_start_without_clobbering() {
         cmds.iter()
             .any(|c| c.contains("loomweave hook session-start"))
     );
-    assert!(!dir.path().join(".loomweave").exists());
+    assert!(!dir.path().join(".weft/loomweave").exists());
 }
 
 #[test]
@@ -136,7 +156,10 @@ fn install_all_does_init_skills_and_hooks() {
         .assert()
         .success();
 
-    assert!(dir.path().join(".loomweave/loomweave.db").exists(), "no db");
+    assert!(
+        dir.path().join(".weft/loomweave/loomweave.db").exists(),
+        "no db"
+    );
     assert!(
         dir.path()
             .join(".claude/skills/loomweave-workflow/SKILL.md")
@@ -170,7 +193,7 @@ fn install_all_is_rerunnable_and_preserves_index() {
         .arg(dir.path())
         .assert()
         .success();
-    let db = dir.path().join(".loomweave/loomweave.db");
+    let db = dir.path().join(".weft/loomweave/loomweave.db");
     assert!(db.exists(), "first --all did not create db");
     // Mark the db so we can prove the second run did NOT recreate it.
     let before = std::fs::metadata(&db).unwrap().modified().unwrap();

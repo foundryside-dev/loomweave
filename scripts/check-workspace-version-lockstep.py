@@ -51,8 +51,52 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CARGO_TOML = REPO_ROOT / "Cargo.toml"
 PLUGIN_PYPROJECT_TOML = REPO_ROOT / "plugins/python/pyproject.toml"
 CLI_PYPROJECT_TOML = REPO_ROOT / "crates/loomweave-cli/pyproject.toml"
+RUST_PLUGIN_PYPROJECT_TOML = REPO_ROOT / "packaging/rust-plugin-dist/pyproject.toml"
 
 PLUGIN_PACKAGE = "loomweave-plugin-python"
+RUST_PLUGIN_PACKAGE = "loomweave-plugin-rust"
+
+
+def check_rust_wheel_lockstep(
+    cargo: dict[str, Any],
+    cli_pyproject: dict[str, Any],
+    rust_plugin_pyproject: dict[str, Any],
+) -> list[str]:
+    """Drift errors for the Rust plugin wheel (mirror of the Python checks).
+
+    The `loomweave` wheel pins `loomweave-plugin-rust==<v>`; if the Rust plugin
+    wheel's own version drifts from that pin (or the workspace), `pip install`
+    fails to resolve on first release — the same hazard this guard closes for
+    the Python plugin.
+    """
+    errors: list[str] = []
+    try:
+        rust_norm = _normalize(_dig(cargo, "workspace", "package", "version"))
+    except _Missing as missing:
+        return [f"Cargo.toml key {missing} not found"]
+
+    try:
+        wheel_version = _dig(rust_plugin_pyproject, "project", "version")
+        if _normalize(wheel_version) != rust_norm:
+            errors.append(
+                f"loomweave-plugin-rust wheel version {wheel_version!r} != "
+                f"workspace {rust_norm!r}"
+            )
+    except _Missing as missing:
+        errors.append(f"packaging/rust-plugin-dist/pyproject.toml key {missing} not found")
+
+    try:
+        pin = _pinned_version(_dig(cli_pyproject, "project", "dependencies"), RUST_PLUGIN_PACKAGE)
+        if pin is None:
+            errors.append(f"loomweave-cli pyproject does not pin {RUST_PLUGIN_PACKAGE}==<version>")
+        elif _normalize(pin) != rust_norm:
+            errors.append(
+                f"loomweave-cli pins {RUST_PLUGIN_PACKAGE}=={pin} != workspace {rust_norm!r}"
+            )
+    except _Missing as missing:
+        errors.append(f"crates/loomweave-cli/pyproject.toml key {missing} not found")
+
+    return errors
 
 
 class _Missing(Exception):
@@ -73,6 +117,19 @@ def _dig(data: dict[str, Any], *keys: str) -> Any:
             raise _Missing(".".join(keys))
         cursor = cursor[key]
     return cursor
+
+
+def _normalize(version: str) -> str:
+    """Normalize a version string for cross-ecosystem comparison.
+
+    Cargo requires SemVer prerelease syntax (`1.1.0-rc1`) while the Python
+    packages (maturin/hatchling wheels) use PEP 440 (`1.1.0rc1`). The only `-`
+    in a valid workspace SemVer string is the prerelease separator, so stripping
+    hyphens maps the Cargo form onto the PEP 440 form. A no-op on final releases
+    like `1.0.0`, so the strict-equality policy is preserved for non-prerelease
+    versions.
+    """
+    return version.replace("-", "")
 
 
 def _pinned_version(dependencies: Any, package: str) -> str | None:
@@ -105,10 +162,13 @@ def check_lockstep(
     except _Missing as missing:
         # Without the anchor version there is nothing to compare against.
         return [f"Cargo.toml key {missing} not found"]
+    # Compare against the PEP 440 form: the Cargo SemVer `1.1.0-rc1` and the
+    # wheel `1.1.0rc1` are the same product version (see `_normalize`).
+    rust_norm = _normalize(rust_version)
 
     try:
         plugin_version = _dig(plugin_pyproject, "project", "version")
-        if plugin_version != rust_version:
+        if _normalize(plugin_version) != rust_norm:
             errors.append(
                 f"plugin version {plugin_version!r} != workspace {rust_version!r}"
             )
@@ -117,7 +177,7 @@ def check_lockstep(
 
     try:
         cli_version = _dig(cli_pyproject, "project", "version")
-        if cli_version != rust_version:
+        if _normalize(cli_version) != rust_norm:
             errors.append(
                 f"loomweave-cli version {cli_version!r} != workspace {rust_version!r}"
             )
@@ -131,7 +191,7 @@ def check_lockstep(
             errors.append(
                 f"loomweave-cli pyproject does not pin {PLUGIN_PACKAGE}==<version>"
             )
-        elif pin != rust_version:
+        elif _normalize(pin) != rust_norm:
             errors.append(
                 f"loomweave-cli pins {PLUGIN_PACKAGE}=={pin} != workspace {rust_version!r}"
             )
@@ -143,7 +203,8 @@ def check_lockstep(
 
 def _self_test() -> int:
     """Exercise check_lockstep against in-memory fixtures."""
-    cargo = tomllib.loads('[workspace.package]\nversion = "1.0.0"\n')
+    def cargo_at(version: str) -> dict[str, Any]:
+        return tomllib.loads(f'[workspace.package]\nversion = "{version}"\n')
 
     def plugin(version: str) -> dict[str, Any]:
         return tomllib.loads(
@@ -156,33 +217,81 @@ def _self_test() -> int:
         )
 
     good_deps = 'dependencies = ["loomweave-plugin-python==1.0.0"]'
-    cases: list[tuple[str, dict[str, Any], dict[str, Any], bool]] = [
-        ("aligned", plugin("1.0.0"), cli("1.0.0", good_deps), True),
-        ("plugin version drift", plugin("1.0.1"), cli("1.0.0", good_deps), False),
-        ("cli version drift", plugin("1.0.0"), cli("0.9.0", good_deps), False),
+    rc_deps = 'dependencies = ["loomweave-plugin-python==1.1.0rc1"]'
+    final = cargo_at("1.0.0")
+    # Prerelease: the Cargo SemVer `1.1.0-rc1` and the PEP 440 wheel `1.1.0rc1`
+    # name the same product version and must read as aligned (see `_normalize`).
+    rc = cargo_at("1.1.0-rc1")
+    cases: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], bool]] = [
+        ("aligned", final, plugin("1.0.0"), cli("1.0.0", good_deps), True),
+        ("plugin version drift", final, plugin("1.0.1"), cli("1.0.0", good_deps), False),
+        ("cli version drift", final, plugin("1.0.0"), cli("0.9.0", good_deps), False),
         (
             "cli pin drift",
+            final,
             plugin("1.0.0"),
             cli("1.0.0", 'dependencies = ["loomweave-plugin-python==0.9.0"]'),
             False,
         ),
         (
             "cli pin absent",
+            final,
             plugin("1.0.0"),
             cli("1.0.0", 'dependencies = ["something-else>=1"]'),
             False,
         ),
         (
             "cli pin unpinned (>=)",
+            final,
             plugin("1.0.0"),
             cli("1.0.0", 'dependencies = ["loomweave-plugin-python>=1.0.0"]'),
             False,
         ),
+        # Cross-ecosystem prerelease normalization.
+        ("rc aligned", rc, plugin("1.1.0rc1"), cli("1.1.0rc1", rc_deps), True),
+        ("rc plugin drift", rc, plugin("1.1.0rc2"), cli("1.1.0rc1", rc_deps), False),
+        ("rc pin drift", rc, plugin("1.1.0rc1"), cli("1.1.0rc1", good_deps), False),
     ]
 
     failures = 0
-    for name, plugin_py, cli_py, expect_ok in cases:
+    for name, cargo, plugin_py, cli_py, expect_ok in cases:
         errors = check_lockstep(cargo, plugin_py, cli_py)
+        actual_ok = not errors
+        if actual_ok != expect_ok:
+            failures += 1
+            print(
+                f"  SELF-TEST FAIL [{name}]: expected ok={expect_ok}, got {errors!r}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  self-test ok [{name}]")
+
+    # Rust wheel lockstep (separate function).
+    def rust_cli(deps: str) -> dict[str, Any]:
+        return tomllib.loads(f'[project]\nname = "loomweave"\n{deps}\n')
+
+    def rust_wheel(version: str) -> dict[str, Any]:
+        return tomllib.loads(
+            f'[project]\nname = "loomweave-plugin-rust"\nversion = "{version}"\n'
+        )
+
+    rc_both = (
+        'dependencies = ["loomweave-plugin-python==1.1.0rc1", '
+        '"loomweave-plugin-rust==1.1.0rc1"]'
+    )
+    rust_cases: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], bool]] = [
+        ("rust aligned", rc, rust_cli(rc_both), rust_wheel("1.1.0rc1"), True),
+        ("rust wheel drift", rc, rust_cli(rc_both), rust_wheel("1.1.0rc2"), False),
+        (
+            "rust pin absent",
+            rc,
+            rust_cli('dependencies = ["loomweave-plugin-python==1.1.0rc1"]'),
+            rust_wheel("1.1.0rc1"),
+            False,
+        ),
+    ]
+    for name, cargo, cli_py, rust_py, expect_ok in rust_cases:
+        errors = check_rust_wheel_lockstep(cargo, cli_py, rust_py)
         actual_ok = not errors
         if actual_ok != expect_ok:
             failures += 1
@@ -210,8 +319,10 @@ def main(argv: list[str]) -> int:
     cargo = _read_toml(CARGO_TOML)
     plugin_pyproject = _read_toml(PLUGIN_PYPROJECT_TOML)
     cli_pyproject = _read_toml(CLI_PYPROJECT_TOML)
+    rust_plugin_pyproject = _read_toml(RUST_PLUGIN_PYPROJECT_TOML)
 
     errors = check_lockstep(cargo, plugin_pyproject, cli_pyproject)
+    errors += check_rust_wheel_lockstep(cargo, cli_pyproject, rust_plugin_pyproject)
     if errors:
         print("check-workspace-version-lockstep: drift detected", file=sys.stderr)
         for error in errors:

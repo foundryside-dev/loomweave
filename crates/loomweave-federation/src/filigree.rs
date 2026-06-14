@@ -17,6 +17,9 @@ use crate::scan_results::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EntityAssociationsResponse {
+    /// `default` so an absent/empty envelope key degrades to an empty list
+    /// (enrich-only) rather than hard-failing the whole entity issue-list read.
+    #[serde(default)]
     pub associations: Vec<EntityAssociation>,
 }
 
@@ -27,6 +30,13 @@ pub struct EntityAssociationsResponse {
 /// without breaking this read.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct IssueDetail {
+    /// The Filigree issue id, carried INSIDE the stub so a consumer acting on
+    /// a matched row has the complete (id, title, status) tuple in one place
+    /// (weft-4a46553503 / dogfood-4 B9). Deserializes from the route's
+    /// `issue_id` field; `default` keeps the read enrich-only against an older
+    /// server that omits it (the caller backfills from the association row).
+    #[serde(alias = "issue_id", default)]
+    pub id: String,
     pub title: String,
     pub status: String,
     pub priority: i64,
@@ -75,9 +85,24 @@ pub struct EntityAssociation {
     /// Opaque Loomweave association key as stored by Filigree. New bindings use
     /// the entity's SEI (`loomweave:eid:*`); legacy rows may still carry the
     /// mutable locator (`{plugin}:{kind}:{qualname}`).
+    ///
+    /// `alias = "clarion_entity_id"` tolerates the pre-v26 producer field name
+    /// (Filigree renamed `clarion_entity_id` → `loomweave_entity_id` in schema
+    /// v26 / 3.0.0 with no compat alias), so a pre-v26 server or JSONL export
+    /// still deserializes. We deliberately do NOT alias the co-emitted canonical
+    /// `entity_id`: the live producer emits BOTH keys with identical values, and
+    /// serde rejects the duplicate field slot — aliasing `entity_id` would
+    /// hard-fail against the current server. `clarion_entity_id` is safe because
+    /// it is never co-emitted alongside `loomweave_entity_id`.
+    #[serde(alias = "clarion_entity_id")]
     pub loomweave_entity_id: String,
     pub content_hash_at_attach: String,
+    /// `default`: display-only enrichment (never routing/drift logic), so its
+    /// absence degrades to an empty string instead of failing the read.
+    #[serde(default)]
     pub attached_at: String,
+    /// `default`: display-only actor identity; absence degrades, never fails.
+    #[serde(default)]
     pub attached_by: String,
 }
 
@@ -269,6 +294,22 @@ pub trait FiligreeLookup: Send + Sync {
     }
 }
 
+/// Read the per-project federation token the Filigree daemon auto-mints at
+/// `<root>/.weft/filigree/federation_token` on first serve (its inbound
+/// resolver's tier 2; mirrored by wardline's credential loader). The file is
+/// loopback deconfliction plumbing, not a secret — absence or unreadability
+/// just means the rung resolves to None and auth stays off.
+fn read_minted_federation_token(root: &Path) -> Option<String> {
+    let path = root.join(".weft").join("filigree").join("federation_token");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let token = raw.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_owned())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FiligreeHttpClient {
     base_url: String,
@@ -304,7 +345,18 @@ impl FiligreeHttpClient {
             .timeout(Duration::from_secs(config.timeout_seconds.max(1)))
             .build()
             .map_err(FiligreeClientError::Build)?;
-        let token = env_lookup(&config.token_env).filter(|value| !value.trim().is_empty());
+        // Resolve the configured env var (default `WEFT_FEDERATION_TOKEN`) first;
+        // fall back to the legacy `FILIGREE_API_TOKEN` name so a pre-rename global
+        // export keeps working during the transition (deprecated — remove once
+        // operators have migrated to the Weft-prefixed name); finally fall back to
+        // the token file the Filigree daemon auto-mints in the project store. That
+        // last rung is the same-host zero-ceremony default (C-9e): the MCP server
+        // is typically launched with an empty env, so without it every weft-gated
+        // read (the wardline-findings joins) 401s — dogfood-4 A5.
+        let token = env_lookup(&config.token_env)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| env_lookup("FILIGREE_API_TOKEN").filter(|value| !value.trim().is_empty()))
+            .or_else(|| project_root.and_then(read_minted_federation_token));
         Ok(Some(Self {
             base_url: config.base_url.clone(),
             actor: config.actor.clone(),
@@ -853,6 +905,146 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    fn canonical_entity_association_fixture_body(example_name: &str) -> serde_json::Value {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/federation/fixtures/filigree-entity-associations-response.json"
+        ))
+        .expect("parse canonical Filigree EntityAssociation fixture");
+        fixture
+            .get("examples")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|examples| {
+                examples.iter().find(|example| {
+                    example.get("name").and_then(serde_json::Value::as_str) == Some(example_name)
+                })
+            })
+            .and_then(|example| example.pointer("/response/body"))
+            .cloned()
+            .unwrap_or_else(|| panic!("missing fixture example body {example_name}"))
+    }
+
+    /// Minimal enabled config; `from_config` does not connect until a request is
+    /// issued, so no server is needed to exercise token resolution.
+    fn token_resolution_config() -> FiligreeConfig {
+        FiligreeConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:1".to_owned(),
+            actor: "loomweave-test".to_owned(),
+            token_env: "WEFT_FEDERATION_TOKEN".to_owned(),
+            timeout_seconds: 1,
+            emit_findings: false,
+            prune_unseen_days: 30,
+        }
+    }
+
+    fn resolved_token(env: &[(&str, &str)]) -> Option<String> {
+        let config = token_resolution_config();
+        FiligreeHttpClient::from_config(&config, |name| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+        .expect("build client")
+        .expect("enabled client")
+        .token
+    }
+
+    #[test]
+    fn token_resolution_prefers_configured_env_var() {
+        assert_eq!(
+            resolved_token(&[("WEFT_FEDERATION_TOKEN", "new-secret")]),
+            Some("new-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_falls_back_to_legacy_filigree_api_token() {
+        // Pre-rename global export still works during the transition.
+        assert_eq!(
+            resolved_token(&[("FILIGREE_API_TOKEN", "legacy-secret")]),
+            Some("legacy-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_configured_var_wins_over_legacy_fallback() {
+        assert_eq!(
+            resolved_token(&[
+                ("WEFT_FEDERATION_TOKEN", "new-secret"),
+                ("FILIGREE_API_TOKEN", "legacy-secret"),
+            ]),
+            Some("new-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_empty_configured_var_falls_through_to_legacy() {
+        assert_eq!(
+            resolved_token(&[
+                ("WEFT_FEDERATION_TOKEN", "   "),
+                ("FILIGREE_API_TOKEN", "legacy-secret"),
+            ]),
+            Some("legacy-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_none_when_neither_set() {
+        assert_eq!(resolved_token(&[]), None);
+    }
+
+    fn mint_token_file(root: &Path, contents: &str) {
+        let dir = root.join(".weft").join("filigree");
+        std::fs::create_dir_all(&dir).expect("create store dir");
+        std::fs::write(dir.join("federation_token"), contents).expect("write token");
+    }
+
+    fn resolved_token_with_root(env: &[(&str, &str)], root: &Path) -> Option<String> {
+        let config = token_resolution_config();
+        FiligreeHttpClient::from_config_with_project_root(
+            &config,
+            |name| {
+                env.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            },
+            Some(root),
+        )
+        .expect("build client")
+        .expect("enabled client")
+        .token
+    }
+
+    #[test]
+    fn token_resolution_falls_back_to_minted_project_store_file() {
+        // Dogfood-4 A5: the MCP serve path launches with an empty env; the
+        // daemon's auto-minted token file is the same-host zero-ceremony rung.
+        let dir = tempfile::tempdir().expect("tempdir");
+        mint_token_file(dir.path(), "minted-secret\n");
+        assert_eq!(
+            resolved_token_with_root(&[], dir.path()),
+            Some("minted-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_env_wins_over_minted_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        mint_token_file(dir.path(), "minted-secret");
+        assert_eq!(
+            resolved_token_with_root(&[("WEFT_FEDERATION_TOKEN", "env-secret")], dir.path()),
+            Some("env-secret".to_owned()),
+        );
+    }
+
+    #[test]
+    fn token_resolution_none_when_minted_file_absent_or_blank() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(resolved_token_with_root(&[], dir.path()), None);
+        mint_token_file(dir.path(), "   \n");
+        assert_eq!(resolved_token_with_root(&[], dir.path()), None);
+    }
+
     #[test]
     fn parses_reverse_entity_association_response_shape() {
         let parsed = parse_entity_associations_response(
@@ -900,6 +1092,127 @@ mod tests {
             parsed.associations[0].loomweave_entity_id,
             "loomweave:eid:0123456789abcdef0123456789abcdef"
         );
+    }
+
+    // --- G15: rename/drift-tolerant deserialization (clarion-18d0f42964) ---
+    // Defensive half only; the shared cross-member conformance vector is the
+    // deferred producer-coupled half. See `residual` note at the end.
+
+    /// The live Filigree v27 producer co-emits BOTH `entity_id` and
+    /// `loomweave_entity_id` (identical values) plus governance/computed/null
+    /// fields the consumer does not model. This MUST parse — and it is the
+    /// regression guard for the alias trap: serde rejects a duplicate field
+    /// slot, so if `loomweave_entity_id` ever gains `alias = "entity_id"` this
+    /// vector fails with `duplicate field`. `alias = "clarion_entity_id"` is
+    /// safe here because `clarion_entity_id` is absent.
+    #[test]
+    fn parses_live_v27_both_keys_and_governance_fields() {
+        let parsed = parse_entity_associations_response(
+            r#"{"associations":[{
+                "issue_id":"filigree-1234567890",
+                "entity_id":"loomweave:eid:0123456789abcdef0123456789abcdef",
+                "loomweave_entity_id":"loomweave:eid:0123456789abcdef0123456789abcdef",
+                "entity_kind":"function",
+                "content_hash_at_attach":"hash-a",
+                "attached_at":"2026-05-17T00:00:00.000Z",
+                "attached_by":"codex",
+                "migration_orphaned_at":null,
+                "orphan_status":"unknown",
+                "freshness_status":"unknown",
+                "signature":null,"signoff_seq":null,"signed_content_hash":null
+            }]}"#,
+        )
+        .expect("live v27 both-keys shape must parse (no duplicate-field trap)");
+        assert_eq!(parsed.associations.len(), 1);
+        assert_eq!(
+            parsed.associations[0].loomweave_entity_id,
+            "loomweave:eid:0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn parses_canonical_filigree_entity_association_fixture() {
+        let body = canonical_entity_association_fixture_body("live_v27_reverse_lookup_200");
+        let parsed = parse_entity_associations_response(&body.to_string())
+            .expect("canonical live Filigree EntityAssociation fixture must deserialize");
+
+        assert_eq!(parsed.associations.len(), 1);
+        let row = &parsed.associations[0];
+        assert_eq!(row.issue_id, "test-045076e30f");
+        assert_eq!(
+            row.loomweave_entity_id,
+            "loomweave:eid:0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(row.content_hash_at_attach, "hash-g15-oracle");
+        assert_eq!(row.attached_at, "2026-06-13T00:00:00+00:00");
+        assert_eq!(row.attached_by, "g15-oracle");
+    }
+
+    /// A pre-v26 producer (or pre-v26 JSONL export) names the same value
+    /// `clarion_entity_id`; the alias routes it into the canonical slot.
+    #[test]
+    fn parses_pre_v26_clarion_entity_id_via_alias() {
+        let parsed = parse_entity_associations_response(
+            r#"{"associations":[{
+                "issue_id":"filigree-1234567890",
+                "clarion_entity_id":"python:function:demo.hello",
+                "content_hash_at_attach":"hash-a",
+                "attached_at":"2026-05-17T00:00:00.000Z",
+                "attached_by":"codex"
+            }]}"#,
+        )
+        .expect("pre-v26 clarion_entity_id must deserialize via alias");
+        assert_eq!(
+            parsed.associations[0].loomweave_entity_id,
+            "python:function:demo.hello"
+        );
+    }
+
+    /// Unknown/future producer fields are ignored (no `deny_unknown_fields`).
+    #[test]
+    fn ignores_unknown_producer_fields() {
+        let parsed = parse_entity_associations_response(
+            r#"{"associations":[{
+                "issue_id":"filigree-1",
+                "loomweave_entity_id":"python:function:demo.hello",
+                "content_hash_at_attach":"hash-a",
+                "attached_at":"2026-05-17T00:00:00.000Z",
+                "attached_by":"codex",
+                "some_future_field":{"nested":true}
+            }]}"#,
+        )
+        .expect("unknown fields must be ignored, not rejected");
+        assert_eq!(
+            parsed.associations[0].loomweave_entity_id,
+            "python:function:demo.hello"
+        );
+    }
+
+    /// Dropped display-only fields degrade to empty strings via `default`,
+    /// rather than hard-failing the whole read.
+    #[test]
+    fn defaults_absent_display_fields() {
+        let parsed = parse_entity_associations_response(
+            r#"{"associations":[{
+                "issue_id":"filigree-1",
+                "loomweave_entity_id":"python:function:demo.hello",
+                "content_hash_at_attach":"hash-a"
+            }]}"#,
+        )
+        .expect("absent attached_at/attached_by must default, not fail");
+        let row = &parsed.associations[0];
+        assert_eq!(row.attached_at, "");
+        assert_eq!(row.attached_by, "");
+        assert_eq!(row.content_hash_at_attach, "hash-a");
+    }
+
+    /// An absent top-level `associations` key degrades to an empty list
+    /// (enrich-only), rather than erroring `missing field associations`.
+    #[test]
+    fn defaults_absent_envelope_to_empty_list() {
+        let parsed = parse_entity_associations_response("{}")
+            .expect("absent envelope key must default to empty list");
+        assert!(parsed.associations.is_empty());
     }
 
     #[test]
@@ -1024,6 +1337,10 @@ mod tests {
             .issue_detail("clarion-51a2868c86")
             .expect("issue detail request")
             .expect("issue present");
+        assert_eq!(
+            detail.id, "clarion-51a2868c86",
+            "id deserializes from the route's issue_id field (weft-4a46553503)"
+        );
         assert_eq!(detail.title, "enrich");
         assert_eq!(detail.status, "proposed");
         assert_eq!(detail.priority, 3);
@@ -1109,7 +1426,7 @@ mod tests {
         .expect("enabled client");
 
         let row = crate::scan_results::FindingForEmit {
-            id: "core:finding:run-1:circular".to_owned(),
+            id: "core:finding:circular".to_owned(),
             rule_id: "LMWV-PY-STRUCTURE-001".to_owned(),
             kind: "defect".to_owned(),
             severity: "WARN".to_owned(),

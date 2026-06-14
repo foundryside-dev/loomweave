@@ -9,7 +9,7 @@
 //! processes.
 //!
 //! This module acquires an exclusive `fs2`-advisory lock on a dedicated
-//! sentinel file `.loomweave/loomweave.lock` for the duration of the analyze
+//! sentinel file `.weft/loomweave/loomweave.lock` for the duration of the analyze
 //! run. The lock file is separate from `loomweave.db` so `SQLite`'s own
 //! locking (per-connection, transaction-scoped) is independent. The
 //! guard's `Drop` releases the OS-level lock.
@@ -39,13 +39,13 @@ pub(crate) struct AnalyzeLockGuard {
 
 /// Acquire an exclusive cross-process lock on `<loomweave_dir>/loomweave.lock`.
 ///
-/// `loomweave_dir` is the `.loomweave/` directory inside the project root. The
+/// `loomweave_dir` is the `.weft/loomweave/` directory inside the project root. The
 /// lock file is created on first use (0-byte sentinel) and kept across
 /// runs. The returned guard holds the lock for its lifetime.
 ///
 /// # Errors
 ///
-/// - The lock file cannot be opened (missing `.loomweave/` directory,
+/// - The lock file cannot be opened (missing `.weft/loomweave/` directory,
 ///   permission denied, filesystem read-only).
 /// - Another `loomweave analyze` process already holds the lock. Returns
 ///   an error containing the lock-file path so the operator can identify
@@ -90,7 +90,7 @@ pub(crate) fn acquire_analyze_lock(loomweave_dir: &Path) -> Result<AnalyzeLockGu
 mod tests {
     use super::*;
 
-    /// Two concurrent `acquire_analyze_lock` calls on the same `.loomweave/`
+    /// Two concurrent `acquire_analyze_lock` calls on the same `.weft/loomweave/`
     /// directory must fail the second call. This is the core STO-01
     /// invariant: a second analyze cannot start while the first holds
     /// the writer.
@@ -132,7 +132,7 @@ mod tests {
         drop(second);
     }
 
-    /// Missing `.loomweave/` directory must surface as an IO error, not a
+    /// Missing `.weft/loomweave/` directory must surface as an IO error, not a
     /// `WouldBlock` masquerade. (Operator may have skipped `loomweave install`.)
     #[test]
     fn missing_loomweave_dir_errors() {

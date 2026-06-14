@@ -16,7 +16,7 @@ fn loomweave_bin() -> Command {
 }
 
 fn latest_run_config(project_root: &std::path::Path) -> serde_json::Value {
-    let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
     let config_raw: String = conn
         .query_row(
             "SELECT config FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -28,7 +28,7 @@ fn latest_run_config(project_root: &std::path::Path) -> serde_json::Value {
 }
 
 fn latest_run_stats(project_root: &std::path::Path) -> serde_json::Value {
-    let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
     let stats_raw: String = conn
         .query_row(
             "SELECT stats FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -434,6 +434,200 @@ ontology_version = "0.6.0"
 file_scope = ["module"]
 "#;
 
+// ── Cross-file anchored-edge fixture ──────────────────────────────────────────
+//
+// A content-driven plugin for the incremental host-seam edge-retention tests. Each
+// `.cx` file is a tiny directive script the plugin reads line-by-line:
+//
+//   entity <name>          → emit a child function `crossfixture:function:<stem>.<name>`
+//                            (parented to the module, with a `contains` edge), so the
+//                            symbol can be DROPPED between runs by editing the file.
+//   impl <stem>.<name>     → emit an anchored `implements` edge from this module to
+//                            `crossfixture:function:<stem>.<name>` (a CROSS-FILE
+//                            endpoint into another file's entity — the case the
+//                            seen-entity gate must handle). `implements` is used
+//                            rather than `imports` because the host filters `imports`
+//                            targets down to file-scope modules; `implements` flows
+//                            through the seen-set gate to an arbitrary entity target.
+//
+// Every file always emits its module `crossfixture:module:<stem>`. Because the
+// emission is a pure function of the file's content, changing the content between
+// analyze runs deterministically changes which entities/edges the file produces —
+// which is exactly what the positive (target unchanged) and negative (target's
+// symbol dropped) incremental scenarios require.
+#[cfg(unix)]
+const CROSS_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "loomweave-plugin-cross",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        module_id = f"crossfixture:module:{stem}"
+        entities = [
+            {
+                "id": module_id,
+                "kind": "module",
+                "qualified_name": stem,
+                "source": {"file_path": path},
+            },
+        ]
+        edges = []
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        for lineno, raw in enumerate(lines, start=1):
+            line = raw.strip()
+            if line.startswith("entity "):
+                name = line[len("entity "):].strip()
+                ent_id = f"crossfixture:function:{stem}.{name}"
+                entities.append({
+                    "id": ent_id,
+                    "kind": "function",
+                    "qualified_name": f"{stem}.{name}",
+                    "source": {
+                        "file_path": path,
+                        "source_range": {
+                            "start_line": lineno,
+                            "start_col": 0,
+                            "end_line": lineno,
+                            "end_col": len(raw),
+                        },
+                    },
+                    "parent_id": module_id,
+                })
+                edges.append({
+                    "kind": "contains",
+                    "from_id": module_id,
+                    "to_id": ent_id,
+                })
+            elif line.startswith("impl "):
+                target = line[len("impl "):].strip()
+                target_stem, _, sym = target.partition(".")
+                to_id = f"crossfixture:function:{target_stem}.{sym}"
+                edges.append({
+                    "kind": "implements",
+                    "from_id": module_id,
+                    "to_id": to_id,
+                    "source_byte_start": 0,
+                    "source_byte_end": 10,
+                    "confidence": "resolved",
+                })
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "entities": entities,
+                "edges": edges,
+                "stats": {},
+            },
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const CROSS_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "loomweave-plugin-cross"
+plugin_id = "crossfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "loomweave-plugin-cross"
+language = "crossfixture"
+extensions = ["cx"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains", "implements"]
+rule_id_prefix = "LMWV-CROSS-"
+ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+"#;
+
+#[cfg(unix)]
+fn write_cross_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("loomweave-plugin-cross");
+    std::fs::write(&plugin_script, CROSS_PLUGIN_SCRIPT).expect("write cross plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat cross plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod cross plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), CROSS_PLUGIN_MANIFEST)
+        .expect("write cross plugin manifest");
+}
+
+/// Install Loomweave + the cross-file fixture plugin into a fresh project. Returns
+/// the project dir, the plugin dir (kept alive so the script stays on disk), and
+/// the `PATH` value that exposes the plugin to `loomweave analyze`.
+#[cfg(unix)]
+fn cross_env() -> (tempfile::TempDir, tempfile::TempDir, std::ffi::OsString) {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_cross_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    (project_dir, plugin_dir, plugin_path)
+}
+
 #[cfg(unix)]
 fn write_ambiguous_calls_plugin(plugin_dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -804,11 +998,10 @@ fn analyze_persists_plugin_tags_and_populates_embedding_sidecar() {
             r"
 semantic_search:
   enabled: true
-  allow_live_provider: true
+  provider: local_openai
   endpoint_url: {embedding_url}
   model_id: test-embed
   dimensions: 2
-  api_key_env: TEST_EMBEDDING_KEY
   timeout_seconds: 2
   session_token_ceiling: 10000
 "
@@ -823,7 +1016,6 @@ semantic_search:
         .arg(&config_path)
         .arg(project_dir.path())
         .env("PATH", &plugin_path)
-        .env("TEST_EMBEDDING_KEY", "test-key")
         .assert()
         .success();
 
@@ -839,7 +1031,7 @@ semantic_search:
         requests[0]
     );
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let tag_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entity_tags \
@@ -852,7 +1044,7 @@ semantic_search:
         .expect("query persisted tags");
     assert_eq!(tag_count, 1, "plugin-emitted tags must be persisted");
 
-    let sidecar = project_dir.path().join(".loomweave/embeddings.db");
+    let sidecar = project_dir.path().join(".weft/loomweave/embeddings.db");
     assert!(sidecar.exists(), "analyze should create embeddings sidecar");
     let sidecar_conn = Connection::open(sidecar).unwrap();
     let embedding_count: i64 = sidecar_conn
@@ -893,7 +1085,7 @@ fn analyze_without_plugins_writes_skipped_run_row() {
         .assert()
         .success();
 
-    let conn = Connection::open(dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (count, status): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MAX(status), '') FROM runs",
@@ -926,7 +1118,7 @@ fn analyze_migrates_a_stale_db_instead_of_failing() {
         .assert()
         .success();
 
-    let db = dir.path().join(".loomweave/loomweave.db");
+    let db = dir.path().join(".weft/loomweave/loomweave.db");
     // Rewind to the pre-0007 (v6) shape: no `analyzed_at_commit`, no v7 ledger
     // row, user_version back to 6 — exactly an upgraded-binary-vs-old-DB state.
     {
@@ -1082,7 +1274,7 @@ analysis:
         "stderr should identify invalid clustering algorithm; got: {stderr}"
     );
 
-    let conn = Connection::open(dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .expect("query run count");
@@ -1096,7 +1288,7 @@ fn analyze_phase3_emits_subsystem_entities_and_edges() {
         &["auth_a", "auth_b", "billing_a", "billing_b"],
         &phase3_config(2),
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
 
     let subsystem_count: i64 = conn
         .query_row(
@@ -1138,7 +1330,7 @@ fn analyze_phase3_emits_subsystem_entities_and_edges() {
 #[test]
 fn analyze_phase3_is_deterministic_across_two_runs() {
     fn signature(project_root: &std::path::Path) -> Vec<(String, String)> {
-        let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+        let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
         conn.prepare("SELECT id, properties FROM entities WHERE kind = 'subsystem' ORDER BY id")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -1158,7 +1350,7 @@ fn analyze_phase3_is_deterministic_across_two_runs() {
 #[test]
 fn analyze_phase3_skips_empty_graph_with_stats() {
     let project_dir = run_phase3_fixture(&["solo"], &phase3_config(2));
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let subsystem_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
@@ -1186,7 +1378,7 @@ fn analyze_phase3_skips_empty_graph_with_stats() {
 #[test]
 fn analyze_phase3_emits_weak_modularity_fact_when_below_threshold() {
     let project_dir = run_phase3_fixture(&["weak_a", "weak_b"], &phase3_config(2));
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let row: (String, String, String, String, String) = conn
         .query_row(
             "SELECT rule_id, kind, severity, status, properties \
@@ -1216,6 +1408,46 @@ fn analyze_phase3_emits_weak_modularity_fact_when_below_threshold() {
     assert_eq!(
         stats["clustering"]["weak_modularity_finding_emitted"].as_bool(),
         Some(true)
+    );
+}
+
+/// L1 / ADR-047 regression: re-analyzing an UNCHANGED tree must not accumulate
+/// duplicate finding rows. Finding ids are content-keyed (`core:finding:<disc>`),
+/// not run-scoped, so the `ON CONFLICT(id)` upsert de-dupes across fresh runs;
+/// before the fix every re-analyze minted new run-scoped rows and the count grew
+/// (the dogfood `255 -> 259 -> 263` symptom).
+#[cfg(unix)]
+#[test]
+fn analyze_findings_do_not_accumulate_across_reruns() {
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["weak_a", "weak_b"]);
+    let db = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let count = || -> i64 {
+        Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM findings", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    let after_first = count();
+    assert!(
+        after_first > 0,
+        "fixture should produce at least one finding to make the test meaningful"
+    );
+
+    // Re-analyze the UNCHANGED tree twice more (same source, new run_id each time).
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let config = std::path::PathBuf::from(&config_path);
+    run_phase3_analyze(project_dir.path(), &config, &plugin_path);
+    let after_second = count();
+    run_phase3_analyze(project_dir.path(), &config, &plugin_path);
+    let after_third = count();
+
+    assert_eq!(
+        (after_second, after_third),
+        (after_first, after_first),
+        "finding count must be stable across re-analyses of an unchanged tree \
+         (got {after_first} -> {after_second} -> {after_third})"
     );
 }
 
@@ -1385,7 +1617,8 @@ fn analyze_emits_post_commit_tier_finding_to_filigree_at_project_anchor() {
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
 
     {
-        let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
         // Two subsystems → two tier findings, both anchored to the project root.
         // auth disagrees (MIXING); billing agrees (UNANIMOUS). They share
         // (rule-family, path, null line) but carry subsystem-distinct messages —
@@ -1464,7 +1697,7 @@ fn analyze_emits_entity_deleted_finding_when_file_removed() {
         &plugin_path,
     );
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     // The plugin's `module` entity carries the canonical finding shape.
     let (kind, severity, status): (String, String, String) = conn
         .query_row(
@@ -1510,7 +1743,7 @@ fn analyze_emits_guidance_orphan_and_invalidates_summary_cache_on_deletion() {
         phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     let target = "phase3fixture:module:billing_a";
 
     // Inject a guidance sheet that `guides` the soon-to-be-deleted entity, plus a
@@ -1590,7 +1823,7 @@ fn analyze_emits_guidance_orphan_for_match_rule_entity_and_dedupes() {
         phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     let target = "phase3fixture:module:billing_a";
 
     {
@@ -1670,7 +1903,7 @@ fn analyze_emits_guidance_expired_for_past_expiry_only() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
@@ -1730,7 +1963,7 @@ fn analyze_emits_guidance_expired_under_no_sei() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
@@ -1778,7 +2011,7 @@ fn analyze_emits_guidance_churn_stale_with_asymmetric_pinned_threshold() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     // Seed git_churn_count on the matched module via properties JSON (the analyze
     // pipeline does not populate it). A `kind:module` match_rule selects both
@@ -1866,7 +2099,7 @@ fn analyze_guidance_churn_stale_is_honest_empty_without_churn() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
@@ -1901,378 +2134,6 @@ fn analyze_guidance_churn_stale_is_honest_empty_without_churn() {
         )
         .unwrap();
     assert_eq!(count, 0, "no churn populated ⇒ CHURN-STALE inert");
-}
-
-#[cfg(unix)]
-fn write_wardline_manifest(project_root: &std::path::Path, tier_content: &str) {
-    std::fs::write(
-        project_root.join("wardline.yaml"),
-        format!(
-            r#"version: 1
-tiers:
-  integral:
-    paths:
-      - auth_a.p3
-    content: "{tier_content}"
-boundaries:
-  payment_api:
-    paths:
-      - billing_a.p3
-annotation_groups:
-  secrets:
-    paths:
-      - auth_b.p3
-"#
-        ),
-    )
-    .expect("write wardline.yaml");
-}
-
-#[cfg(unix)]
-fn write_real_wardline_output_fixture(project_root: &std::path::Path) {
-    std::fs::create_dir_all(project_root.join("src/payments"))
-        .expect("create Wardline overlay dir");
-    std::fs::write(
-        project_root.join("wardline.yaml"),
-        r#"tiers:
-  - id: AUDIT_TRAIL
-    tier: 1
-    description: "Fully audited code"
-  - id: EXTERNAL_RAW
-    tier: 4
-    description: "Unvetted external input"
-
-module_tiers:
-  - path: "src/core"
-    default_taint: "AUDIT_TRAIL"
-  - path: "src/integrations"
-    default_taint: "EXTERNAL_RAW"
-"#,
-    )
-    .expect("write real wardline.yaml");
-    std::fs::write(
-        project_root.join("wardline.fingerprint.json"),
-        r#"{
-  "python_version": "3.12",
-  "generated_at": "2026-03-01T00:00:00Z",
-  "coverage": {
-    "annotated": 2,
-    "total": 3,
-    "ratio": 0.66,
-    "tier1_annotated": 1,
-    "tier1_total": 1
-  },
-  "fingerprints": [
-    {
-      "qualified_name": "core.auth.validate_token",
-      "module": "core.auth",
-      "decorators": ["wardline.tier"],
-      "annotation_hash": "sha256:aaa111",
-      "tier_context": 1,
-      "artefact_class": "policy"
-    },
-    {
-      "qualified_name": "integrations.handler.process",
-      "module": "integrations.handler",
-      "decorators": ["wardline.tier", "wardline.external_boundary"],
-      "annotation_hash": "sha256:bbb222",
-      "tier_context": 4,
-      "boundary_transition": "shape_validation",
-      "artefact_class": "enforcement"
-    }
-  ]
-}
-"#,
-    )
-    .expect("write real wardline.fingerprint.json");
-    std::fs::write(
-        project_root.join("wardline.exceptions.json"),
-        r#"{
-  "exceptions": [
-    {
-      "id": "EXC-001",
-      "rule": "PY-WL-001",
-      "taint_state": "EXTERNAL_RAW",
-      "location": "src/integrations/handler.py::process",
-      "exceptionability": "STANDARD",
-      "severity_at_grant": "ERROR",
-      "rationale": "Legacy integration pending migration",
-      "reviewer": "j.smith",
-      "expires": "2027-12-01"
-    }
-  ]
-}
-"#,
-    )
-    .expect("write real wardline.exceptions.json");
-    std::fs::write(
-        project_root.join("src/payments/wardline.overlay.yaml"),
-        r#"overlay_for: "src/payments"
-
-boundaries:
-  - function: "process_payment"
-    transition: "construction"
-    from_tier: 1
-    to_tier: 3
-  - function: "validate_receipt"
-    transition: "shape_validation"
-    from_tier: 3
-    to_tier: 2
-"#,
-    )
-    .expect("write real wardline.overlay.yaml");
-}
-
-#[cfg(unix)]
-#[test]
-fn analyze_generates_pinned_wardline_derived_guidance() {
-    let (project_dir, plugin_dir, config_path) =
-        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a"]);
-    let plugin_path =
-        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
-    write_wardline_manifest(project_dir.path(), "Keep integral code isolated.");
-
-    run_phase3_analyze(
-        project_dir.path(),
-        std::path::Path::new(&config_path),
-        &plugin_path,
-    );
-
-    let conn = Connection::open(&db_path).unwrap();
-    let rows: Vec<(String, serde_json::Value)> = conn
-        .prepare(
-            "SELECT id, properties FROM entities \
-             WHERE kind = 'guidance' AND id LIKE 'core:guidance:wardline-%' \
-             ORDER BY id",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let raw: String = row.get(1)?;
-            Ok((id, serde_json::from_str(&raw).unwrap()))
-        })
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
-    assert_eq!(
-        ids,
-        vec![
-            "core:guidance:wardline-annotation-group-secrets".to_owned(),
-            "core:guidance:wardline-boundary-payment_api".to_owned(),
-            "core:guidance:wardline-tier-integral".to_owned(),
-        ]
-    );
-
-    let tier = rows
-        .iter()
-        .find(|(id, _)| id == "core:guidance:wardline-tier-integral")
-        .expect("tier guidance")
-        .1
-        .clone();
-    assert_eq!(tier["provenance"], "wardline_derived");
-    assert_eq!(tier["pinned"], true);
-    assert_eq!(tier["wardline_kind"], "tier");
-    assert_eq!(tier["wardline_key"], "integral");
-    assert_eq!(tier["content"], "Keep integral code isolated.");
-    assert!(
-        tier["wardline_manifest_hash"]
-            .as_str()
-            .unwrap()
-            .starts_with("blake3:")
-    );
-    assert_eq!(
-        tier["match_rules"][0],
-        serde_json::json!({"type":"path","pattern":"auth_a.p3"})
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn analyze_accepts_real_wardline_output_bundle() {
-    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["seed"]);
-    let plugin_path =
-        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
-    write_real_wardline_output_fixture(project_dir.path());
-
-    run_phase3_analyze(
-        project_dir.path(),
-        std::path::Path::new(&config_path),
-        &plugin_path,
-    );
-
-    let conn = Connection::open(&db_path).unwrap();
-    let rows: Vec<(String, serde_json::Value)> = conn
-        .prepare(
-            "SELECT id, properties FROM entities \
-             WHERE kind = 'guidance' AND id LIKE 'core:guidance:wardline-%' \
-             ORDER BY id",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let raw: String = row.get(1)?;
-            Ok((id, serde_json::from_str(&raw).unwrap()))
-        })
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
-    assert!(ids.contains(&"core:guidance:wardline-tier-src-core-AUDIT_TRAIL".to_owned()));
-    assert!(ids.contains(&"core:guidance:wardline-tier-src-integrations-EXTERNAL_RAW".to_owned()));
-    assert!(
-        ids.contains(&"core:guidance:wardline-boundary-src-payments-process_payment".to_owned())
-    );
-    assert!(
-        ids.contains(&"core:guidance:wardline-boundary-src-payments-validate_receipt".to_owned())
-    );
-    assert!(ids.contains(&"core:guidance:wardline-annotation-group-wardline.tier".to_owned()));
-    assert!(ids.contains(
-        &"core:guidance:wardline-annotation-group-wardline.external_boundary".to_owned()
-    ));
-
-    let tier = rows
-        .iter()
-        .find(|(id, _)| id == "core:guidance:wardline-tier-src-core-AUDIT_TRAIL")
-        .expect("module-tier guidance")
-        .1
-        .clone();
-    assert_eq!(tier["provenance"], "wardline_derived");
-    assert_eq!(tier["pinned"], true);
-    assert_eq!(tier["wardline_kind"], "tier");
-    assert_eq!(tier["wardline_key"], "src/core-AUDIT_TRAIL");
-    assert_eq!(
-        tier["match_rules"][0],
-        serde_json::json!({"type":"path","pattern":"src/core/**"})
-    );
-    assert_eq!(tier["wardline_fingerprint_count"], 2);
-    assert_eq!(tier["wardline_exception_count"], 1);
-    assert!(
-        tier["wardline_fingerprint_hash"]
-            .as_str()
-            .unwrap()
-            .starts_with("blake3:")
-    );
-    assert!(
-        tier["wardline_exceptions_hash"]
-            .as_str()
-            .unwrap()
-            .starts_with("blake3:")
-    );
-
-    let boundary = rows
-        .iter()
-        .find(|(id, _)| id == "core:guidance:wardline-boundary-src-payments-process_payment")
-        .expect("overlay boundary guidance")
-        .1
-        .clone();
-    assert_eq!(boundary["scope_level"], "subsystem");
-    assert!(
-        boundary["content"]
-            .as_str()
-            .unwrap()
-            .contains("construction")
-    );
-    assert_eq!(
-        boundary["match_rules"][0],
-        serde_json::json!({"type":"path","pattern":"src/payments/**"})
-    );
-
-    let group = rows
-        .iter()
-        .find(|(id, _)| id == "core:guidance:wardline-annotation-group-wardline.tier")
-        .expect("fingerprint annotation-group guidance")
-        .1
-        .clone();
-    assert_eq!(group["scope_level"], "project");
-    assert_eq!(
-        group["match_rules"][0],
-        serde_json::json!({"type":"wardline_group","name":"wardline.tier"})
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn analyze_preserves_wardline_override_and_emits_guidance_stale() {
-    let (project_dir, plugin_dir, config_path) =
-        phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a"]);
-    let plugin_path =
-        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
-    write_wardline_manifest(project_dir.path(), "Initial Wardline guidance.");
-    run_phase3_analyze(
-        project_dir.path(),
-        std::path::Path::new(&config_path),
-        &plugin_path,
-    );
-
-    {
-        let conn = Connection::open(&db_path).unwrap();
-        let raw: String = conn
-            .query_row(
-                "SELECT properties FROM entities WHERE id = 'core:guidance:wardline-tier-integral'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let mut props: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        props["content"] = serde_json::Value::String("Operator override text.".to_owned());
-        conn.execute(
-            "UPDATE entities SET properties = ?1 WHERE id = 'core:guidance:wardline-tier-integral'",
-            [props.to_string()],
-        )
-        .unwrap();
-    }
-
-    write_wardline_manifest(project_dir.path(), "Updated Wardline guidance.");
-    run_phase3_analyze(
-        project_dir.path(),
-        std::path::Path::new(&config_path),
-        &plugin_path,
-    );
-
-    let conn = Connection::open(&db_path).unwrap();
-    let raw: String = conn
-        .query_row(
-            "SELECT properties FROM entities WHERE id = 'core:guidance:wardline-tier-integral'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let props: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(props["content"], "Operator override text.");
-    assert_eq!(props["provenance"], "wardline_derived_overridden");
-
-    let (severity, confidence, evidence): (String, f64, String) = conn
-        .query_row(
-            "SELECT severity, confidence, evidence FROM findings \
-             WHERE rule_id = 'LMWV-FACT-GUIDANCE-STALE' \
-               AND entity_id = 'core:guidance:wardline-tier-integral'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("guidance-stale finding");
-    assert_eq!(severity, "WARN");
-    assert!((confidence - 1.0).abs() < f64::EPSILON);
-    let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
-    assert_eq!(
-        evidence["guidance_id"],
-        "core:guidance:wardline-tier-integral"
-    );
-    assert!(
-        evidence["stored_manifest_hash"]
-            .as_str()
-            .unwrap()
-            .starts_with("blake3:")
-    );
-    assert!(
-        evidence["current_manifest_hash"]
-            .as_str()
-            .unwrap()
-            .starts_with("blake3:")
-    );
 }
 
 #[cfg(unix)]
@@ -2311,7 +2172,7 @@ fn analyze_emits_tier_mixing_and_unanimous_findings() {
         phase3_project_for_rerun(&["auth_a", "auth_b", "billing_a", "billing_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
 
     {
         let conn = Connection::open(&db_path).unwrap();
@@ -2371,7 +2232,7 @@ fn analyze_resolves_function_tier_through_contains_chain_to_subsystem() {
     let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&["auth_a", "auth_b"]);
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     let func = "phase3fixture:function:auth_a.handler";
 
     {
@@ -2432,7 +2293,7 @@ analysis:
     weak_modularity_threshold: 0.0
 ",
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let finding_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM findings \
@@ -2461,7 +2322,7 @@ fn analyze_phase3_does_not_emit_weak_modularity_fact_when_threshold_is_met() {
         &["auth_a", "auth_b", "billing_a", "billing_b"],
         &phase3_config(2),
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let finding_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM findings \
@@ -2492,7 +2353,7 @@ fn analyze_phase3_min_cluster_size_drops_undersized_weighted_components() {
         &["auth_a", "auth_b", "billing_a", "billing_b"],
         &phase3_weighted_components_config(3),
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let subsystem_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entities WHERE kind = 'subsystem'",
@@ -2529,7 +2390,7 @@ fn analyze_phase3_persists_weighted_components_algorithm_when_selected() {
         &["auth_a", "auth_b", "billing_a", "billing_b"],
         &phase3_weighted_components_config(2),
     );
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let properties_json: String = conn
         .query_row(
             "SELECT properties FROM entities \
@@ -2591,7 +2452,7 @@ fn analyze_stats_reports_ambiguous_edges_total() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let stats_raw: String = conn
         .query_row("SELECT stats FROM runs LIMIT 1", [], |row| row.get(0))
         .expect("query runs.stats");
@@ -2688,7 +2549,7 @@ fn analyze_mints_core_file_entity_for_registry_resolution() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let resolved = loomweave_storage::resolve_file(&conn, project_dir.path(), "demo.call", "")
         .expect("resolve_file should not error")
         .expect("analyzed ordinary source file should resolve as a core file entity");
@@ -2734,7 +2595,7 @@ fn analyze_filters_external_import_edges_before_writer_insert() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let import_edges: Vec<(String, String)> = conn
         .prepare("SELECT from_id, to_id FROM edges WHERE kind = 'imports' ORDER BY from_id, to_id")
         .unwrap()
@@ -2820,7 +2681,7 @@ fn analyze_failrun_exits_nonzero_with_run_row_marked_failed() {
     // The run row must still be marked `failed` — the FailRun WriterCmd
     // runs before the bail, so the DB state is consistent with the exit
     // code.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -2875,7 +2736,7 @@ fn analyze_finding_emission_is_best_effort_when_filigree_unreachable() {
 
     // run_phase3_fixture already asserted the analyze invocation `.success()`;
     // confirm the run row landed `completed` despite the emission failure.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -3037,7 +2898,8 @@ fn analyze_resume_reuses_run_row_and_emits_mark_unseen_false() {
 
     // Capture the fresh run's id, then resume it (POST 2).
     let run_id: String = {
-        let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
         conn.query_row(
             "SELECT id FROM runs ORDER BY started_at DESC LIMIT 1",
             [],
@@ -3067,7 +2929,7 @@ fn analyze_resume_reuses_run_row_and_emits_mark_unseen_false() {
     );
 
     // Resume reused the run row — exactly one row in `runs`, finalized.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .unwrap();
@@ -3221,7 +3083,7 @@ fn analyze_prune_unseen_is_best_effort_when_filigree_unreachable() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -3361,7 +3223,7 @@ fn analyze_prune_unseen_is_best_effort_on_non_2xx() {
     server.join().expect("mock server thread");
 
     // A non-2xx clean-stale response must never fail the run.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let run_status: String = conn
         .query_row(
             "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
@@ -3443,7 +3305,7 @@ fn analyze_rewrites_prior_index_to_current_run_entity_set() {
     use std::collections::BTreeSet;
 
     fn prior_index_locators(project_root: &std::path::Path) -> BTreeSet<String> {
-        let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+        let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
         conn.prepare("SELECT locator FROM sei_prior_index")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
@@ -3508,7 +3370,7 @@ fn analyze_rewrites_prior_index_to_current_run_entity_set() {
 
     // Column contract: body_hash populated (NOT NULL), recorded_at stamped, and
     // signature still NULL in Wave 0 (the WS1 matcher fills it later).
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (body_hash, recorded_at, signature): (String, String, Option<String>) = conn
         .query_row(
             "SELECT body_hash, recorded_at, signature FROM sei_prior_index WHERE locator = ?1",
@@ -3528,7 +3390,7 @@ fn analyze_rewrites_prior_index_to_current_run_entity_set() {
 fn alive_sei_bindings(
     project_root: &std::path::Path,
 ) -> std::collections::BTreeMap<String, String> {
-    let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
     conn.prepare(
         "SELECT current_locator, sei FROM sei_bindings \
          WHERE status = 'alive' AND current_locator IS NOT NULL",
@@ -3543,7 +3405,7 @@ fn alive_sei_bindings(
 }
 
 fn all_entity_ids(project_root: &std::path::Path) -> std::collections::BTreeSet<String> {
-    let conn = Connection::open(project_root.join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
     conn.prepare("SELECT id FROM entities")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
@@ -3709,7 +3571,7 @@ fn analyze_orphans_deleted_entity_bindings_through_the_real_pipeline() {
     std::fs::remove_file(project_dir.path().join("sei_drop.p3")).unwrap();
     analyze();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     // The dropped entity's binding is now orphaned (by SEI — its row persists).
     let dropped_status: String = conn
         .query_row(
@@ -3816,7 +3678,7 @@ fn analyze_stamps_entities_with_git_head_commit() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     for entity_id in ["core:file:demo.p3", "phase3fixture:module:demo"] {
         let (first_seen, last_seen): (Option<String>, Option<String>) = conn
             .query_row(
@@ -3903,7 +3765,7 @@ fn analyze_incremental_skip_does_not_orphan_unchanged_file_entities() {
     );
     // And the binding's status is literally alive (belt-and-braces: alive_sei_bindings
     // already filters status='alive', but assert no orphaned lineage was recorded).
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let orphaned_for_stable: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sei_lineage WHERE sei = ?1 AND event = 'orphaned'",
@@ -3914,6 +3776,191 @@ fn analyze_incremental_skip_does_not_orphan_unchanged_file_entities() {
     assert_eq!(
         orphaned_for_stable, 0,
         "no orphaned lineage event may be recorded for a skipped-unchanged entity"
+    );
+}
+
+/// POSITIVE host-seam edge retention (clarion incremental data-loss fix). An
+/// anchored `imports` edge from a CHANGED file into an UNCHANGED file's entity must
+/// PERSIST across an incremental run. The endpoint row still exists in the committed
+/// DB (its file was skipped, not re-analysed, not deleted), so the FK resolves — the
+/// edge must drain ready, not be dropped-and-counted as if the endpoint were absent.
+///
+/// Before the fix, `seen_plugin_entity_ids` started empty and was only extended with
+/// THIS run's re-analysed entities; the unchanged target's id was never present, so
+/// the edge stayed pending and was dropped at end-of-plugin.
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_retains_edge_into_unchanged_file_entity() {
+    let (project_dir, _plugin_dir, plugin_path) = cross_env();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // File B defines `bar`; file A implements it. Run 1 stores both files' entities
+    // and the cross-file edge a -> b.bar.
+    let path_a = project_dir.path().join("a.cx");
+    let path_b = project_dir.path().join("b.cx");
+    std::fs::write(&path_b, b"entity bar\n").unwrap();
+    std::fs::write(&path_a, b"impl b.bar\n").unwrap();
+    analyze();
+
+    let edge_present = |conn: &Connection| -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edges \
+             WHERE kind = 'implements' \
+               AND from_id = 'crossfixture:module:a' \
+               AND to_id = 'crossfixture:function:b.bar'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    };
+    {
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+        assert!(
+            edge_present(&conn),
+            "run 1 (full) must store the cross-file implements edge"
+        );
+    }
+
+    // Run 2: change ONLY a.cx (still implementing b.bar); b.cx is byte-identical →
+    // skipped. The edge's target `crossfixture:function:b.bar` lives in the skipped
+    // file, so it is not re-emitted this run — the exact data-loss case the fix addresses.
+    std::fs::write(&path_a, b"impl b.bar\n# touched\n").unwrap();
+    analyze();
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "exactly b.cx must be skipped on the incremental re-run: {stats}"
+    );
+
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    assert!(
+        edge_present(&conn),
+        "the implements edge into the UNCHANGED file's entity must PERSIST across the \
+         incremental run (endpoint still in the committed DB), not be dropped: {stats}"
+    );
+    assert_eq!(
+        stats["plugin_edges_dropped_unseen_total"].as_u64(),
+        Some(0),
+        "no edge should be dropped-as-unseen when its endpoint survives in the DB: {stats}"
+    );
+}
+
+/// NEGATIVE / SAFETY host-seam guard (the test that prevents shipping the
+/// resurrection bug). A CHANGED file C drops a symbol `foo` (no longer emitted this
+/// run) while another CHANGED file A still references `C::foo`. The stale edge must
+/// be DROPPED-AND-COUNTED and the run must COMPLETE; no edge row to the now-dead
+/// symbol may be written.
+///
+/// This discriminates the SAFE fix (seed seen-set from SKIPPED files only) from the
+/// UNSAFE one (seed from the FULL prior index). Entities are cumulative, so c.foo's
+/// row lingers from run 1 — a full-index seed would mark it seen, drain the edge
+/// ready, and write a FK-valid-but-STALE edge to a symbol the source no longer
+/// defines (a zombie edge — wrong data, not a crash). The skipped-only seed never
+/// marks a re-analysed file's locator, so the edge stays pending and is dropped.
+/// With the bug (empty seed) the edge is also dropped, so this test passes on both
+/// the bug and the safe fix and FAILS only on the unsafe full-index seed — exactly
+/// the regression it must catch.
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_drops_edge_to_this_run_deleted_entity() {
+    let (project_dir, _plugin_dir, plugin_path) = cross_env();
+    let analyze = || {
+        let mut cmd = loomweave_bin();
+        cmd.args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path);
+        cmd
+    };
+
+    // Run 1: C defines `foo`; A implements it. Both stored, edge a -> c.foo present.
+    let path_a = project_dir.path().join("a.cx");
+    let path_c = project_dir.path().join("c.cx");
+    std::fs::write(&path_c, b"entity foo\n").unwrap();
+    std::fs::write(&path_a, b"impl c.foo\n").unwrap();
+    analyze().assert().success();
+
+    {
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+        let edge1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE kind = 'implements' \
+                   AND from_id = 'crossfixture:module:a' \
+                   AND to_id = 'crossfixture:function:c.foo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge1, 1, "run 1 must store the cross-file implements edge");
+    }
+
+    // Run 2: change BOTH files. C drops `foo` (entity deleted this run); A still
+    // implements c.foo but is also edited so it is re-analysed. Neither file is
+    // skipped, so the deleted `c.foo` is never re-seen and never resurrected.
+    std::fs::write(&path_c, b"entity other\n").unwrap();
+    std::fs::write(&path_a, b"impl c.foo\n# touched\n").unwrap();
+    // The run must COMPLETE — a resurrected endpoint would write a dangling FK and
+    // HardFail (non-zero exit) here.
+    analyze().assert().success();
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(0),
+        "both files changed, so nothing is skipped: {stats}"
+    );
+    assert_eq!(
+        stats["plugin_edges_dropped_unseen_total"].as_u64(),
+        Some(1),
+        "the edge to the this-run-deleted entity must be dropped-AND-COUNTED: {stats}"
+    );
+
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    // No dangling FK row: the edge to the now-deleted c.foo must NOT have been written.
+    let dangling: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'implements' \
+               AND from_id = 'crossfixture:module:a' \
+               AND to_id = 'crossfixture:function:c.foo'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        dangling, 0,
+        "no dangling implements edge may persist to the this-run-deleted entity"
+    );
+    // Entities are CUMULATIVE (never pruned, no run-scoping — see the analyze
+    // pipeline's prior-index notes), so c.foo's row from run 1 survives even though
+    // the symbol no longer exists in the source. THAT is precisely why a naive
+    // "seed seen-set from the full prior index" fix is unsafe: c.foo's locator would
+    // still be in the prior index, the seed would mark it seen, the edge would drain
+    // ready, and the host would write a FK-valid-but-STALE edge to a symbol the
+    // source no longer defines. The skipped-only seed never marks a re-analysed
+    // file's locator, so the stale edge is correctly dropped above. This assertion
+    // documents the lingering row that makes the resurrection hazard real.
+    let foo_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = 'crossfixture:function:c.foo'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        foo_rows, 1,
+        "entities are cumulative: c.foo's row lingers — which is exactly why a \
+         full-index seed would resurrect a stale edge to it (the hazard this guards)"
     );
 }
 
@@ -4138,7 +4185,7 @@ fn analyze_persists_syntax_error_finding_for_unparseable_file() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (count, anchor): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \
@@ -4165,6 +4212,258 @@ fn analyze_persists_syntax_error_finding_for_unparseable_file() {
         )
         .unwrap();
     assert_eq!(anchor_exists, 1, "finding anchor entity is present");
+}
+
+/// A `synfixture`-style plugin whose `parse_status` keys on file *content*
+/// (`BROKEN` substring), not the filename stem. This lets a test toggle a
+/// file-anchored `LMWV-PY-SYNTAX-ERROR` finding on and off by rewriting the SAME
+/// file's bytes — the module entity id is stable, so no entity-deleted noise — and
+/// makes content edits drive the incremental skip/walk decision. Used by the
+/// ADR-048 stale-finding-sweep gate tests.
+#[cfg(unix)]
+const SWEEP_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "name": "loomweave-plugin-sweep",
+                "version": "0.1.0",
+                "ontology_version": "0.6.0",
+                "capabilities": {},
+            },
+        })
+    elif method == "analyze_file":
+        path = msg["params"]["file_path"]
+        stem = pathlib.Path(path).stem
+        try:
+            content = pathlib.Path(path).read_text()
+        except OSError:
+            content = ""
+        parse_status = "syntax_error" if "BROKEN" in content else "ok"
+        entity = {
+            "id": f"sweepfixture:module:{stem}",
+            "kind": "module",
+            "qualified_name": stem,
+            "source": {"file_path": path},
+            "parse_status": parse_status,
+        }
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {"entities": [entity], "edges": [], "stats": {}},
+        })
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const SWEEP_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "loomweave-plugin-sweep"
+plugin_id = "sweepfixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "loomweave-plugin-sweep"
+language = "sweepfixture"
+extensions = ["swp"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 256
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = []
+rule_id_prefix = "LMWV-SWP-"
+ontology_version = "0.6.0"
+
+[ontology.roles]
+file_scope = ["module"]
+syntax_degraded_module = ["module"]
+"#;
+
+#[cfg(unix)]
+fn write_sweep_plugin(plugin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_script = plugin_dir.join("loomweave-plugin-sweep");
+    std::fs::write(&plugin_script, SWEEP_PLUGIN_SCRIPT).expect("write sweep plugin script");
+    let mut perms = std::fs::metadata(&plugin_script)
+        .expect("stat sweep plugin")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, perms).expect("chmod sweep plugin");
+
+    std::fs::write(plugin_dir.join("plugin.toml"), SWEEP_PLUGIN_MANIFEST)
+        .expect("write sweep plugin manifest");
+}
+
+/// Count the file-anchored syntax-error findings the sweep fixture produces.
+#[cfg(unix)]
+fn syntax_error_finding_count(project_root: &std::path::Path) -> i64 {
+    Connection::open(project_root.join(".weft/loomweave/loomweave.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-PY-SYNTAX-ERROR'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// ADR-048 acceptance #1 + #3: a finding the current run no longer reproduces is
+/// retired by the stale-finding sweep, and the whole-project finding count drops.
+/// `mod_a.swp` carries a `BROKEN` marker (→ one `LMWV-PY-SYNTAX-ERROR` finding);
+/// fixing its content and re-running a clean full pass (`--no-incremental`, so the
+/// sweep gate's `skipped_files == 0` holds) must DELETE the now-unreproduced
+/// finding. This fails if the sweep is removed (the row would linger at the old
+/// `run_id`).
+#[cfg(unix)]
+#[test]
+fn analyze_stale_finding_sweep_retires_unreproduced_finding_on_full_run() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = |extra: &[&str]| {
+        let mut cmd = loomweave_bin();
+        cmd.arg("analyze");
+        for a in extra {
+            cmd.arg(a);
+        }
+        cmd.arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // Run 1: mod_a is broken → one syntax-error finding (run_id R1).
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n").unwrap();
+    analyze(&[]);
+    assert_eq!(
+        syntax_error_finding_count(project_dir.path()),
+        1,
+        "run 1 must produce exactly one syntax-error finding for the broken file"
+    );
+    let total_after_run1: i64 =
+        Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM findings", [], |row| row.get(0))
+            .unwrap();
+
+    // Fix mod_a's content (byte change → re-walked) and re-run a clean FULL pass.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"ok\n").unwrap();
+    analyze(&["--no-incremental"]);
+
+    assert_eq!(
+        syntax_error_finding_count(project_dir.path()),
+        0,
+        "the fixed file's finding no longer reproduces and must be swept"
+    );
+    let total_after_run2: i64 =
+        Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM findings", [], |row| row.get(0))
+            .unwrap();
+    assert!(
+        total_after_run2 < total_after_run1,
+        "whole-project finding count must DROP after a fix (got {total_after_run1} -> {total_after_run2})"
+    );
+}
+
+/// ADR-048 gate (the incremental-skip clause): a finding in a file the run did
+/// NOT re-walk (incrementally skipped, so still-reproducing) must NOT be swept,
+/// even though its row keeps a prior `run_id`. Run 1 broke `mod_a`; run 2 touches
+/// only `mod_b`, so `mod_a` is skipped (`skipped_files > 0`) and its finding is
+/// not re-emitted — the gate must block the sweep so the still-valid finding
+/// survives. This fails if the `skipped_files == 0` gate clause is removed (the
+/// sweep would then delete the finding at run 2's `run_id`).
+#[cfg(unix)]
+#[test]
+fn analyze_stale_finding_sweep_skipped_on_incremental_run() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // Run 1: mod_a broken → finding at R1; mod_b clean.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n").unwrap();
+    analyze();
+    assert_eq!(syntax_error_finding_count(project_dir.path()), 1);
+
+    // Run 2: touch ONLY mod_b. mod_a is unchanged → incrementally skipped, so its
+    // still-valid finding is not re-emitted and keeps R1 while the run is R2.
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n# touched\n").unwrap();
+    analyze();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(1),
+        "mod_a must be incrementally skipped so the gate is exercised"
+    );
+    assert_eq!(
+        syntax_error_finding_count(project_dir.path()),
+        1,
+        "an incremental run must NOT sweep a still-reproducing finding in a skipped file"
+    );
 }
 
 /// A plugin that crashes mid-`analyze_file`. Initializes cleanly, then exits
@@ -4293,7 +4592,7 @@ fn analyze_persists_crash_finding_anchored_to_project() {
         .assert()
         .failure();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (count, anchor): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \
@@ -4466,7 +4765,7 @@ fn analyze_persists_timeout_finding_for_hanging_plugin() {
         .assert()
         .failure();
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (timeout_count, anchor): (i64, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \

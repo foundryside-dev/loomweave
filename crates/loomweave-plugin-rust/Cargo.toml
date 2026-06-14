@@ -1,0 +1,38 @@
+[package]
+name = "loomweave-plugin-rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# The cargo artifact is named OFF the `loomweave-plugin-*` discovery glob
+# (see loomweave-core/src/plugin/discovery.rs). A `cargo build --workspace
+# --bins` drops this binary into `target/<profile>/` next to `loomweave`; if it
+# matched the glob, current_exe()-relative discovery would find a manifest-less
+# "plugin" beside the running binary and fail the run. To run it through the
+# host it must be staged under the discovery name `loomweave-plugin-rust` with a
+# neighbour `plugin.toml`. The automated tests (tests/host_integration.rs,
+# tests/analyze_e2e.rs) self-stage it that way (copy/symlink the binary under the
+# discovery name + copy the neighbour plugin.toml). LIVE `loomweave install`
+# plugin staging is a SEPARATE deferred follow-up — install.rs has no
+# plugin-staging code yet. This mirrors loomweave-plugin-fixture's deliberate
+# off-glob naming.
+[[bin]]
+name = "loomweave-rust-plugin"
+path = "src/main.rs"
+
+[dependencies]
+loomweave-core = { path = "../loomweave-core", version = "1.1.0-rc5" }
+serde_json.workspace = true
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rusqlite = { workspace = true }

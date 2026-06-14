@@ -9,7 +9,20 @@
     "to resolution_confidence: heuristic|none — there is no error, only a worse match.",
     "This file is the STANDALONE spec vector; the live conformance oracle",
     "(GET /api/v1/entities/resolve?scheme=wardline_qualname) is DEFERRED and not",
-    "implemented as of release:1.1. Mirrors the role of fixtures/entity_id.json."
+    "implemented as of release:1.1. Mirrors the role of fixtures/entity_id.json.",
+    "TODO(wardline-7eccab28ee): the ResolveRequest plugin-hint rollout (agreed in",
+    "wardline's 2026-06-11-wardline-resolve-plugin-hint-proposal.md, landed",
+    "Loomweave-side under clarion-b1a158f7f5) names three conformance rows —",
+    "hinted-hit, hinted-miss (qualname owned by the OTHER plugin only), and",
+    "unhinted-ambiguous -> unresolved. They are NOT expressible in the",
+    "qualified_name_vectors schema, whose single expected_entity_id key drives",
+    "both entity seeding and the expected resolution: hinted-miss and",
+    "unhinted-ambiguous need seeded-ids-vs-expected-outcome separation. Until a",
+    "hint-aware vector section is agreed alongside Wardline's client slice",
+    "(wardline-7eccab28ee), the three cases are pinned as tests on both sides of",
+    "the resolver: crates/loomweave-cli/src/http_read/wardline.rs",
+    "(wardline_resolve_plugin_hint_*) and",
+    "crates/loomweave-storage/src/wardline_taint.rs (hinted_resolve_*)."
   ],
   "rules_source": {
     "module_normalization_fn": "plugins/python/src/loomweave_plugin_python/extractor.py::module_dotted_name",

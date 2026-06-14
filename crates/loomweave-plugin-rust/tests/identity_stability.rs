@@ -1,0 +1,310 @@
+use loomweave_plugin_rust::extract::extract_file;
+use std::collections::BTreeSet;
+
+fn id_set(src: &str) -> BTreeSet<String> {
+    extract_file("k", "k.m", "/p/src/m.rs", src)
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn reordering_impl_blocks_does_not_change_method_ids() {
+    let a = "struct Foo;\nimpl A for Foo { fn x(&self){} }\nimpl B for Foo { fn y(&self){} }\ntrait A { fn x(&self); }\ntrait B { fn y(&self); }\n";
+    let b = "struct Foo;\nimpl B for Foo { fn y(&self){} }\nimpl A for Foo { fn x(&self){} }\ntrait A { fn x(&self); }\ntrait B { fn y(&self); }\n";
+    assert_eq!(id_set(a), id_set(b));
+}
+
+#[test]
+fn mutating_one_impls_method_set_does_not_churn_other_ids() {
+    // ADR-049 §4.3 benign-edit stability: adding/removing a method in one impl
+    // must not perturb any *other* entity's locator. `b` adds `fn n` alongside
+    // `m` in the same inherent block; every id from `a` must survive verbatim,
+    // and exactly one new id (the added method) appears.
+    let a = "struct Foo;\nimpl Foo { fn m(&self){} }\n";
+    let b = "struct Foo;\nimpl Foo { fn m(&self){} fn n(&self){} }\n";
+    let before = id_set(a);
+    let after = id_set(b);
+    assert!(
+        before.is_subset(&after),
+        "adding `fn n` churned a pre-existing id: {:?}",
+        &before - &after
+    );
+    assert_eq!(
+        (&after - &before).len(),
+        1,
+        "expected exactly the new method's id to be added, got {:?}",
+        &after - &before
+    );
+}
+
+#[test]
+fn renaming_a_generic_param_is_a_noop_for_inherent_impl_ids() {
+    let t = "struct Foo<X>(X);\nimpl<T> Foo<T> { fn m(&self){} }\n";
+    let u = "struct Foo<X>(X);\nimpl<U> Foo<U> { fn m(&self){} }\n";
+    // the method id (which carries the inherent-impl positional signature) is unchanged
+    let mt: BTreeSet<_> = id_set(t).into_iter().filter(|i| i.contains(".m")).collect();
+    let mu: BTreeSet<_> = id_set(u).into_iter().filter(|i| i.contains(".m")).collect();
+    assert_eq!(mt, mu);
+}
+
+/// ADR-049 Amendment 8 benign-edit stability: adding (or removing) an
+/// UNRELATED `#[path]` mount must not churn any other entity's id — the mount
+/// overlay is targeted, so files no mount covers keep their byte-identical
+/// filesystem route.
+#[test]
+fn adding_an_unrelated_path_mount_churns_no_other_entity_id() {
+    use loomweave_plugin_rust::symbol_table::build_symbol_table;
+
+    let write_base = |root: &std::path::Path| {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"w\"\n").unwrap();
+        std::fs::write(root.join("src/alpha.rs"), "pub fn a() {}\n").unwrap();
+    };
+    let before_dir = tempfile::tempdir().unwrap();
+    write_base(before_dir.path());
+    std::fs::write(
+        before_dir.path().join("src/lib.rs"),
+        "mod alpha;\npub fn top() {}\n",
+    )
+    .unwrap();
+    let after_dir = tempfile::tempdir().unwrap();
+    write_base(after_dir.path());
+    std::fs::write(
+        after_dir.path().join("src/lib.rs"),
+        "mod alpha;\npub fn top() {}\n#[path = \"extra_impl.rs\"]\nmod extra;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        after_dir.path().join("src/extra_impl.rs"),
+        "pub fn e() {}\n",
+    )
+    .unwrap();
+
+    let before: BTreeSet<String> = build_symbol_table(before_dir.path())
+        .iter_ids()
+        .map(ToOwned::to_owned)
+        .collect();
+    let after: BTreeSet<String> = build_symbol_table(after_dir.path())
+        .iter_ids()
+        .map(ToOwned::to_owned)
+        .collect();
+    assert!(
+        before.is_subset(&after),
+        "adding an unrelated #[path] mount churned pre-existing ids: {:?}",
+        &before - &after
+    );
+    let added: BTreeSet<String> = (&after - &before).into_iter().collect();
+    let want_added: BTreeSet<String> = [
+        "rust:module:w.extra".to_owned(),
+        "rust:function:w.extra.e".to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        added, want_added,
+        "exactly the mounted module and its item may be added"
+    );
+}
+
+// --- ADR-049 Amendments 6/7 negative controls (byte-pins). The residual-
+// collision ladder (@cfg on bare keys → S on post-cfg groups → T on post-S
+// groups → method-@cfg on final keys) qualifies a written path ONLY inside a
+// fired group; everything below pins the OFF states byte-for-byte.
+
+#[test]
+fn lone_path_qualified_self_type_keeps_last_segment_base() {
+    // Stage-S gate off: a LONE `impl T for a::X` (no same-key twin) keeps the
+    // bare last-segment self-type base — Amendment 6 must not churn the
+    // ubiquitous lone path-qualified impl (e.g. loomweave-cli guidance.rs
+    // `impl StorageResultExt for loomweave_storage::Result`).
+    let ids = id_set("pub trait T {}\nmod a { pub struct X; }\nimpl T for a::X {}\n");
+    assert!(
+        ids.contains("rust:impl:k.m.X.impl[T]"),
+        "lone path-qualified self-type impl id moved: {ids:?}"
+    );
+}
+
+#[test]
+fn lone_multi_segment_trait_path_keeps_last_segment_fragment() {
+    // Stage-T gate off: a LONE `impl std::fmt::Display for Foo` keeps the
+    // bare `impl[Display]` fragment (reinforces the corpus `trait_method`
+    // row) — Amendment 7 must not churn the ubiquitous std-trait impl.
+    let ids = id_set(
+        "struct Foo;\nimpl std::fmt::Display for Foo { fn fmt(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\n",
+    );
+    assert!(
+        ids.contains("rust:impl:k.m.Foo.impl[Display]"),
+        "lone multi-segment trait-path impl id moved: {ids:?}"
+    );
+    assert!(ids.contains("rust:function:k.m.Foo.impl[Display].fmt"));
+}
+
+#[test]
+fn same_path_cfg_twins_keep_cfg_only_ids() {
+    // Stage 1 (@cfg) splits same-path cfg twins exactly as before Amendments
+    // 6/7; S sees two singleton post-cfg groups with one witness each and
+    // stays cold — the ids carry @cfg only, no path qualification.
+    let ids = id_set(
+        "pub trait T {}\nmod a { pub struct X; }\n#[cfg(unix)] impl T for a::X {}\n#[cfg(windows)] impl T for a::X {}\n",
+    );
+    assert!(
+        ids.contains("rust:impl:k.m.X.impl[T]@cfg(unix)")
+            && ids.contains("rust:impl:k.m.X.impl[T]@cfg(windows)"),
+        "same-path cfg-twin impl ids changed: {ids:?}"
+    );
+}
+
+#[test]
+fn cross_path_cfg_twins_keep_todays_cfg_ids() {
+    // THE ladder-ordering pin (the no-churn invariant the @cfg-before-S
+    // ordering exists for): cfg-twins across DIFFERENT self-type paths
+    // (`#[cfg(unix)] impl T for a::X` / `#[cfg(windows)] impl T for b::X`)
+    // are split by stage 1 on the BARE key, so S groups are singletons and
+    // stay cold — the ids are byte-identical to the pre-Amendment-6 @cfg ids
+    // (no `%3A%3A` anywhere).
+    let ids = id_set(
+        "pub trait T {}\nmod a { pub struct X; }\nmod b { pub struct X; }\n#[cfg(unix)] impl T for a::X {}\n#[cfg(windows)] impl T for b::X {}\n",
+    );
+    assert!(
+        ids.contains("rust:impl:k.m.X.impl[T]@cfg(unix)")
+            && ids.contains("rust:impl:k.m.X.impl[T]@cfg(windows)"),
+        "cross-path cfg-twin impl ids changed from the @cfg-only form: {ids:?}"
+    );
+    assert!(
+        ids.iter().all(|id| !id.contains("%3A")),
+        "cfg-split cross-path twins must NOT be path-qualified: {ids:?}"
+    );
+}
+
+#[test]
+fn same_path_inherent_blocks_still_merge_to_one_impl_with_both_methods() {
+    // Merge fidelity: two `impl a::X { … }` blocks share one witness, so S is
+    // cold and the Option-(b) merge is untouched — ONE impl entity, both
+    // methods hang off it.
+    let entities = extract_file(
+        "k",
+        "k.m",
+        "/p/src/m.rs",
+        "mod a { pub struct X; }\nimpl a::X { fn f(&self){} }\nimpl a::X { fn g(&self){} }\n",
+    )
+    .unwrap();
+    let impl_ids: Vec<&str> = entities
+        .iter()
+        .filter(|e| e["kind"] == "impl")
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        impl_ids,
+        vec!["rust:impl:k.m.X.impl#<>"],
+        "same-path inherent blocks must still merge to ONE bare-base impl"
+    );
+    let ids = id_set(
+        "mod a { pub struct X; }\nimpl a::X { fn f(&self){} }\nimpl a::X { fn g(&self){} }\n",
+    );
+    assert!(ids.contains("rust:function:k.m.X.impl#<>.f"));
+    assert!(ids.contains("rust:function:k.m.X.impl#<>.g"));
+}
+
+#[test]
+fn mixed_bare_and_qualified_group_moves_only_the_multi_segment_member() {
+    // A fired S group containing a BARE-path member: the single-segment
+    // witness renders byte-identically to today, so only the multi-segment
+    // member moves (`b%3A%3AX`); the bare member's id is unchanged.
+    let ids = id_set(
+        "pub trait T {}\nstruct X;\nmod b { pub struct X; }\nimpl T for X {}\nimpl T for b::X {}\n",
+    );
+    assert!(
+        ids.contains("rust:impl:k.m.X.impl[T]"),
+        "bare member of a mixed S group must keep its id: {ids:?}"
+    );
+    assert!(
+        ids.contains("rust:impl:k.m.b%3A%3AX.impl[T]"),
+        "qualified member of a mixed S group must carry its written path: {ids:?}"
+    );
+}
+
+#[test]
+fn reordering_a_self_type_path_twin_pair_is_id_stable() {
+    // The S/T witness sets are BTree-collected, so a source reorder of the
+    // twin pair yields the identical id set.
+    let a = "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for a::X { fn go(&self){} }\nimpl T for b::X { fn go(&self){} }\n";
+    let b = "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for b::X { fn go(&self){} }\nimpl T for a::X { fn go(&self){} }\n";
+    assert_eq!(id_set(a), id_set(b));
+}
+
+#[test]
+fn reordering_a_trait_path_twin_pair_is_id_stable() {
+    // The T-family analogue of the S reorder test: the rendering sets are
+    // BTree-collected, so reordering the trait-path twin pair (the Compat
+    // shape) yields the identical id set.
+    let a = "struct Compat<T>(T);\nmod a { pub trait AsyncRead { fn poll_read(&self); } }\nmod b { pub trait AsyncRead { fn poll_read(&self); } }\nimpl<T> a::AsyncRead for Compat<T> { fn poll_read(&self){} }\nimpl<T> b::AsyncRead for Compat<T> { fn poll_read(&self){} }\n";
+    let b = "struct Compat<T>(T);\nmod a { pub trait AsyncRead { fn poll_read(&self); } }\nmod b { pub trait AsyncRead { fn poll_read(&self); } }\nimpl<T> b::AsyncRead for Compat<T> { fn poll_read(&self){} }\nimpl<T> a::AsyncRead for Compat<T> { fn poll_read(&self){} }\n";
+    assert_eq!(id_set(a), id_set(b));
+}
+
+#[test]
+fn s_then_t_residual_fires_t_only_for_the_still_colliding_group() {
+    // The S→T residual shape: three impls share the bare key `k.m.X.impl[Tr]`.
+    // S fires (witnesses c::X / d::X) and qualifies every base — but the two
+    // c::X members STILL collide post-S, so T fires on THAT group and
+    // switches both fragments to the qualified trait rendering. The d::X
+    // member's post-S group is a singleton, so T stays cold for it and it
+    // keeps the bare `impl[Tr]` fragment (minimal qualification). Exact
+    // bytes pinned by the extractor-generated
+    // `impl_ladder_self_then_trait_residual` conformance row too.
+    let ids = id_set(
+        "mod a { pub trait Tr { fn go(&self); } }\nmod b { pub trait Tr { fn go(&self); } }\nmod c { pub struct X; }\nmod d { pub struct X; }\nimpl a::Tr for c::X { fn go(&self){} }\nimpl b::Tr for c::X { fn go(&self){} }\nimpl a::Tr for d::X { fn go(&self){} }\n",
+    );
+    for id in [
+        "rust:impl:k.m.c%3A%3AX.impl[a%3A%3ATr]",
+        "rust:function:k.m.c%3A%3AX.impl[a%3A%3ATr].go",
+        "rust:impl:k.m.c%3A%3AX.impl[b%3A%3ATr]",
+        "rust:function:k.m.c%3A%3AX.impl[b%3A%3ATr].go",
+        "rust:impl:k.m.d%3A%3AX.impl[Tr]",
+        "rust:function:k.m.d%3A%3AX.impl[Tr].go",
+    ] {
+        assert!(ids.contains(id), "missing {id}; got {ids:#?}");
+    }
+}
+
+#[test]
+fn method_cfg_twins_key_on_the_final_post_s_impl_qualname() {
+    // Method-@cfg (Amendment 5) on the FINAL post-S/T key: an S-fired group
+    // whose a::X member is TWO merged same-witness blocks carrying cfg-twin
+    // `go` methods. Both blocks land on the single S-qualified impl entity,
+    // so the two `go` methods are twins on the FINAL key and each carries
+    // its own @cfg suffix on the `%3A%3A`-qualified method id; the b::X
+    // member's lone `go` collects none.
+    let ids = id_set(
+        "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nmod b { pub struct X; }\nimpl T for a::X { #[cfg(unix)] fn go(&self){} }\nimpl T for a::X { #[cfg(windows)] fn go(&self){} }\nimpl T for b::X { fn go(&self){} }\n",
+    );
+    for id in [
+        "rust:impl:k.m.a%3A%3AX.impl[T]",
+        "rust:function:k.m.a%3A%3AX.impl[T].go@cfg(unix)",
+        "rust:function:k.m.a%3A%3AX.impl[T].go@cfg(windows)",
+        "rust:impl:k.m.b%3A%3AX.impl[T]",
+        "rust:function:k.m.b%3A%3AX.impl[T].go",
+    ] {
+        assert!(ids.contains(id), "missing {id}; got {ids:#?}");
+    }
+}
+
+#[test]
+fn leading_colon_self_type_twin_splits_with_a_leading_escape() {
+    // Amendment-6 witness symmetry: `impl T for a::X` + `impl T for ::a::X`
+    // fire S (the leading `::` is part of the witness) and the qualified
+    // bases render `a%3A%3AX` vs `%3A%3Aa%3A%3AX`.
+    let ids = id_set(
+        "pub trait T { fn go(&self); }\nmod a { pub struct X; }\nimpl T for a::X { fn go(&self){} }\nimpl T for ::a::X { fn go(&self){} }\n",
+    );
+    for id in [
+        "rust:impl:k.m.a%3A%3AX.impl[T]",
+        "rust:function:k.m.a%3A%3AX.impl[T].go",
+        "rust:impl:k.m.%3A%3Aa%3A%3AX.impl[T]",
+        "rust:function:k.m.%3A%3Aa%3A%3AX.impl[T].go",
+    ] {
+        assert!(ids.contains(id), "missing {id}; got {ids:#?}");
+    }
+}

@@ -1,17 +1,52 @@
 use std::path::Path;
-use std::{fs, net::SocketAddr};
+use std::{
+    fs,
+    net::{IpAddr, SocketAddr},
+};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
+    /// Config schema version marker. Accepted and currently informational; it
+    /// exists so a versioned `loomweave.yaml` (the install stub writes
+    /// `version: 1`) still parses under `deny_unknown_fields`.
+    pub version: u32,
     #[serde(alias = "llm_policy")]
     pub llm: LlmConfig,
     pub semantic_search: SemanticSearchConfig,
     pub integrations: IntegrationsConfig,
     pub serve: ServeConfig,
+    /// Tolerated-and-ignored sibling section. The same `loomweave.yaml` is
+    /// parsed by two structs: `AnalyzeConfig` (loomweave-cli) owns the top-level
+    /// `analysis:` clustering block, while `McpConfig` owns `integrations` and is
+    /// consulted at finding-emission time. Because `McpConfig` is
+    /// `deny_unknown_fields` (so typos in the fields it *does* own fail loudly —
+    /// agent-first-feedback §2), it must still declare `analysis` or it rejects
+    /// any config carrying that documented section, silently disabling Filigree
+    /// emission via `load_mcp_config`'s default-on-error fallback. Captured as an
+    /// opaque value and never read here; `AnalyzeConfig` is the typed owner.
+    #[serde(default)]
+    pub analysis: serde_norway::Value,
+}
+
+fn default_config_version() -> u32 {
+    1
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            version: default_config_version(),
+            llm: LlmConfig::default(),
+            semantic_search: SemanticSearchConfig::default(),
+            integrations: IntegrationsConfig::default(),
+            serve: ServeConfig::default(),
+            analysis: serde_norway::Value::Null,
+        }
+    }
 }
 
 impl McpConfig {
@@ -34,27 +69,104 @@ impl McpConfig {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
-        if self.llm.provider == LlmProviderKind::Anthropic
-            || self.llm.anthropic_api_key_env.is_some()
-        {
-            return Err(ConfigError::DeprecatedProvider {
-                code: "LMWV-CONFIG-DEPRECATED-PROVIDER",
-            });
+    /// Parse the document for *structure* (schema shape + alias-collision
+    /// guard) plus the trust of ONLY the section just edited, WITHOUT the
+    /// cross-section trust validation that whole-config `validate()` runs.
+    ///
+    /// The `config` tool is the recovery surface for a federation that has
+    /// drifted into an untrusted state, and `validate()` is whole-config: it
+    /// rejects on a stale value in a section the caller never touched. That
+    /// turns the recovery surface into a trap — `config llm set --disable` was
+    /// blocked by a stale enabled non-loopback `semantic_search`, and
+    /// `config semantic set --disable` (the very action that clears the
+    /// offending state) was blocked by a stale enabled non-loopback
+    /// `serve.http` (L2). An edit to one section must never be gated by
+    /// another. The just-edited section IS still trust-validated (so
+    /// re-enabling a non-loopback endpoint in the same edit is still refused);
+    /// any cross-section trust issue that genuinely remains surfaces at the
+    /// next full load (`serve` / `doctor` / `config check`).
+    fn from_yaml_str_section_scoped(
+        raw: &str,
+        edited: EditedSection,
+    ) -> Result<Self, ConfigError> {
+        if raw.trim().is_empty() {
+            return Ok(Self::default());
         }
+        reject_llm_policy_alias_collision(raw)?;
+        let config: Self =
+            serde_norway::from_str(raw).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+        match edited {
+            EditedSection::SemanticSearch => config.semantic_search.validate_endpoint_trust()?,
+            EditedSection::Llm => {}
+        }
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
         if self.integrations.filigree.enabled && self.integrations.filigree.actor.trim().is_empty()
         {
             return Err(ConfigError::InvalidFiligreeActor {
                 code: "LMWV-CONFIG-FILIGREE-ACTOR-BLANK",
             });
         }
+        self.semantic_search.validate_endpoint_trust()?;
         self.serve.http.validate_loopback_trust()?;
         Ok(())
+    }
+
+    /// Non-fatal diagnostics about the *effective* LLM state, for surfacing at
+    /// `serve` startup, in `loomweave doctor`, and in `loomweave config check`.
+    ///
+    /// These never fail config load — `enabled: false` is the legitimate
+    /// safe default — they only explain why a configured provider may be inert,
+    /// so a misconfiguration announces itself instead of silently disabling
+    /// summaries (the agent-first-feedback §2.1 failure mode).
+    #[must_use]
+    pub fn llm_warnings(&self) -> Vec<String> {
+        let llm = &self.llm;
+        let provider = llm.provider.as_str();
+        let mut warnings = Vec::new();
+        if !llm.enabled {
+            if llm.allow_live_provider {
+                warnings.push(format!(
+                    "llm_policy.provider={provider} with allow_live_provider=true but \
+                     enabled=false → live summaries are off and entity_summary_get is \
+                     cache-only. Set llm_policy.enabled: true to enable."
+                ));
+            }
+        } else if !llm.allow_live_provider {
+            warnings.push(format!(
+                "llm_policy.enabled=true with provider={provider} but \
+                 allow_live_provider=false → live summaries are off (unless \
+                 LOOMWEAVE_LLM_LIVE=1 is set); entity_summary_get is cache-only. Set \
+                 llm_policy.allow_live_provider: true to enable live calls."
+            ));
+        } else {
+            // Live path is on: warn about an unpinned coding-agent model, which
+            // inherits the local CLI default and can be an expensive tier
+            // (agent-first-feedback §2.6).
+            match llm.provider {
+                LlmProviderKind::ClaudeCli if llm.claude_cli.model.is_none() => warnings.push(
+                    "llm_policy.claude_cli.model is unset → summaries inherit the local \
+                     `claude` CLI default model, which may be an expensive tier. Pin \
+                     llm_policy.claude_cli.model to control per-summary cost."
+                        .to_owned(),
+                ),
+                LlmProviderKind::CodexCli if llm.codex_cli.model.is_none() => warnings.push(
+                    "llm_policy.codex_cli.model is unset → summaries inherit the local \
+                     `codex` CLI default model. Pin llm_policy.codex_cli.model to control \
+                     per-summary cost."
+                        .to_owned(),
+                ),
+                _ => {}
+            }
+        }
+        warnings
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
     pub enabled: bool,
     pub provider: LlmProviderKind,
@@ -67,7 +179,6 @@ pub struct LlmConfig {
     pub recording_fixture_path: Option<String>,
     pub max_inferred_edges_per_caller: u32,
     pub cache_max_age_days: u32,
-    pub anthropic_api_key_env: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -84,7 +195,30 @@ impl Default for LlmConfig {
             recording_fixture_path: None,
             max_inferred_edges_per_caller: 8,
             cache_max_age_days: 180,
-            anthropic_api_key_env: None,
+        }
+    }
+}
+
+impl LlmConfig {
+    /// Human-readable label for the model summaries will actually use, for
+    /// diagnostics (`serve` startup, `doctor`, `config check`). A coding-agent
+    /// CLI with an unpinned `model` inherits the local CLI's default, which this
+    /// names explicitly rather than rendering as a bare null.
+    #[must_use]
+    pub fn effective_model_label(&self) -> String {
+        match self.provider {
+            LlmProviderKind::OpenRouter => self.model_id.clone(),
+            LlmProviderKind::ClaudeCli => self
+                .claude_cli
+                .model
+                .clone()
+                .unwrap_or_else(|| "(local claude CLI default)".to_owned()),
+            LlmProviderKind::CodexCli => self
+                .codex_cli
+                .model
+                .clone()
+                .unwrap_or_else(|| "(local codex CLI default)".to_owned()),
+            LlmProviderKind::Recording => "(recording fixture)".to_owned(),
         }
     }
 }
@@ -94,9 +228,10 @@ impl Default for LlmConfig {
 /// nothing here makes a hosted embedding service required. When `enabled` is
 /// false the `search_semantic` tool degrades honestly to "not enabled".
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SemanticSearchConfig {
     pub enabled: bool,
+    pub provider: SemanticProviderKind,
     /// Explicit opt-in to the live API provider (in addition to `enabled`).
     pub allow_live_provider: bool,
     /// Embedding model id; embeddings are cache-keyed by this.
@@ -116,6 +251,7 @@ impl Default for SemanticSearchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: SemanticProviderKind::Api,
             allow_live_provider: false,
             model_id: "text-embedding-3-small".to_owned(),
             dimensions: 1536,
@@ -127,21 +263,165 @@ impl Default for SemanticSearchConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+impl SemanticSearchConfig {
+    /// Loopback-trust gate for the local OpenAI-compatible provider.
+    ///
+    /// Gated on `enabled` (matching [`HttpReadConfig::validate_loopback_trust`]):
+    /// a disabled semantic block can never reach the endpoint, so its
+    /// `endpoint_url` must not fail config load — otherwise
+    /// `semantic_search.enabled: false` plus a stale non-loopback endpoint
+    /// hard-fails `loomweave serve` AND traps recovery, because
+    /// `update_semantic_config_file` re-parses before writing, so even
+    /// `config semantic set --disable` was rejected (weft-ac59e8e730). The edit
+    /// paths now parse via `from_yaml_str_section_scoped` (L2), which runs this
+    /// gate only for the edited section and skips cross-section trust so an edit
+    /// to one section is never trapped by a stale value in another.
+    pub fn validate_endpoint_trust(&self) -> Result<(), ConfigError> {
+        if !self.enabled || self.provider != SemanticProviderKind::LocalOpenAi {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(&self.endpoint_url).map_err(|source| {
+            ConfigError::InvalidSemanticEndpoint {
+                code: "LMWV-CONFIG-SEMANTIC-ENDPOINT-URL",
+                endpoint_url: self.endpoint_url.clone(),
+                parse_error: source.to_string(),
+            }
+        })?;
+        if matches!(url.scheme(), "http" | "https") && semantic_url_is_loopback(&url) {
+            return Ok(());
+        }
+        Err(ConfigError::NonLoopbackSemanticEndpoint {
+            code: "LMWV-CONFIG-SEMANTIC-NON-LOOPBACK",
+            endpoint_url: self.endpoint_url.clone(),
+        })
+    }
+}
+
+fn semantic_url_is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.localdomain")
+    {
+        return true;
+    }
+    // `host_str()` keeps the URL-syntax brackets on an IPv6 host (`[::1]`),
+    // which `IpAddr::from_str` rejects — strip them so IPv6 loopback is
+    // recognised (weft-ac59e8e730).
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticProviderKind {
+    #[serde(rename = "api", alias = "openai", alias = "openai_api")]
+    Api,
+    #[serde(rename = "local_openai", alias = "local", alias = "openai_local")]
+    LocalOpenAi,
+}
+
+impl SemanticProviderKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::LocalOpenAi => "local_openai",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "api" | "openai" | "openai_api" => Ok(Self::Api),
+            "local_openai" | "local" | "openai_local" => Ok(Self::LocalOpenAi),
+            other => Err(ConfigError::InvalidSemanticProvider {
+                provider: other.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProviderKind {
-    #[serde(rename = "openrouter", alias = "open_router")]
+    #[serde(rename = "openrouter", alias = "open_router", alias = "openrouter_api")]
     OpenRouter,
-    #[serde(rename = "codex_cli", alias = "codex")]
+    #[serde(rename = "codex_cli", alias = "codex", alias = "codex_sidecar")]
     CodexCli,
-    #[serde(rename = "claude_cli", alias = "claude_code")]
+    #[serde(rename = "claude_cli", alias = "claude_code", alias = "claude_sidecar")]
     ClaudeCli,
-    Anthropic,
     Recording,
 }
 
+impl LlmProviderKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::CodexCli => "codex_cli",
+            Self::ClaudeCli => "claude_cli",
+            Self::Recording => "recording",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "openrouter" | "open_router" | "openrouter_api" => Ok(Self::OpenRouter),
+            "codex_cli" | "codex" | "codex_sidecar" => Ok(Self::CodexCli),
+            "claude_cli" | "claude_code" | "claude_sidecar" => Ok(Self::ClaudeCli),
+            "recording" => Ok(Self::Recording),
+            other => Err(ConfigError::InvalidLlmProvider {
+                provider: other.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlmConfigPatch {
+    pub enabled: Option<bool>,
+    pub provider: Option<LlmProviderKind>,
+    pub allow_live_provider: Option<bool>,
+    pub enable_write_tools: Option<bool>,
+    pub model_id: Option<String>,
+    pub codex_model: Option<String>,
+    pub claude_model: Option<String>,
+    pub openrouter_api_key_env: Option<String>,
+    pub openrouter_endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmConfigEditResult {
+    pub path: String,
+    pub created: bool,
+    pub config: McpConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticConfigPatch {
+    pub enabled: Option<bool>,
+    pub provider: Option<SemanticProviderKind>,
+    pub allow_live_provider: Option<bool>,
+    pub model_id: Option<String>,
+    pub dimensions: Option<usize>,
+    pub endpoint_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub session_token_ceiling: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticConfigEditResult {
+    pub path: String,
+    pub created: bool,
+    pub config: McpConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OpenRouterConfig {
     pub endpoint_url: String,
     pub api_key_env: String,
@@ -161,7 +441,7 @@ impl Default for OpenRouterConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OpenRouterAttributionConfig {
     pub referer: String,
     pub title: String,
@@ -177,7 +457,7 @@ impl Default for OpenRouterAttributionConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CodexCliConfig {
     pub executable: String,
     pub model: Option<String>,
@@ -218,7 +498,7 @@ impl CodexSandboxMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClaudeCliConfig {
     pub executable: String,
     pub model: Option<String>,
@@ -270,20 +550,20 @@ impl ClaudePermissionMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IntegrationsConfig {
     pub filigree: FiligreeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServeConfig {
     pub mcp: McpServeConfig,
     pub http: HttpReadConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct McpServeConfig {
     /// Enable MCP tools that can mutate state, spawn processes, or call an LLM.
     /// Default false: `loomweave serve` exposes consult-mode read tools unless an
@@ -292,11 +572,14 @@ pub struct McpServeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HttpReadConfig {
     pub enabled: bool,
-    #[serde(deserialize_with = "deserialize_socket_addr")]
-    pub bind: SocketAddr,
+    /// Bind address for the HTTP read API. `None` (the default) auto-selects a
+    /// per-project deterministic port on `127.0.0.1` (ADR-044). `Some(addr)` is
+    /// honored verbatim (operator override).
+    #[serde(default, deserialize_with = "deserialize_optional_socket_addr")]
+    pub bind: Option<SocketAddr>,
     pub allow_non_loopback: bool,
     /// Name of the env var holding the inbound bearer token. When the env
     /// var is set, every `/api/v1/files`-family request must carry
@@ -323,7 +606,7 @@ impl Default for HttpReadConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind: SocketAddr::from(([127, 0, 0, 1], 9111)),
+            bind: None,
             allow_non_loopback: false,
             token_env: "WEFT_TOKEN".to_owned(),
             identity_token_env: None,
@@ -335,10 +618,13 @@ impl Default for HttpReadConfig {
 impl HttpReadConfig {
     pub fn validate_loopback_trust(&self) -> Result<(), ConfigError> {
         if self.enabled && !self.allow_non_loopback && !self.is_loopback_bind() {
-            return Err(ConfigError::NonLoopbackHttpBind {
-                code: "LMWV-CONFIG-HTTP-NON-LOOPBACK",
-                bind: self.bind,
-            });
+            // is_loopback_bind() is true for None, so reaching here implies Some(non-loopback).
+            if let Some(bind) = self.bind {
+                return Err(ConfigError::NonLoopbackHttpBind {
+                    code: "LMWV-CONFIG-HTTP-NON-LOOPBACK",
+                    bind,
+                });
+            }
         }
         Ok(())
     }
@@ -369,7 +655,11 @@ impl HttpReadConfig {
             }
             None => false,
         };
-        if self.is_loopback_bind() {
+        // None (auto-select) always binds 127.0.0.1, so it is loopback.
+        let Some(bind_addr) = self.bind else {
+            return Ok(());
+        };
+        if bind_addr.ip().is_loopback() {
             return Ok(());
         }
         if has_identity_secret {
@@ -383,32 +673,41 @@ impl HttpReadConfig {
         }
         Err(ConfigError::NonLoopbackHttpNoAuth {
             code: "LMWV-CONFIG-HTTP-NO-AUTH",
-            bind: self.bind,
+            bind: bind_addr,
             token_env: self.token_env.clone(),
         })
     }
 
+    /// `None` (auto-select) always binds `127.0.0.1`, so it is loopback.
     #[must_use]
     pub fn is_loopback_bind(&self) -> bool {
-        self.bind.ip().is_loopback()
+        self.bind.is_none_or(|addr| addr.ip().is_loopback())
     }
 }
 
-fn deserialize_socket_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+fn deserialize_optional_socket_addr<'de, D>(deserializer: D) -> Result<Option<SocketAddr>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = String::deserialize(deserializer)?;
-    raw.parse()
-        .map_err(|err| serde::de::Error::custom(format!("invalid serve.http.bind {raw:?}: {err}")))
+    let raw = Option::<String>::deserialize(deserializer)?;
+    match raw {
+        None => Ok(None),
+        Some(raw) => raw.parse().map(Some).map_err(|err| {
+            serde::de::Error::custom(format!("invalid serve.http.bind {raw:?}: {err}"))
+        }),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FiligreeConfig {
     pub enabled: bool,
     pub base_url: String,
     pub actor: String,
+    /// Name of the environment variable holding the Filigree bearer token.
+    /// Defaults to `WEFT_FEDERATION_TOKEN` (Weft-suite federation plumbing).
+    /// The legacy `FILIGREE_API_TOKEN` name is still honoured as a deprecated
+    /// fallback at token-resolution time — see `FiligreeHttpClient::from_config`.
     pub token_env: String,
     pub timeout_seconds: u64,
     /// Whether `loomweave analyze` POSTs its findings to Filigree's
@@ -434,7 +733,7 @@ impl Default for FiligreeConfig {
             enabled: false,
             base_url: "http://127.0.0.1:8766".to_owned(),
             actor: "loomweave-mcp".to_owned(),
-            token_env: "FILIGREE_API_TOKEN".to_owned(),
+            token_env: "WEFT_FEDERATION_TOKEN".to_owned(),
             timeout_seconds: 5,
             emit_findings: false,
             prune_unseen_days: 30,
@@ -464,9 +763,6 @@ where
 
     match config.llm.provider {
         LlmProviderKind::Recording => Ok(ProviderSelection::Recording),
-        LlmProviderKind::Anthropic => Err(ConfigError::DeprecatedProvider {
-            code: "LMWV-CONFIG-DEPRECATED-PROVIDER",
-        }),
         LlmProviderKind::OpenRouter => {
             let live_env_opt_in = env_lookup("LOOMWEAVE_LLM_LIVE").as_deref() == Some("1");
             if !config.llm.allow_live_provider && !live_env_opt_in {
@@ -502,6 +798,298 @@ where
     }
 }
 
+/// Which config section an edit-path touched — selects the section-scoped
+/// trust validation in [`McpConfig::from_yaml_str_section_scoped`] (L2).
+#[derive(Debug, Clone, Copy)]
+enum EditedSection {
+    Llm,
+    SemanticSearch,
+}
+
+#[allow(clippy::similar_names)] // path/patch are both the precise domain terms
+pub fn update_llm_config_file(
+    path: &Path,
+    patch: &LlmConfigPatch,
+) -> Result<LlmConfigEditResult, ConfigError> {
+    let (mut document, created) = if path.exists() {
+        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if raw.trim().is_empty() {
+            (versioned_empty_document(), false)
+        } else {
+            reject_llm_policy_alias_collision(&raw)?;
+            (
+                serde_norway::from_str::<serde_norway::Value>(&raw)
+                    .map_err(|err| ConfigError::Yaml(err.to_string()))?,
+                false,
+            )
+        }
+    } else {
+        (versioned_empty_document(), true)
+    };
+
+    apply_llm_patch(&mut document, patch)?;
+    let rendered =
+        serde_norway::to_string(&document).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+    // Editing the llm section must not be trapped by a stale value in an
+    // unrelated section (L2): validate structure (+ this section's own trust,
+    // of which llm has none), not cross-section trust.
+    let parsed = McpConfig::from_yaml_str_section_scoped(&rendered, EditedSection::Llm)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    fs::write(path, rendered).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(LlmConfigEditResult {
+        path: path.display().to_string(),
+        created,
+        config: parsed,
+    })
+}
+
+#[allow(clippy::similar_names)] // path/patch are both the precise domain terms
+pub fn update_semantic_config_file(
+    path: &Path,
+    patch: &SemanticConfigPatch,
+) -> Result<SemanticConfigEditResult, ConfigError> {
+    let (mut document, created) = if path.exists() {
+        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if raw.trim().is_empty() {
+            (versioned_empty_document(), false)
+        } else {
+            reject_llm_policy_alias_collision(&raw)?;
+            (
+                serde_norway::from_str::<serde_norway::Value>(&raw)
+                    .map_err(|err| ConfigError::Yaml(err.to_string()))?,
+                false,
+            )
+        }
+    } else {
+        (versioned_empty_document(), true)
+    };
+
+    apply_semantic_patch(&mut document, patch)?;
+    let rendered =
+        serde_norway::to_string(&document).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+    // Editing the semantic_search section must not be trapped by a stale value
+    // in an unrelated section (L2) — and crucially `--disable` is itself the
+    // recovery action. Validate structure + THIS section's own endpoint trust
+    // (so re-enabling a non-loopback endpoint is still refused), but never
+    // cross-section trust.
+    let parsed =
+        McpConfig::from_yaml_str_section_scoped(&rendered, EditedSection::SemanticSearch)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    fs::write(path, rendered).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(SemanticConfigEditResult {
+        path: path.display().to_string(),
+        created,
+        config: parsed,
+    })
+}
+
+fn versioned_empty_document() -> serde_norway::Value {
+    let mut mapping = serde_norway::Mapping::new();
+    mapping.insert(
+        serde_norway::Value::String("version".to_owned()),
+        serde_norway::Value::Number(1.into()),
+    );
+    serde_norway::Value::Mapping(mapping)
+}
+
+fn apply_llm_patch(
+    document: &mut serde_norway::Value,
+    patch: &LlmConfigPatch,
+) -> Result<(), ConfigError> {
+    let root = mapping_mut(document)?;
+    let llm_key = if root.contains_key("llm_policy") {
+        "llm_policy"
+    } else if root.contains_key("llm") {
+        "llm"
+    } else {
+        "llm_policy"
+    };
+    let llm = child_mapping_mut(root, llm_key)?;
+    if let Some(enabled) = patch.enabled {
+        set_bool(llm, "enabled", enabled);
+    }
+    if let Some(provider) = patch.provider {
+        set_string(llm, "provider", provider.as_str());
+    }
+    if let Some(allow_live_provider) = patch.allow_live_provider {
+        set_bool(llm, "allow_live_provider", allow_live_provider);
+    }
+    if let Some(model_id) = patch.model_id.as_deref() {
+        set_non_empty_string(llm, "model_id", model_id)?;
+    }
+    if let Some(model) = patch.codex_model.as_deref() {
+        let codex = child_mapping_mut(llm, "codex_cli")?;
+        set_non_empty_string(codex, "model", model)?;
+    }
+    if let Some(model) = patch.claude_model.as_deref() {
+        let claude = child_mapping_mut(llm, "claude_cli")?;
+        set_non_empty_string(claude, "model", model)?;
+    }
+    if let Some(api_key_env) = patch.openrouter_api_key_env.as_deref() {
+        let openrouter = child_mapping_mut(llm, "openrouter")?;
+        set_non_empty_string(openrouter, "api_key_env", api_key_env)?;
+    }
+    if let Some(endpoint_url) = patch.openrouter_endpoint_url.as_deref() {
+        let openrouter = child_mapping_mut(llm, "openrouter")?;
+        set_non_empty_string(openrouter, "endpoint_url", endpoint_url)?;
+    }
+    if let Some(enable_write_tools) = patch.enable_write_tools {
+        let serve = child_mapping_mut(root, "serve")?;
+        let mcp = child_mapping_mut(serve, "mcp")?;
+        set_bool(mcp, "enable_write_tools", enable_write_tools);
+    }
+    Ok(())
+}
+
+fn apply_semantic_patch(
+    document: &mut serde_norway::Value,
+    patch: &SemanticConfigPatch,
+) -> Result<(), ConfigError> {
+    let root = mapping_mut(document)?;
+    let semantic = child_mapping_mut(root, "semantic_search")?;
+    if let Some(enabled) = patch.enabled {
+        set_bool(semantic, "enabled", enabled);
+    }
+    if let Some(provider) = patch.provider {
+        set_string(semantic, "provider", provider.as_str());
+    }
+    if let Some(allow_live_provider) = patch.allow_live_provider {
+        set_bool(semantic, "allow_live_provider", allow_live_provider);
+    }
+    if let Some(model_id) = patch.model_id.as_deref() {
+        set_non_empty_string(semantic, "model_id", model_id)?;
+    }
+    if let Some(dimensions) = patch.dimensions {
+        if dimensions == 0 {
+            return Err(ConfigError::Yaml(
+                "dimensions must be greater than zero".to_owned(),
+            ));
+        }
+        set_usize(semantic, "dimensions", dimensions)?;
+    }
+    if let Some(endpoint_url) = patch.endpoint_url.as_deref() {
+        set_non_empty_string(semantic, "endpoint_url", endpoint_url)?;
+    }
+    if let Some(api_key_env) = patch.api_key_env.as_deref() {
+        set_non_empty_string(semantic, "api_key_env", api_key_env)?;
+    }
+    if let Some(timeout_seconds) = patch.timeout_seconds {
+        if timeout_seconds == 0 {
+            return Err(ConfigError::Yaml(
+                "timeout_seconds must be greater than zero".to_owned(),
+            ));
+        }
+        set_u64(semantic, "timeout_seconds", timeout_seconds)?;
+    }
+    if let Some(session_token_ceiling) = patch.session_token_ceiling {
+        set_u64(semantic, "session_token_ceiling", session_token_ceiling)?;
+    }
+    Ok(())
+}
+
+fn mapping_mut(value: &mut serde_norway::Value) -> Result<&mut serde_norway::Mapping, ConfigError> {
+    value
+        .as_mapping_mut()
+        .ok_or_else(|| ConfigError::Yaml("loomweave.yaml root must be a YAML mapping".to_owned()))
+}
+
+fn child_mapping_mut<'a>(
+    mapping: &'a mut serde_norway::Mapping,
+    key: &str,
+) -> Result<&'a mut serde_norway::Mapping, ConfigError> {
+    let key_value = serde_norway::Value::String(key.to_owned());
+    // Treat an ABSENT key and a present-but-NULL sub-block identically: both are
+    // populated with a fresh empty mapping (L7). A bare `semantic_search:` with
+    // nothing indented parses as YAML-null, not a mapping — `contains_key` is
+    // true, so without this the `as_mapping_mut` below would fail and
+    // `config set --enable` would be a recovery dead-end (it errors and writes
+    // nothing). YAML-null is the empty mapping for our edit purposes.
+    let needs_init = match mapping.get(&key_value) {
+        None | Some(serde_norway::Value::Null) => true,
+        Some(_) => false,
+    };
+    if needs_init {
+        mapping.insert(
+            key_value.clone(),
+            serde_norway::Value::Mapping(serde_norway::Mapping::new()),
+        );
+    }
+    mapping
+        .get_mut(&key_value)
+        .and_then(serde_norway::Value::as_mapping_mut)
+        .ok_or_else(|| ConfigError::Yaml(format!("{key} must be a YAML mapping")))
+}
+
+fn set_bool(mapping: &mut serde_norway::Mapping, key: &str, value: bool) {
+    mapping.insert(
+        serde_norway::Value::String(key.to_owned()),
+        serde_norway::Value::Bool(value),
+    );
+}
+
+fn set_string(mapping: &mut serde_norway::Mapping, key: &str, value: &str) {
+    mapping.insert(
+        serde_norway::Value::String(key.to_owned()),
+        serde_norway::Value::String(value.to_owned()),
+    );
+}
+
+fn set_u64(mapping: &mut serde_norway::Mapping, key: &str, value: u64) -> Result<(), ConfigError> {
+    let number = serde_norway::to_value(value).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+    mapping.insert(serde_norway::Value::String(key.to_owned()), number);
+    Ok(())
+}
+
+fn set_usize(
+    mapping: &mut serde_norway::Mapping,
+    key: &str,
+    value: usize,
+) -> Result<(), ConfigError> {
+    let number = serde_norway::to_value(value).map_err(|err| ConfigError::Yaml(err.to_string()))?;
+    mapping.insert(serde_norway::Value::String(key.to_owned()), number);
+    Ok(())
+}
+
+fn set_non_empty_string(
+    mapping: &mut serde_norway::Mapping,
+    key: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Yaml(format!("{key} must not be blank")));
+    }
+    set_string(mapping, key, value);
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("read MCP config {path}: {source}")]
@@ -516,11 +1104,6 @@ pub enum ConfigError {
 
     #[error("live OpenRouter provider selected but API key env var {env_var} is missing")]
     MissingOpenRouterApiKey { env_var: String },
-
-    #[error(
-        "{code}: llm.provider=anthropic is deprecated; use llm_policy.provider: openrouter with llm_policy.openrouter.api_key_env and llm_policy.model_id"
-    )]
-    DeprecatedProvider { code: &'static str },
 
     #[error("{code}: integrations.filigree.actor must not be blank when Filigree is enabled")]
     InvalidFiligreeActor { code: &'static str },
@@ -561,6 +1144,33 @@ pub enum ConfigError {
          Pick one and remove the other."
     )]
     AmbiguousLlmKey { code: &'static str },
+
+    #[error(
+        "unknown LLM provider {provider:?}; expected one of: openrouter, openrouter_api, codex_cli, codex_sidecar, claude_cli, claude_sidecar"
+    )]
+    InvalidLlmProvider { provider: String },
+
+    #[error(
+        "unknown semantic search provider {provider:?}; expected one of: api, openai, openai_api, local_openai, local, openai_local"
+    )]
+    InvalidSemanticProvider { provider: String },
+
+    #[error(
+        "{code}: semantic_search.endpoint_url {endpoint_url:?} is not a valid URL: {parse_error}"
+    )]
+    InvalidSemanticEndpoint {
+        code: &'static str,
+        endpoint_url: String,
+        parse_error: String,
+    },
+
+    #[error(
+        "{code}: semantic_search.provider=local_openai requires semantic_search.endpoint_url to be http(s) on localhost or a loopback IP; got {endpoint_url:?}"
+    )]
+    NonLoopbackSemanticEndpoint {
+        code: &'static str,
+        endpoint_url: String,
+    },
 }
 
 /// Reject configs that name both `llm` and `llm_policy` at the top level.
@@ -690,6 +1300,23 @@ llm_policy:
     }
 
     #[test]
+    fn accepts_operator_facing_llm_provider_mode_aliases() {
+        let cases = [
+            ("openrouter_api", LlmProviderKind::OpenRouter),
+            ("codex_sidecar", LlmProviderKind::CodexCli),
+            ("claude_sidecar", LlmProviderKind::ClaudeCli),
+        ];
+
+        for (provider, expected) in cases {
+            let cfg = McpConfig::from_yaml_str(&format!(
+                "llm_policy:\n  enabled: true\n  provider: {provider}\n"
+            ))
+            .unwrap_or_else(|err| panic!("provider alias {provider:?} should parse: {err}"));
+            assert_eq!(cfg.llm.provider, expected);
+        }
+    }
+
+    #[test]
     fn rejects_both_llm_and_llm_policy_keys_present_together() {
         // Realistic migration-doc copy-paste case: operator copies the new
         // `llm_policy:` block but forgets to delete the old `llm:` block.
@@ -723,9 +1350,7 @@ llm_policy:
                 provider: LlmProviderKind::OpenRouter,
                 ..LlmConfig::default()
             },
-            semantic_search: SemanticSearchConfig::default(),
-            integrations: IntegrationsConfig::default(),
-            serve: ServeConfig::default(),
+            ..McpConfig::default()
         };
 
         let selected = select_provider_with_env(&cfg, |name| {
@@ -745,9 +1370,7 @@ llm_policy:
                 allow_live_provider: true,
                 ..LlmConfig::default()
             },
-            semantic_search: SemanticSearchConfig::default(),
-            integrations: IntegrationsConfig::default(),
-            serve: ServeConfig::default(),
+            ..McpConfig::default()
         };
 
         let missing = select_provider_with_env(&cfg, |_| None).expect_err("missing key");
@@ -808,9 +1431,7 @@ llm_policy:
                 provider: LlmProviderKind::CodexCli,
                 ..LlmConfig::default()
             },
-            semantic_search: SemanticSearchConfig::default(),
-            integrations: IntegrationsConfig::default(),
-            serve: ServeConfig::default(),
+            ..McpConfig::default()
         };
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
@@ -872,9 +1493,7 @@ llm_policy:
                 provider: LlmProviderKind::ClaudeCli,
                 ..LlmConfig::default()
             },
-            semantic_search: SemanticSearchConfig::default(),
-            integrations: IntegrationsConfig::default(),
-            serve: ServeConfig::default(),
+            ..McpConfig::default()
         };
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
@@ -885,6 +1504,194 @@ llm_policy:
         })
         .expect("provider selection via env opt-in");
         assert_eq!(env_selected, ProviderSelection::ClaudeCli);
+    }
+
+    #[test]
+    fn disabled_semantic_block_with_non_loopback_local_endpoint_still_loads() {
+        // weft-ac59e8e730: the loopback-trust gate must be conditioned on
+        // `enabled` — a disabled block can never reach the endpoint, and
+        // failing here hard-failed `loomweave serve` / `config status` AND
+        // trapped recovery (`config semantic set --disable` re-parses the
+        // file before writing).
+        let cfg = McpConfig::from_yaml_str(
+            r"
+semantic_search:
+  enabled: false
+  provider: local_openai
+  endpoint_url: http://192.168.1.50:11434/v1
+",
+        )
+        .expect("disabled semantic block must load regardless of endpoint trust");
+        assert!(!cfg.semantic_search.enabled);
+        assert_eq!(
+            cfg.semantic_search.provider,
+            SemanticProviderKind::LocalOpenAi
+        );
+    }
+
+    #[test]
+    fn enabled_local_semantic_provider_still_rejects_non_loopback_endpoint() {
+        let err = McpConfig::from_yaml_str(
+            r"
+semantic_search:
+  enabled: true
+  provider: local_openai
+  endpoint_url: http://192.168.1.50:11434/v1
+",
+        )
+        .expect_err("enabled local provider with a non-loopback endpoint must fail");
+        assert!(
+            err.to_string()
+                .contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn semantic_set_disable_succeeds_on_non_loopback_local_endpoint_config() {
+        // weft-ac59e8e730 recovery path: `config semantic set --disable` on a
+        // file whose enabled local provider points at a non-loopback endpoint
+        // must be able to write the disabled state.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loomweave.yaml");
+        fs::write(
+            &path,
+            "semantic_search:\n  enabled: false\n  provider: local_openai\n  endpoint_url: http://192.168.1.50:11434/v1\n",
+        )
+        .expect("seed config");
+
+        let result = update_semantic_config_file(
+            &path,
+            &SemanticConfigPatch {
+                enabled: Some(false),
+                ..SemanticConfigPatch::default()
+            },
+        )
+        .expect("disabling semantic search must succeed despite the stale endpoint");
+        assert!(!result.config.semantic_search.enabled);
+
+        // And re-enabling against the same stale endpoint is still refused.
+        let err = update_semantic_config_file(
+            &path,
+            &SemanticConfigPatch {
+                enabled: Some(true),
+                ..SemanticConfigPatch::default()
+            },
+        )
+        .expect_err("re-enabling with a non-loopback local endpoint must fail");
+        assert!(
+            err.to_string()
+                .contains("LMWV-CONFIG-SEMANTIC-NON-LOOPBACK"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn semantic_enable_populates_a_present_but_null_sub_block() {
+        // L7 recovery dead-end: a bare `semantic_search:` with nothing indented
+        // parses as YAML-null, not a mapping. `config semantic set --enable`
+        // must populate it (treat null as an empty mapping), not error and write
+        // nothing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loomweave.yaml");
+        fs::write(&path, "version: 1\nsemantic_search:\n").expect("seed config");
+
+        let result = update_semantic_config_file(
+            &path,
+            &SemanticConfigPatch {
+                enabled: Some(true),
+                provider: Some(SemanticProviderKind::LocalOpenAi),
+                endpoint_url: Some("http://127.0.0.1:11434/v1".to_owned()),
+                ..SemanticConfigPatch::default()
+            },
+        )
+        .expect("enabling a null semantic_search sub-block must populate it, not error");
+        assert!(result.config.semantic_search.enabled);
+        assert_eq!(
+            result.config.semantic_search.endpoint_url,
+            "http://127.0.0.1:11434/v1"
+        );
+
+        // And the change is actually persisted (not a silent no-op write).
+        let written = fs::read_to_string(&path).expect("re-read config");
+        let reloaded = McpConfig::from_yaml_str(&written).expect("reload written config");
+        assert!(reloaded.semantic_search.enabled);
+    }
+
+    #[test]
+    fn llm_disable_succeeds_despite_stale_non_loopback_semantic_search() {
+        // L2 cross-section recovery-trap: editing the llm section was rejected
+        // by whole-config `validate()` because an UNRELATED, stale
+        // semantic_search block was enabled with a non-loopback endpoint. An
+        // edit to one section must never be gated by another.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loomweave.yaml");
+        fs::write(
+            &path,
+            "version: 1\n\
+             llm_policy:\n  enabled: true\n\
+             semantic_search:\n  enabled: true\n  provider: local_openai\n  endpoint_url: http://192.168.1.50:11434/v1\n",
+        )
+        .expect("seed config");
+
+        let result = update_llm_config_file(
+            &path,
+            &LlmConfigPatch {
+                enabled: Some(false),
+                ..LlmConfigPatch::default()
+            },
+        )
+        .expect("disabling llm must succeed despite the stale non-loopback semantic endpoint");
+        assert!(!result.config.llm.enabled);
+    }
+
+    #[test]
+    fn semantic_disable_succeeds_despite_stale_non_loopback_serve_http() {
+        // L2 cross-section recovery-trap (the worst case): `config semantic set
+        // --disable` is the very recovery action, yet it was rejected by a
+        // stale enabled non-loopback `serve.http` in a DIFFERENT section.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("loomweave.yaml");
+        fs::write(
+            &path,
+            "version: 1\n\
+             semantic_search:\n  enabled: true\n  provider: local_openai\n  endpoint_url: http://127.0.0.1:11434/v1\n\
+             serve:\n  http:\n    enabled: true\n    bind: 192.168.1.50:8080\n",
+        )
+        .expect("seed config");
+
+        let result = update_semantic_config_file(
+            &path,
+            &SemanticConfigPatch {
+                enabled: Some(false),
+                ..SemanticConfigPatch::default()
+            },
+        )
+        .expect("disabling semantic must succeed despite the stale non-loopback serve.http");
+        assert!(!result.config.semantic_search.enabled);
+    }
+
+    #[test]
+    fn ipv6_loopback_semantic_endpoint_is_trusted() {
+        // weft-ac59e8e730 (minor): url::host_str() returns the bracketed form
+        // for IPv6 hosts, which IpAddr parsing rejected, so `http://[::1]:...`
+        // was wrongly refused as non-loopback.
+        let cfg = SemanticSearchConfig {
+            enabled: true,
+            provider: SemanticProviderKind::LocalOpenAi,
+            endpoint_url: "http://[::1]:11434/v1".to_owned(),
+            ..SemanticSearchConfig::default()
+        };
+        cfg.validate_endpoint_trust()
+            .expect("IPv6 loopback endpoint must satisfy the loopback-trust gate");
+
+        let non_loopback = SemanticSearchConfig {
+            endpoint_url: "http://[2001:db8::1]:11434/v1".to_owned(),
+            ..cfg
+        };
+        non_loopback
+            .validate_endpoint_trust()
+            .expect_err("non-loopback IPv6 endpoint must still be refused");
     }
 
     #[test]
@@ -899,7 +1706,10 @@ serve:
         )
         .expect("parse HTTP bind");
 
-        assert_eq!(cfg.serve.http.bind, SocketAddr::from(([127, 0, 0, 1], 0)));
+        assert_eq!(
+            cfg.serve.http.bind,
+            Some(SocketAddr::from(([127, 0, 0, 1], 0)))
+        );
     }
 
     #[test]
@@ -1068,20 +1878,52 @@ serve:
     }
 
     #[test]
-    fn old_anthropic_provider_shape_reports_deprecated_provider() {
-        let err = McpConfig::from_yaml_str(
-            r"
-llm:
-  enabled: true
-  provider: anthropic
-  anthropic_api_key_env: ANTHROPIC_API_KEY
-",
-        )
-        .expect_err("old provider shape should be rejected");
+    fn http_bind_defaults_to_none_auto_select() {
+        // ADR-044: the installer no longer pins a port; an unset bind means
+        // "auto-select a per-project deterministic port and publish it".
+        assert_eq!(HttpReadConfig::default().bind, None);
+    }
 
-        assert!(matches!(err, ConfigError::DeprecatedProvider { .. }));
-        assert!(err.to_string().contains("LMWV-CONFIG-DEPRECATED-PROVIDER"));
-        assert!(err.to_string().contains("provider: openrouter"));
+    #[test]
+    fn http_bind_none_is_treated_as_loopback() {
+        // Auto-select always binds 127.0.0.1, so an absent bind is loopback and
+        // must satisfy the loopback-trust gate without allow_non_loopback.
+        let cfg = HttpReadConfig {
+            enabled: true,
+            bind: None,
+            ..HttpReadConfig::default()
+        };
+        assert!(cfg.is_loopback_bind());
+        assert!(cfg.validate_loopback_trust().is_ok());
+    }
+
+    #[test]
+    fn http_explicit_bind_still_parses() {
+        let cfg = McpConfig::from_yaml_str(
+            "serve:\n  http:\n    enabled: true\n    bind: \"127.0.0.1:9412\"\n",
+        )
+        .expect("parse explicit bind");
+        assert_eq!(
+            cfg.serve.http.bind,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9412)))
+        );
+    }
+
+    #[test]
+    fn http_bind_none_passes_auth_trust_validation() {
+        let cfg = HttpReadConfig {
+            enabled: true,
+            bind: None,
+            ..HttpReadConfig::default()
+        };
+        assert!(cfg.validate_auth_trust(|_| None).is_ok());
+    }
+
+    #[test]
+    fn http_bind_explicit_null_is_treated_as_auto_select() {
+        let cfg = McpConfig::from_yaml_str("serve:\n  http:\n    enabled: true\n    bind: ~\n")
+            .expect("explicit YAML null should parse as auto-select");
+        assert_eq!(cfg.serve.http.bind, None);
     }
 
     #[test]
@@ -1097,5 +1939,153 @@ integrations:
         .expect_err("blank Filigree actor should be rejected");
 
         assert!(err.to_string().contains("LMWV-CONFIG-FILIGREE-ACTOR-BLANK"));
+    }
+
+    #[test]
+    fn version_marker_is_accepted() {
+        let cfg = McpConfig::from_yaml_str("version: 1\n").expect("version marker should parse");
+        assert_eq!(cfg.version, 1);
+        // Omitting it falls back to the default schema version.
+        assert_eq!(McpConfig::default().version, 1);
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        let err = McpConfig::from_yaml_str("not_a_real_section: true\n")
+            .expect_err("unknown top-level key should be rejected");
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Yaml(_)), "got: {msg}");
+        assert!(msg.contains("not_a_real_section"), "got: {msg}");
+    }
+
+    #[test]
+    fn tolerates_analysis_section_without_disabling_filigree_emission() {
+        // clarion-1d405be546: the same loomweave.yaml is parsed by AnalyzeConfig
+        // (which owns the top-level `analysis:` clustering block) and by McpConfig
+        // (which owns `integrations.filigree`, consulted at emission time). Under
+        // deny_unknown_fields, McpConfig must still PARSE a config that carries a
+        // sibling `analysis:` section — otherwise load_mcp_config's
+        // default-on-error fallback silently sets filigree.enabled = false and
+        // emission is skipped with no surfaced error.
+        let cfg = McpConfig::from_yaml_str(
+            r"
+analysis:
+  clustering:
+    min_cluster_size: 2
+integrations:
+  filigree:
+    enabled: true
+    emit_findings: true
+    actor: loomweave-test
+",
+        )
+        .expect("config carrying both analysis: and integrations.filigree: must load");
+        assert!(
+            cfg.integrations.filigree.enabled,
+            "a sibling analysis: section must not disable Filigree"
+        );
+        assert!(
+            cfg.integrations.filigree.emit_findings,
+            "a sibling analysis: section must not disable finding emission"
+        );
+    }
+
+    #[test]
+    fn unknown_nested_key_under_claude_cli_is_rejected() {
+        // The exact agent-first-feedback §2.1 bug: `model_id` placed inside
+        // claude_cli (whose field is `model`) was silently dropped. With
+        // deny_unknown_fields it must now fail loudly, naming the key.
+        let err = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+  allow_live_provider: true
+  claude_cli:
+    model_id: claude-sonnet-4-6
+",
+        )
+        .expect_err("misplaced key under claude_cli should be rejected");
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Yaml(_)), "got: {msg}");
+        assert!(msg.contains("model_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn fully_specified_live_provider_behind_disabled_emits_warning() {
+        // enabled omitted (defaults false) but allow_live_provider set: a config
+        // that looks live but is inert. Must load (disabled is a legitimate
+        // default) AND warn.
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  provider: claude_cli
+  allow_live_provider: true
+",
+        )
+        .expect("configured-but-disabled provider should still load");
+        assert!(!cfg.llm.enabled);
+        let warnings = cfg.llm_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("enabled=false")),
+            "expected an enabled=false warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn enabled_without_allow_live_provider_emits_warning() {
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+",
+        )
+        .expect("enabled-without-opt-in should load");
+        let warnings = cfg.llm_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("allow_live_provider=false")),
+            "expected an allow_live_provider=false warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unpinned_claude_cli_model_on_live_path_warns_about_cost() {
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+  allow_live_provider: true
+",
+        )
+        .expect("live claude_cli without a pinned model should load");
+        let warnings = cfg.llm_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("claude_cli.model")),
+            "expected an unpinned-model cost warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn healthy_live_config_emits_no_warnings() {
+        let cfg = McpConfig::from_yaml_str(
+            r"
+llm_policy:
+  enabled: true
+  provider: claude_cli
+  allow_live_provider: true
+  claude_cli:
+    model: claude-sonnet-4-6
+",
+        )
+        .expect("healthy live config should load");
+        assert!(
+            cfg.llm_warnings().is_empty(),
+            "expected no warnings, got: {:?}",
+            cfg.llm_warnings()
+        );
     }
 }

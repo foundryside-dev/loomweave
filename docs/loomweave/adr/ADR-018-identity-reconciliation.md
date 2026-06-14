@@ -98,10 +98,11 @@ This preserves the federation test: removing Wardline breaks Wardline-derived an
 Wardline now publishes the NG-25 trust-vocabulary descriptor as `vocabulary.yaml`
 and through `wardline vocab`. Loomweave's Python plugin consumes that descriptor
 instead of importing `wardline.core.registry.REGISTRY`. Resolution is
-project-local `.wardline/vocabulary.yaml` first, then the installed Wardline
-distribution data file `wardline/core/vocabulary.yaml`; both paths are plain
-file reads and neither imports `wardline`, `wardline.core`, or
-`wardline.core.registry`.
+project-local first — the consolidated `.weft/wardline/vocabulary.yaml` only, with
+no fallback to the pre-consolidation `.wardline/vocabulary.yaml` path (ADR-046
+clean break) — then the installed Wardline distribution data file
+`wardline/core/vocabulary.yaml`; all paths are plain file reads and none import
+`wardline`, `wardline.core`, or `wardline.core.registry`.
 
 The plugin records source-observed decorator facts on Loomweave entities as
 Wardline metadata and `wardline:*` tags. Wardline remains authoritative for the

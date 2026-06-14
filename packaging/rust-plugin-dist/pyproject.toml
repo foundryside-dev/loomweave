@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "loomweave-plugin-rust"
+version = "1.1.0rc5"
+description = "Loomweave Rust language plugin — JSON-RPC entity/edge extractor"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "John Morrissey", email = "qacona@gmail.com" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Repository = "https://github.com/foundryside-dev/loomweave"
+
+[tool.maturin]
+# Ship the discovery-glob-named bin (loomweave-plugin-rust) into the venv's
+# scripts dir, so exe-dir discovery finds it next to the `loomweave` binary.
+bindings = "bin"
+manifest-path = "Cargo.toml"
+bins = ["loomweave-plugin-rust"]
+strip = true
+# Route plugin.toml to <venv>/share/loomweave/plugins/rust/plugin.toml — exactly
+# where discovery's install-prefix fallback looks (<bin>/../share/loomweave/
+# plugins/<suffix>/plugin.toml, suffix = name minus "loomweave-plugin-"). The
+# `wheel-data/` tree mirrors the sysconfig "data" scheme (installs at the venv
+# root). Its plugin.toml is a tracked copy of the canonical
+# crates/loomweave-plugin-rust/plugin.toml, kept in lockstep by
+# scripts/check-rust-plugin-manifest-lockstep.py.
+data = "wheel-data"

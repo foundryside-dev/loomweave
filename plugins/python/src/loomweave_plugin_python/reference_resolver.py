@@ -10,7 +10,12 @@ if TYPE_CHECKING:
     from loomweave_plugin_python.call_resolver import Finding
 
 
-ReferenceSiteKind = Literal["name", "annotation"]
+# ``name``/``annotation`` resolve into ``references`` edges; ``base`` and
+# ``decorator`` are relation sites resolving into ``inherits_from`` /
+# ``decorates`` edges respectively (clarion-43416be550). All four ride the
+# same pyright resolution machinery (external-skip, per-file cap, lookup
+# cache); the site kind selects the emitted edge kind.
+ReferenceSiteKind = Literal["name", "annotation", "base", "decorator"]
 
 
 @dataclass(frozen=True)
@@ -30,7 +35,16 @@ class ReferencesEdgeProperties(TypedDict):
 
 
 class ReferencesRawEdge(TypedDict):
-    kind: Literal["references"]
+    """Anchored edge produced by the reference-site resolution pass.
+
+    Despite the name (historic — B.5* shipped ``references`` alone), this is
+    the wire shape for all three site-derived edge kinds. ``candidates`` in
+    ``properties`` is present only on ambiguous edges; for ``decorates`` the
+    candidates are alternative *from*-side decorator entities (direction is
+    inverted relative to the site owner).
+    """
+
+    kind: Literal["references", "inherits_from", "decorates"]
     from_id: str
     to_id: str
     source_byte_start: int

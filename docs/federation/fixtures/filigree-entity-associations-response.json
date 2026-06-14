@@ -1,0 +1,64 @@
+{
+  "_meta": {
+    "contract": "filigree-entity-associations-response",
+    "endpoint": "GET /api/entity-associations?entity_id={entity_id}",
+    "fixture_version": 1,
+    "stability": "normative",
+    "authority": "Weft G15 / ADR-029 EntityAssociation producer-consumer conformance",
+    "producer": "Filigree dashboard_routes.entities.api_list_associations_by_entity",
+    "consumer": "Loomweave loomweave_federation::filigree::parse_entity_associations_response",
+    "repo_local_copies": [
+      "filigree/tests/fixtures/contracts/entity-associations-response.json",
+      "loomweave/docs/federation/fixtures/filigree-entity-associations-response.json"
+    ],
+    "verification": "Filigree: uv run pytest tests/api/test_entity_associations.py -q; Loomweave: cargo test -p loomweave-federation filigree::tests::parses_canonical_filigree_entity_association_fixture",
+    "updated": "2026-06-13",
+    "description": "Canonical live Filigree reverse-lookup response for EntityAssociation rows. The producer test emits this body through Filigree's HTTP route; the consumer test deserializes the same body in Loomweave."
+  },
+  "shape_decl": {
+    "kind": "filigree-entity-associations-fixture-shapes",
+    "shapes": {
+      "entity_associations_response": {
+        "status": 200,
+        "required_fields": {
+          "associations": {
+            "type": "array"
+          }
+        },
+        "allow_extra_fields": false
+      }
+    }
+  },
+  "examples": [
+    {
+      "name": "live_v27_reverse_lookup_200",
+      "request": {
+        "method": "GET",
+        "path": "/api/entity-associations?entity_id=loomweave%3Aeid%3A0123456789abcdef0123456789abcdef"
+      },
+      "response": {
+        "status": 200,
+        "shape": "entity_associations_response",
+        "body": {
+          "associations": [
+            {
+              "issue_id": "test-045076e30f",
+              "entity_id": "loomweave:eid:0123456789abcdef0123456789abcdef",
+              "loomweave_entity_id": "loomweave:eid:0123456789abcdef0123456789abcdef",
+              "entity_kind": "function",
+              "content_hash_at_attach": "hash-g15-oracle",
+              "attached_at": "2026-06-13T00:00:00+00:00",
+              "attached_by": "g15-oracle",
+              "migration_orphaned_at": null,
+              "orphan_status": "unknown",
+              "freshness_status": "unknown",
+              "signature": null,
+              "signoff_seq": null,
+              "signed_content_hash": null
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

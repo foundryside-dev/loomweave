@@ -1,0 +1,16 @@
+-- 0010: Clear run-scoped findings so the content-keyed finding id can take over.
+--
+-- L1 fix (clarion-772ff358da / ADR-047): finding ids were `core:finding:{run_id}:…`,
+-- so a fresh re-analyze minted a NEW row for the same logical finding (the upsert
+-- only de-duped a `--resume` re-walk under the same run_id). Findings accumulated
+-- across runs (255 -> 259 -> 263) and every re-analyze orphaned the prior row's
+-- Filigree linkage. The new id is content-keyed (`core:finding:<discriminator>`),
+-- so ON CONFLICT(id) now de-dupes across runs and preserves lifecycle.
+--
+-- On an existing database the new content-keyed rows would land BESIDE the old
+-- run-scoped ones (a one-time worse doubling that never self-cleans, since no
+-- sweep matches the legacy id format). Findings are fully regenerable derived
+-- data — the next `loomweave analyze` repopulates them with content-keyed ids —
+-- so the clean fix is to drop the legacy rows here. (The store is itself a
+-- regenerable cache per ADR-005 as reversed by C1/weft-d822a7de2d.)
+DELETE FROM findings;

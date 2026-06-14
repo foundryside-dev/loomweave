@@ -89,7 +89,7 @@ Entity kinds are strings declared by a language plugin's manifest, not a fixed e
 
 Loomweave records typed edges between entities. Core reserves `contains`, `guides`, `emits_finding`, and `in_subsystem`; all other edge kinds are plugin-declared.
 
-**Rationale**: Edges are how navigation queries and clustering work. A language-agnostic core with a handful of reserved edges keeps the property-graph generic while giving plugins full expressive range for language-specific relationships (Python's `imports`, `calls`, `inherits_from`, `decorated_by`).
+**Rationale**: Edges are how navigation queries and clustering work. A language-agnostic core with a handful of reserved edges keeps the property-graph generic while giving plugins full expressive range for language-specific relationships (Python's `imports`, `calls`, `inherits_from`, `decorates`).
 **Verification**: Plugin emits edges with plugin-defined kinds; core persists them; `neighbors(id, edge_kind=...)` returns them correctly.
 **See**: System Design §3 (Data Model).
 
@@ -308,11 +308,9 @@ Operators author guidance via CLI (`loomweave guidance create/edit/list/show/del
 
 #### REQ-GUIDANCE-04 — Wardline-derived guidance
 
-On every `loomweave analyze` run with `wardline.yaml` present, Loomweave auto-generates `provenance: wardline_derived` guidance sheets for declared tier assignments, boundary contracts, and annotation groups in use. Auto-generated sheets carry `pinned: true`. User edits are preserved (`provenance: wardline_derived_overridden`) across regenerations.
+> **Retired 2026-06-11** (clarion-7c9336163e). This requirement assumed Wardline publishes a `wardline.yaml` manifest (tiers / boundary contracts / annotation groups) plus `wardline.fingerprint.json` / `wardline.exceptions.json` / `wardline.overlay.yaml` artifacts. Verified against Wardline HEAD and its full git history: Wardline never produced that format — its config is `weft.toml [wardline]` (no tier/boundary/group vocabulary), and its only published vocabulary artifact is the NG-25 decorator descriptor (`.weft/wardline/vocabulary.yaml`), which carries decorator names/groups/attrs, not guidance-sheet material. The ingest (`wardline_guidance.rs`), its analyze hook, and the `LMWV-FACT-GUIDANCE-STALE` staleness signal were dormant on every real project and have been removed. If Wardline ever publishes a guidance-bearing manifest, a successor requirement should be written against that real contract.
 
-**Rationale**: Wardline declarations (tiers, contracts) are project-wide institutional knowledge Loomweave already reads at analysis time. Regenerating the corresponding guidance sheets eliminates the manual labour of keeping them in sync with `wardline.yaml`; preserving user edits respects operator curation.
-**Verification**: Fixture with `wardline.yaml` produces auto-derived sheets on first run; edit a sheet; re-run; assert the edit is preserved and flagged `wardline_derived_overridden`.
-**See**: System Design §7 (Guidance System, Wardline-derived).
+*Original (historical) text*: On every `loomweave analyze` run with `wardline.yaml` present, Loomweave auto-generates `provenance: wardline_derived` guidance sheets for declared tier assignments, boundary contracts, and annotation groups in use. Auto-generated sheets carry `pinned: true`. User edits are preserved (`provenance: wardline_derived_overridden`) across regenerations.
 
 #### REQ-GUIDANCE-05 — Staleness signals tied to code churn
 
@@ -452,7 +450,7 @@ Write-effect tools (`emit_observation`, `promote_observation`, `propose_guidance
 
 > **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.6)](../../implementation/sprint-2/scope-amendment-2026-05.md). Session persistence is the cursor-based Navigation model deferred with [REQ-MCP-01](#req-mcp-01--cursor-based-session-model); v1.0 tools take explicit `id` arguments per-call and hold no per-session state beyond the request scope.
 
-Sessions are created on MCP `initialize`, idle-timeout after 1 hour (configurable), and persist to `.loomweave/sessions/<id>.json` for reconnection. `loomweave sessions list` and `loomweave sessions close <id>` provide admin surfaces.
+Sessions are created on MCP `initialize`, idle-timeout after 1 hour (configurable), and persist to `.weft/loomweave/sessions/<id>.json` for reconnection. `loomweave sessions list` and `loomweave sessions close <id>` provide admin surfaces.
 
 **Rationale**: Agents reconnecting after a transport interruption expect their cursor and breadcrumbs to survive; losing session state mid-investigation is hostile to the workflow.
 **Verification**: Open a session, populate cursor, disconnect, reconnect, assert state restored.
@@ -468,7 +466,7 @@ Human-readable outputs from `loomweave analyze`.
 
 > **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.4 removed)](../../implementation/sprint-2/scope-amendment-2026-05.md). The `catalog.json` artefact has no consumer in the v1.0 MVP MCP surface; the MCP tools query the SQLite store directly.
 
-`loomweave analyze` emits `.loomweave/catalog.json` — a deterministic, stable-shape dump of the entity catalog, edges, subsystems, and findings at run completion.
+`loomweave analyze` emits `.weft/loomweave/catalog.json` — a deterministic, stable-shape dump of the entity catalog, edges, subsystems, and findings at run completion.
 
 **Rationale**: JSON is the universal interchange format; downstream consumers (dashboards, bespoke scripts, CI gates) can read the catalog without speaking SQLite. Deterministic output means git diffs reflect real changes, not run-to-run noise.
 **Verification**: Two consecutive runs produce byte-identical `catalog.json`; schema conforms to a versioned JSON schema.
@@ -478,7 +476,7 @@ Human-readable outputs from `loomweave analyze`.
 
 > **Deferred to v1.1** per the [Sprint 2 scope amendment §3 (Box B.5 removed)](../../implementation/sprint-2/scope-amendment-2026-05.md). Subsystem rendering lands with WP4 in v1.1.
 
-`loomweave analyze` emits `.loomweave/catalog/<subsystem>.md` (one markdown file per subsystem) plus `.loomweave/catalog/index.md` (top-level navigation). Markdown is generated from the store, not authored.
+`loomweave analyze` emits `.weft/loomweave/catalog/<subsystem>.md` (one markdown file per subsystem) plus `.weft/loomweave/catalog/index.md` (top-level navigation). Markdown is generated from the store, not authored.
 
 **Rationale**: Markdown is the human-reading surface for cases where a human (reviewer, new team member) wants to read the catalog without running `loomweave serve` or speaking MCP. Subsystem granularity matches how humans think about large codebases; the index makes discovery cheap.
 **Verification**: For each subsystem entity, a corresponding markdown file exists and renders cleanly; index lists all subsystems.
@@ -568,17 +566,20 @@ Plugins implement two phases of lifecycle calls: batch (`initialize`, `analyze_f
 
 #### REQ-PLUGIN-04 — Python plugin (v1.0)
 
-Loomweave ships a Python plugin supporting Python >=3.11. The v1.0 plugin
-declares and emits the narrower ontology that is present in
+Loomweave ships a Python plugin supporting Python >=3.11. The plugin
+declares and emits the ontology that is present in
 `plugins/python/plugin.toml`: `function`, `class`, and `module` entities, plus
-`contains`, `calls`, `references`, and `imports` edges. The plugin is not
-Wardline-aware in v1.0 and does not declare or emit `protocol`, `global`, or
-`package` entity kinds, nor `inherits_from`, `decorated_by`, `uses_type`, or
-`alias_of` edges. Those signals are deferred until the manifest declares them
-and the extractor has fixture-backed support for them.
+`contains`, `calls`, `references`, `imports`, `inherits_from`, and `decorates`
+edges (the last two are the ontology-0.8.0 addition, clarion-43416be550; the
+shipped kind is spelled `decorates` — direction decorator → decorated — and
+supersedes this document's earlier `decorated_by` sketch, which read the
+opposite way). The plugin does not declare or emit `protocol`, `global`, or
+`package` entity kinds, nor `uses_type` or `alias_of` edges. Those signals are
+deferred until the manifest declares them and the extractor has fixture-backed
+support for them.
 
 **Rationale**: Python is the validating first-customer language (elspeth is ~425k LOC Python). Shipping the plugin alongside the core for v1.0 establishes the plugin-authoring contract and validates the plugin protocol against a real workload, while keeping the advertised ontology limited to signals that are actually emitted. `pipx` isolation prevents venv conflicts with the analysed project.
-**Verification**: The plugin manifest smoke test pins the v1.0 entity/edge kinds and `wardline_aware = false`; `tests/fixtures/elspeth-slice/` runs through the Python plugin and produces expected entity/edge counts; installation via pipx succeeds.
+**Verification**: The plugin manifest smoke test pins the declared entity/edge kinds (`plugins/python/tests/test_package.py`); `tests/fixtures/elspeth-slice/` runs through the Python plugin and produces expected entity/edge counts; installation via pipx succeeds.
 **See**: System Design §2 (Python plugin specifics).
 
 #### REQ-PLUGIN-05 — Python import resolution policy
@@ -597,14 +598,22 @@ package re-exports and does not mint `python:unresolved:*` placeholder entities.
 
 #### REQ-PLUGIN-06 — Decorator detection policy
 
-Decorator semantics are deferred for the Python plugin until the ontology grows.
-In v1.0 the extractor preserves decorator source spans in entity definition
-metadata so source navigation covers the decorated declaration, but it does not
-declare or emit `decorated_by` edges, decorator tags, Wardline annotation
-metadata, decorator arguments, or alias-resolved decorator facts.
+The extractor preserves decorator source spans in entity definition metadata
+so source navigation covers the decorated declaration, and (since ontology
+0.8.0, clarion-43416be550) emits anchored `decorates` edges with direction
+decorator → decorated. Decorator expressions reduce to their dotted path
+token — factory calls (`@app.route("/x")`) reduce to the callee path, and the
+factory's arguments are not extracted. The reduced token resolves through the
+pyright reference machinery to a precise in-project entity only (no module-id
+coarse fallback); external/builtin decorators and self-references yield no
+edge. Stacking order is not represented: the edges primary key is
+`(kind, from_id, to_id)`, so duplicate decorators on one entity dedupe to a
+single edge. Aliased decorators (`deco = make()` then `@deco`) resolve to the
+alias assignment, which is not an entity, and are dropped by the
+precise-entity discipline.
 
-**Rationale**: Decorator-as-DSL is widespread in Python (FastAPI, Pydantic, Wardline itself). The v1.0 plugin keeps source spans honest while avoiding a false ontology claim. A later implementation must add the edge kind to the manifest and fixture-backed extraction for direct, factory, stacked, class, and aliased decorators before advertising decorator semantics.
-**Verification**: Current fixtures assert decorated entity spans include decorator lines and that the manifest does not advertise Wardline semantics. Future decorator extraction must add fixtures for direct, factory, stacked, class, and aliased decorators and assert emitted `decorated_by` edges with preserved order/arguments.
+**Rationale**: Decorator-as-DSL is widespread in Python (FastAPI, Pydantic, Wardline itself). The `decorates` edge answers the relation question consult-mode agents actually ask ("what does `@app.route` decorate") without advertising argument or stacking-order semantics that are not implemented.
+**Verification**: Fixture-backed tests cover direct, factory, stacked, class, dotted cross-module, and aliased/self-reference decorator forms (`plugins/python/tests/test_extractor.py`, `test_pyright_session.py`); the walking-skeleton e2e pins a `decorates` row end-to-end with exact tuple equality.
 **See**: System Design §2 (Python plugin specifics, Decorator detection).
 
 ---
@@ -743,6 +752,8 @@ Loomweave's Python plugin imports `wardline.core.registry.REGISTRY` at startup a
 #### REQ-INTEG-WARDLINE-02 — Manifest + overlay ingest
 
 > **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP9-B Wardline-config ingest). v1.0 ships only the [REQ-INTEG-WARDLINE-01](#req-integ-wardline-01--direct-registry-import-with-version-pin) runtime REGISTRY probe; state-file ingest (`wardline.yaml` + overlays) lands with the Wardline read-side bundle in v1.1.
+>
+> **Input-format caveat (2026-06-11, clarion-7c9336163e)**: current Wardline does not produce a `wardline.yaml` manifest at all (config is `weft.toml [wardline]`; the published vocabulary artifact is the NG-25 decorator descriptor). Any v1.1 revival of this requirement must first re-derive the input contract from what Wardline actually publishes — see the REQ-GUIDANCE-04 retirement note above for the evidence.
 
 Loomweave reads `wardline.yaml` and overlay files matching `src/**/wardline.overlay.yaml` at analyse time; declared tiers, groups, and boundary contracts become `WardlineMeta` properties on affected entities.
 
@@ -836,7 +847,7 @@ Loomweave v0.1 is validated against `elspeth` (~425k LOC Python, ~1,100 files). 
 
 #### NFR-SCALE-02 — DB size bound
 
-The `.loomweave/loomweave.db` store for an elspeth-scale project fits within 2GB. Larger projects degrade gracefully — no hard cap, but cost of commit-the-DB grows.
+The `.weft/loomweave/loomweave.db` store for an elspeth-scale project fits within 2GB. Larger projects degrade gracefully — no hard cap, but cost of commit-the-DB grows.
 
 **Rationale**: Committed DBs live in git; a 2GB DB is uncomfortable but workable, 10GB is pathological. Matching elspeth to 500MB-2GB keeps the commit-DB story honest.
 **Verification**: Elspeth run produces a DB within the bound; DB growth linear with entity count.
@@ -856,7 +867,7 @@ The `.loomweave/loomweave.db` store for an elspeth-scale project fits within 2GB
 
 #### NFR-SEC-01 — Pre-ingest secret scanning
 
-Before any file content reaches the LLM provider, Loomweave runs a pre-ingest secret scanner (bundled `detect-secrets` or equivalent) on the file buffer. Unredacted secrets emit `LMWV-SEC-SECRET-DETECTED` and **block LLM dispatch for that file**. False-positive whitelist at `.loomweave/secrets-baseline.yaml`.
+Before any file content reaches the LLM provider, Loomweave runs a pre-ingest secret scanner (bundled `detect-secrets` or equivalent) on the file buffer. Unredacted secrets emit `LMWV-SEC-SECRET-DETECTED` and **block LLM dispatch for that file**. False-positive whitelist at `.weft/loomweave/secrets-baseline.yaml`.
 
 **Rationale**: The first real user running `loomweave analyze` on a repo with a committed `.env` would otherwise silently leak to Anthropic. Pre-ingest redaction is a hard dependency for v0.1; retrofitting it after a leak is too late.
 **Verification**: Fixture with a deliberately-committed test secret blocks LLM dispatch; baseline whitelist suppresses the block for approved false positives.
@@ -916,10 +927,10 @@ Every security-relevant event (`LMWV-SEC-SECRET-DETECTED`, `LMWV-SEC-UNREDACTED-
 
 #### NFR-SEC-05 — Run log exclusion from git by default
 
-`runs/<run_id>/log.jsonl` (raw LLM request/response bodies) is git-excluded by default via `.loomweave/.gitignore` (`runs/*/log.jsonl`). Operators opt-in to committing explicitly.
+`runs/<run_id>/log.jsonl` (raw LLM request/response bodies) is git-excluded by default via `.weft/loomweave/.gitignore` (`runs/*/log.jsonl`). Operators opt-in to committing explicitly.
 
 **Rationale**: Run logs may contain source excerpts appropriate to ship to Anthropic but not appropriate to commit to a public repo. Default-exclude prevents accidental exposure; explicit opt-in forces the operator to own the choice.
-**Verification**: Fresh install produces `.loomweave/.gitignore` with the rule; log files not tracked in the next `git status`.
+**Verification**: Fresh install produces `.weft/loomweave/.gitignore` with the rule; log files not tracked in the next `git status`.
 **See**: System Design §4 (Storage, Commit posture), §10 (Security, Operator guidance).
 
 ---
@@ -942,9 +953,9 @@ Loomweave runs entirely locally. The only required network egress is the LLM pro
 **Verification**: Network egress audit during `loomweave analyze`: only Anthropic endpoints in the packet capture.
 **See**: System Design §1 (Context & Boundaries).
 
-#### NFR-OPS-03 — `.loomweave/` git-committable
+#### NFR-OPS-03 — `.weft/loomweave/` git-committable
 
-The `.loomweave/` directory (including `loomweave.db` by default) is safe to commit to git. Textual DB export (`loomweave db export --textual`) and a merge helper (`loomweave db merge-helper`) handle multi-developer conflicts.
+The `.weft/loomweave/` directory (including `loomweave.db` by default) is safe to commit to git. Textual DB export (`loomweave db export --textual`) and a merge helper (`loomweave db merge-helper`) handle multi-developer conflicts.
 
 **Rationale**: Shared analysis state benefits small teams (one developer pays the LLM cost; the team sees the briefings). Commit-by-default matches Filigree's and Wardline's storage patterns. Textual export makes git diffs meaningful.
 **Verification**: `git add .loomweave && git commit` succeeds on a populated store; two developers' simultaneous runs produce a DB that the merge helper resolves deterministically.
@@ -964,7 +975,7 @@ The Python plugin installs via `pipx install loomweave-plugin-python` into its o
 
 #### NFR-OBSERV-01 — Structured JSON logs
 
-Loomweave emits structured JSON-line logs via the `tracing` crate. Logs rotate at 100MB with 5 files kept. Per-run log at `.loomweave/runs/<run_id>/log.jsonl`; per-process log at `.loomweave/loomweave.log`.
+Loomweave emits structured JSON-line logs via the `tracing` crate. Logs rotate at 100MB with 5 files kept. Per-run log at `.weft/loomweave/runs/<run_id>/log.jsonl`; per-process log at `.weft/loomweave/loomweave.log`.
 
 **Rationale**: Structured logs are machine-parseable; text logs aren't. Downstream log aggregation (if operators route Loomweave's output into Vector / Loki / Splunk) works by default.
 **Verification**: Log entries parse as JSON; rotation verified; log levels respected.
@@ -1032,7 +1043,7 @@ The dry-run cost estimate is within ±50% of actual spend on representative proj
 
 #### NFR-RELIABILITY-01 — Crash-surviving store
 
-> **v1.x status amended by ADR-041.** `.loomweave/loomweave.db` must survive
+> **v1.x status amended by ADR-041.** `.weft/loomweave/loomweave.db` must survive
 > unclean shutdown (SIGKILL during analyze) without corruption. Subsequent
 > `loomweave analyze --resume <run_id>` safely reopens and re-walks the same run
 > id; it does not continue from a phase/file checkpoint.
@@ -1251,6 +1262,8 @@ Symbol-rename-without-file-move detaches cross-tool references in v0.1. Explicit
 
 Loomweave v0.1 ships only a Python plugin. A second language plugin (Java, Rust, TypeScript) is v0.2+.
 
+> **Amended:** the first-party Rust language plugin (`crates/loomweave-plugin-rust`) shipped post-v1.0 in the 1.x line, proving the plugin protocol generalises beyond Python — it emits `contains` / `calls` / `imports` / `derives` / `references` / `implements` edges. The deferred set narrows to Java and TypeScript.
+
 **Why**: Proving the plugin protocol with one language before extending is prudent; elspeth is Python.
 
 ### NG-16 — Deferred: plugin hash-pinning
@@ -1309,7 +1322,7 @@ Churn is captured at file level (`REQ-CATALOG-04`). Co-change graphs, authorship
 
 ### NG-25 — Deferred: Wardline annotation descriptor consumption
 
-Wardline shipping a YAML/JSON descriptor of its REGISTRY (instead of requiring direct Python import) is v0.2. V0.1's Python-only plugin can import directly; non-Python plugins in v0.2+ will need the descriptor.
+Wardline shipping a YAML/JSON descriptor of its REGISTRY (instead of requiring direct Python import) is v0.2. V0.1's Python-only plugin can import directly; the now-shipped first-party Rust plugin (`crates/loomweave-plugin-rust`) consumes that trust-vocabulary descriptor as an on-disk file rather than importing Python objects.
 
 **Why**: Python-direct import works for v0.1's single plugin; descriptor is a cross-language requirement for later.
 

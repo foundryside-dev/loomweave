@@ -10,12 +10,15 @@
 //!   an existing signal (categorisation tag / git churn) and returning an honest
 //!   empty result with a missing-signal note where the signal is absent.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Value, json};
 
 use loomweave_core::{EdgeConfidence, McpErrorCode};
-use loomweave_storage::{call_edges_targeting, entities_by_churn, entity_by_id};
+use loomweave_storage::{
+    call_edges_targeting, entities_by_churn, entities_targeted_by_unresolved_call_sites,
+    entity_by_id, resolve_entity_ref,
+};
 
 use crate::ParamError;
 use crate::ServerState;
@@ -36,6 +39,21 @@ const EDGE_SCAN_ORDER_BY: &str = "ORDER BY kind, from_id, to_id, confidence, \
 /// `find_dead_code` — entities "called from outside" the codebase. Tag-emitting
 /// plugins populate these; the empty-root guard protects indexes with no root
 /// tags from a flood of false positives.
+///
+/// The trailing `wardline:*` entries are Wardline-derived trust boundaries
+/// (clarion-bf496d55d1, §4.2): the Python plugin emits `wardline:external_boundary`
+/// / `wardline:trusted` from the on-disk Wardline vocabulary descriptor
+/// (`@external_boundary` / `@trusted` decorators) into `entity_tags` at analyze
+/// time — a developer-annotated, higher-confidence "called from outside the
+/// static graph" signal than the structural heuristics. They map onto the
+/// existing entry-point / exported-api root classes (`external_boundary` →
+/// entry point, `trusted` → exported API); for dead-code reachability only the
+/// union matters, so both simply join the root set, reading the same single
+/// `entity_tags` signal under the same host validation discipline as every
+/// other tag. Enrich-only: with no Wardline descriptor no `wardline:*` tag is
+/// emitted and the root set is byte-identical to before. Stale facts cannot
+/// resurrect a deleted entity as a root — `entity_tags` rows cascade-delete
+/// with their entity, and roots join only live `entities`.
 const DEAD_CODE_ROOT_TAGS: &[&str] = &[
     "entry-point",
     "http-route",
@@ -43,6 +61,8 @@ const DEAD_CODE_ROOT_TAGS: &[&str] = &[
     "data-model",
     "cli-command",
     "exported-api",
+    "wardline:external_boundary",
+    "wardline:trusted",
 ];
 
 /// Tags that force an entity to be treated as live regardless of static
@@ -55,6 +75,13 @@ const DEAD_CODE_BARRIER_TAGS: &[&str] = &["dynamic-dispatch", "reflection"];
 /// framework-magic entry kinds (decorated handlers, plugin hooks) whose callers
 /// are invisible to static analysis.
 const DEAD_CODE_EXCLUDED_TAGS: &[&str] = &["framework-handler", "plugin-hook"];
+
+/// Entity KINDS that are not code and therefore can never be "dead code":
+/// core `file` anchors (a config sidecar like `.env.example` is not dead
+/// code — dogfood-4 B2, weft-3fb0f5dfc7), the synthetic project anchor,
+/// subsystems (groupings, not code), and guidance sheets. Exclusion is by
+/// kind, not plugin, so a plugin-emitted non-code kind is covered too.
+const DEAD_CODE_NON_CODE_KINDS: &[&str] = &["file", "project", "subsystem", "guidance"];
 
 /// Runtime import predicate used by graph shortcuts. Missing or malformed
 /// properties fail toward inclusion; explicit `type_only=true` or
@@ -331,15 +358,31 @@ impl ServerState {
                 let reachable = forward_reachable(&adjacency, live);
 
                 let excluded = ids_with_any_tag(conn, DEAD_CODE_EXCLUDED_TAGS)?;
-                let (all_ids, entity_scan_truncated) = all_entity_ids(conn)?;
+                // Fail toward live: an entity whose name matches an unresolved
+                // call site is a plausible callee and must NOT be flagged dead.
+                // The Rust resolver emits no `calls` edge for `x.method()` /
+                // `Type::assoc()` (no type inference), so those callees are
+                // invisible to static reachability — without this they would be
+                // false-flagged dead. Language-agnostic: a fully-resolving
+                // plugin (pyright-backed Python) leaves this set empty.
+                let unresolved_targets = entities_targeted_by_unresolved_call_sites(conn)?;
+                let CandidateSet {
+                    mut candidates,
+                    excluded_by_plugin,
+                    blocked_reason_by_id,
+                    entity_scan_truncated,
+                } = dead_code_candidate_set(conn, &reachable, &excluded, in_scope.as_ref())?;
 
-                let mut candidates: Vec<String> = all_ids
-                    .into_iter()
-                    .filter(|id| !reachable.contains(id))
-                    .filter(|id| !excluded.contains(id))
-                    .filter(|id| in_scope.as_ref().is_none_or(|ids| ids.contains(id)))
-                    .collect();
-                candidates.sort();
+                // Count the unresolved-call-site shield separately so the
+                // disclosure is exact, then remove the shielded candidates.
+                let unresolved_call_site_suppressed = candidates
+                    .iter()
+                    .filter(|id| unresolved_targets.contains(*id))
+                    .count();
+                candidates.retain(|id| !unresolved_targets.contains(id));
+
+                let (withheld_count, withheld_reasons) =
+                    withhold_blocked_candidates(&mut candidates, &blocked_reason_by_id);
 
                 let total = candidates.len();
                 let returned: Vec<String> = candidates
@@ -350,6 +393,10 @@ impl ServerState {
                 let returned_count = returned.len();
                 let truncated = page.offset.saturating_add(returned_count) < total;
 
+                // Per-row payload is the entity alone; the constant facets
+                // (rule/kind/confidence/reason) are stated ONCE in the
+                // top-level `finding` block instead of verbatim on every row
+                // of every page (weft-3fb0f5dfc7 / dogfood-4 B2).
                 let dead_code: Vec<Value> = returned
                     .iter()
                     .map(|id| {
@@ -357,21 +404,37 @@ impl ServerState {
                             Ok(Some(entity)) => entity_json(conn, &entity),
                             _ => json!({ "id": id, "sei": Value::Null }),
                         };
-                        json!({
-                            "entity": entity,
-                            "rule_id": DEAD_CODE_RULE_ID,
-                            "kind": "fact",
-                            "confidence": DEAD_CODE_CONFIDENCE,
-                            "confidence_basis": "heuristic",
-                            "reason": "unreachable from the reachability root set over call+import \
-                                       edges across all confidence tiers; static reachability \
-                                       cannot prove dynamic or reflective reach",
-                        })
+                        json!({ "entity": entity })
                     })
                     .collect();
 
                 Ok(success_envelope(json!({
                     "dead_code": dead_code,
+                    // The constant facets every candidate shares, hoisted.
+                    "finding": {
+                        "rule_id": DEAD_CODE_RULE_ID,
+                        "kind": "fact",
+                        "confidence": DEAD_CODE_CONFIDENCE,
+                        "confidence_basis": "heuristic",
+                        "reason": "unreachable from the reachability root set over call+import \
+                                   edges across all confidence tiers; static reachability \
+                                   cannot prove dynamic or reflective reach",
+                    },
+                    "excluded": {
+                        "non_code_kinds": DEAD_CODE_NON_CODE_KINDS,
+                        "plugins_without_roots": plugins_without_roots_json(excluded_by_plugin),
+                    },
+                    // Aggregate-level actionability without identity
+                    // disclosure: how many candidate rows were withheld as
+                    // briefing-blocked, why, and how to recover them.
+                    "withheld": {
+                        "count": withheld_count,
+                        "reasons": withheld_reasons.iter().collect::<Vec<_>>(),
+                        "recovery": withheld_reasons
+                            .iter()
+                            .next()
+                            .map(|reason| crate::briefing_block_remediation(reason)),
+                    },
                     "page": {
                         "total": total,
                         "offset": page.offset,
@@ -381,6 +444,7 @@ impl ServerState {
                     },
                     "scope_truncated": scope_truncated,
                     "scan_truncated": scan_truncated || entity_scan_truncated,
+                    "unresolved_call_site_suppressed": unresolved_call_site_suppressed,
                 })))
             })
             .await;
@@ -506,7 +570,7 @@ impl ServerState {
         let result = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &entity_id)? else {
+                let Some(entity) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(tool_error_envelope(
                         McpErrorCode::EntityNotFound,
                         &format!("entity {entity_id} was not found"),
@@ -710,10 +774,134 @@ fn ids_with_any_tag(
     Ok(out)
 }
 
-/// All entity ids, bounded by [`ENTITY_SCAN_CAP`]. Returns `(ids, truncated)`.
-fn all_entity_ids(conn: &rusqlite::Connection) -> loomweave_storage::Result<(Vec<String>, bool)> {
+/// Withhold briefing-blocked candidates from the dead-code row set
+/// (weft-3fb0f5dfc7, dogfood-4 B2 + PM ruling): an all-null stub row is
+/// unactionable noise, and an identity-bearing row would breach the
+/// stub-collapse non-disclosure invariant (clarion-307668e2be) — so neither
+/// appears. The exclusion is reported ONCE, in aggregate; counted only over
+/// rows that would otherwise have been candidates, so the count is exact.
+fn withhold_blocked_candidates(
+    candidates: &mut Vec<String>,
+    blocked_reason_by_id: &HashMap<String, String>,
+) -> (usize, BTreeSet<String>) {
+    let mut reasons: BTreeSet<String> = BTreeSet::new();
+    let mut count = 0usize;
+    candidates.retain(|id| match blocked_reason_by_id.get(id) {
+        Some(reason) => {
+            count += 1;
+            reasons.insert(reason.clone());
+            false
+        }
+        None => true,
+    });
+    (count, reasons)
+}
+
+/// Render the per-plugin missing-root-coverage exclusions as the in-band
+/// scope marker.
+fn plugins_without_roots_json(excluded_by_plugin: BTreeMap<String, usize>) -> Vec<Value> {
+    excluded_by_plugin
+        .into_iter()
+        .map(|(plugin, count)| {
+            json!({
+                "plugin": plugin,
+                "entities_excluded": count,
+                "reason": format!(
+                    "plugin '{plugin}' emitted no reachability root tags \
+                     (entry-point / exported-api / …), so its entities cannot \
+                     be honestly surveyed — excluded rather than false-flagged \
+                     dead"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The filtered dead-code candidate id set plus the in-band exclusion
+/// bookkeeping (`weft-3fb0f5dfc7`).
+struct CandidateSet {
+    /// Sorted candidate ids: code-kind entities of root-covered plugins that
+    /// are unreachable, not barrier/framework-excluded, and in scope.
+    candidates: Vec<String>,
+    /// Per-plugin counts of entities excluded for missing root coverage.
+    excluded_by_plugin: BTreeMap<String, usize>,
+    /// Briefing-block reason per surviving candidate id (withheld later).
+    blocked_reason_by_id: HashMap<String, String>,
+    entity_scan_truncated: bool,
+}
+
+/// Build the dead-code candidate set with the survey-honesty exclusions
+/// (weft-3fb0f5dfc7 / dogfood-4 B2):
+///
+/// - non-code KINDS (file anchors, the project anchor, subsystems, guidance)
+///   are never dead-CODE candidates;
+/// - a plugin that emitted NO reachability root tags (the Rust plugin today —
+///   binary/lib roots unsupported) would have its ENTIRE entity set
+///   false-flagged dead, so its entities are excluded and counted for the
+///   in-band scope marker instead — a wrong answer is worse than an honest
+///   scope statement (the dogfooded `specimen-rs/src/main.rs` false positive).
+fn dead_code_candidate_set(
+    conn: &rusqlite::Connection,
+    reachable: &HashSet<String>,
+    excluded: &HashSet<String>,
+    in_scope: Option<&HashSet<String>>,
+) -> loomweave_storage::Result<CandidateSet> {
+    let (all_rows, entity_scan_truncated) = all_entity_rows(conn)?;
+    let plugins_with_roots = plugins_with_root_tags(conn)?;
+    let mut excluded_by_plugin: BTreeMap<String, usize> = BTreeMap::new();
+    let mut blocked_reason_by_id: HashMap<String, String> = HashMap::new();
+
+    let mut candidates: Vec<String> = all_rows
+        .into_iter()
+        .filter(|row| !DEAD_CODE_NON_CODE_KINDS.contains(&row.kind.as_str()))
+        .filter(|row| {
+            if plugins_with_roots.contains(&row.plugin_id) {
+                true
+            } else {
+                *excluded_by_plugin.entry(row.plugin_id.clone()).or_default() += 1;
+                false
+            }
+        })
+        .map(|row| {
+            if let Some(reason) = row.briefing_blocked {
+                blocked_reason_by_id.insert(row.id.clone(), reason);
+            }
+            row.id
+        })
+        .filter(|id| !reachable.contains(id))
+        .filter(|id| !excluded.contains(id))
+        .filter(|id| in_scope.is_none_or(|ids| ids.contains(id)))
+        .collect();
+    candidates.sort();
+
+    Ok(CandidateSet {
+        candidates,
+        excluded_by_plugin,
+        blocked_reason_by_id,
+        entity_scan_truncated,
+    })
+}
+
+/// A dead-code candidate row: just enough to apply the kind / plugin-coverage
+/// exclusions without materialising full entities.
+struct CandidateRow {
+    id: String,
+    kind: String,
+    plugin_id: String,
+    /// The briefing-block reason (the `briefing_blocked` generated column,
+    /// migration 0002) — `Some` for a secret-scan-withheld entity.
+    briefing_blocked: Option<String>,
+}
+
+/// All entity (id, kind, plugin, block-reason) rows, bounded by
+/// [`ENTITY_SCAN_CAP`]. Returns `(rows, truncated)`.
+fn all_entity_rows(
+    conn: &rusqlite::Connection,
+) -> loomweave_storage::Result<(Vec<CandidateRow>, bool)> {
     let cap = i64::try_from(ENTITY_SCAN_CAP.saturating_add(1)).unwrap_or(i64::MAX);
-    let mut stmt = conn.prepare("SELECT id FROM entities ORDER BY id LIMIT ?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, plugin_id, briefing_blocked FROM entities ORDER BY id LIMIT ?1",
+    )?;
     let mut rows = stmt.query(rusqlite::params![cap])?;
     let mut out = Vec::new();
     let mut truncated = false;
@@ -722,9 +910,37 @@ fn all_entity_ids(conn: &rusqlite::Connection) -> loomweave_storage::Result<(Vec
             truncated = true;
             break;
         }
-        out.push(row.get::<_, String>(0)?);
+        out.push(CandidateRow {
+            id: row.get::<_, String>(0)?,
+            kind: row.get::<_, String>(1)?,
+            plugin_id: row.get::<_, String>(2)?,
+            briefing_blocked: row.get::<_, Option<String>>(3)?,
+        });
     }
     Ok((out, truncated))
+}
+
+/// The plugins that own at least one ROOT-tagged entity — i.e. the plugins
+/// whose entity sets the dead-code survey can answer honestly. One query over
+/// `entity_tags ⋈ entities`.
+fn plugins_with_root_tags(
+    conn: &rusqlite::Connection,
+) -> loomweave_storage::Result<HashSet<String>> {
+    let placeholders = std::iter::repeat_n("?", DEAD_CODE_ROOT_TAGS.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT DISTINCT e.plugin_id FROM entity_tags t \
+         JOIN entities e ON e.id = t.entity_id \
+         WHERE t.tag IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(DEAD_CODE_ROOT_TAGS.iter()))?;
+    let mut out = HashSet::new();
+    while let Some(row) = rows.next()? {
+        out.insert(row.get::<_, String>(0)?);
+    }
+    Ok(out)
 }
 
 /// The call+import adjacency over *all* confidence tiers (the conservative,

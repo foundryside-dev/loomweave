@@ -4,12 +4,14 @@ use std::path::Path;
 
 use loomweave_core::EdgeConfidence;
 use loomweave_storage::{
-    ModuleDependencyEdge, ReferenceDirection, SubsystemMember, call_edges_from,
-    call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id,
-    entity_at_line, entity_briefing_block_reason, entity_by_id, find_entities, findings_for_emit,
-    module_dependency_edges, module_reference_rollup, normalize_source_path, pragma,
-    reference_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
-    subsystem_for_member, subsystem_members, subsystem_of_entity, unresolved_call_sites_for_caller,
+    ModuleDependencyEdge, ReferenceDirection, RelationEdgeMatch, SubsystemMember, call_edges_from,
+    call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id, edge_total,
+    entities_targeted_by_unresolved_call_sites, entity_at_line, entity_briefing_block_reason,
+    entity_by_id, entity_total, find_entities, findings_for_emit, module_dependency_edges,
+    module_reference_rollup, normalize_source_path, pragma, reference_edges_for_entity,
+    relation_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
+    preferred_finding_anchor_by_file, stored_secret_finding_anchor_by_file, subsystem_for_member,
+    subsystem_members, subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
     unresolved_callers_for_target,
 };
 use rusqlite::{Connection, params};
@@ -39,6 +41,26 @@ fn insert_entity_with_hash(conn: &Connection, id: &str, kind: &str, content_hash
         params![id, kind, content_hash],
     )
     .expect("insert entity with hash");
+}
+
+fn insert_entity_with_properties(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    short_name: &str,
+    properties_json: &str,
+) {
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+         ) VALUES (
+            ?1, 'python', ?2, ?1, ?3, ?4,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![id, kind, short_name, properties_json],
+    )
+    .expect("insert entity with properties");
 }
 
 fn insert_named_entity(
@@ -153,6 +175,52 @@ fn insert_references_edge(
         params![from_id, to_id, confidence.as_str(), start, end],
     )
     .expect("insert references edge");
+}
+
+fn insert_relation_edge(
+    conn: &Connection,
+    kind: &str,
+    from_id: &str,
+    to_id: &str,
+    confidence: EdgeConfidence,
+    candidates: &[&str],
+    start: i64,
+    end: i64,
+) {
+    let properties = if candidates.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "candidates": candidates }).to_string())
+    };
+    // The anchor-file FK target; relation anchors always carry a file
+    // (anchored kinds, ADR-026).
+    conn.execute(
+        "INSERT OR IGNORE INTO entities (
+            id, plugin_id, kind, name, short_name, properties, created_at, updated_at
+         ) VALUES (
+            'core:file:src/demo.py', 'core', 'file', 'src/demo.py', 'demo.py', '{}',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert anchor file entity");
+    conn.execute(
+        "INSERT INTO edges (
+            kind, from_id, to_id, confidence, properties, source_file_id,
+            source_byte_start, source_byte_end
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'core:file:src/demo.py', ?6, ?7)",
+        params![
+            kind,
+            from_id,
+            to_id,
+            confidence.as_str(),
+            properties,
+            start,
+            end
+        ],
+    )
+    .expect("insert relation edge");
 }
 
 fn insert_imports_edge(conn: &Connection, from_id: &str, to_id: &str) {
@@ -508,6 +576,94 @@ fn unresolved_callers_for_target_filters_stale_caller_content_hash_rows() {
 }
 
 #[test]
+fn entities_targeted_by_unresolved_sites_matches_method_and_assoc_leaves() {
+    // The dead-code fail-toward-live input: an entity whose short_name matches
+    // the terminal identifier of an unresolved call site is a plausible target.
+    // Critically this must match the Rust associated-function `::` form
+    // (`Svc::make` -> `make`), which the `.`-only leaf extraction in
+    // `candidate_entities_for_expr` / `unresolved_callers_for_target` misses.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_hash(&conn, "rust:function:app.run", "function", "hc");
+    insert_named_entity(
+        &conn,
+        "rust:function:app.Svc.impl#<>.do_work",
+        "function",
+        "app.Svc.impl#<>.do_work",
+        "do_work",
+        None,
+    );
+    insert_named_entity(
+        &conn,
+        "rust:function:app.Svc.impl#<>.make",
+        "function",
+        "app.Svc.impl#<>.make",
+        "make",
+        None,
+    );
+    insert_named_entity(
+        &conn,
+        "rust:function:app.helper",
+        "function",
+        "app.helper",
+        "helper",
+        None,
+    );
+    insert_named_entity(
+        &conn,
+        "rust:function:app.orphan",
+        "function",
+        "app.orphan",
+        "orphan",
+        None,
+    );
+
+    // Method call `.do_work`; assoc path `Svc::make`; dotted path `m.helper`;
+    // a non-identifier form `<expr>()` (contributes no leaf).
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s0", ".do_work");
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s1", "Svc::make");
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s2", "m.helper");
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s3", "<expr>()");
+
+    let targeted = entities_targeted_by_unresolved_call_sites(&conn).unwrap();
+
+    assert!(
+        targeted.contains("rust:function:app.Svc.impl#<>.do_work"),
+        "method-call leaf `.do_work` must target `do_work`: {targeted:?}"
+    );
+    assert!(
+        targeted.contains("rust:function:app.Svc.impl#<>.make"),
+        "assoc-call leaf `Svc::make` must target `make` (the :: form the `.`-only \
+         matchers miss): {targeted:?}"
+    );
+    assert!(
+        targeted.contains("rust:function:app.helper"),
+        "dotted-path leaf `m.helper` must target `helper`: {targeted:?}"
+    );
+    assert!(
+        !targeted.contains("rust:function:app.orphan"),
+        "an entity matched by no call leaf must NOT be targeted: {targeted:?}"
+    );
+}
+
+#[test]
+fn entities_targeted_by_unresolved_sites_skips_stale_caller() {
+    // A site whose caller content-hash is stale must not target anything
+    // (same staleness filter as unresolved_callers_for_target).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_hash(&conn, "rust:function:app.run", "function", "hc");
+    insert_named_entity(&conn, "rust:function:app.t", "function", "app.t", "t", None);
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "stale", "s0", ".t");
+
+    let targeted = entities_targeted_by_unresolved_call_sites(&conn).unwrap();
+    assert!(
+        targeted.is_empty(),
+        "a stale-caller site must not target anything: {targeted:?}"
+    );
+}
+
+#[test]
 fn subsystem_members_returns_modules_ordered_by_name() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);
@@ -618,6 +774,205 @@ fn reference_edges_for_entity_returns_directional_neighbors() {
     assert_eq!(outbound[0].confidence, EdgeConfidence::Ambiguous);
     assert_eq!(outbound[0].source_byte_start, Some(30));
     assert_eq!(outbound[0].source_byte_end, Some(39));
+}
+
+#[test]
+fn relation_edges_for_entity_returns_directional_neighbors_across_kinds() {
+    // "What subclasses Base" is a TO-side (In) lookup on inherits_from; "what
+    // does wrap decorate" is a FROM-side (Out) lookup on decorates (ADR-051).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:class:demo.Base", "class");
+    insert_entity(&conn, "python:class:demo.Child", "class");
+    insert_entity(&conn, "python:function:demo.wrap", "function");
+    insert_entity(&conn, "python:function:demo.handler", "function");
+    insert_relation_edge(
+        &conn,
+        "inherits_from",
+        "python:class:demo.Child",
+        "python:class:demo.Base",
+        EdgeConfidence::Resolved,
+        &[],
+        100,
+        117,
+    );
+    insert_relation_edge(
+        &conn,
+        "decorates",
+        "python:function:demo.wrap",
+        "python:function:demo.handler",
+        EdgeConfidence::Resolved,
+        &[],
+        200,
+        204,
+    );
+    // Non-relation kinds targeting the same entities must never leak into a
+    // relation read (the inverse of the write-only gap this surface closes).
+    insert_calls_edge(
+        &conn,
+        "python:function:demo.handler",
+        "python:class:demo.Base",
+        EdgeConfidence::Resolved,
+        &[],
+    );
+    insert_references_edge(
+        &conn,
+        "python:class:demo.Child",
+        "python:class:demo.Base",
+        EdgeConfidence::Resolved,
+        10,
+        15,
+    );
+
+    let subclasses = relation_edges_for_entity(
+        &conn,
+        "python:class:demo.Base",
+        ReferenceDirection::In,
+        None,
+    )
+    .expect("inbound relations");
+    assert_eq!(
+        subclasses,
+        vec![RelationEdgeMatch {
+            kind: "inherits_from".to_owned(),
+            from_id: "python:class:demo.Child".to_owned(),
+            to_id: "python:class:demo.Base".to_owned(),
+            confidence: EdgeConfidence::Resolved,
+            candidates: Vec::new(),
+            source_file_id: Some("core:file:src/demo.py".to_owned()),
+            source_byte_start: Some(100),
+            source_byte_end: Some(117),
+        }],
+        "In on Base must list the subclass edge only, never calls/references"
+    );
+
+    let supertypes = relation_edges_for_entity(
+        &conn,
+        "python:class:demo.Child",
+        ReferenceDirection::Out,
+        None,
+    )
+    .expect("outbound relations");
+    assert_eq!(supertypes.len(), 1);
+    assert_eq!(supertypes[0].kind, "inherits_from");
+    assert_eq!(supertypes[0].to_id, "python:class:demo.Base");
+
+    let decorated = relation_edges_for_entity(
+        &conn,
+        "python:function:demo.wrap",
+        ReferenceDirection::Out,
+        None,
+    )
+    .expect("outbound decorates");
+    assert_eq!(decorated.len(), 1);
+    assert_eq!(decorated[0].kind, "decorates");
+    assert_eq!(decorated[0].to_id, "python:function:demo.handler");
+
+    let decorators = relation_edges_for_entity(
+        &conn,
+        "python:function:demo.handler",
+        ReferenceDirection::In,
+        None,
+    )
+    .expect("inbound decorates");
+    assert_eq!(decorators.len(), 1);
+    assert_eq!(decorators[0].from_id, "python:function:demo.wrap");
+}
+
+#[test]
+fn relation_edges_for_entity_kind_filter_and_deterministic_order() {
+    // One entity targeted by all four relation kinds (a Rust trait can be both
+    // implemented and derived); unfiltered reads order by kind then neighbor.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "rust:trait:demo::Render", "trait");
+    insert_entity(&conn, "rust:struct:demo::Panel", "struct");
+    insert_entity(&conn, "rust:struct:demo::Badge", "struct");
+    insert_entity(&conn, "python:class:demo.Widget", "class");
+    insert_entity(&conn, "python:function:demo.deco", "function");
+    insert_relation_edge(
+        &conn,
+        "implements",
+        "rust:struct:demo::Panel",
+        "rust:trait:demo::Render",
+        EdgeConfidence::Resolved,
+        &[],
+        10,
+        16,
+    );
+    insert_relation_edge(
+        &conn,
+        "derives",
+        "rust:struct:demo::Badge",
+        "rust:trait:demo::Render",
+        EdgeConfidence::Resolved,
+        &[],
+        20,
+        26,
+    );
+    insert_relation_edge(
+        &conn,
+        "inherits_from",
+        "python:class:demo.Widget",
+        "rust:trait:demo::Render",
+        EdgeConfidence::Resolved,
+        &[],
+        30,
+        36,
+    );
+    insert_relation_edge(
+        &conn,
+        "decorates",
+        "python:function:demo.deco",
+        "rust:trait:demo::Render",
+        EdgeConfidence::Ambiguous,
+        &["python:function:demo.deco", "python:function:demo.other"],
+        40,
+        44,
+    );
+
+    let all = relation_edges_for_entity(
+        &conn,
+        "rust:trait:demo::Render",
+        ReferenceDirection::In,
+        None,
+    )
+    .expect("all inbound relations");
+    let kinds: Vec<&str> = all.iter().map(|m| m.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["decorates", "derives", "implements", "inherits_from"],
+        "unfiltered relations order by kind then neighbor: {all:?}"
+    );
+    // Ambiguous rows carry their candidate ids through (sorted); resolved rows
+    // carry none.
+    assert_eq!(
+        all[0].candidates,
+        vec![
+            "python:function:demo.deco".to_owned(),
+            "python:function:demo.other".to_owned(),
+        ],
+    );
+    assert!(all[1].candidates.is_empty());
+
+    let implementors = relation_edges_for_entity(
+        &conn,
+        "rust:trait:demo::Render",
+        ReferenceDirection::In,
+        Some("implements"),
+    )
+    .expect("kind-filtered relations");
+    assert_eq!(implementors.len(), 1);
+    assert_eq!(implementors[0].from_id, "rust:struct:demo::Panel");
+
+    let none = relation_edges_for_entity(
+        &conn,
+        "rust:trait:demo::Render",
+        ReferenceDirection::Out,
+        None,
+    )
+    .expect("outbound from a pure target");
+    assert!(none.is_empty(), "Render originates no relation: {none:?}");
 }
 
 #[test]
@@ -995,6 +1350,84 @@ fn find_entities_kind_filter_applies_on_punctuation_like_path() {
         like_module.iter().any(|e| e.id == "python:module:pkg.svc"),
         "{like_module:?}"
     );
+}
+
+#[test]
+fn find_entities_matches_concept_word_in_docstring() {
+    // weft-b7ce301e92 (LW-1): a concept word that lives only in docstring prose
+    // — not in any entity name — must be discoverable. FTS over name/short_name
+    // alone returns empty here ("borrow" is no entity's name); the LIKE content
+    // path over the docstring is what makes discovery beat grep at the entry.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_properties(
+        &conn,
+        "python:class:loan.LoanPolicy",
+        "class",
+        "LoanPolicy",
+        r#"{"docstring": "Strategy interface: how many days a user may borrow a book."}"#,
+    );
+    // A decoy with no matching content.
+    insert_entity(&conn, "python:class:user.User", "class");
+
+    let hits = find_entities(&conn, "borrow", 20, 0, None).expect("docstring search");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].id, "python:class:loan.LoanPolicy");
+}
+
+#[test]
+fn find_entities_matches_identifier_substring_fts_cannot() {
+    // weft-b7ce301e92 (LW-1): the marquee case. The concept word `library` is a
+    // substring of the CamelCase identifier `LibraryService`, but FTS matches
+    // whole stemmed tokens (`libraryservice`), so `MATCH 'library'` returns
+    // nothing. The LIKE substring path is what surfaces the class an agent is
+    // actually looking for.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_properties(
+        &conn,
+        "python:class:catalog.LibraryService",
+        "class",
+        "LibraryService",
+        "{}",
+    );
+
+    let hits = find_entities(&conn, "library", 20, 0, None).expect("identifier-substring search");
+    assert!(
+        hits.iter()
+            .any(|e| e.id == "python:class:catalog.LibraryService"),
+        "substring of a CamelCase identifier must be discoverable: {hits:?}"
+    );
+}
+
+#[test]
+fn find_entities_does_not_leak_briefing_blocked_docstring_content() {
+    // weft-b7ce301e92 secret-safety invariant (cf. clarion-307668e2be): a
+    // docstring withheld by the pre-ingest scanner (briefing_blocked set) must
+    // never become matchable via the new content path — otherwise searching for
+    // a leaked secret would resurface the very entity the block exists to hide.
+    // An identical docstring WITHOUT the block must match (proves the guard, not
+    // the absence of indexing, is what suppresses it).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_properties(
+        &conn,
+        "python:function:secrets.blocked",
+        "function",
+        "blocked",
+        r#"{"docstring": "uniquesecrettoken in here", "briefing_blocked": "secret_present"}"#,
+    );
+    insert_entity_with_properties(
+        &conn,
+        "python:function:secrets.visible",
+        "function",
+        "visible",
+        r#"{"docstring": "uniquesecrettoken in here"}"#,
+    );
+
+    let hits = find_entities(&conn, "uniquesecrettoken", 20, 0, None).expect("guarded search");
+    assert_eq!(hits.len(), 1, "blocked docstring must not match: {hits:?}");
+    assert_eq!(hits[0].id, "python:function:secrets.visible");
 }
 
 #[test]
@@ -1705,4 +2138,75 @@ fn containing_module_id_walks_up_to_the_nearest_module() {
         containing_module_id(&conn, "python:function:orphan").expect("query"),
         None,
     );
+}
+
+#[test]
+fn graph_totals_count_all_entities_subsystems_and_edges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&dir);
+
+    // Three entities — one of which is a subsystem — and two edges.
+    insert_entity(&conn, "python:module:a", "module");
+    insert_entity(&conn, "python:function:a.f", "function");
+    insert_entity(&conn, "core:subsystem:abcd", "subsystem");
+    insert_contains_edge(&conn, "python:module:a", "python:function:a.f");
+    insert_contains_edge(&conn, "python:module:a", "core:subsystem:abcd");
+
+    // entity_total counts every kind, INCLUDING the subsystem (matching the
+    // `project_status` convention); subsystem_total is the subset.
+    assert_eq!(entity_total(&conn).expect("entity_total"), 3);
+    assert_eq!(subsystem_total(&conn).expect("subsystem_total"), 1);
+    assert_eq!(edge_total(&conn).expect("edge_total"), 2);
+}
+
+#[test]
+fn stored_secret_anchor_reads_the_actual_keyed_entity_not_the_heuristic() {
+    // L1 (weft-4165f1ed71): a file with two same-rank module candidates (a Rust
+    // inline `mod` block: the file module + an inline submodule share one
+    // source_file_path, both rank 0). The in-run `remember_finding_anchors`
+    // breaks the tie on EMISSION ORDER (last module wins), while the skip-path
+    // heuristic `preferred_finding_anchor_by_file` breaks it on SMALLEST ID. If
+    // the prior run anchored its secret finding to the larger-id module (because
+    // it was emitted last), the heuristic would re-derive the smaller-id module
+    // on the next incremental skip and flip the anchor-keyed finding id, minting
+    // a duplicate row. The stored-anchor reader returns the entity the prior run
+    // ACTUALLY keyed the finding to, removing the lockstep requirement.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&dir);
+
+    let file = "src/lib.rs";
+    // Two module entities for one file; ids chosen so the LAST-emitted (what
+    // remember_finding_anchors keeps) is NOT the smallest id (what the heuristic
+    // would pick). The prior run keyed its finding to the larger-id module.
+    insert_named_entity(&conn, "rust:module:a_outer", "module", file, "a_outer", Some(file));
+    insert_named_entity(&conn, "rust:module:z_inner", "module", file, "z_inner", Some(file));
+
+    // The heuristic would pick the smallest id (a_outer) — diverging from what
+    // the prior run stored.
+    let heuristic = preferred_finding_anchor_by_file(&conn).expect("heuristic");
+    assert_eq!(heuristic.get(file).map(String::as_str), Some("rust:module:a_outer"));
+
+    // The prior run anchored the secret finding to z_inner (emitted last).
+    insert_run(&conn, "run-1");
+    insert_finding(
+        &conn,
+        "core:finding:x",
+        "run-1",
+        "LMWV-SEC-SECRET-DETECTED",
+        "defect",
+        "ERROR",
+        "rust:module:z_inner",
+        "[]",
+    );
+
+    let stored = stored_secret_finding_anchor_by_file(&conn).expect("stored");
+    assert_eq!(
+        stored.get(file).map(String::as_str),
+        Some("rust:module:z_inner"),
+        "stored anchor must be the entity the prior run actually keyed, not the heuristic re-derivation",
+    );
+
+    // A file with no prior secret finding is simply absent — the caller falls
+    // back to the heuristic for first-time anchors (nothing to duplicate).
+    assert!(!stored.contains_key("src/clean.rs"));
 }

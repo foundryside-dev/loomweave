@@ -251,6 +251,45 @@ pub enum WriterCmd {
         recorded_at: String,
         ack: Ack<()>,
     },
+    /// Retire findings the current run no longer reproduces (clarion-87c1eba2bd /
+    /// ADR-048): DELETE every `open`, Filigree-unlinked finding whose `run_id` is
+    /// not `current_run_id`. Mirrors the prior-index diff for findings, using the
+    /// `run_id` signal ADR-047 established (a reproduced finding carries the current
+    /// `run_id`; a vanished one keeps its prior one). PRESERVES lifecycle —
+    /// `filigree_issue_id`-linked or non-`open` findings are operator decisions
+    /// owned by the Filigree unseen/soft-archive path, never this sweep. The
+    /// caller gates this to a clean full pass (Completed, non-resume, fully
+    /// walked, non-`--no-sei`). Query-time write: it runs after `CommitRun` (no
+    /// active run transaction), best-effort, and never gates the run's own
+    /// outcome. Returns the number of rows deleted.
+    SweepStaleFindings {
+        current_run_id: String,
+        ack: Ack<usize>,
+    },
+    /// Rule-scoped stale-finding sweep (weft-7256739b31): retire stale `open`,
+    /// Filigree-unlinked findings of the named rules only. For rule families
+    /// whose producer is a FULL pass every run regardless of the incremental
+    /// file skip (the pre-ingest secret scan), so `run_id != current` means
+    /// "looked, no longer detected" even on a run the general sweep must skip.
+    /// Same lifecycle preservation and query-time-write posture as
+    /// [`WriterCmd::SweepStaleFindings`].
+    ///
+    /// `examined_source_files` scopes the sweep to files the producer actually
+    /// re-examined this run (L3): the "full pass" is full only over the
+    /// CURRENTLY-installed plugins' extension union, so uninstalling/disabling a
+    /// plugin between runs silently drops its files from the scan. Without this
+    /// scope, those files' still-valid findings would be retired as "looked,
+    /// clean" when they were never looked at again ("scope shrinkage" — the walk
+    /// raises no error, so the `source_walk_skipped_entries == 0` caller gate
+    /// does not catch it). A finding survives unless its anchor entity's
+    /// `source_file_path` is in this set. Canonical-absolute path strings,
+    /// matching the form entities store. An empty set retires nothing.
+    SweepStaleFindingsForRules {
+        current_run_id: String,
+        rule_ids: Vec<String>,
+        examined_source_files: Vec<String>,
+        ack: Ack<usize>,
+    },
     /// Upsert one SEI binding (mint or carry) — Wave 1 / WS1 (ADR-038). A carry
     /// REPLACEs the binding's own row by SEI PK, moving `current_locator` in
     /// place; it never creates a second alive row. Query-time write: the SEI

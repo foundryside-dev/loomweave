@@ -362,3 +362,49 @@ async fn open_validated_accepts_legacy_zero_application_id_without_mutating() {
         .expect("read app id");
     assert_eq!(app_id, 0, "read validation must not stamp legacy DBs");
 }
+
+#[tokio::test]
+async fn open_validated_rejects_unmigrated_index(/* review #8 */) {
+    // A header-valid SQLite file that never had Loomweave migrations applied
+    // (user_version=0, application_id=0) must be rejected at serve rather than
+    // auto-materialised into an empty index that answers every query with zero
+    // rows.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unmigrated.db");
+    {
+        let conn = Connection::open(&path).expect("open");
+        // A valid SQLite file (a real table) but no Loomweave schema/migrations.
+        conn.execute_batch("CREATE TABLE marker(id INTEGER);")
+            .expect("seed bare db");
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uv, 0, "precondition: an unmigrated file is user_version=0");
+    }
+
+    match ReaderPool::open_validated(&path, 2) {
+        Err(loomweave_storage::StorageError::UnmigratedIndex) => {}
+        Err(other) => panic!("expected UnmigratedIndex, got {other:?}"),
+        Ok(_) => panic!("open_validated must reject an unmigrated file"),
+    }
+}
+
+#[tokio::test]
+async fn open_validated_accepts_migrated_but_empty_index(/* review #8 */) {
+    // The discriminator is the *schema version*, NOT row counts: an installed
+    // index that has not been analyzed yet is user_version=CURRENT with zero
+    // entities and is a valid serve target.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir); // migrated, zero entities
+    let entity_count: i64 = {
+        let conn = Connection::open(&path).expect("open");
+        conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
+            .expect("count entities")
+    };
+    assert_eq!(
+        entity_count, 0,
+        "precondition: migrated DB is empty of entities"
+    );
+
+    ReaderPool::open_validated(&path, 2).expect("migrated-but-empty index is a valid serve target");
+}
