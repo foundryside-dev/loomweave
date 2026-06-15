@@ -1120,6 +1120,53 @@ fn findings_status_check_accepts_all_documented_values() {
 }
 
 #[test]
+fn migration_0010_preserves_operator_lifecycle_findings() {
+    // The dedupe migration drops regenerable open+unlinked findings, but must
+    // keep operator-owned lifecycle rows — Filigree-linked or triaged out of
+    // `open` (Codex P1: a blanket DELETE reopened already-triaged issues). This
+    // re-runs the 0010 body over seeded rows and asserts the surviving set.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_run(&conn, "r1");
+    insert_anchor_entity(&conn, "python:function:demo.a");
+
+    let put = |id: &str, status: &str, issue: Option<&str>| {
+        conn.execute(
+            "INSERT INTO findings (id, tool, tool_version, run_id, rule_id, kind, severity, \
+             entity_id, related_entities, message, evidence, properties, supports, \
+             supported_by, status, filigree_issue_id, created_at, updated_at) \
+             VALUES (?1, 'loomweave', '0.1', 'r1', 'LMWV-FACT-TODO', 'fact', 'INFO', \
+             'python:function:demo.a', '[]', 'm', '{}', '{}', '[]', '[]', ?2, ?3, \
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![id, status, issue],
+        )
+        .unwrap();
+    };
+    put("core:finding:r1:open-unlinked", "open", None);
+    put("core:finding:r1:linked", "open", Some("clarion-123"));
+    put("core:finding:r1:acked", "acknowledged", None);
+
+    conn.execute_batch(include_str!(
+        "../migrations/0010_dedupe_findings_drop_run_scoped_ids.sql"
+    ))
+    .unwrap();
+
+    let surviving: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM findings ORDER BY id").unwrap();
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        rows.map(std::result::Result::unwrap).collect()
+    };
+    assert_eq!(
+        surviving,
+        vec![
+            "core:finding:r1:acked".to_string(),
+            "core:finding:r1:linked".to_string(),
+        ],
+        "0010 must drop only open+unlinked findings, preserving linked/triaged rows"
+    );
+}
+
+#[test]
 fn runs_status_check_rejects_unknown_value() {
     let tempdir = tempfile::tempdir().unwrap();
     let conn = open_fresh(&tempdir);

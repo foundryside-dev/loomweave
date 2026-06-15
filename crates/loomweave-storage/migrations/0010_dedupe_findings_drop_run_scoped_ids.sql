@@ -9,8 +9,23 @@
 --
 -- On an existing database the new content-keyed rows would land BESIDE the old
 -- run-scoped ones (a one-time worse doubling that never self-cleans, since no
--- sweep matches the legacy id format). Findings are fully regenerable derived
--- data — the next `loomweave analyze` repopulates them with content-keyed ids —
--- so the clean fix is to drop the legacy rows here. (The store is itself a
--- regenerable cache per ADR-005 as reversed by C1/weft-d822a7de2d.)
-DELETE FROM findings;
+-- sweep matches the legacy id format). Most findings are fully regenerable
+-- derived data — the next `loomweave analyze` repopulates them with
+-- content-keyed ids — so the clean fix is to drop the legacy rows here. (The
+-- store is itself a regenerable cache per ADR-005 as reversed by
+-- C1/weft-d822a7de2d.)
+--
+-- BUT operator-owned lifecycle state is NOT regenerable: a finding that is
+-- Filigree-linked (`filigree_issue_id`) or triaged out of `open`
+-- (`acknowledged` / `suppressed` / `promoted_to_issue`) carries decisions a
+-- re-analyze cannot reconstruct. A blanket DELETE would discard that triage and
+-- let the next run recreate the finding as a fresh open, unlinked row —
+-- reopening or duplicating already-resolved issues. So drop ONLY the regenerable
+-- open + unlinked rows — exactly the set the runtime `sweep_stale_findings` is
+-- permitted to retire — and leave lifecycle rows in place. (A preserved legacy
+-- id may transiently double against a new content-keyed row on the next analyze;
+-- that is a benign, dedupable duplicate, never the silent loss of operator
+-- state.)
+DELETE FROM findings
+WHERE status = 'open'
+  AND filigree_issue_id IS NULL;
