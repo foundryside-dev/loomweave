@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 use ignore::{DirEntry, WalkBuilder};
 use rusqlite::Connection;
+use serde::Serialize;
 use time::{OffsetDateTime, macros::format_description};
 use uuid::Uuid;
 
@@ -296,6 +297,10 @@ impl Drop for ProgressHeartbeatGuard {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+// A flat bag of resolved CLI options (each field mirrors one `analyze` flag), not
+// a state machine — the bools are independent toggles, so the pedantic
+// excessive-bools lint does not apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnalyzeOptions {
     pub(crate) config_path: Option<PathBuf>,
@@ -326,6 +331,12 @@ pub(crate) struct AnalyzeOptions {
     /// working-tree window stays on the shell source, so an unset/unreachable
     /// `legis` leaves behaviour byte-identical to pre-WS9. `None` ⇒ shell only.
     pub(crate) legis_url: Option<String>,
+    /// `--json`: after the human-readable completion line, emit an additive
+    /// structured-output block (graph totals + the TYPED `weft-reason` carrier for
+    /// the Filigree emit seam) for machine consumers (the seam-health roll-up / L2
+    /// strategic view / tag-board feed), so they read a `reason_class` they can
+    /// switch on instead of grepping the completion line (G3 / PDR-0023).
+    pub(crate) json: bool,
 }
 
 /// Run the analyze command against `project_path` with resolved CLI options.
@@ -1260,8 +1271,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // reading the DB. A clean (emitted / disabled / true-negative) emit yields
     // `None` and the completion line stays unchanged (PDR-0023 honesty invariant).
     let primary_emit_marker = emit_status_marker(&filigree_emission);
+    // The TYPED `weft-reason` carrier for the same emit blob (G3): the
+    // structured-output sibling of the substring marker above, read from the same
+    // source so the two never disagree on which shapes are clean vs degraded.
+    let primary_emit_reason = emit_reason_carrier(&filigree_emission);
     // The Phase-8c (post-commit) emit, captured in the Completed arm below.
     let mut postrun_emit_marker: Option<String> = None;
+    let mut postrun_emit_reason: Option<EmitReason> = None;
 
     // Phase 8b (WP9-B, REQ-FINDING-06): `--prune-unseen` retention sweep. Runs
     // after emission for the same non-hard-failed outcomes, so a fresh run's
@@ -1543,6 +1559,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // never reached Filigree is the same dead-seam family as the during-run
             // one and must not exit-0-silent.
             postrun_emit_marker = emit_status_marker(&postrun_emission);
+            postrun_emit_reason = Some(emit_reason_carrier(&postrun_emission));
             // Stale-finding sweep (clarion-87c1eba2bd / ADR-048): retire findings
             // whose code no longer reproduces them. Runs LAST in the Completed arm
             // — after every during-run `InsertFinding` AND every post-commit
@@ -1738,40 +1755,78 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // `emit:<status>(reason)` for a dead/partial/skipped-pre-wire seam so the
     // best-effort emit can no longer swallow a total failure as a confident exit-0.
     let emit_marker = combined_emit_marker(primary_emit_marker, postrun_emit_marker);
+    // The typed sibling of `emit_marker` (G3): rolled up the same way for the
+    // structured `--json` block, so a typed consumer reads a `reason_class` it can
+    // switch on instead of grepping the completion line's substring.
+    let emit_reason = combined_emit_reason(primary_emit_reason, postrun_emit_reason);
     let emit_suffix = emit_marker
         .as_deref()
         .map_or_else(String::new, |m| format!("; {m}"));
-    let run_delta_summary = || {
-        format!(
-            "analyze complete: run {run_id} completed \
-             ({total_entity_count} entities, {total_edge_count} edges){emit_suffix}"
-        )
-    };
-    let summary = match Connection::open(&db_path) {
+    // Resolve the whole-graph totals once: both the human completion line and the
+    // structured `--json` block report the SAME numbers. `None` ⇒ the totals read
+    // failed and we fall back to this run's insert delta (a cosmetic hiccup never
+    // masks a successful run).
+    let graph_totals = match Connection::open(&db_path) {
         Ok(conn) => match (
             loomweave_storage::entity_total(&conn),
             loomweave_storage::subsystem_total(&conn),
             loomweave_storage::edge_total(&conn),
         ) {
-            (Ok(entities), Ok(subsystems), Ok(edges)) => format_analyze_complete(
-                &run_id,
-                entities,
-                subsystems,
-                edges,
-                skipped_files_total,
-                emit_marker.as_deref(),
-            ),
-            _ => run_delta_summary(),
+            (Ok(entities), Ok(subsystems), Ok(edges)) => Some((entities, subsystems, edges)),
+            _ => None,
         },
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 "analyze complete: graph-total read failed; reporting run delta"
             );
-            run_delta_summary()
+            None
         }
     };
+    let summary = match graph_totals {
+        Some((entities, subsystems, edges)) => format_analyze_complete(
+            &run_id,
+            entities,
+            subsystems,
+            edges,
+            skipped_files_total,
+            emit_marker.as_deref(),
+        ),
+        None => format!(
+            "analyze complete: run {run_id} completed \
+             ({total_entity_count} entities, {total_edge_count} edges){emit_suffix}"
+        ),
+    };
     println!("{summary}");
+    // Additive structured-output surface (G3 / PDR-0023). The human line above is
+    // unchanged for interactive use; `--json` adds a machine-readable block whose
+    // emit outcome is a TYPED `weft-reason` carrier (not a stdout substring), for
+    // the seam-health roll-up / L2 strategic view / tag-board feed. Falls back to
+    // the run delta when the whole-graph read failed, matching the human line.
+    if options.json {
+        let (entities, subsystems, edges) = graph_totals.unwrap_or((
+            i64::try_from(total_entity_count).unwrap_or(i64::MAX),
+            0,
+            i64::try_from(total_edge_count).unwrap_or(i64::MAX),
+        ));
+        let payload = AnalyzeJsonOutput {
+            run_id: &run_id,
+            entities,
+            subsystems,
+            edges,
+            skipped_files: skipped_files_total,
+            emit: emit_reason,
+        };
+        // A serialization failure here must not mask an otherwise-successful run;
+        // surface it on stderr and continue (the human line already printed).
+        match serde_json::to_string_pretty(&payload) {
+            Ok(json) => println!("{json}"),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "analyze complete: structured --json output could not be serialized"
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -1905,6 +1960,179 @@ fn combined_emit_marker(
     postrun: Option<String>,
 ) -> Option<String> {
     primary.or(postrun)
+}
+
+/// The typed `weft-reason` carrier for the Filigree emit seam (PDR-0023 / G3 /
+/// `weft-reason-contract-G1`). The human-readable completion-line marker
+/// ([`emit_status_marker`]) is a *substring* — a typed consumer (the seam-health
+/// Layer-3 roll-up, the L2 strategic-view MCP, the tag-board feed) needs to switch
+/// on a machine-readable class, not grep stdout. This is the typed sibling of that
+/// marker: it reads the *same* `filigree_emission` blob and lands the outcome on
+/// the canonical 11-class vocab.
+///
+/// A `clean` carrier omits `cause`/`fix` (the empty is earned and complete, and a
+/// present-but-`clean` carrier is never ambiguous with a forgotten one); every
+/// non-`clean` class carries both a `cause` (what mechanically happened) and a
+/// recruiting `fix` (the action that gets the caller what they wanted) — `fix` is
+/// MANDATORY on the non-clean classes per the contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EmitReason {
+    /// One of the canonical 11 `reason_class` strings.
+    reason_class: &'static str,
+    /// CAUSE — what mechanically happened. Omitted only on `clean`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<String>,
+    /// FIX — the recruiting action. Omitted only on `clean`; present on every
+    /// non-`clean` class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<String>,
+}
+
+impl EmitReason {
+    /// A clean, earned true-negative (or a disabled integration): no cause/fix.
+    fn clean(reason_class: &'static str) -> Self {
+        Self {
+            reason_class,
+            cause: None,
+            fix: None,
+        }
+    }
+
+    /// A non-clean class: cause + a mandatory recruiting fix.
+    fn degraded(reason_class: &'static str, cause: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self {
+            reason_class,
+            cause: Some(cause.into()),
+            fix: Some(fix.into()),
+        }
+    }
+}
+
+/// Map a `filigree_emission` stats blob onto the canonical `weft-reason` vocab as a
+/// TYPED carrier (not a stdout substring). The blob is the same one classified by
+/// [`emit_status_marker`] for the human line; the two stay in lock-step on which
+/// shapes are clean vs degraded, but this returns a class a consumer can switch on.
+///
+/// The marker-string → `reason_class` mapping, each justified against the contract:
+///   • `Null` (integration off / `emit_findings=false`)        → `disabled`
+///     — not on, not a failure; no cause/fix (clean-family).
+///   • `status:"emitted"`, no intake warnings                  → `clean`
+///     — a real emit of zero-or-many findings is success, the earned true-negative.
+///   • `status:"emitted"` WITH intake warnings                 → `partial`
+///     — the POST landed but Filigree rejected/coerced some findings; an incomplete
+///       ingest the bare `emitted` would read as full success (qualified-trust).
+///   • `status:"unreachable"` (POST never landed)              → `unreachable`
+///     — outage / transport / panic at the producer→consumer wire.
+///   • `status:"skipped"`, `no_postrun_findings_with_path`     → `clean`
+///     — the Phase-8c filtered no-op: nothing emittable remained. A true-negative.
+///   • `status:"skipped"`, any other reason                    → `error`
+///     — a pre-wire flush/read/open failure swallowed before the network. NOT
+///       `unreachable` (the wire was never reached) and NOT `dead_path` (the seam is
+///       wired, an internal step failed): it is an internal pre-wire error, the loud
+///       catch-all for "something broke before we could emit". Justified as `error`
+///       over `unreachable` because the failure is on OUR side of the socket.
+///   • unrecognized / absent `status`                          → `error`
+///     — contract drift; the loud catch-all, never silently read as clean.
+fn emit_reason_carrier(emission: &serde_json::Value) -> EmitReason {
+    if emission.is_null() {
+        return EmitReason::clean("disabled");
+    }
+    let status = emission.get("status").and_then(serde_json::Value::as_str);
+    match status {
+        Some("emitted") => {
+            let warnings = emission
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            if warnings == 0 {
+                EmitReason::clean("clean")
+            } else {
+                let noun = if warnings == 1 { "warning" } else { "warnings" };
+                EmitReason::degraded(
+                    "partial",
+                    format!(
+                        "Filigree accepted the batch but flagged {warnings} intake {noun} \
+                         (findings rejected or coerced)"
+                    ),
+                    "inspect filigree_emission.warnings in stats.json; fix the flagged \
+                     fields and re-emit to complete the ingest",
+                )
+            }
+        }
+        Some("unreachable") => {
+            let reason = emission
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unreachable");
+            EmitReason::degraded(
+                "unreachable",
+                format!("the findings POST never landed: {reason}"),
+                "check the Filigree endpoint is up and reachable, then re-run analyze \
+                 (or `analyze --resume RUN_ID`) to re-emit",
+            )
+        }
+        Some("skipped") => {
+            let reason = emission
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("skipped");
+            if reason == "no_postrun_findings_with_path" {
+                // The Phase-8c filtered no-op is a clean true-negative — nothing
+                // emittable remained — not a degraded seam.
+                EmitReason::clean("clean")
+            } else {
+                EmitReason::degraded(
+                    "error",
+                    format!("emit aborted before the wire (pre-POST failure: {reason})"),
+                    "check the analyze logs for the flush/read/open failure behind \
+                     this skip, then re-run analyze to re-emit",
+                )
+            }
+        }
+        // An unknown/absent status string is itself a contract drift — the loud
+        // catch-all, never silently read as clean.
+        other => EmitReason::degraded(
+            "error",
+            format!(
+                "unrecognized Filigree emit status {}",
+                other.unwrap_or("<missing>")
+            ),
+            "(contract drift) report the unexpected emit status to the weft hub",
+        ),
+    }
+}
+
+/// Combine the Phase-8 (during-run) and (optional) Phase-8c (post-commit) typed
+/// emit carriers into the single, worst-case carrier for the structured block.
+/// Mirrors [`combined_emit_marker`]: the primary seam wins when both are non-clean
+/// (one loud carrier is enough for a consumer to gate); otherwise a non-clean
+/// post-run carrier surfaces over a clean primary, so a degraded Phase-8c emit is
+/// never masked by a clean during-run one.
+fn combined_emit_reason(primary: EmitReason, postrun: Option<EmitReason>) -> EmitReason {
+    if primary.reason_class != "clean" && primary.reason_class != "disabled" {
+        return primary;
+    }
+    match postrun {
+        Some(p) if p.reason_class != "clean" && p.reason_class != "disabled" => p,
+        // Both clean/disabled: keep the primary (it carries the during-run posture;
+        // `disabled` beats `clean` only when the primary itself was disabled).
+        _ => primary,
+    }
+}
+
+/// The additive structured-output payload emitted by `analyze --json`: the
+/// whole-graph totals plus the TYPED emit carrier. The human-readable completion
+/// line is still printed for interactive use; this block is the machine-readable
+/// surface a typed consumer reads instead of grepping stdout (G3).
+#[derive(Debug, Serialize)]
+struct AnalyzeJsonOutput<'a> {
+    run_id: &'a str,
+    entities: i64,
+    subsystems: i64,
+    edges: i64,
+    skipped_files: u64,
+    /// The typed `weft-reason` carrier for the Filigree emit seam.
+    emit: EmitReason,
 }
 
 fn dedup_descriptors_by_locator(descriptors: Vec<NewEntityDescriptor>) -> Vec<NewEntityDescriptor> {
@@ -6194,6 +6422,177 @@ mod tests {
         );
         // Both clean → no marker.
         assert_eq!(combined_emit_marker(None, None), None);
+    }
+
+    // --- emit_reason_carrier: the TYPED weft-reason carrier (G3 / PDR-0023) ---
+    //
+    // The structured-output sibling of `emit_status_marker`: the degraded shapes
+    // must land a TYPED `{reason_class, cause, fix}` a consumer switches on (not a
+    // stdout substring), and the clean/disabled shapes must omit cause/fix. The
+    // reason_class strings are constrained to the canonical 11-class vocab.
+
+    #[test]
+    fn emit_reason_disabled_when_integration_off() {
+        // A `Null` blob = integration off / emit_findings=false → `disabled`
+        // (clean-family: no cause/fix), NOT `clean` — the two stay distinguishable.
+        let r = emit_reason_carrier(&serde_json::Value::Null);
+        assert_eq!(r.reason_class, "disabled");
+        assert_eq!(r.cause, None);
+        assert_eq!(r.fix, None);
+    }
+
+    #[test]
+    fn emit_reason_clean_for_true_negative_emit() {
+        // A real POST with zero intake warnings is the earned true-negative →
+        // `clean`, cause/fix omitted (and so absent from the JSON).
+        let blob = serde_json::json!({
+            "status": "emitted",
+            "emitted": 0,
+            "warnings": [],
+        });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "clean");
+        assert_eq!(r.cause, None);
+        assert_eq!(r.fix, None);
+        // A clean carrier serializes WITHOUT cause/fix keys (skip_serializing_if).
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json, serde_json::json!({ "reason_class": "clean" }));
+    }
+
+    #[test]
+    fn emit_reason_clean_for_filtered_no_op_skip() {
+        // The Phase-8c "nothing emittable remained" skip is a clean true-negative.
+        let blob = serde_json::json!({
+            "status": "skipped",
+            "reason": "no_postrun_findings_with_path",
+        });
+        assert_eq!(emit_reason_carrier(&blob).reason_class, "clean");
+    }
+
+    #[test]
+    fn emit_reason_degraded_emits_typed_carrier_not_a_substring() {
+        // THE G3 STRIKE: an unrecognized (drift) emit status must surface a TYPED
+        // {reason_class, cause, fix} carrier a consumer can switch on — not a
+        // grepped stdout substring. `reason_class` is the canonical `error` class
+        // (the loud catch-all for contract drift); cause + a recruiting fix are
+        // both present and machine-readable.
+        let blob = serde_json::json!({ "status": "bizarro" });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "error");
+        assert_eq!(
+            r.cause.as_deref(),
+            Some("unrecognized Filigree emit status bizarro")
+        );
+        // FIX is mandatory on every non-clean class (contract): present + non-empty.
+        let fix = r.fix.as_deref().expect("non-clean carrier must carry a fix");
+        assert!(!fix.is_empty());
+        // And it serializes as a typed object, NOT a bare string a consumer would
+        // have to substring-match.
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.is_object());
+        assert_eq!(json["reason_class"], "error");
+        assert_eq!(json["cause"], "unrecognized Filigree emit status bizarro");
+        assert!(json["fix"].is_string());
+    }
+
+    #[test]
+    fn emit_reason_unreachable_carries_cause_and_fix() {
+        // POST never landed → canonical `unreachable`, with the transport error in
+        // the cause and a recruiting retry in the fix.
+        let blob = serde_json::json!({
+            "status": "unreachable",
+            "error": "error sending request: connection refused",
+        });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "unreachable");
+        assert!(
+            r.cause
+                .as_deref()
+                .is_some_and(|c| c.contains("connection refused"))
+        );
+        assert!(r.fix.is_some());
+    }
+
+    #[test]
+    fn emit_reason_partial_for_intake_warnings() {
+        // A landed POST whose findings were rejected/coerced → `partial` (qualified
+        // trust): the bare `emitted` would read as full success.
+        let blob = serde_json::json!({
+            "status": "emitted",
+            "emitted": 5,
+            "warnings": ["coerced severity for f1", "unknown scan_run_id for f2"],
+        });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "partial");
+        assert!(r.cause.as_deref().is_some_and(|c| c.contains("2 intake")));
+        assert!(r.fix.is_some());
+    }
+
+    #[test]
+    fn emit_reason_pre_wire_skip_is_error_not_unreachable() {
+        // A pre-POST flush/read/open skip is an INTERNAL pre-wire failure (our side
+        // of the socket, the wire was never reached) → canonical `error`, the loud
+        // catch-all — justified over `unreachable` (which means the POST itself
+        // failed on the network).
+        let blob = serde_json::json!({ "status": "skipped", "reason": "flush_failed" });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "error");
+        assert!(r.cause.as_deref().is_some_and(|c| c.contains("flush_failed")));
+        assert!(r.fix.is_some());
+    }
+
+    #[test]
+    fn emit_reason_carrier_stays_in_lockstep_with_substring_marker() {
+        // The typed carrier and the human substring marker read the SAME blob and
+        // must never disagree on clean-vs-degraded: a marker `None` ⇔ a clean/
+        // disabled class; a `Some(_)` marker ⇔ a non-clean class.
+        let cases = [
+            serde_json::Value::Null,
+            serde_json::json!({ "status": "emitted", "warnings": [] }),
+            serde_json::json!({ "status": "emitted", "warnings": ["w"] }),
+            serde_json::json!({ "status": "unreachable", "error": "x" }),
+            serde_json::json!({ "status": "skipped", "reason": "no_postrun_findings_with_path" }),
+            serde_json::json!({ "status": "skipped", "reason": "flush_failed" }),
+            serde_json::json!({ "status": "bizarro" }),
+        ];
+        for blob in cases {
+            let marker_clean = emit_status_marker(&blob).is_none();
+            let class = emit_reason_carrier(&blob).reason_class;
+            let carrier_clean = class == "clean" || class == "disabled";
+            assert_eq!(
+                marker_clean, carrier_clean,
+                "marker/carrier disagree on clean-ness for blob {blob}"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_emit_reason_primary_wins_then_postrun() {
+        let unreachable = EmitReason::degraded("unreachable", "a", "retry");
+        let error = EmitReason::degraded("error", "b", "report");
+        // Both degraded → the during-run (primary) carrier surfaces.
+        assert_eq!(
+            combined_emit_reason(unreachable.clone(), Some(error.clone())).reason_class,
+            "unreachable"
+        );
+        // Primary clean, post-run degraded → the post-run carrier surfaces (a
+        // degraded Phase-8c emit is never masked by a clean during-run one).
+        assert_eq!(
+            combined_emit_reason(EmitReason::clean("clean"), Some(error.clone())).reason_class,
+            "error"
+        );
+        // Both clean → clean.
+        assert_eq!(
+            combined_emit_reason(EmitReason::clean("clean"), None).reason_class,
+            "clean"
+        );
+        // Primary disabled, post-run clean → disabled is preserved (the during-run
+        // posture), not flattened to clean.
+        assert_eq!(
+            combined_emit_reason(EmitReason::clean("disabled"), Some(EmitReason::clean("clean")))
+                .reason_class,
+            "disabled"
+        );
     }
 
     #[test]

@@ -83,6 +83,7 @@ fn main() -> Result<()> {
             no_sei,
             no_incremental,
             legis_url,
+            json,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -109,6 +110,7 @@ fn main() -> Result<()> {
                     no_sei,
                     no_incremental,
                     legis_url,
+                    json,
                 },
             ))
         }

@@ -161,6 +161,14 @@ pub enum Command {
         /// behaviour byte-identical. Omit to use Loomweave's shell git source only.
         #[arg(long)]
         legis_url: Option<String>,
+
+        /// After the human-readable completion line, also emit a structured-output
+        /// block (graph totals + the typed `weft-reason` carrier for the Filigree
+        /// emit seam) for machine consumers. The emit outcome is a typed
+        /// `{reason_class, cause, fix}` a consumer switches on, not a stdout
+        /// substring (G3 / PDR-0023). Additive: the human line is unchanged.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run the MCP stdio server.
