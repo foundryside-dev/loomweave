@@ -70,6 +70,17 @@ jobs:
 
   build-rust:
     needs: [verify, assert-on-main]
+    # assert-on-main is push-only (skipped on workflow_dispatch). GitHub's
+    # default success() gate would then skip every job that needs it, so the
+    # manual dispatch dry-run would build nothing. Run when verify passed and
+    # assert-on-main either passed (tag push) or was skipped (dispatch); a verify
+    # failure, or a tag not on main (assert-on-main == failure), still blocks the
+    # build (Codex P2; clarion-c9f62eec7d).
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && (needs.assert-on-main.result == 'success'
+          || needs.assert-on-main.result == 'skipped')
     name: Build loomweave (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -136,6 +147,13 @@ jobs:
 
   build-wheels:
     needs: [verify, assert-on-main]
+    # Run on dispatch (assert-on-main skipped) and tag push; block on verify
+    # failure or a not-on-main tag. See build-rust for the full rationale.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && (needs.assert-on-main.result == 'success'
+          || needs.assert-on-main.result == 'skipped')
     name: Build loomweave wheel (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     # maturin bin-wheels for PyPI. Matrix mirrors `build-rust` (Linux x86_64 +
@@ -187,6 +205,13 @@ jobs:
 
   build-rust-plugin:
     needs: [verify, assert-on-main]
+    # Run on dispatch (assert-on-main skipped) and tag push; block on verify
+    # failure or a not-on-main tag. See build-rust for the full rationale.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && (needs.assert-on-main.result == 'success'
+          || needs.assert-on-main.result == 'skipped')
     name: Build loomweave-plugin-rust wheel (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     # maturin bin-wheels for the Rust language plugin (packaging/rust-plugin-dist,
@@ -238,6 +263,13 @@ jobs:
 
   build-plugin:
     needs: [verify, assert-on-main]
+    # Run on dispatch (assert-on-main skipped) and tag push; block on verify
+    # failure or a not-on-main tag. See build-rust for the full rationale.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && (needs.assert-on-main.result == 'success'
+          || needs.assert-on-main.result == 'skipped')
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
