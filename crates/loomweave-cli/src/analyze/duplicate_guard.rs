@@ -150,6 +150,13 @@ impl DuplicateLocatorGuard {
             second_path.to_owned(),
         );
         metadata.insert("shape".to_owned(), shape.as_str().to_owned());
+        // Anchor the finding to a real file (the first-seen declaration) so it
+        // carries a `source_file_path` and reaches Filigree's scan-results emit.
+        // Without this, `host_finding_anchor_id` falls back to the file-less
+        // project anchor (`core:project:*`), which the emit skips as
+        // `skipped_no_path` — leaving the duplicate-locator lacuna untrackable
+        // in Filigree (the residual half of the dogfood's Friction A).
+        metadata.insert("anchor_file_path".to_owned(), first_path.to_owned());
         Some(HostFinding {
             subcode: DUPLICATE_LOCATOR_RULE_ID.to_owned(),
             message: format!(

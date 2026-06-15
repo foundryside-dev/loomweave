@@ -3631,11 +3631,16 @@ async fn emit_findings_to_filigree(
             // Filigree's scan-results intake requires project-relative finding
             // paths; Loomweave stores absolute `source_file_path`s, so strip the
             // project-root prefix before emit. An out-of-root path is left as-is
-            // (Filigree rejects it loudly, which beats silently rewriting it).
+            // (Filigree rejects it loudly, which beats silently rewriting it). A
+            // path equal to the project root relativizes to "" — that is a
+            // project-anchored (file-less) finding, not a real file location, so
+            // drop it to `None` (path-less → skipped) rather than emit an empty
+            // path Filigree rejects.
             let rel = row
                 .source_file_path
                 .as_deref()
-                .map(|path| relativize_for_emit(project_root, path));
+                .map(|path| relativize_for_emit(project_root, path))
+                .filter(|rel| !rel.is_empty());
             // Clear line numbers past EOF before emit. Loomweave can record a
             // line beyond a file's last line for a syntax-error/degraded entity;
             // Filigree's strict batch intake 400s the WHOLE batch on such a
@@ -3656,17 +3661,18 @@ async fn emit_findings_to_filigree(
         })
         .collect::<Vec<_>>();
 
-    // In the Phase-8c (post-`CommitRun`, filtered) pass, anchor path-less
-    // synthetic-entity findings — the subsystem-anchored tier facts — to the
-    // project root (mirroring the `core:project:*` finding anchor) so they POST
-    // rather than being dropped as `skipped_no_path`. The wire layer flags these
-    // `metadata.loomweave.synthetic_anchor=true`. The Phase-8 pass passes `None`,
-    // so during-run path-less findings (e.g. the weak-modularity subsystem fact)
-    // keep their existing store-only treatment.
-    // The synthetic-anchor fallback is the project root itself; emit it as the
-    // relative "." so it satisfies Filigree's project-relative path rule (an
-    // absolute project-root path is rejected the same as any other absolute path).
-    let default_path = rule_filter.map(|_| ".".to_owned());
+    // Path-less findings have no real file to anchor to, and Filigree's
+    // scan-results intake rejects every synthetic stand-in: an absolute project
+    // root (absolute paths rejected), AND the relative "." — its
+    // `_normalize_scan_path` collapses "." to "", rejected as "path is empty
+    // after normalization". There is no valid project-level path, so a path-less
+    // finding is skipped (`skipped_no_path` — surfaced, never silently dropped)
+    // rather than forced under a bogus path that 400s the whole batch. The
+    // file-anchored defects still reach Filigree: `lw-duplicate-locator` now
+    // carries an `anchor_file_path` (see `duplicate_guard`) so it resolves to a
+    // real file instead of the file-less project anchor. Genuinely project-level
+    // facts (e.g. the weak-modularity subsystem fact) stay store-only by design.
+    let default_path = None;
 
     let batch = prepare_batch(
         &rows,
@@ -5819,6 +5825,10 @@ mod tests {
             relativize_for_emit(root, "/etc/passwd"),
             "/etc/passwd"
         );
+        // The project root itself relativizes to "" — the emit map filters this
+        // to None (a file-less, project-anchored finding) rather than emitting an
+        // empty path Filigree rejects ("path is empty after normalization").
+        assert_eq!(relativize_for_emit(root, "/home/u/proj"), "");
     }
 
     #[test]

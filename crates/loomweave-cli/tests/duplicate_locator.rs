@@ -180,6 +180,11 @@ fn in_run_same_file_duplicate_emits_single_error_finding() {
         evidence.contains("in_run_same_file"),
         "evidence must carry the same-file shape; got {evidence}"
     );
+    assert!(
+        evidence.contains("anchor_file_path"),
+        "finding must carry anchor_file_path so it reaches Filigree's emit \
+         (a file-less project anchor is skipped as skipped_no_path); got {evidence}"
+    );
 
     // The run committed: the entity row exists despite the collision.
     let run_status: String = conn

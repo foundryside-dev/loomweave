@@ -12,6 +12,34 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.1.0rc7] — 2026-06-15
+
+Seventh 1.1 release candidate. Completes the loomweave→Filigree finding-emit work
+from rc6: file-*less* findings now reach Filigree too. The
+`LMWV-DUPLICATE-LOCATOR` finding now carries an `anchor_file_path` (its first-seen
+declaration) so it anchors to a real file instead of the file-less project anchor
+— previously such findings were skipped at emit (`skipped_no_path`), leaving the
+duplicate-locator lacuna untrackable in Filigree (the residual half of the
+dogfood's Friction A). No package is published for release candidates.
+(Cargo SemVer `1.1.0-rc7`; Python wheels normalise to PEP 440 `1.1.0rc7`.)
+
+### Fixed
+
+- **Duplicate-locator findings reach Filigree.** `LMWV-DUPLICATE-LOCATOR` now
+  sets `anchor_file_path` (its first-seen declaration), so
+  `host_finding_anchor_id` anchors it to a real file and the scan-results emit
+  carries it instead of dropping it as `skipped_no_path` under the file-less
+  `core:project:*` anchor.
+- **File-less findings are skipped, not forced under a bogus path.** A genuinely
+  project-level finding (e.g. the weak-modularity subsystem fact) has no real
+  file, and Filigree's intake rejects every synthetic stand-in — an absolute
+  project root, and the relative `"."` (its `_normalize_scan_path` collapses
+  `"."` to `""`, rejected as "path is empty after normalization"). The emit no
+  longer attempts a synthetic project-anchor path (which 400'd the whole batch);
+  such findings stay store-only and are counted `skipped_no_path`. A finding
+  whose path equals the project root (relativizes to `""`) is likewise treated as
+  path-less rather than emitted empty.
+
 ## [1.1.0rc6] — 2026-06-15
 
 Sixth 1.1 release candidate. Makes the Loomweave→Filigree finding-emit seam work
