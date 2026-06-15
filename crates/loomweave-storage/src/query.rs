@@ -1475,7 +1475,22 @@ pub fn relation_edges_for_entity(
     )?;
     for row in ambiguous.query_map([], map_relation_edge_match)? {
         let edge = row?;
-        if edge.candidates.iter().any(|cid| cid == entity_id) {
+        if !edge.candidates.iter().any(|cid| cid == entity_id) {
+            continue;
+        }
+        // `candidates` are direction-specific, not endpoint-neutral: for
+        // inherits_from / implements / derives they are alternative TARGET-side
+        // entities (so they answer an `In` lookup, which keys on to_id), while
+        // `decorates` candidates are alternative SOURCE-side decorators (so they
+        // answer an `Out` lookup, which keys on from_id). Admitting a candidate
+        // for the other direction would surface an edge whose stored endpoints
+        // do not include entity_id, and the relation/neighborhood renderer would
+        // then report a false relation (Codex review).
+        let candidate_answers_direction = match direction {
+            ReferenceDirection::In => edge.kind != "decorates",
+            ReferenceDirection::Out => edge.kind == "decorates",
+        };
+        if candidate_answers_direction {
             push_relation_match(&mut matches, &mut seen, edge);
         }
     }

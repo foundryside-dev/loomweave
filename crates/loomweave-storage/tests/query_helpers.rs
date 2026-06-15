@@ -1086,6 +1086,18 @@ fn relation_edges_for_entity_matches_ambiguous_candidate_endpoints() {
         1,
         "the edge appears once even though a::Render is both to_id and a candidate: {deduped:?}"
     );
+
+    // Direction gating (Codex review): `implements` candidates are TARGET-side,
+    // so b::Render answers an `In` lookup only. An `Out` query from b::Render
+    // must NOT surface the edge — b::Render is not a source endpoint, so
+    // returning it would make the renderer report a false outbound relation.
+    let wrong_direction =
+        relation_edges_for_entity(&conn, "rust:trait:b::Render", ReferenceDirection::Out, None)
+            .expect("outbound for target-side candidate");
+    assert!(
+        wrong_direction.is_empty(),
+        "a target-side candidate must not match an Out lookup: {wrong_direction:?}"
+    );
 }
 
 #[test]
