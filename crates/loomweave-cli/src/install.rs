@@ -330,6 +330,11 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
                 loomweave_dir.display()
             );
         }
+        // A `weft.toml` `[loomweave].store_dir` override can point `store_dir`
+        // anywhere — `"."` (the project root), `".."` (an ancestor), or an
+        // arbitrary absolute dir. `--force`'s recursive delete must never wipe
+        // such a path, so validate that this is a Loomweave-owned store first.
+        ensure_safe_to_force_remove(&loomweave_dir, project_root)?;
         fs::remove_dir_all(&loomweave_dir)
             .with_context(|| format!("remove existing {}", loomweave_dir.display()))?;
     }
@@ -357,6 +362,48 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
         "loomweave install complete"
     );
     println!("Initialised {}", loomweave_dir.display());
+    Ok(())
+}
+
+/// Refuse `--force`'s recursive delete unless `loomweave_dir` is a Loomweave-owned
+/// store. A `weft.toml` `[loomweave].store_dir` override resolves to an arbitrary
+/// path (`"."` → project root, `".."` → an ancestor, or any absolute dir), so a
+/// blind `remove_dir_all` could wipe the project tree or an unrelated directory.
+///
+/// Two independent checks must both pass:
+/// 1. The store dir must not be the project root or an ancestor of it (canonical
+///    path comparison) — this alone defuses `store_dir = "."` / `".."`.
+/// 2. It must look like a Loomweave store: the canonical `.weft/loomweave`
+///    location, or a directory that actually holds a `loomweave.db`. An arbitrary
+///    absolute path or a misconfigured under-tree override is refused, not wiped.
+fn ensure_safe_to_force_remove(loomweave_dir: &Path, project_root: &Path) -> Result<()> {
+    let store_canon = loomweave_dir
+        .canonicalize()
+        .unwrap_or_else(|_| loomweave_dir.to_path_buf());
+    let root_canon = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    if root_canon == store_canon || root_canon.starts_with(&store_canon) {
+        bail!(
+            "--force refuses to delete {}: the configured store_dir is the project \
+             root or an ancestor of it. Fix [loomweave].store_dir in weft.toml.",
+            loomweave_dir.display()
+        );
+    }
+
+    let is_canonical_default = loomweave_dir
+        == project_root
+            .join(loomweave_core::store::WEFT_DIR)
+            .join(loomweave_core::store::MEMBER);
+    let holds_store_db = loomweave_dir.join("loomweave.db").is_file();
+    if !is_canonical_default && !holds_store_db {
+        bail!(
+            "--force refuses to delete {}: it does not look like a Loomweave store \
+             (no loomweave.db, and not the default .weft/loomweave path). Remove it \
+             manually if you intend to wipe it.",
+            loomweave_dir.display()
+        );
+    }
     Ok(())
 }
 

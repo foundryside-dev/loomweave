@@ -578,3 +578,47 @@ fn explicit_env_var_wins_over_dotenv() {
          stderr was:\n{stderr}"
     );
 }
+
+#[test]
+fn install_force_refuses_to_wipe_project_root_via_store_dir_override() {
+    let dir = tempfile::tempdir().unwrap();
+    // A malicious/misconfigured weft.toml relocating the store to the project
+    // root itself: `--force`'s remove_dir_all would otherwise delete everything.
+    fs::write(dir.path().join("weft.toml"), "[loomweave]\nstore_dir = \".\"\n").unwrap();
+    let sentinel = dir.path().join("KEEP_ME.txt");
+    fs::write(&sentinel, "precious").unwrap();
+
+    loomweave_bin()
+        .args(["install", "--force", "--path"])
+        .arg(dir.path())
+        .assert()
+        .failure();
+
+    assert!(
+        sentinel.exists(),
+        "--force must not delete the project root when store_dir points at it"
+    );
+}
+
+#[test]
+fn install_force_reinitialises_a_real_store() {
+    // The default-location store IS a recognised Loomweave dir, so --force still
+    // re-creates it (the guard only blocks unsafe/unowned targets).
+    let dir = tempfile::tempdir().unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    assert!(dir.path().join(".weft/loomweave/loomweave.db").exists());
+
+    loomweave_bin()
+        .args(["install", "--force", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    assert!(
+        dir.path().join(".weft/loomweave/loomweave.db").exists(),
+        "--force should re-create a fresh store at the default location"
+    );
+}
