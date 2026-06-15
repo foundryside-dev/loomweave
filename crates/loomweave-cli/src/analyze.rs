@@ -648,9 +648,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     // diverges from the in-run `remember_finding_anchors` tie-break on
                     // same-rank candidates (Rust inline `mod` blocks), which would
                     // flip the anchor-keyed finding id and mint a duplicate row.
-                    let mut anchors =
-                        loomweave_storage::preferred_finding_anchor_by_file(&conn)
-                            .unwrap_or_default();
+                    let mut anchors = loomweave_storage::preferred_finding_anchor_by_file(&conn)
+                        .unwrap_or_default();
                     anchors.extend(
                         loomweave_storage::stored_secret_finding_anchor_by_file(&conn)
                             .unwrap_or_default(),
@@ -1939,8 +1938,7 @@ fn emit_status_marker(emission: &serde_json::Value) -> Option<String> {
             // The filtered (Phase-8c) "nothing emittable remained" skip is a clean
             // true-negative, not a degraded seam — emit nothing for it. Every other
             // skip is a pre-wire failure (flush/read/open) the run must not bury.
-            (reason != "no_postrun_findings_with_path")
-                .then(|| format!("emit:skipped ({reason})"))
+            (reason != "no_postrun_findings_with_path").then(|| format!("emit:skipped ({reason})"))
         }
         // An unknown/absent status string is itself a contract drift — surface it
         // rather than silently reading it as clean.
@@ -1955,10 +1953,7 @@ fn emit_status_marker(emission: &serde_json::Value) -> Option<String> {
 /// worst-case completion-line marker. The during-run (Phase-8) emit is the primary
 /// seam; a degraded Phase-8c (post-commit) emit also surfaces, but the primary
 /// marker wins when both degrade (one loud marker is enough for a caller to gate).
-fn combined_emit_marker(
-    primary: Option<String>,
-    postrun: Option<String>,
-) -> Option<String> {
+fn combined_emit_marker(primary: Option<String>, postrun: Option<String>) -> Option<String> {
     primary.or(postrun)
 }
 
@@ -1999,7 +1994,11 @@ impl EmitReason {
     }
 
     /// A non-clean class: cause + a mandatory recruiting fix.
-    fn degraded(reason_class: &'static str, cause: impl Into<String>, fix: impl Into<String>) -> Self {
+    fn degraded(
+        reason_class: &'static str,
+        cause: impl Into<String>,
+        fix: impl Into<String>,
+    ) -> Self {
         Self {
             reason_class,
             cause: Some(cause.into()),
@@ -6163,10 +6162,7 @@ mod tests {
         );
         // An out-of-root path is left untouched (Filigree rejects it loudly
         // rather than us silently rewriting it into something wrong).
-        assert_eq!(
-            relativize_for_emit(root, "/etc/passwd"),
-            "/etc/passwd"
-        );
+        assert_eq!(relativize_for_emit(root, "/etc/passwd"), "/etc/passwd");
         // The project root itself relativizes to "" — the emit map filters this
         // to None (a file-less, project-anchored finding) rather than emitting an
         // empty path Filigree rejects ("path is empty after normalization").
@@ -6484,7 +6480,10 @@ mod tests {
             Some("unrecognized Filigree emit status bizarro")
         );
         // FIX is mandatory on every non-clean class (contract): present + non-empty.
-        let fix = r.fix.as_deref().expect("non-clean carrier must carry a fix");
+        let fix = r
+            .fix
+            .as_deref()
+            .expect("non-clean carrier must carry a fix");
         assert!(!fix.is_empty());
         // And it serializes as a typed object, NOT a bare string a consumer would
         // have to substring-match.
@@ -6537,7 +6536,11 @@ mod tests {
         let blob = serde_json::json!({ "status": "skipped", "reason": "flush_failed" });
         let r = emit_reason_carrier(&blob);
         assert_eq!(r.reason_class, "error");
-        assert!(r.cause.as_deref().is_some_and(|c| c.contains("flush_failed")));
+        assert!(
+            r.cause
+                .as_deref()
+                .is_some_and(|c| c.contains("flush_failed"))
+        );
         assert!(r.fix.is_some());
     }
 
@@ -6589,8 +6592,11 @@ mod tests {
         // Primary disabled, post-run clean → disabled is preserved (the during-run
         // posture), not flattened to clean.
         assert_eq!(
-            combined_emit_reason(EmitReason::clean("disabled"), Some(EmitReason::clean("clean")))
-                .reason_class,
+            combined_emit_reason(
+                EmitReason::clean("disabled"),
+                Some(EmitReason::clean("clean"))
+            )
+            .reason_class,
             "disabled"
         );
     }
@@ -6605,7 +6611,7 @@ mod tests {
     // holds on every shape. It FAILS if loomweave ever drifts: adds a reason_class
     // outside the canonical set, or drops cause/fix from a non-clean carrier.
 
-    /// The canonical 11 reason_classes (closed set) from the G1 contract,
+    /// The canonical 11 `reason_classes` (closed set) from the G1 contract,
     /// `contracts/weft-reason-vocab.json`. Kept inline (no shared runtime dep —
     /// members stay independent repos and conform by this per-member test).
     const CANONICAL_REASON_CLASSES: [&str; 11] = [
@@ -6691,14 +6697,12 @@ mod tests {
                 );
             } else {
                 // non-clean: cause + a MANDATORY, non-empty fix, on struct + wire.
-                let cause = carrier
-                    .cause
-                    .as_deref()
-                    .unwrap_or_else(|| panic!("non-clean {} must carry a cause", carrier.reason_class));
-                let fix = carrier
-                    .fix
-                    .as_deref()
-                    .unwrap_or_else(|| panic!("non-clean {} must carry a fix", carrier.reason_class));
+                let cause = carrier.cause.as_deref().unwrap_or_else(|| {
+                    panic!("non-clean {} must carry a cause", carrier.reason_class)
+                });
+                let fix = carrier.fix.as_deref().unwrap_or_else(|| {
+                    panic!("non-clean {} must carry a fix", carrier.reason_class)
+                });
                 assert!(
                     !cause.is_empty(),
                     "non-clean {} carries an empty cause",

@@ -397,7 +397,10 @@ mod tests {
             &["/x.py"],
         )
         .unwrap();
-        assert_eq!(deleted, 1, "only the re-examined file's stale finding is retired");
+        assert_eq!(
+            deleted, 1,
+            "only the re-examined file's stale finding is retired"
+        );
         assert_eq!(
             ids(&conn),
             ["core:finding:unexamined"],

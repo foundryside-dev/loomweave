@@ -9,7 +9,7 @@
 //!
 //! **Freshness is DERIVED, not computed here** (convention C-12,
 //! weft-4165f1ed71): the snapshot calls the same
-//! [`crate::index_diff::compute_freshness`] oracle `index_diff_get` reports,
+//! `index_diff::compute_freshness` oracle `index_diff_get` reports,
 //! and maps its verdict onto [`Staleness`]. The former mtime/structural
 //! detector — which watched the *parents* of ingested paths and could wedge a
 //! project to permanent `Stale` via `$HOME` churn whenever the project-anchor
@@ -25,7 +25,7 @@ use crate::index_diff::FreshnessOverall;
 
 /// Freshness of the `.weft/loomweave/` index relative to the source files Loomweave
 /// ingested — the snapshot-side rendering of the single freshness oracle
-/// ([`crate::index_diff::compute_freshness`], C-12 / weft-4165f1ed71).
+/// (`index_diff::compute_freshness`, C-12 / weft-4165f1ed71).
 ///
 /// The oracle's channels: commit mismatch (analyzed commit vs HEAD), HEAD
 /// committer date vs analyze time, per-file mtime/existence stats over the
@@ -230,7 +230,7 @@ impl ProjectSnapshot {
 /// `false` case is produced by the caller when the db file is missing.
 ///
 /// The staleness verdict DERIVES from the single freshness oracle
-/// ([`crate::index_diff::compute_freshness`]) — the same code path
+/// (`index_diff::compute_freshness`) — the same code path
 /// `index_diff_get` reports — so the two surfaces cannot disagree (C-12,
 /// weft-4165f1ed71).
 #[must_use]

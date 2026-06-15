@@ -187,14 +187,14 @@ fn spawn_over(root: &std::path::Path) -> (tempfile::TempDir, SubprocessHost, std
     let (host, child) = loop {
         match PluginHost::spawn(manifest.clone(), root, &exec) {
             Err(loomweave_core::HostError::Spawn(msg))
-                if msg.contains("Text file busy")
-                    && std::time::Instant::now() < deadline =>
+                if msg.contains("Text file busy") && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             other => {
-                break other
-                    .expect("spawn must succeed: the symbol-table walk must skip bombs, not abort");
+                break other.expect(
+                    "spawn must succeed: the symbol-table walk must skip bombs, not abort",
+                );
             }
         }
     };

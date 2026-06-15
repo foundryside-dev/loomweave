@@ -273,8 +273,7 @@ impl TrafficLoggingProvider {
         // file (not the log itself) so it survives the rotation rename and is
         // never invalidated when the log is renamed away mid-flight.
         let lock_path = llm_traffic_lock_path(&self.log_path);
-        let lock_file =
-            OpenOptions::new()
+        let lock_file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 // The lock file is a pure flock token; we never write its
@@ -302,18 +301,12 @@ impl TrafficLoggingProvider {
                 .append(true)
                 .open(&self.log_path)
                 .map_err(|err| LlmProviderError::Cli {
-                    message: format!(
-                        "open LLM traffic log {}: {err}",
-                        self.log_path.display()
-                    ),
+                    message: format!("open LLM traffic log {}: {err}", self.log_path.display()),
                     retryable: false,
                 })?;
             file.write_all(line.as_bytes())
                 .map_err(|err| LlmProviderError::Cli {
-                    message: format!(
-                        "write LLM traffic log {}: {err}",
-                        self.log_path.display()
-                    ),
+                    message: format!("write LLM traffic log {}: {err}", self.log_path.display()),
                     retryable: false,
                 })
         })();
@@ -2478,7 +2471,12 @@ mod tests {
             Some("gpt-5-codex")
         );
         // Unset stays unset.
-        assert!(CodexCliProvider::from_config(cfg(None)).unwrap().model.is_none());
+        assert!(
+            CodexCliProvider::from_config(cfg(None))
+                .unwrap()
+                .model
+                .is_none()
+        );
     }
 
     #[tokio::test]

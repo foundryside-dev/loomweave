@@ -183,7 +183,11 @@ fn bind_entity_rules_to_locator(conn: &Connection, rules: &mut [Value]) -> Resul
         if rule_type != "entity" && rule_type != "subsystem" {
             continue;
         }
-        let Some(raw_id) = rule.get("id").and_then(Value::as_str).map(ToOwned::to_owned) else {
+        let Some(raw_id) = rule
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
             continue;
         };
         let resolved = resolve_entity_ref(conn, &raw_id)

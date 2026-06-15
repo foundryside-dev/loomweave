@@ -85,10 +85,7 @@ impl McpConfig {
     /// re-enabling a non-loopback endpoint in the same edit is still refused);
     /// any cross-section trust issue that genuinely remains surfaces at the
     /// next full load (`serve` / `doctor` / `config check`).
-    fn from_yaml_str_section_scoped(
-        raw: &str,
-        edited: EditedSection,
-    ) -> Result<Self, ConfigError> {
+    fn from_yaml_str_section_scoped(raw: &str, edited: EditedSection) -> Result<Self, ConfigError> {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
@@ -897,8 +894,7 @@ pub fn update_semantic_config_file(
     // recovery action. Validate structure + THIS section's own endpoint trust
     // (so re-enabling a non-loopback endpoint is still refused), but never
     // cross-section trust.
-    let parsed =
-        McpConfig::from_yaml_str_section_scoped(&rendered, EditedSection::SemanticSearch)?;
+    let parsed = McpConfig::from_yaml_str_section_scoped(&rendered, EditedSection::SemanticSearch)?;
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

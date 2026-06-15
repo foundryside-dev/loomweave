@@ -238,8 +238,7 @@ impl RawScope {
                 // circular-import). A namespace that matches no entity falls back
                 // to a path glob so a filename-shaped token (`utils.py`) still
                 // behaves as before.
-                let (ids, truncated) =
-                    entity_ids_in_namespace(conn, raw, SCOPE_DESCENDANT_CAP)?;
+                let (ids, truncated) = entity_ids_in_namespace(conn, raw, SCOPE_DESCENDANT_CAP)?;
                 if ids.is_empty() {
                     return Ok(ScopeFilter::Path {
                         pattern: raw.clone(),
@@ -401,10 +400,7 @@ mod tests {
         // A bare dotted qualname (no path sigil, fewer than three colon
         // segments) is neither an entity id nor a path glob — it is a qualname
         // to be resolved, not silently matched as a path.
-        assert!(matches!(
-            RawScope::classify("specimen"),
-            RawScope::Bare(_)
-        ));
+        assert!(matches!(RawScope::classify("specimen"), RawScope::Bare(_)));
         assert!(matches!(
             RawScope::classify("specimen.dead_code"),
             RawScope::Bare(_)

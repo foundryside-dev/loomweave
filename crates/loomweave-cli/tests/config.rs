@@ -90,7 +90,10 @@ fn config_example_accepts_every_llm_provider_parse_alias() {
 
     for (alias, canonical) in cases {
         let (code, stdout, stderr) = config(Path::new("."), &["example", "--provider", alias]);
-        assert_eq!(code, 0, "alias {alias} should be accepted; stderr: {stderr}");
+        assert_eq!(
+            code, 0,
+            "alias {alias} should be accepted; stderr: {stderr}"
+        );
         assert!(
             stdout.contains(&format!("\n  provider: {canonical}")),
             "alias {alias} should select canonical provider {canonical}. stub: {stdout}"

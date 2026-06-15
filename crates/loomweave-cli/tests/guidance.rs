@@ -1577,8 +1577,7 @@ fn create_binds_entity_rule_sei_to_locator() {
         .assert()
         .success();
     assert!(
-        String::from_utf8_lossy(&filtered.get_output().stdout)
-            .contains("core:guidance:sei-bound"),
+        String::from_utf8_lossy(&filtered.get_output().stdout).contains("core:guidance:sei-bound"),
         "SEI-bound sheet must match its entity via the resolved locator"
     );
 }

@@ -144,8 +144,7 @@ fn spawn_with_etxtbsy_retry(
     loop {
         match PluginHost::spawn(manifest.clone(), project_root, exec) {
             Err(loomweave_core::HostError::Spawn(msg))
-                if msg.contains("Text file busy")
-                    && std::time::Instant::now() < deadline =>
+                if msg.contains("Text file busy") && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }

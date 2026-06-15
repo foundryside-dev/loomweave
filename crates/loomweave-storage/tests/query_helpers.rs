@@ -8,9 +8,9 @@ use loomweave_storage::{
     call_edges_targeting, child_entity_ids, contained_entity_ids, containing_module_id, edge_total,
     entities_targeted_by_unresolved_call_sites, entity_at_line, entity_briefing_block_reason,
     entity_by_id, entity_total, find_entities, findings_for_emit, module_dependency_edges,
-    module_reference_rollup, normalize_source_path, pragma, reference_edges_for_entity,
-    relation_edges_for_entity, resolve_file, resolve_file_catalog_entry, schema,
-    preferred_finding_anchor_by_file, stored_secret_finding_anchor_by_file, subsystem_for_member,
+    module_reference_rollup, normalize_source_path, pragma, preferred_finding_anchor_by_file,
+    reference_edges_for_entity, relation_edges_for_entity, resolve_file,
+    resolve_file_catalog_entry, schema, stored_secret_finding_anchor_by_file, subsystem_for_member,
     subsystem_members, subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
     unresolved_callers_for_target,
 };
@@ -2178,13 +2178,30 @@ fn stored_secret_anchor_reads_the_actual_keyed_entity_not_the_heuristic() {
     // Two module entities for one file; ids chosen so the LAST-emitted (what
     // remember_finding_anchors keeps) is NOT the smallest id (what the heuristic
     // would pick). The prior run keyed its finding to the larger-id module.
-    insert_named_entity(&conn, "rust:module:a_outer", "module", file, "a_outer", Some(file));
-    insert_named_entity(&conn, "rust:module:z_inner", "module", file, "z_inner", Some(file));
+    insert_named_entity(
+        &conn,
+        "rust:module:a_outer",
+        "module",
+        file,
+        "a_outer",
+        Some(file),
+    );
+    insert_named_entity(
+        &conn,
+        "rust:module:z_inner",
+        "module",
+        file,
+        "z_inner",
+        Some(file),
+    );
 
     // The heuristic would pick the smallest id (a_outer) — diverging from what
     // the prior run stored.
     let heuristic = preferred_finding_anchor_by_file(&conn).expect("heuristic");
-    assert_eq!(heuristic.get(file).map(String::as_str), Some("rust:module:a_outer"));
+    assert_eq!(
+        heuristic.get(file).map(String::as_str),
+        Some("rust:module:a_outer")
+    );
 
     // The prior run anchored the secret finding to z_inner (emitted last).
     insert_run(&conn, "run-1");

@@ -553,9 +553,8 @@ pub(crate) fn compute_freshness(
         || !file_drift.missing.is_empty()
         || file_drift.skipped_non_files > 0
         || state.files.is_empty();
-    let could_observe = file_channel_observed
-        || commit_mismatch.is_some()
-        || head_newer_than_analyze.is_some();
+    let could_observe =
+        file_channel_observed || commit_mismatch.is_some() || head_newer_than_analyze.is_some();
     let overall = if state.analyzed_at.is_none() {
         FreshnessOverall::NeverAnalyzed
     } else if drift_signal {
