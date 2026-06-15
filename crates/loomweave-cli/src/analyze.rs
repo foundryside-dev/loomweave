@@ -1254,6 +1254,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     } else {
         serde_json::Value::Null
     };
+    // Capture the degraded-emit marker BEFORE `filigree_emission` is moved into the
+    // `stats.json` blob below. The durable blob records the full emit outcome; this
+    // marker is the loud, stdout-facing distillation a caller gates on without
+    // reading the DB. A clean (emitted / disabled / true-negative) emit yields
+    // `None` and the completion line stays unchanged (PDR-0023 honesty invariant).
+    let primary_emit_marker = emit_status_marker(&filigree_emission);
+    // The Phase-8c (post-commit) emit, captured in the Completed arm below.
+    let mut postrun_emit_marker: Option<String> = None;
 
     // Phase 8b (WP9-B, REQ-FINDING-06): `--prune-unseen` retention sweep. Runs
     // after emission for the same non-hard-failed outcomes, so a fresh run's
@@ -1530,6 +1538,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 ),
                 _ => {}
             }
+            // Surface a degraded Phase-8c emit on the completion line too (rolled up
+            // with the Phase-8 marker at summary time): a post-commit emit that
+            // never reached Filigree is the same dead-seam family as the during-run
+            // one and must not exit-0-silent.
+            postrun_emit_marker = emit_status_marker(&postrun_emission);
             // Stale-finding sweep (clarion-87c1eba2bd / ADR-048): retire findings
             // whose code no longer reproduces them. Runs LAST in the Completed arm
             // — after every during-run `InsertFinding` AND every post-commit
@@ -1720,10 +1733,18 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // it as the graph having shrunk. Fall back to the run delta only if the
     // post-commit count read fails, so a cosmetic hiccup never masks a
     // successful run.
+    // Roll the Phase-8 + Phase-8c emit outcomes into one completion-line marker.
+    // `None` for a clean emit (the line is byte-identical to pre-PDR-0023); a loud
+    // `emit:<status>(reason)` for a dead/partial/skipped-pre-wire seam so the
+    // best-effort emit can no longer swallow a total failure as a confident exit-0.
+    let emit_marker = combined_emit_marker(primary_emit_marker, postrun_emit_marker);
+    let emit_suffix = emit_marker
+        .as_deref()
+        .map_or_else(String::new, |m| format!("; {m}"));
     let run_delta_summary = || {
         format!(
             "analyze complete: run {run_id} completed \
-             ({total_entity_count} entities, {total_edge_count} edges)"
+             ({total_entity_count} entities, {total_edge_count} edges){emit_suffix}"
         )
     };
     let summary = match Connection::open(&db_path) {
@@ -1732,9 +1753,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             loomweave_storage::subsystem_total(&conn),
             loomweave_storage::edge_total(&conn),
         ) {
-            (Ok(entities), Ok(subsystems), Ok(edges)) => {
-                format_analyze_complete(&run_id, entities, subsystems, edges, skipped_files_total)
-            }
+            (Ok(entities), Ok(subsystems), Ok(edges)) => format_analyze_complete(
+                &run_id,
+                entities,
+                subsystems,
+                edges,
+                skipped_files_total,
+                emit_marker.as_deref(),
+            ),
             _ => run_delta_summary(),
         },
         Err(err) => {
@@ -1788,6 +1814,7 @@ fn format_analyze_complete(
     subsystems: i64,
     edges: i64,
     skipped_files: u64,
+    emit_marker: Option<&str>,
 ) -> String {
     let incremental = if skipped_files > 0 {
         let noun = if skipped_files == 1 { "file" } else { "files" };
@@ -1795,10 +1822,89 @@ fn format_analyze_complete(
     } else {
         String::new()
     };
+    // A degraded Filigree emit rides on the completion line so a caller gating on
+    // `analyze` stdout (not the durable `stats.json` blob) can see the dead/partial
+    // seam without re-deriving it. A healthy, disabled, or clean-true-negative emit
+    // adds nothing — only a degraded emit is loud (PDR-0023 honesty invariant).
+    let emit = emit_marker.map_or_else(String::new, |m| format!("; {m}"));
     format!(
         "analyze complete: run {run_id} completed \
-         (graph: {entities} entities incl. {subsystems} subsystems, {edges} edges{incremental})"
+         (graph: {entities} entities incl. {subsystems} subsystems, {edges} edges{incremental}){emit}"
     )
+}
+
+/// Classify a `filigree_emission` stats blob into a loud, machine-readable
+/// completion-line marker for a DEGRADED emit, or `None` when the emit was clean.
+///
+/// The blob is the same one folded into `stats.json` ([`emit_findings_to_filigree`]
+/// / [`post_findings_batch`] / [`unreachable_stats`]). Three blob shapes are clean
+/// and intentionally produce NO marker — they must stay byte-distinguishable from a
+/// degraded emit and from each other (PDR-0023):
+///   • disabled         — `Null` (integration off, or `emit_findings=false`);
+///   • clean true-negative — `status:"emitted"` with no intake warnings (a real
+///     emit, whether of zero or many findings — zero findings emitted because there
+///     were zero findings is success, not degradation);
+///   • a `skipped` filtered (Phase-8c) no-op — nothing emittable remained.
+/// Every other shape is degraded and surfaced with a `reason`:
+///   • `emit:unreachable(...)` — the POST never landed (outage / transport / panic);
+///   • `emit:partial(N warnings)` — the POST landed but Filigree rejected/coerced
+///     some findings (per-finding intake warnings) — a partial ingest that the bare
+///     `status:"emitted"` would otherwise read as full success;
+///   • `emit:skipped(reason)` — a pre-POST skip that is NOT the clean filtered no-op
+///     (a flush/read/open failure swallowed before the wire — the same family as the
+///     dead-for-weeks seam: an emit that never even reached the network).
+fn emit_status_marker(emission: &serde_json::Value) -> Option<String> {
+    if emission.is_null() {
+        return None;
+    }
+    let status = emission.get("status").and_then(serde_json::Value::as_str);
+    match status {
+        Some("emitted") => {
+            let warnings = emission
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            (warnings > 0).then(|| {
+                let noun = if warnings == 1 { "warning" } else { "warnings" };
+                format!("emit:partial ({warnings} intake {noun})")
+            })
+        }
+        Some("unreachable") => {
+            let reason = emission
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unreachable");
+            Some(format!("emit:unreachable ({reason})"))
+        }
+        Some("skipped") => {
+            let reason = emission
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("skipped");
+            // The filtered (Phase-8c) "nothing emittable remained" skip is a clean
+            // true-negative, not a degraded seam — emit nothing for it. Every other
+            // skip is a pre-wire failure (flush/read/open) the run must not bury.
+            (reason != "no_postrun_findings_with_path")
+                .then(|| format!("emit:skipped ({reason})"))
+        }
+        // An unknown/absent status string is itself a contract drift — surface it
+        // rather than silently reading it as clean.
+        _ => Some(format!(
+            "emit:degraded (unrecognized status {})",
+            status.unwrap_or("<missing>")
+        )),
+    }
+}
+
+/// Combine the Phase-8 and (optional) Phase-8c emit markers into the single,
+/// worst-case completion-line marker. The during-run (Phase-8) emit is the primary
+/// seam; a degraded Phase-8c (post-commit) emit also surfaces, but the primary
+/// marker wins when both degrade (one loud marker is enough for a caller to gate).
+fn combined_emit_marker(
+    primary: Option<String>,
+    postrun: Option<String>,
+) -> Option<String> {
+    primary.or(postrun)
 }
 
 fn dedup_descriptors_by_locator(descriptors: Vec<NewEntityDescriptor>) -> Vec<NewEntityDescriptor> {
@@ -5913,7 +6019,7 @@ mod tests {
     fn analyze_complete_full_run_reports_whole_graph_totals() {
         // A full run (no unchanged files skipped) reports the graph totals with
         // the subsystem breakdown, matching `project_status` phrasing.
-        let line = format_analyze_complete("run-1", 263, 5, 496, 0);
+        let line = format_analyze_complete("run-1", 263, 5, 496, 0, None);
         assert_eq!(
             line,
             "analyze complete: run run-1 completed \
@@ -5925,7 +6031,7 @@ mod tests {
     fn analyze_complete_incremental_run_annotates_skipped_files() {
         // An incremental run that skipped unchanged files reports the SAME graph
         // totals (not the tiny insert delta) plus an explicit incremental marker.
-        let line = format_analyze_complete("run-2", 263, 5, 496, 29);
+        let line = format_analyze_complete("run-2", 263, 5, 496, 29, None);
         assert_eq!(
             line,
             "analyze complete: run run-2 completed \
@@ -5936,13 +6042,158 @@ mod tests {
 
     #[test]
     fn analyze_complete_incremental_singular_file_uses_singular_noun() {
-        let line = format_analyze_complete("run-3", 10, 0, 4, 1);
+        let line = format_analyze_complete("run-3", 10, 0, 4, 1, None);
         assert_eq!(
             line,
             "analyze complete: run run-3 completed \
              (graph: 10 entities incl. 0 subsystems, 4 edges; \
              incremental: 1 unchanged file skipped)"
         );
+    }
+
+    #[test]
+    fn analyze_complete_degraded_emit_rides_the_completion_line() {
+        // PDR-0023 honesty invariant: a dead Filigree emit must be visible on the
+        // command's stdout completion line, not swallowed as a confident exit-0.
+        // The marker carries a machine-readable status + reason a caller can gate on.
+        let line = format_analyze_complete(
+            "run-4",
+            10,
+            0,
+            4,
+            0,
+            Some("emit:unreachable (connection refused)"),
+        );
+        assert_eq!(
+            line,
+            "analyze complete: run run-4 completed \
+             (graph: 10 entities incl. 0 subsystems, 4 edges); \
+             emit:unreachable (connection refused)"
+        );
+    }
+
+    // --- emit_status_marker: the honesty-invariant classifier (PDR-0023) ---
+    //
+    // The three CLEAN shapes must yield NO marker (byte-indistinguishable from a
+    // plain success on the completion line), and must stay distinguishable from
+    // each DEGRADED shape — which is the whole point of the invariant.
+
+    #[test]
+    fn emit_marker_none_when_integration_disabled() {
+        // A `Null` blob = integration off / emit_findings=false: a clean disabled
+        // state, not a degraded seam. No marker.
+        assert_eq!(emit_status_marker(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn emit_marker_none_for_clean_true_negative_emit() {
+        // A real POST that landed with zero intake warnings is success — whether it
+        // carried zero findings (a clean true-negative) or many. No marker.
+        let blob = serde_json::json!({
+            "status": "emitted",
+            "findings_total": 0,
+            "emitted": 0,
+            "findings_created": 0,
+            "warnings": [],
+        });
+        assert_eq!(emit_status_marker(&blob), None);
+        let blob_nonempty = serde_json::json!({
+            "status": "emitted",
+            "emitted": 7,
+            "findings_created": 7,
+            "warnings": [],
+        });
+        assert_eq!(emit_status_marker(&blob_nonempty), None);
+    }
+
+    #[test]
+    fn emit_marker_none_for_filtered_no_op_skip() {
+        // The Phase-8c "nothing emittable remained" skip is a clean true-negative,
+        // NOT a degraded seam. No marker.
+        let blob = serde_json::json!({
+            "status": "skipped",
+            "reason": "no_postrun_findings_with_path",
+            "findings_total": 0,
+        });
+        assert_eq!(emit_status_marker(&blob), None);
+    }
+
+    #[test]
+    fn emit_marker_surfaces_total_unreachable_failure() {
+        // THE STRIKE: a total emit failure (the POST never landed) is the
+        // best-effort swallow. It must surface a degraded marker with its reason,
+        // distinguishable from `emitted` and from `disabled`.
+        let blob = serde_json::json!({
+            "status": "unreachable",
+            "rule_id": "LMWV-INFRA-FILIGREE-UNREACHABLE",
+            "endpoint": "http://127.0.0.1:9/api/v1/scan-results",
+            "emitted_attempted": 12,
+            "error": "error sending request: connection refused",
+        });
+        assert_eq!(
+            emit_status_marker(&blob).as_deref(),
+            Some("emit:unreachable (error sending request: connection refused)")
+        );
+    }
+
+    #[test]
+    fn emit_marker_surfaces_partial_intake() {
+        // A POST that landed but whose findings were rejected/coerced (intake
+        // warnings) is a PARTIAL emit — the bare `status:"emitted"` would read as
+        // full success. Surface it as partial with the warning count.
+        let blob = serde_json::json!({
+            "status": "emitted",
+            "emitted": 5,
+            "findings_created": 3,
+            "warnings": ["coerced severity for f1", "unknown scan_run_id for f2"],
+        });
+        assert_eq!(
+            emit_status_marker(&blob).as_deref(),
+            Some("emit:partial (2 intake warnings)")
+        );
+    }
+
+    #[test]
+    fn emit_marker_surfaces_pre_wire_skip() {
+        // A skip that is NOT the clean filtered no-op (a flush/read/open failure
+        // swallowed before the wire — an emit that never even reached the network,
+        // the same family as the dead-for-weeks seam) must surface.
+        let blob = serde_json::json!({"status": "skipped", "reason": "flush_failed"});
+        assert_eq!(
+            emit_status_marker(&blob).as_deref(),
+            Some("emit:skipped (flush_failed)")
+        );
+    }
+
+    #[test]
+    fn emit_marker_surfaces_unrecognized_status_as_drift() {
+        // An unknown/absent status string is itself a contract drift — never read
+        // as clean.
+        let blob = serde_json::json!({"status": "bizarro"});
+        assert_eq!(
+            emit_status_marker(&blob).as_deref(),
+            Some("emit:degraded (unrecognized status bizarro)")
+        );
+    }
+
+    #[test]
+    fn combined_emit_marker_primary_wins_then_postrun() {
+        // Both degraded → the during-run (primary) marker is the one surfaced.
+        assert_eq!(
+            combined_emit_marker(
+                Some("emit:unreachable (a)".to_owned()),
+                Some("emit:unreachable (b)".to_owned())
+            )
+            .as_deref(),
+            Some("emit:unreachable (a)")
+        );
+        // Only the post-commit emit degraded → it surfaces.
+        assert_eq!(
+            combined_emit_marker(None, Some("emit:unreachable (b)".to_owned())).as_deref(),
+            Some("emit:unreachable (b)")
+        );
+        // Both clean → no marker.
+        assert_eq!(combined_emit_marker(None, None), None);
     }
 
     #[test]
