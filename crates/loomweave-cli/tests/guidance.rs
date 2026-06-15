@@ -1512,3 +1512,136 @@ fn import_is_partial_but_safe_when_a_later_file_is_malformed() {
         "a sheet committed before the malformed file survives the abort"
     );
 }
+
+// ── On-spine entity binding at create time (SEI doctrine / ADR-029) ───────────
+//
+// CLI `guidance create` is the operator twin of MCP `propose_guidance`. The MCP
+// path resolves a pasted SEI to the canonical locator at entry
+// (clarion-d76e7f7267) so the stored rule binds to a live entity. These tests
+// assert the CLI now has the same property: an `entity:` / `subsystem:` rule
+// whose id is a SEI is bound to the locator before the write, a plain locator is
+// stored unchanged (existing callers unaffected), and an unresolvable id aborts
+// the create with an `unresolved_input` error — writing NOTHING.
+
+/// Seed an alive `sei_bindings` row binding `sei` to `locator`, so
+/// `resolve_entity_ref(sei)` returns the locator's entity row.
+fn seed_sei(root: &std::path::Path, sei: &str, locator: &str) {
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
+    let conn = Connection::open(&db_path).expect("open db for seed_sei");
+    conn.execute(
+        "INSERT INTO sei_bindings \
+         (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at) \
+         VALUES (?1, ?2, 'bh', 's', 'alive', 'run-seed', 'run-seed', \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        rusqlite::params![sei, locator],
+    )
+    .expect("seed sei binding");
+}
+
+#[test]
+fn create_binds_entity_rule_sei_to_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    let locator = "python:function:auth.tokens.refresh";
+    let sei = "loomweave:eid:deadbeefdeadbeefdeadbeefdeadbeef";
+    seed_sei(dir.path(), sei, locator);
+
+    // Paste the SEI as the entity-rule value, exactly as an agent might.
+    loomweave_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "function"])
+        .args(["--name", "sei-bound"])
+        .args(["--match", &format!("entity:{sei}")])
+        .args(["--content", "Bound via a pasted SEI."])
+        .assert()
+        .success();
+
+    let props = properties(dir.path(), "core:guidance:sei-bound");
+    let rules = props["match_rules"].as_array().unwrap();
+    // The stored rule carries the resolved LOCATOR, not the pasted SEI — so the
+    // read path's exact-match `id == entities.id` compare can actually fire.
+    assert_eq!(
+        rules[0],
+        serde_json::json!({"type": "entity", "id": locator}),
+        "entity rule must be rewritten to the canonical locator (on-spine)"
+    );
+
+    // End-to-end: the sheet now matches the entity through the bound rule.
+    let filtered = loomweave_bin()
+        .args(["guidance", "list"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--for-entity", locator])
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&filtered.get_output().stdout)
+            .contains("core:guidance:sei-bound"),
+        "SEI-bound sheet must match its entity via the resolved locator"
+    );
+}
+
+#[test]
+fn create_preserves_plain_locator_entity_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    let locator = "python:function:auth.tokens.refresh";
+
+    // A literal locator (the existing-caller shape) must pass through unchanged.
+    loomweave_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "function"])
+        .args(["--name", "locator-bound"])
+        .args(["--match", &format!("entity:{locator}")])
+        .args(["--content", "Bound via a literal locator."])
+        .assert()
+        .success();
+
+    let props = properties(dir.path(), "core:guidance:locator-bound");
+    let rules = props["match_rules"].as_array().unwrap();
+    assert_eq!(
+        rules[0],
+        serde_json::json!({"type": "entity", "id": locator}),
+        "a literal locator must be stored verbatim (non-breaking)"
+    );
+}
+
+#[test]
+fn create_rejects_unresolvable_entity_rule_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    // A SEI with no alive binding — the off-spine input we must refuse.
+    let orphan_sei = "loomweave:eid:00000000000000000000000000000000";
+
+    let assert = loomweave_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "function"])
+        .args(["--name", "should-not-exist"])
+        .args(["--match", &format!("entity:{orphan_sei}")])
+        .args(["--content", "This must never be written."])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("unresolved_input"),
+        "must surface the unresolved_input contract: {stderr}"
+    );
+
+    // Honesty: NOTHING was written — no unbound-but-looks-bound sheet.
+    let db_path = dir.path().join(".weft/loomweave").join("loomweave.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = ?1",
+            rusqlite::params!["core:guidance:should-not-exist"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "a non-resolving input must create NOTHING");
+}

@@ -32,7 +32,8 @@ use loomweave_storage::{
     GuidanceProposal, GuidanceSheet, GuidanceSheetInput, PortableSheet, delete_guidance_sheet,
     get_guidance_sheet, guidance_sheet_is_expired, guidance_sheet_is_stale,
     guidance_sheet_matches_entity, import_portable_sheet, insert_guidance_sheet,
-    invalidate_summaries_for_sheet, list_guidance_sheets, upsert_guidance_sheet,
+    invalidate_summaries_for_sheet, list_guidance_sheets, resolve_entity_ref,
+    upsert_guidance_sheet,
 };
 
 use crate::cli::GuidanceCommand;
@@ -154,6 +155,59 @@ fn parse_match_rules(raw: &[String]) -> Result<Vec<Value>> {
     raw.iter().map(|r| parse_match_rule(r)).collect()
 }
 
+/// Bind every entity-addressing `--match` rule to the canonical locator at
+/// create time, so an operator who pastes a SEI gets the same on-spine binding
+/// the MCP `propose_guidance` tool enforces (clarion-d76e7f7267).
+///
+/// `entity:` and `subsystem:` rules are matched by the read path
+/// (`loomweave_storage::rule_match`) with an exact compare against the entity's
+/// canonical `entities.id` (a locator). A rule whose `id` is a Stable Entity
+/// Identity token — or a locator that has since been renamed — would store
+/// verbatim and silently never match: the data would enter OFF the spine. We
+/// resolve each such `id` through [`resolve_entity_ref`] (SEI -> alive locator,
+/// or locator passthrough) and rewrite the rule to carry the resolved locator.
+///
+/// `path:`, `tag:`, and `kind:` rules are entity-agnostic selectors (they match
+/// many entities, not one identity) and are left untouched.
+///
+/// # Errors
+///
+/// On an `id` that does not resolve to any live entity, returns an
+/// `unresolved_input` error carrying the cause and the fix, and the caller
+/// creates NOTHING — never an unbound-but-looks-bound sheet.
+fn bind_entity_rules_to_locator(conn: &Connection, rules: &mut [Value]) -> Result<()> {
+    for rule in rules.iter_mut() {
+        let Some(rule_type) = rule.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if rule_type != "entity" && rule_type != "subsystem" {
+            continue;
+        }
+        let Some(raw_id) = rule.get("id").and_then(Value::as_str).map(ToOwned::to_owned) else {
+            continue;
+        };
+        let resolved = resolve_entity_ref(conn, &raw_id)
+            .into_anyhow()
+            .with_context(|| format!("resolve --match {rule_type}:{raw_id}"))?;
+        let Some(entity) = resolved else {
+            bail!(
+                "unresolved_input: --match {rule_type}:{raw_id} does not resolve to a live \
+                 entity in this project's graph. cause: the id is an unknown/orphaned/superseded \
+                 SEI or a stale locator, so the read path's exact-match rule would never fire and \
+                 the guidance would enter off the identity spine. fix: pass the entity's current \
+                 locator or a live SEI (see `loomweave entity find` / `entity_resolve`); run \
+                 `loomweave analyze` first if the graph is empty."
+            );
+        };
+        if entity.id != raw_id
+            && let Some(obj) = rule.as_object_mut()
+        {
+            obj.insert("id".to_owned(), json!(entity.id));
+        }
+    }
+    Ok(())
+}
+
 fn validate_scope_level(level: &str) -> Result<()> {
     if SCOPE_LEVELS.contains(&level) {
         Ok(())
@@ -210,7 +264,7 @@ struct CreateArgs<'a> {
 
 fn create(project_root: &Path, args: CreateArgs<'_>) -> Result<()> {
     validate_scope_level(args.scope_level)?;
-    let match_rules = parse_match_rules(args.raw_match)?;
+    let mut match_rules = parse_match_rules(args.raw_match)?;
 
     // Content: explicit flag, else stdin / $EDITOR.
     let content = match args.content {
@@ -229,6 +283,12 @@ fn create(project_root: &Path, args: CreateArgs<'_>) -> Result<()> {
     let short_name = slug.rsplit('.').next().unwrap_or(&slug).to_owned();
 
     let conn = open_db(project_root)?;
+
+    // On-spine binding (ADR-029 / the SEI doctrine): resolve every entity- and
+    // subsystem-addressing match rule to its canonical locator BEFORE the write,
+    // so a pasted SEI binds to a live entity instead of landing verbatim and
+    // never matching. A non-resolving id aborts the create — nothing is written.
+    bind_entity_rules_to_locator(&conn, &mut match_rules)?;
 
     // Normalise `--expires` *before* the write so the stored instant is
     // byte-format-identical to the read path's `now` (the expiry compare is
