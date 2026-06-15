@@ -88,7 +88,12 @@ MAX_CONSECUTIVE_SPAWN_DEFERRALS = 50
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 PYRIGHT_CALL_TIMEOUT_SECS = 5.0
-PYRIGHT_FILE_TIMEOUT_SECS = 3.0
+# Per-file wall-clock budget for reference resolution. Large, heavily-typed
+# files (e.g. numpy/torch-vectorised ML code) can starve a tighter budget and
+# surface LMWV-PY-REFERENCE-RESOLUTION-TIMEOUT findings with edges left
+# unresolved. Such files are rare enough that the extra ceiling is worth the
+# more-complete graph.
+PYRIGHT_FILE_TIMEOUT_SECS = 10.0
 STDERR_TAIL_LIMIT = 65536
 PYRIGHT_EXCLUDE_PATTERNS = [
     "**/.weft/**",
