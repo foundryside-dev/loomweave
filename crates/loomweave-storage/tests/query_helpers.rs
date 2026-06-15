@@ -12,7 +12,7 @@ use loomweave_storage::{
     reference_edges_for_entity, relation_edges_for_entity, resolve_file,
     resolve_file_catalog_entry, schema, stored_secret_finding_anchor_by_file, subsystem_for_member,
     subsystem_members, subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
-    unresolved_callers_for_target,
+    unresolved_caller_count_for_target, unresolved_callers_for_target,
 };
 use rusqlite::{Connection, params};
 
@@ -576,6 +576,48 @@ fn unresolved_callers_for_target_filters_stale_caller_content_hash_rows() {
 }
 
 #[test]
+fn unresolved_callers_for_target_matches_rust_colon_path_callees() {
+    // A Rust unresolved call site like `Type::assoc()` or `crate::m::f()` stores
+    // a `::`-joined `callee_expr` (`"Svc::make"`, `"crate::m::f"`). The terminal
+    // identifier is the leaf after the last `::` (`make`, `f`) — but the old
+    // matcher only tested `= leaf`, `= name`, and `LIKE %.leaf`, so a `::`-suffixed
+    // callee matched none of them and the `assoc`/`f` target reported ZERO
+    // unresolved callers. Both the page reader and the unbounded honesty count
+    // must now see the `%::leaf` form.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity_with_hash(&conn, "rust:function:app.run", "function", "hc");
+    insert_named_entity(
+        &conn,
+        "rust:function:app.Svc.impl#<>.make",
+        "function",
+        "app.Svc.impl#<>.make",
+        "make",
+        None,
+    );
+    // Associated-function path `Svc::make`; deeper module path `crate::m::make`.
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s0", "Svc::make");
+    insert_unresolved_call_site(&conn, "rust:function:app.run", "hc", "s1", "crate::m::make");
+
+    let target = entity_by_id(&conn, "rust:function:app.Svc.impl#<>.make")
+        .unwrap()
+        .expect("target");
+
+    let sites = unresolved_callers_for_target(&conn, &target, 10).unwrap();
+    assert_eq!(
+        sites.len(),
+        2,
+        "both `::`-path callees must match the `make` target: {sites:?}"
+    );
+
+    let count = unresolved_caller_count_for_target(&conn, &target).unwrap();
+    assert_eq!(
+        count, 2,
+        "the unresolved_name_matches honesty count must also see `::`-path callees"
+    );
+}
+
+#[test]
 fn entities_targeted_by_unresolved_sites_matches_method_and_assoc_leaves() {
     // The dead-code fail-toward-live input: an entity whose short_name matches
     // the terminal identifier of an unresolved call site is a plausible target.
@@ -976,6 +1018,77 @@ fn relation_edges_for_entity_kind_filter_and_deterministic_order() {
 }
 
 #[test]
+fn relation_edges_for_entity_matches_ambiguous_candidate_endpoints() {
+    // An ambiguous `implements` edge resolved to ONE same-named trait but listed
+    // the alternative in `properties.candidates`. Querying inbound relations for
+    // the alternative (the candidate, NOT the stored `to_id`) must surface the
+    // edge — mirroring `call_edges_targeting`'s candidate pass. Before the fix
+    // the direct `to_id = ?` filter returned nothing for the candidate trait.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "rust:struct:demo::Panel", "struct");
+    insert_entity(&conn, "rust:trait:a::Render", "trait");
+    insert_entity(&conn, "rust:trait:b::Render", "trait");
+    // The resolver keyed the edge to a::Render but kept b::Render as a candidate.
+    insert_relation_edge(
+        &conn,
+        "implements",
+        "rust:struct:demo::Panel",
+        "rust:trait:a::Render",
+        EdgeConfidence::Ambiguous,
+        &["rust:trait:a::Render", "rust:trait:b::Render"],
+        10,
+        16,
+    );
+
+    // The stored endpoint resolves directly, as before.
+    let direct =
+        relation_edges_for_entity(&conn, "rust:trait:a::Render", ReferenceDirection::In, None)
+            .expect("inbound for stored endpoint");
+    assert_eq!(direct.len(), 1, "stored to_id still matches: {direct:?}");
+    assert_eq!(direct[0].from_id, "rust:struct:demo::Panel");
+
+    // The candidate endpoint now resolves through the candidate pass.
+    let candidate =
+        relation_edges_for_entity(&conn, "rust:trait:b::Render", ReferenceDirection::In, None)
+            .expect("inbound for candidate endpoint");
+    assert_eq!(
+        candidate.len(),
+        1,
+        "an ambiguous candidate endpoint must surface the edge: {candidate:?}"
+    );
+    assert_eq!(candidate[0].kind, "implements");
+    assert_eq!(candidate[0].from_id, "rust:struct:demo::Panel");
+    assert_eq!(
+        candidate[0].to_id, "rust:trait:a::Render",
+        "the edge keeps its stored endpoints; the candidate match does not rewrite them",
+    );
+
+    // Kind-filter still narrows the candidate-matched set.
+    let filtered = relation_edges_for_entity(
+        &conn,
+        "rust:trait:b::Render",
+        ReferenceDirection::In,
+        Some("derives"),
+    )
+    .expect("kind-filtered candidate read");
+    assert!(
+        filtered.is_empty(),
+        "a non-matching kind filter drops the candidate edge: {filtered:?}"
+    );
+
+    // An edge that matches BOTH directly and via candidate is deduped to one.
+    let deduped =
+        relation_edges_for_entity(&conn, "rust:trait:a::Render", ReferenceDirection::In, None)
+            .expect("inbound for endpoint also in its own candidates");
+    assert_eq!(
+        deduped.len(),
+        1,
+        "the edge appears once even though a::Render is both to_id and a candidate: {deduped:?}"
+    );
+}
+
+#[test]
 fn module_reference_rollup_aggregates_contained_symbol_edges_excluding_internal() {
     // A `from pkg.contracts import RunStatus` records a `references` edge to the
     // class, not the module — so the module's own edges are empty and the
@@ -1350,6 +1463,41 @@ fn find_entities_kind_filter_applies_on_punctuation_like_path() {
         like_module.iter().any(|e| e.id == "python:module:pkg.svc"),
         "{like_module:?}"
     );
+}
+
+#[test]
+fn find_entities_rejects_deep_cursor_before_expanding_fetch() {
+    // The cursor offset feeds `fetch_cap = offset + limit`, which both recall
+    // paths materialise at OFFSET 0 — so an unbounded offset lets a deep or
+    // malformed cursor force SQLite to scan and return a huge prefix on every
+    // page. A cursor past the documented maximum (100_000) must be rejected
+    // rather than expand the fetch.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_entity(&conn, "python:function:demo.target", "function");
+
+    // A cursor far past any honest paging is rejected, and the message names the
+    // bound so a client can correct course.
+    let err = find_entities(&conn, "demo", 20, 5_000_000, None)
+        .expect_err("a deep cursor must be rejected, not materialised");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cursor offset") && msg.contains("100000"),
+        "rejection must name the offset and its bound: {msg}"
+    );
+
+    // The boundary itself is accepted (off-by-one guard): offset == max paginates
+    // normally (here past the single row, so an empty page).
+    let at_bound = find_entities(&conn, "demo", 20, 100_000, None)
+        .expect("the maximum offset is still a legal page");
+    assert!(
+        at_bound.is_empty(),
+        "offset past the data yields an empty page"
+    );
+
+    // And shallow, legitimate pagination is unaffected.
+    let first = find_entities(&conn, "demo", 20, 0, None).expect("first page");
+    assert_eq!(first.len(), 1);
 }
 
 #[test]
@@ -2226,4 +2374,67 @@ fn stored_secret_anchor_reads_the_actual_keyed_entity_not_the_heuristic() {
     // A file with no prior secret finding is simply absent — the caller falls
     // back to the heuristic for first-time anchors (nothing to duplicate).
     assert!(!stored.contains_key("src/clean.rs"));
+}
+
+#[test]
+fn stored_secret_anchor_includes_baseline_only_findings() {
+    // A baseline-SUPPRESSED detection emits `LMWV-INFRA-SECRET-BASELINE-MATCH`
+    // with NO companion `LMWV-SEC-SECRET-DETECTED` row. The old reader consulted
+    // only the secret-detected rule, so such a file had no stored anchor, fell
+    // back to the heuristic, and could re-anchor (and mint a duplicate baseline
+    // finding) on the next incremental skip when the heuristic's same-rank
+    // tie-break diverged from the prior run's anchor. The reader must now read
+    // the stored anchor for EVERY pre-ingest secret-scan rule.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = open_fresh(&dir);
+
+    let file = "src/lib.rs";
+    // Two same-rank module candidates for one file (Rust inline `mod` block).
+    // The heuristic picks the smallest id (a_outer); the prior run keyed its
+    // baseline finding to the larger-id module (z_inner, emitted last).
+    insert_named_entity(
+        &conn,
+        "rust:module:a_outer",
+        "module",
+        file,
+        "a_outer",
+        Some(file),
+    );
+    insert_named_entity(
+        &conn,
+        "rust:module:z_inner",
+        "module",
+        file,
+        "z_inner",
+        Some(file),
+    );
+    assert_eq!(
+        preferred_finding_anchor_by_file(&conn)
+            .expect("heuristic")
+            .get(file)
+            .map(String::as_str),
+        Some("rust:module:a_outer"),
+        "heuristic would diverge from the stored baseline anchor"
+    );
+
+    // The only prior secret-scan finding for this file is a BASELINE MATCH —
+    // no secret-detected row exists.
+    insert_run(&conn, "run-1");
+    insert_finding(
+        &conn,
+        "core:finding:baseline-x",
+        "run-1",
+        "LMWV-INFRA-SECRET-BASELINE-MATCH",
+        "fact",
+        "INFO",
+        "rust:module:z_inner",
+        "[]",
+    );
+
+    let stored = stored_secret_finding_anchor_by_file(&conn).expect("stored");
+    assert_eq!(
+        stored.get(file).map(String::as_str),
+        Some("rust:module:z_inner"),
+        "a baseline-only file must still yield its stored anchor (not fall back to the heuristic)",
+    );
 }

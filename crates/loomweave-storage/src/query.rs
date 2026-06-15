@@ -756,6 +756,14 @@ pub fn ancestor_chain(conn: &Connection, entity_id: &str) -> Result<Vec<EntityRo
 /// Python nesting is shallow; this only guards against a malformed cycle.
 const MAX_ANCESTOR_DEPTH: usize = 64;
 
+/// Upper bound on the `find_entities` cursor offset. The offset feeds
+/// `fetch_cap = offset + limit`, which both recall paths materialise at
+/// OFFSET 0 — so this caps the largest result prefix a single client-supplied
+/// cursor can force `SQLite` to scan. Far deeper than any honest paging of the
+/// discovery surface (pages are <=100 and the contract is "narrow the pattern,
+/// not page to the millionth match"); a cursor past it is rejected.
+const MAX_FIND_ENTITIES_OFFSET: usize = 100_000;
+
 pub fn find_entities(
     conn: &Connection,
     pattern: &str,
@@ -795,6 +803,21 @@ pub fn find_entities(
         ));
     }
     let limit = limit.clamp(1, 100);
+    // Bound the client-supplied cursor BEFORE it expands the fetch. `fetch_cap`
+    // below is `offset + limit`, and both recall paths materialise `LIMIT
+    // fetch_cap` rows at OFFSET 0 — so an unbounded offset lets a deep or
+    // malformed cursor force SQLite to scan and return a huge prefix on every
+    // page, even though we only ever hand back <=100 rows. Reject anything past
+    // `MAX_FIND_ENTITIES_OFFSET`: deeper than any genuine paging of this surface
+    // (pages are <=100, and the discovery contract is "narrow the pattern, don't
+    // page to the millionth match"), and it keeps the materialised prefix
+    // bounded. Legitimate pagination is unaffected.
+    if offset > MAX_FIND_ENTITIES_OFFSET {
+        return Err(StorageError::InvalidQuery(format!(
+            "entity search cursor offset {offset} exceeds the maximum of \
+             {MAX_FIND_ENTITIES_OFFSET}"
+        )));
+    }
     // We materialise `offset + limit` rows from each recall path, merge them
     // FTS-first, then page in Rust. `offset + limit` is the smallest prefix of
     // the merged stream that can contain this page, so both sources fetch at
@@ -1017,6 +1040,22 @@ pub fn preferred_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<Str
     Ok(best.into_iter().map(|(path, (_, id))| (path, id)).collect())
 }
 
+/// Every rule the pre-ingest secret scan can persist against a per-file anchor
+/// entity (weft-4165f1ed71). MUST stay in lockstep with the CLI's
+/// `secret_scan::per_run_swept_rule_ids` — the canonical emit-side set — which
+/// `loomweave-storage` (a leaf crate) cannot reference without an upward
+/// dependency, so the strings are mirrored here. Each of these re-anchors on an
+/// incremental skip, so [`stored_secret_finding_anchor_by_file`] must read the
+/// stored anchor for ALL of them, not only `LMWV-SEC-SECRET-DETECTED`: a
+/// baseline-suppressed file emits only `LMWV-INFRA-SECRET-BASELINE-MATCH` (no
+/// secret-detected row), and missing it flips the anchor on the next skip.
+pub const PRE_INGEST_SECRET_SCAN_RULE_IDS: &[&str] = &[
+    "LMWV-SEC-SECRET-DETECTED",
+    "LMWV-INFRA-SECRET-BASELINE-MATCH",
+    "LMWV-INFRA-SECRET-BASELINE-NO-JUSTIFICATION",
+    "LMWV-SEC-UNREDACTED-SECRETS-ALLOWED",
+];
+
 /// The actual secret-finding anchor entity per source file, read straight from
 /// the persisted `findings` rows (weft-4165f1ed71, L1 regression repair). This
 /// is the ground-truth companion to [`preferred_finding_anchor_by_file`]: where
@@ -1034,24 +1073,36 @@ pub fn preferred_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<Str
 /// entity's own `source_file_path` (the secret scan anchors a finding to an
 /// entity whose source file is the scanned file).
 ///
-/// Only the secret-scan rule (`LMWV-SEC-SECRET-DETECTED`) is consulted: that is
-/// the only finding family the pre-ingest scan re-anchors on a skip. A file with
-/// no prior secret finding row is simply absent here — there is nothing to
+/// EVERY pre-ingest secret-scan rule is consulted, not only
+/// `LMWV-SEC-SECRET-DETECTED` (see [`PRE_INGEST_SECRET_SCAN_RULE_IDS`]). A
+/// baseline-suppressed detection emits `LMWV-INFRA-SECRET-BASELINE-MATCH` with
+/// NO companion secret-detected row, so a file whose only prior secret-scan
+/// finding is a baseline match (or override-allowed audit, or
+/// baseline-no-justification) would otherwise be absent here, fall back to the
+/// heuristic, and mint a duplicate on the first incremental skip whenever the
+/// heuristic's same-rank tie-break diverges from the prior run's anchor — the
+/// exact failure mode this reader exists to prevent. A file with no prior
+/// pre-ingest secret-scan finding at all is still absent — there is nothing to
 /// duplicate, so the caller falls back to the heuristic for first-time anchors.
 ///
 /// # Errors
 ///
 /// Returns [`StorageError::Sqlite`] if the query fails.
 pub fn stored_secret_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare(
+    let placeholders = std::iter::repeat_n("?", PRE_INGEST_SECRET_SCAN_RULE_IDS.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
         "SELECT DISTINCT e.source_file_path, f.entity_id \
          FROM findings f \
          JOIN entities e ON e.id = f.entity_id \
-         WHERE f.rule_id = ?1 AND e.source_file_path IS NOT NULL",
+         WHERE f.rule_id IN ({placeholders}) AND e.source_file_path IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(PRE_INGEST_SECRET_SCAN_RULE_IDS.iter().copied()),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
-    let rows = stmt.query_map(params!["LMWV-SEC-SECRET-DETECTED"], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
     let mut out: HashMap<String, String> = HashMap::new();
     for row in rows {
         let (path, entity_id) = row.map_err(StorageError::from)?;
@@ -1267,12 +1318,7 @@ pub fn unresolved_call_sites_for_caller(
 /// on the caller-navigation surface (clarion-df87b4f381) — the count must be
 /// the true magnitude, not a page length.
 pub fn unresolved_caller_count_for_target(conn: &Connection, target: &EntityRow) -> Result<i64> {
-    let target_short = target
-        .short_name
-        .rsplit('.')
-        .next()
-        .unwrap_or(&target.short_name);
-    let suffix = format!("%.{}", escape_like(target_short));
+    let (target_short, dot_suffix, colon_suffix) = unresolved_target_match_patterns(target);
     conn.query_row(
         "SELECT COUNT(*) \
          FROM entity_unresolved_call_sites u \
@@ -1280,8 +1326,9 @@ pub fn unresolved_caller_count_for_target(conn: &Connection, target: &EntityRow)
          WHERE caller.content_hash = u.caller_content_hash \
            AND (u.callee_expr = ?1 \
              OR u.callee_expr = ?2 \
-             OR u.callee_expr LIKE ?3 ESCAPE '\\')",
-        params![target_short, target.name, suffix],
+             OR u.callee_expr LIKE ?3 ESCAPE '\\' \
+             OR u.callee_expr LIKE ?4 ESCAPE '\\')",
+        params![target_short, target.name, dot_suffix, colon_suffix],
         |row| row.get(0),
     )
     .map_err(StorageError::from)
@@ -1310,12 +1357,7 @@ pub fn unresolved_callers_for_target(
     let limit_i64 = i64::try_from(limit.clamp(1, 500)).map_err(|_| {
         StorageError::InvalidQuery("unresolved caller limit is too large".to_owned())
     })?;
-    let target_short = target
-        .short_name
-        .rsplit('.')
-        .next()
-        .unwrap_or(&target.short_name);
-    let suffix = format!("%.{}", escape_like(target_short));
+    let (target_short, dot_suffix, colon_suffix) = unresolved_target_match_patterns(target);
     let mut stmt = conn.prepare(
         "SELECT u.caller_entity_id, u.caller_content_hash, u.site_key, u.site_ordinal, \
                 u.source_file_id, u.source_byte_start, u.source_byte_end, u.callee_expr \
@@ -1324,16 +1366,18 @@ pub fn unresolved_callers_for_target(
          WHERE caller.content_hash = u.caller_content_hash \
            AND (u.callee_expr = ?1 \
              OR u.callee_expr = ?2 \
-             OR u.callee_expr LIKE ?3 ESCAPE '\\') \
-         ORDER BY CASE WHEN caller.source_file_id = ?4 THEN 0 ELSE 1 END, \
+             OR u.callee_expr LIKE ?3 ESCAPE '\\' \
+             OR u.callee_expr LIKE ?4 ESCAPE '\\') \
+         ORDER BY CASE WHEN caller.source_file_id = ?5 THEN 0 ELSE 1 END, \
                   u.caller_entity_id, u.site_ordinal, u.site_key \
-         LIMIT ?5",
+         LIMIT ?6",
     )?;
     let rows = stmt.query_map(
         params![
             target_short,
             target.name,
-            suffix,
+            dot_suffix,
+            colon_suffix,
             target.source_file_id,
             limit_i64,
         ],
@@ -1375,6 +1419,16 @@ pub const RELATION_EDGE_KINDS: &[&str] = &["decorates", "derives", "implements",
 /// does X decorate" is `Out` on `decorates`. A `kind` outside
 /// [`RELATION_EDGE_KINDS`] matches nothing. Results are ordered by
 /// (kind, neighbor, anchor) for determinism.
+///
+/// Ambiguous edges are matched on their alternate endpoints too, mirroring
+/// [`call_edges_targeting`]: an ambiguous relation records the resolver's
+/// alternatives in `properties.candidates`, and `entity_id` may be one of those
+/// rather than the stored `from_id`/`to_id`. Without the candidate pass, asking
+/// "what implements `Trait`" returns nothing for a `Trait` the resolver listed
+/// only as a candidate of an ambiguous `implements` edge it keyed to a
+/// same-named sibling. The candidate pass adds those edges; results are deduped
+/// by `(kind, from_id, to_id, anchor)` so an edge that matches both directly and
+/// by candidate appears once.
 pub fn relation_edges_for_entity(
     conn: &Connection,
     entity_id: &str,
@@ -1399,15 +1453,77 @@ pub fn relation_edges_for_entity(
              ORDER BY kind, to_id, source_byte_start, source_byte_end"
         }
     };
+    let mut seen: BTreeSet<RelationDedupKey> = BTreeSet::new();
+    let mut matches = Vec::new();
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![entity_id], map_relation_edge_match)?;
-    let mut matches = rows
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(StorageError::from)?;
+    for row in stmt.query_map(params![entity_id], map_relation_edge_match)? {
+        push_relation_match(&mut matches, &mut seen, row?);
+    }
+
+    // Candidate pass: an ambiguous edge keyed to a different endpoint may carry
+    // `entity_id` in its `candidates` (the resolver's alternatives), so a direct
+    // `from_id`/`to_id` filter alone misses it. Scan ambiguous relation edges
+    // with a `candidates` payload and admit any that name `entity_id`.
+    let mut ambiguous = conn.prepare(
+        "SELECT kind, from_id, to_id, confidence, properties, source_file_id, \
+                source_byte_start, source_byte_end \
+         FROM edges \
+         WHERE kind IN ('decorates', 'derives', 'implements', 'inherits_from') \
+           AND confidence = 'ambiguous' \
+           AND properties IS NOT NULL \
+         ORDER BY kind, from_id, to_id, source_byte_start, source_byte_end",
+    )?;
+    for row in ambiguous.query_map([], map_relation_edge_match)? {
+        let edge = row?;
+        if edge.candidates.iter().any(|cid| cid == entity_id) {
+            push_relation_match(&mut matches, &mut seen, edge);
+        }
+    }
+
     if let Some(kind) = kind {
         matches.retain(|m| m.kind == kind);
     }
+    // Re-sort: the candidate pass appends after the direct rows, so a single
+    // ORDER BY no longer covers the merged set. Deterministic key matches the
+    // per-direction SQL order (kind, then neighbor side, then anchor).
+    matches.sort_by(|a, b| {
+        let a_neighbor = match direction {
+            ReferenceDirection::In => &a.from_id,
+            ReferenceDirection::Out => &a.to_id,
+        };
+        let b_neighbor = match direction {
+            ReferenceDirection::In => &b.from_id,
+            ReferenceDirection::Out => &b.to_id,
+        };
+        (&a.kind, a_neighbor, a.source_byte_start, a.source_byte_end).cmp(&(
+            &b.kind,
+            b_neighbor,
+            b.source_byte_start,
+            b.source_byte_end,
+        ))
+    });
     Ok(matches)
+}
+
+/// Dedup key for a relation edge across the direct + candidate passes:
+/// `(kind, from_id, to_id, byte_start, byte_end)`.
+type RelationDedupKey = (String, String, String, Option<i64>, Option<i64>);
+
+fn push_relation_match(
+    matches: &mut Vec<RelationEdgeMatch>,
+    seen: &mut BTreeSet<RelationDedupKey>,
+    edge: RelationEdgeMatch,
+) {
+    let key = (
+        edge.kind.clone(),
+        edge.from_id.clone(),
+        edge.to_id.clone(),
+        edge.source_byte_start,
+        edge.source_byte_end,
+    );
+    if seen.insert(key) {
+        matches.push(edge);
+    }
 }
 
 fn map_relation_edge_match(row: &Row<'_>) -> rusqlite::Result<RelationEdgeMatch> {
@@ -1784,6 +1900,33 @@ pub fn candidate_entities_for_unresolved_sites(
 /// the older `.`-only leaf extraction (`candidate_entities_for_expr`,
 /// `unresolved_callers_for_target`) misses it. A leaf that is not a bare
 /// identifier (`<expr>()`, empty) returns `None`.
+/// The `callee_expr` match patterns for finding the unresolved call sites that
+/// name `target`: its terminal identifier plus the two suffix forms a stored
+/// `callee_expr` can carry the leaf in.
+///
+/// Returns `(terminal, dot_suffix, colon_suffix)` where `terminal` is the
+/// last `.`-segment of `target.short_name` (the bare leaf name), `dot_suffix`
+/// is `%.{leaf}` (Python dotted-path / Rust method `.foo` forms), and
+/// `colon_suffix` is `%::{leaf}` (Rust associated / path forms like
+/// `Type::assoc` or `crate::m::f`). The `::` form is the one the original
+/// `.`-only matching missed entirely: `Type::assoc` is neither `= assoc` nor
+/// `LIKE %.assoc`, so a `::`-targeted entity reported zero unresolved callers.
+/// Mirrors the both-separator leaf logic of [`unresolved_callee_leaf`], pushed
+/// into the SQL `LIKE` so the match happens in the query.
+fn unresolved_target_match_patterns(target: &EntityRow) -> (String, String, String) {
+    let terminal = target
+        .short_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(&target.short_name);
+    let escaped = escape_like(terminal);
+    (
+        terminal.to_owned(),
+        format!("%.{escaped}"),
+        format!("%::{escaped}"),
+    )
+}
+
 fn unresolved_callee_leaf(callee_expr: &str) -> Option<String> {
     let leaf = callee_expr
         .rsplit([':', '.'])

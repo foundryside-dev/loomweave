@@ -50,8 +50,8 @@ pub use prior_index::{
 };
 pub use query::{
     CallEdgeMatch, CanonicalProjectPath, ContainedEntities, EntityRow, EntitySubsystem,
-    EntityVisibility, FindingForEmitRow, ModuleDependencyEdge, RELATION_EDGE_KINDS,
-    ReferenceDirection, ReferenceEdgeMatch, RelationEdgeMatch, ResolvedFile,
+    EntityVisibility, FindingForEmitRow, ModuleDependencyEdge, PRE_INGEST_SECRET_SCAN_RULE_IDS,
+    RELATION_EDGE_KINDS, ReferenceDirection, ReferenceEdgeMatch, RelationEdgeMatch, ResolvedFile,
     ResolvedFileCatalogEntry, RolledUpReferenceEdge, SubsystemMember, UnresolvedCallSiteRow,
     ancestor_chain, call_edges_from, call_edges_targeting, candidate_entities_for_unresolved_sites,
     child_entity_ids, contained_entity_ids, containing_module_id, current_file_hash, edge_total,

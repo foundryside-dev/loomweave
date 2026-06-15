@@ -42,6 +42,13 @@ const CONFIRM_TOKEN: &str = "yes-i-understand";
 /// which makes these rules safe for the rule-scoped stale sweep on incremental
 /// runs (weft-7256739b31): a row of one of these rules at a prior `run_id`
 /// means "scanned this run, no longer detected", never "not looked at".
+///
+/// This is the canonical emit-side set. The storage read path mirrors it as
+/// `loomweave_storage::PRE_INGEST_SECRET_SCAN_RULE_IDS` (a leaf crate cannot
+/// depend upward on the CLI), and the skip-path anchor reader
+/// `stored_secret_finding_anchor_by_file` must consult ALL of them — a
+/// `per_run_swept_rule_ids_match_storage_mirror` test below asserts the two
+/// stay in lockstep.
 pub(crate) fn per_run_swept_rule_ids() -> [&'static str; 4] {
     [
         findings::SECRET_DETECTED,
@@ -537,9 +544,27 @@ fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::{
         ConfirmToken, OverridePolicy, PerFileOutcome, SecretScanOptions, display_relative,
-        pre_ingest, scan_source_files_parallel,
+        per_run_swept_rule_ids, pre_ingest, scan_source_files_parallel,
     };
     use std::sync::{Arc, Mutex};
+
+    /// The storage-side mirror used by the skip-path anchor reader
+    /// (`stored_secret_finding_anchor_by_file`) must list exactly the rules the
+    /// CLI emits and sweeps. If a new pre-ingest secret-scan rule is added to
+    /// one set and not the other, a baseline-only file could re-anchor (and
+    /// duplicate) on an incremental skip — so pin the two together.
+    #[test]
+    fn per_run_swept_rule_ids_match_storage_mirror() {
+        let mut emit = per_run_swept_rule_ids().to_vec();
+        let mut storage = loomweave_storage::PRE_INGEST_SECRET_SCAN_RULE_IDS.to_vec();
+        emit.sort_unstable();
+        storage.sort_unstable();
+        assert_eq!(
+            emit, storage,
+            "loomweave_storage::PRE_INGEST_SECRET_SCAN_RULE_IDS must mirror \
+             secret_scan::per_run_swept_rule_ids exactly"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
