@@ -775,32 +775,36 @@ fn analyze_e2e_same_name_same_cfg_twin_mounts_still_dual_claim() {
     assert_consistent("incremental owner");
 }
 
-/// Task 11 (Part B2) — END-TO-END exercise of the host seen-entity-set gate.
+/// FINDING C (resolver/host source-set agreement) — END-TO-END proof that the
+/// plugin's symbol-table walk honours the SAME ignore policy the host's source
+/// walk applies, so the plugin never resolves an edge to a target the host
+/// never stored.
 ///
-/// The gate (`drop_unready_plugin_edges`) was previously only UNIT-tested. This
-/// drives the full `install` -> `analyze` host pipeline over a project crafted so
-/// the PLUGIN resolves a *Resolved* anchored edge whose target the HOST never
-/// stored, and asserts the run still COMPLETES (no dangling-FK hard-fail) with a
-/// non-zero `plugin_edges_dropped_unseen_total`.
-///
-/// The divergence source is D2, confirmed feasible empirically (the host walk
-/// honours `.gitignore` even in a non-git tempdir — `collect_source_files` sets
-/// `require_git(false)`; the plugin's `build_symbol_table` walk uses plain
-/// `std::fs::read_dir` and is NOT gitignore-aware):
+/// Previously the plugin's `build_symbol_table` walk used plain `std::fs` and
+/// was NOT gitignore-aware, while the host walk honours `.gitignore` even in a
+/// non-git tempdir (`collect_source_files` sets `require_git(false)`). That
+/// divergence let the plugin resolve an `implements` edge against a gitignored
+/// trait the host never stored; the edge then either FK-failed the run or was
+/// silently dropped by the host seen-set gate — leaving neither a real edge nor
+/// an unresolved record. `build_symbol_table` now mirrors the host policy (the
+/// `ignore` crate, the same `SKIP_DIRS` + gitignore flags), so:
 ///   - `.gitignore` excludes `src/hidden.rs`,
-///   - `src/hidden.rs` declares `pub trait Hidden {}` — IN a crate's `src/` (so
-///     the plugin's scope guard accepts it) but gitignored (so the host walk
-///     skips it; the host never stores the trait),
+///   - `src/hidden.rs` declares `pub trait Hidden {}` — IN a crate's `src/` but
+///     gitignored, so NEITHER the host NOR the plugin sees it,
 ///   - `src/widget.rs` carries `impl crate::hidden::Hidden for Widget {}` — the
-///     plugin resolves the trait against its gitignore-UNAWARE symbol table
-///     (Resolved), emitting an anchored `implements` edge to a trait id the host
-///     never stored.
+///     plugin can no longer resolve the trait (its table excludes the gitignored
+///     symbol), so it mints NO anchored `implements` edge to the unstored trait.
 ///
-/// The host's seen-set gate drops-and-counts that edge: the run is `completed`,
-/// no `implements` edge to the hidden trait is stored, and
-/// `plugin_edges_dropped_unseen_total` is at least one.
+/// End state: the run is `completed`, the gitignored trait is NOT stored, no
+/// `implements` edge to it survives, and — the FIX vs the old behaviour — the
+/// host seen-set gate has NOTHING to drop from this path
+/// (`plugin_edges_dropped_unseen_total == 0`), because the plugin never produced
+/// the resolved-but-unstored edge in the first place. (The gate itself remains
+/// covered by `drop_unready_plugin_edges`'s unit test and the CLI-level
+/// incremental-run e2e tests, which exercise it via symbol-drop scenarios
+/// independent of the Rust plugin.)
 #[test]
-fn analyze_e2e_seen_set_gate_drops_resolved_edge_to_gitignored_target() {
+fn analyze_e2e_resolver_mirrors_host_ignore_policy_no_edge_to_gitignored_target() {
     let plugin_dir = setup_plugin_dir();
     let driver = loomweave_driver_path();
 
@@ -814,14 +818,15 @@ fn analyze_e2e_seen_set_gate_drops_resolved_edge_to_gitignored_target() {
         "[package]\nname = \"gate_crate\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
     )
     .expect("write Cargo.toml");
-    // The host walk honours this; the plugin's symbol-table walk does not. The
-    // gitignored module file holds the trait the host never stores. (A single
-    // module FILE, not a dir: `src/hidden.rs` is module `hidden`, so the trait's
-    // qualname is `gate_crate.hidden.Hidden` — what the impl path below resolves
-    // to. A `src/hidden/secret.rs` would instead be module `hidden.secret`.)
+    // BOTH the host walk AND the plugin's symbol-table walk now honour this (the
+    // plugin mirrors the host's ignore policy — Finding C). The gitignored module
+    // file holds the trait NEITHER side stores. (A single module FILE, not a dir:
+    // `src/hidden.rs` is module `hidden`, so the trait's qualname would be
+    // `gate_crate.hidden.Hidden` — what the impl path below would have resolved
+    // to before the fix. A `src/hidden/secret.rs` would instead be module
+    // `hidden.secret`.)
     fs::write(root.join(".gitignore"), "src/hidden.rs\n").expect("write .gitignore");
-    // In-`src/` (plugin-visible) but gitignored (host-invisible): the trait the
-    // host never stores.
+    // In-`src/` but gitignored: invisible to BOTH the host AND the plugin.
     fs::write(
         root.join("src/hidden.rs"),
         "pub trait Hidden { fn h(&self); }\n",
@@ -832,9 +837,9 @@ fn analyze_e2e_seen_set_gate_drops_resolved_edge_to_gitignored_target() {
         "pub mod hidden;\npub mod widget;\n",
     )
     .expect("write lib.rs");
-    // The in-`src/` impl whose trait resolves against the gitignore-unaware
-    // plugin symbol table (`crate::hidden::Hidden` -> `gate_crate.hidden.Hidden`)
-    // but whose target the host never stored.
+    // The in-`src/` impl whose trait the plugin can NO LONGER resolve: its
+    // gitignore-mirroring symbol table excludes `gate_crate.hidden.Hidden`, so
+    // no anchored `implements` edge to the host-unstored trait is minted.
     fs::write(
         root.join("src/widget.rs"),
         "pub struct Widget;\n\
@@ -900,7 +905,10 @@ fn analyze_e2e_seen_set_gate_drops_resolved_edge_to_gitignored_target() {
         "no implements edge to the unstored gitignored trait may survive"
     );
 
-    // The gate dropped-and-counted at least the one Resolved-but-unstored edge.
+    // The FIX vs the old behaviour: the plugin never minted a Resolved edge to
+    // the gitignored trait, so the host seen-set gate had NOTHING to drop from
+    // this path. (The plugin's view is now a subset of the host's stored set, so
+    // a resolved reference always has a stored target — no silent drop.)
     let stats: String = conn
         .query_row(
             "SELECT COALESCE(stats, '') FROM runs WHERE status = 'completed' \
@@ -914,10 +922,12 @@ fn analyze_e2e_seen_set_gate_drops_resolved_edge_to_gitignored_target() {
         .get("plugin_edges_dropped_unseen_total")
         .and_then(serde_json::Value::as_u64)
         .expect("stats carries plugin_edges_dropped_unseen_total");
-    assert!(
-        dropped >= 1,
-        "the seen-set gate must drop-and-count the Resolved edge to the \
-         gitignored trait (plugin_edges_dropped_unseen_total >= 1); got {dropped}. \
+    assert_eq!(
+        dropped, 0,
+        "the plugin must not produce a Resolved edge to the gitignored \
+         (host-unstored) trait at all — its symbol table mirrors the host's \
+         ignore policy (Finding C), so the seen-set gate drops nothing from this \
+         path (plugin_edges_dropped_unseen_total == 0); got {dropped}. \
          stats: {stats:#}"
     );
 }
