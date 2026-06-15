@@ -12,7 +12,27 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
-## [1.1.0rc9] — 2026-06-15
+## [1.1.0rc10] — 2026-06-15
+
+Tenth 1.1 release candidate. Adds a self-qualifying lead summary to `find_dead_code`
+(`entity_dead_list`) — the reference implementation of an agent-first convention:
+any tool that returns *a number of things in various kinds* states the breakdown
+up front. No package is published for release candidates. (Cargo SemVer
+`1.1.0-rc10`; Python wheels normalise to PEP 440 `1.1.0rc10`.)
+
+### Added
+
+- **Lead summary on `entity_dead_list`.** The response now carries a top-level
+  `summary` block — `dead_candidates`, `reachable`, `not_analysed`
+  (`plugins_without_roots` / `shielded_by_unresolved_calls` / `withheld_secret`),
+  and a `confidence` verdict — so an agent reads the *shape* of the result without
+  counting rows or hunting for a caveat. When an implausibly large share of
+  analysed entities is unreachable (>25%, the sign that reachability roots don't
+  cover the corpus — e.g. a library exercised only by tests), `confidence` reads
+  `low` and an `advisory` *recruits* the operator to configure entry-point roots,
+  instead of letting a misleading raw candidate count stand (an external review
+  docked trust on exactly this: 141 candidates read as alarming until the caveat
+  was found).
 
 Ninth 1.1 release candidate. Fixes a bare-qualname `scope` returning nothing for a
 *package* name. No package is published for release candidates. (Cargo SemVer

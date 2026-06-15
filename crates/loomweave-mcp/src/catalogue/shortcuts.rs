@@ -409,6 +409,17 @@ impl ServerState {
                     .collect();
 
                 Ok(success_envelope(json!({
+                    // Lead summary: counts by kind + a confidence verdict, so the
+                    // headline is self-qualifying (the agent-first "number of
+                    // things in various kinds → state the breakdown up front"
+                    // convention; reference implementation).
+                    "summary": dead_code_summary(
+                        total,
+                        reachable.len(),
+                        excluded.len(),
+                        unresolved_call_site_suppressed,
+                        withheld_count,
+                    ),
                     "dead_code": dead_code,
                     // The constant facets every candidate shares, hoisted.
                     "finding": {
@@ -455,6 +466,49 @@ impl ServerState {
 const SHORTCUT_PAGE_DEFAULT: usize = 50;
 const SHORTCUT_PAGE_MAX: usize = 200;
 const CHURN_SCAN_CAP: usize = 50_000;
+
+/// Build the lead `summary` block for `find_dead_code` — the agent-first "state
+/// the breakdown up front" convention: counts by kind plus a confidence verdict,
+/// so the headline is self-qualifying and no agent is misled by a raw candidate
+/// count. A LOW confidence verdict (with a recruiting advisory) fires when an
+/// implausibly large share of analysed entities is unreachable — a sign the
+/// reachability roots do not cover the corpus (e.g. a library exercised only by
+/// tests) rather than that the code is genuinely dead.
+fn dead_code_summary(
+    dead_candidates: usize,
+    reachable: usize,
+    plugins_without_roots: usize,
+    shielded_by_unresolved_calls: usize,
+    withheld_secret: usize,
+) -> Value {
+    let analysed = reachable.saturating_add(dead_candidates);
+    let dead_pct = dead_candidates
+        .saturating_mul(100)
+        .checked_div(analysed)
+        .unwrap_or(0);
+    let low_confidence = dead_pct > 25;
+    let advisory = low_confidence.then(|| {
+        format!(
+            "{dead_pct}% of analysed entities ({dead_candidates}/{analysed}) are unreachable \
+             from the configured reachability roots — implausibly high, so the roots likely do \
+             not cover this corpus (e.g. a library exercised only by tests). Treat these \
+             candidates as LOW CONFIDENCE: configure entry-point roots (tag cli-command / \
+             entry-point / test / exported-api / data-model entities) before relying on \
+             dead-code detection."
+        )
+    });
+    json!({
+        "dead_candidates": dead_candidates,
+        "reachable": reachable,
+        "not_analysed": {
+            "plugins_without_roots": plugins_without_roots,
+            "shielded_by_unresolved_calls": shielded_by_unresolved_calls,
+            "withheld_secret": withheld_secret,
+        },
+        "confidence": if low_confidence { "low" } else { "moderate" },
+        "advisory": advisory,
+    })
+}
 
 impl ServerState {
     /// `find_entry_points(scope?)` — entities tagged as entry points. Reads the
@@ -1147,6 +1201,31 @@ fn strongly_connected_cycles(adjacency: &HashMap<String, Vec<String>>) -> Vec<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_code_summary_flags_low_confidence_when_unreachable_share_is_high() {
+        // The lacuna shape: 141 candidates of ~391 analysed (36%) — implausibly
+        // high, so the roots don't cover the corpus. Confidence must read LOW and
+        // recruit the operator, not present 141 as a confident headline.
+        let s = dead_code_summary(141, 250, 1, 3, 5);
+        assert_eq!(s["confidence"], "low");
+        assert!(s["advisory"].as_str().unwrap().contains("LOW CONFIDENCE"));
+        assert_eq!(s["dead_candidates"], 141);
+        assert_eq!(s["reachable"], 250);
+        assert_eq!(s["not_analysed"]["withheld_secret"], 5);
+        assert_eq!(s["not_analysed"]["plugins_without_roots"], 1);
+
+        // A plausible dead share (a few orphans in a well-rooted corpus) reads
+        // MODERATE with no advisory — the breakdown still leads, but no alarm.
+        let s = dead_code_summary(5, 400, 0, 0, 0);
+        assert_eq!(s["confidence"], "moderate");
+        assert!(s["advisory"].is_null());
+
+        // Degenerate: nothing analysed → no division panic, no false alarm.
+        let s = dead_code_summary(0, 0, 0, 0, 0);
+        assert_eq!(s["confidence"], "moderate");
+        assert!(s["advisory"].is_null());
+    }
 
     fn edge_scan_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
