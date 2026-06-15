@@ -72,22 +72,34 @@ fn install_codex_skills_writes_agents_pack_without_initialising_loomweave_dir() 
 }
 
 #[test]
-fn repo_installed_skill_copy_matches_embedded_template() {
-    // The repo's own `.agents/skills/` copy is tracked, and `loomweave install`
-    // overwrites it from the embedded template on every run. If the two drift
-    // (someone edits the installed copy without updating the asset, or vice
-    // versa), each reinstall silently reverts the doc change — so pin them.
+fn installed_codex_skill_matches_embedded_template() {
+    // `loomweave install --codex-skills` must write the embedded SKILL.md
+    // template (the canonical source under crates/loomweave-mcp/assets/) verbatim
+    // to the target's `.agents/`. Install into a temp project and compare the
+    // INSTALLED copy to the embedded asset — a clean, CI-valid end-to-end check
+    // that the install path wires the right asset to the right destination.
+    //
+    // (Earlier this read the loomweave repo's OWN `.agents/skills/...` copy, but
+    // `.agents/` is gitignored — a runtime self-install artifact, never tracked —
+    // so that file is absent in any clean checkout and the test only passed on a
+    // dev box that had previously run `install`.)
     let template = include_str!("../../loomweave-mcp/assets/skills/loomweave-workflow/SKILL.md");
-    let repo_copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.agents/skills/loomweave-workflow/SKILL.md");
-    let body = fs::read_to_string(&repo_copy).expect("repo .agents skill copy");
+    let dir = tempfile::tempdir().unwrap();
+    loomweave_bin()
+        .args(["install", "--codex-skills", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    let installed = fs::read_to_string(
+        dir.path()
+            .join(".agents/skills/loomweave-workflow/SKILL.md"),
+    )
+    .expect("installed codex skill");
     assert_eq!(
-        body,
-        template,
-        "{} has drifted from the embedded template at \
-         crates/loomweave-mcp/assets/skills/loomweave-workflow/SKILL.md — \
-         edit the asset (the canonical source) and re-run `loomweave install`",
-        repo_copy.display()
+        installed, template,
+        "loomweave install --codex-skills must write the embedded SKILL.md \
+         template (crates/loomweave-mcp/assets/skills/loomweave-workflow/SKILL.md) \
+         verbatim"
     );
 }
 
