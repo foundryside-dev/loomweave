@@ -12,13 +12,15 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
-## [1.1.0rc10] — 2026-06-15
+## [1.1.0] — 2026-06-15
 
-Tenth 1.1 release candidate. Adds a self-qualifying lead summary to `find_dead_code`
-(`entity_dead_list`) — the reference implementation of an agent-first convention:
-any tool that returns *a number of things in various kinds* states the breakdown
-up front. No package is published for release candidates. (Cargo SemVer
-`1.1.0-rc10`; Python wheels normalise to PEP 440 `1.1.0rc10`.)
+First stable **1.1.0** release — the GA of the `1.1.0rc1`–`rc10` candidate
+series, cut over from the `rc` line to `main`. The final candidate (rc10) added
+a self-qualifying lead summary to `find_dead_code` (`entity_dead_list`) — the
+reference implementation of an agent-first convention: any tool that returns
+*a number of things in various kinds* states the breakdown up front. The
+cumulative changes since `1.0.0` are catalogued in the `1.1.0rc1`–`rc10`
+sections below. (Cargo SemVer `1.1.0`; Python wheels `1.1.0`.)
 
 ### Added
 

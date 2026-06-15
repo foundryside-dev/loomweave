@@ -1,3 +1,3 @@
 """loomweave-plugin-python — Python language plugin for Loomweave."""
 
-__version__ = "1.1.0rc10"
+__version__ = "1.1.0"

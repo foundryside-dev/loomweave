@@ -14,8 +14,8 @@ and trust-topology tools.
 
 ## Status
 
-**v1.1.0rc5 — active release-candidate line.** `v1.0.0` remains the latest
-tagged GitHub Release; this branch is preparing the 1.1 line. Scope:
+**v1.1.0 — latest stable release.** Cut over from the `rc` line to `main`,
+superseding `v1.0.0`. Scope:
 
 - **Python and Rust first-party plugins.** The Python plugin extracts modules,
   classes, functions, calls, references, decorators, and inheritance edges. The
@@ -116,10 +116,9 @@ pipx install ./plugins/python
 pipx install ./packaging/rust-plugin-dist
 ```
 
-The `loomweave` PyPI package scaffold for this branch depends on both
-`loomweave-plugin-python==1.1.0rc5` and `loomweave-plugin-rust==1.1.0rc5`; once
-those packages are published, a single Python install lands the CLI and both
-plugin executables in the same environment.
+The `loomweave` PyPI package depends on both
+`loomweave-plugin-python==1.1.0` and `loomweave-plugin-rust==1.1.0`; a single
+Python install lands the CLI and both plugin executables in the same environment.
 
 `loomweave install` is the one-step agent setup path: it initialises `.weft/loomweave/`,
 installs the `loomweave-workflow` skill for Claude Code and Codex, writes Claude
