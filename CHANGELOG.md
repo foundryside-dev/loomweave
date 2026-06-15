@@ -12,7 +12,26 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
-## [1.1.0rc8] — 2026-06-15
+## [1.1.0rc9] — 2026-06-15
+
+Ninth 1.1 release candidate. Fixes a bare-qualname `scope` returning nothing for a
+*package* name. No package is published for release candidates. (Cargo SemVer
+`1.1.0-rc9`; Python wheels normalise to PEP 440 `1.1.0rc9`.)
+
+### Fixed
+
+- **`scope` by package name now selects the whole namespace (`lacuna-522ab56124`).**
+  A bare dotted `scope` is treated as a namespace: it selects every entity whose
+  qualname is the scope or a descendant `scope.*`, via the new
+  `entity_ids_in_namespace`. Previously it resolved the scope to a single *exact*
+  entity and walked `contains` edges, so a package name (`specimen`) reached only
+  the package `__init__`'s own members and missed sibling submodules entirely —
+  returning **0** on edge-derived tools (`entity_coupling_hotspot_list`,
+  `module_circular_import_list`), which was a silent-empty that read as "nothing
+  here". Module-qualname scoping is unchanged (the namespace match subsumes it),
+  and a scope that matches no entity still falls back to a path glob. The
+  qualname/`namespace.` boundary test is underscore-safe (no `LIKE` wildcard
+  hazard) and rejects prefix-but-not-namespace look-alikes (`specimentary`).
 
 Eighth 1.1 release candidate. Fixes a routine `loomweave analyze` (the default
 incremental mode) 400'ing its Filigree emit on an unchanged tree, and adds an

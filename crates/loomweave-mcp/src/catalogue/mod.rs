@@ -31,7 +31,7 @@ use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
-use loomweave_storage::{Resolution, contained_entity_ids, resolve_qualnames_all_kinds};
+use loomweave_storage::{contained_entity_ids, entity_ids_in_namespace};
 
 use crate::ParamError;
 
@@ -228,31 +228,27 @@ impl RawScope {
                 })
             }
             RawScope::Bare(raw) => {
-                // Resolve the bare qualname against entity qualnames across every
-                // plugin/kind pair (exact-match, the `resolve_qualnames_all_kinds`
-                // dialect). A hit scopes to the anchor entity(ies) plus their
-                // descendants; a miss falls back to a path glob so a
-                // filename-shaped token (`utils.py`) still behaves as before.
-                let resolved =
-                    resolve_qualnames_all_kinds(conn, std::slice::from_ref(raw), None, None)?;
-                let anchors: Vec<String> = match resolved.into_iter().next().map(|(_, r)| r) {
-                    Some(Resolution::Exact { entity_id }) => vec![entity_id],
-                    Some(Resolution::Ambiguous { entity_ids }) => entity_ids,
-                    _ => {
-                        return Ok(ScopeFilter::Path {
-                            pattern: raw.clone(),
-                        });
-                    }
-                };
-                let mut ids: HashSet<String> = HashSet::new();
-                let mut truncated = false;
-                for anchor in anchors {
-                    let contained = contained_entity_ids(conn, &anchor, SCOPE_DESCENDANT_CAP)?;
-                    truncated |= contained.truncated;
-                    ids.extend(contained.entity_ids);
-                    ids.insert(anchor);
+                // A bare dotted scope is a NAMESPACE: select every entity whose
+                // qualname is `raw` or a descendant `raw.*`. This covers a package
+                // name (`specimen` → every module + their functions/classes, incl.
+                // sibling submodules) as well as a single module — broader and more
+                // correct than resolve-exact + `contains`-edges, which reached only
+                // one module's own members and returned nothing for a package name
+                // (lacuna-522ab56124: `scope="specimen"` → 0 on coupling /
+                // circular-import). A namespace that matches no entity falls back
+                // to a path glob so a filename-shaped token (`utils.py`) still
+                // behaves as before.
+                let (ids, truncated) =
+                    entity_ids_in_namespace(conn, raw, SCOPE_DESCENDANT_CAP)?;
+                if ids.is_empty() {
+                    return Ok(ScopeFilter::Path {
+                        pattern: raw.clone(),
+                    });
                 }
-                Ok(ScopeFilter::Ids { ids, truncated })
+                Ok(ScopeFilter::Ids {
+                    ids: ids.into_iter().collect(),
+                    truncated,
+                })
             }
         }
     }
@@ -456,6 +452,55 @@ mod tests {
                 assert!(
                     ids.contains("python:function:specimen.dead_code.orphaned_helper"),
                     "descendant via contains edge must be in scope, got {ids:?}"
+                );
+            }
+            other => panic!("expected Ids scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_package_scope_includes_sibling_submodules() {
+        // lacuna-522ab56124 regression: a package name must select its sibling
+        // submodules (and their members), not just the package `__init__`'s own
+        // contents. `specimen.hub` is NOT a `contains`-child of the `specimen`
+        // module, so the old resolve-exact + contains-edges path returned only
+        // `python:module:specimen` and missed `specimen.hub.*` entirely (→ 0 on
+        // coupling / circular-import, which operate on the submodule entities).
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        loomweave_storage::schema::apply_migrations(&mut conn).expect("apply migrations");
+        for id in [
+            "python:module:specimen",
+            "python:module:specimen.hub",
+            "python:function:specimen.hub.dispatch",
+            "python:module:specimentary", // prefix-but-not-namespace: must NOT match
+        ] {
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, source_file_path, created_at, updated_at \
+                 ) VALUES (?1, 'python', ?2, ?1, ?1, '{}', 'deadbeef', NULL, \
+                    '2026-06-15T00:00:00.000Z', '2026-06-15T00:00:00.000Z')",
+                rusqlite::params![id, id.split(':').nth(1).unwrap_or("module")],
+            )
+            .expect("insert entity");
+        }
+        let filter = RawScope::classify("specimen")
+            .resolve(&conn)
+            .expect("resolve package scope");
+        match filter {
+            ScopeFilter::Ids { ids, .. } => {
+                assert!(ids.contains("python:module:specimen"), "{ids:?}");
+                assert!(
+                    ids.contains("python:module:specimen.hub"),
+                    "sibling submodule must be in a package scope, got {ids:?}"
+                );
+                assert!(
+                    ids.contains("python:function:specimen.hub.dispatch"),
+                    "submodule member must be in a package scope, got {ids:?}"
+                );
+                assert!(
+                    !ids.contains("python:module:specimentary"),
+                    "a prefix that is not a namespace boundary must NOT match: {ids:?}"
                 );
             }
             other => panic!("expected Ids scope, got {other:?}"),

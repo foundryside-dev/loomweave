@@ -18,12 +18,12 @@ anyhow.workspace = true
 axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
-loomweave-core = { path = "../loomweave-core", version = "1.1.0-rc8" }
-loomweave-analysis = { path = "../loomweave-analysis", version = "1.1.0-rc8" }
-loomweave-federation = { path = "../loomweave-federation", version = "1.1.0-rc8" }
-loomweave-mcp = { path = "../loomweave-mcp", version = "1.1.0-rc8" }
-loomweave-scanner = { path = "../loomweave-scanner", version = "1.1.0-rc8" }
-loomweave-storage = { path = "../loomweave-storage", version = "1.1.0-rc8" }
+loomweave-core = { path = "../loomweave-core", version = "1.1.0-rc9" }
+loomweave-analysis = { path = "../loomweave-analysis", version = "1.1.0-rc9" }
+loomweave-federation = { path = "../loomweave-federation", version = "1.1.0-rc9" }
+loomweave-mcp = { path = "../loomweave-mcp", version = "1.1.0-rc9" }
+loomweave-scanner = { path = "../loomweave-scanner", version = "1.1.0-rc9" }
+loomweave-storage = { path = "../loomweave-storage", version = "1.1.0-rc9" }
 dotenvy.workspace = true
 fs2.workspace = true
 hmac.workspace = true
@@ -46,7 +46,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
-loomweave-plugin-fixture = { path = "../loomweave-plugin-fixture", version = "1.1.0-rc8" }
+loomweave-plugin-fixture = { path = "../loomweave-plugin-fixture", version = "1.1.0-rc9" }
 rusqlite.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

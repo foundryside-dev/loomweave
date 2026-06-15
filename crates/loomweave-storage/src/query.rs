@@ -1883,6 +1883,44 @@ pub fn contained_entity_ids(
     })
 }
 
+/// Entity ids whose qualname is `namespace` or a descendant `namespace.*` — the
+/// namespace-membership test behind a bare-qualname `scope` (e.g. `"specimen"`
+/// selects the whole package: its modules and their functions/classes). Unlike
+/// [`contained_entity_ids`], which walks `contains` edges from a single anchor and
+/// so reaches only one module's own members, this matches by qualname across the
+/// entity table — so a *package* name also selects its sibling submodules (the
+/// `specimen` → 0-on-coupling gap, lacuna-522ab56124). The id is
+/// `{plugin}:{kind}:{qualname}`; the qualname is the segment after the second
+/// colon, which never contains a colon, so the `namespace` / `namespace.` test is
+/// unambiguous and underscore-safe (no `LIKE` wildcard hazard). Bounded by
+/// `max_entities` (`truncated` reports the cap was hit); ids are returned in `id`
+/// order for determinism.
+pub fn entity_ids_in_namespace(
+    conn: &Connection,
+    namespace: &str,
+    max_entities: usize,
+) -> Result<(Vec<String>, bool)> {
+    let descendant_prefix = format!("{namespace}.");
+    let mut stmt = conn.prepare("SELECT id FROM entities ORDER BY id")?;
+    let mut rows = stmt.query([])?;
+    let mut ids = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let Some(qualname) = id.splitn(3, ':').nth(2) else {
+            continue;
+        };
+        if qualname == namespace || qualname.starts_with(&descendant_prefix) {
+            if ids.len() >= max_entities {
+                truncated = true;
+                break;
+            }
+            ids.push(id);
+        }
+    }
+    Ok((ids, truncated))
+}
+
 /// All findings recorded under `run_id`, joined to their anchoring entity's
 /// source location, ordered by finding id for deterministic emission. Used by
 /// the WP9-B cross-product emitter to build a `POST /api/v1/scan-results`

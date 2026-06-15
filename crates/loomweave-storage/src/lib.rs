@@ -56,6 +56,7 @@ pub use query::{
     ancestor_chain, call_edges_from, call_edges_targeting, candidate_entities_for_unresolved_sites,
     child_entity_ids, contained_entity_ids, containing_module_id, current_file_hash, edge_total,
     entities_by_churn, entities_by_kind, entities_by_tag, entities_containing_line,
+    entity_ids_in_namespace,
     entities_targeted_by_unresolved_call_sites, entities_with_wardline_facts, entity_at_line,
     entity_briefing_block_reason, entity_by_id, entity_total, entity_visibility,
     existing_entity_ids, find_entities, findings_for_emit, import_edges_for_entity,
