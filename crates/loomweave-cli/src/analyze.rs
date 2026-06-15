@@ -6135,6 +6135,18 @@ fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> So
             suffix = if skipped == 1 { "y" } else { "ies" },
         );
     }
+    // Sort for a deterministic, filesystem-independent processing order. The
+    // `ignore` walker yields entries in readdir order, which varies by platform
+    // and filesystem (Linux is unsorted, macOS/APFS tends to be sorted), so two
+    // analyses of the same tree could otherwise process files in different
+    // orders. Beyond reproducibility, the incremental move path is currently
+    // order-sensitive: when a moved entity's NEW file is processed before its
+    // OLD file, phase3 trips LMWV-INFRA-PARENT-CONTAINS-MISMATCH (the entity's
+    // parent_id names the new file but the contains edge still anchors the old
+    // one) — see clarion-abda98c869 for the underlying writer-contract fix. A
+    // stable sorted order both fixes that observable failure and is correct in
+    // its own right.
+    out.sort();
     SourceWalkResult {
         files: out,
         skipped_errors,
