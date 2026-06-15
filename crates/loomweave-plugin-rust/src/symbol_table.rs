@@ -108,11 +108,13 @@ pub fn build_symbol_table_with(
     let mut by_qualname: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut duplicates = Vec::new();
     for file in walk_rs_files(project_root) {
-        // Crate-scope discipline (src/-only, redundant-main skip, module-path
-        // derivation) is shared with `analyze_one_file` via `scope::emittable_scope`:
-        // a file outside the library/binary crate the ADR-049 qualname scheme
-        // names contributes nothing rather than minting a colliding
-        // `rust:module:<crate>` locator.
+        // Crate-scope discipline (src/-only gate, binary-target namespace
+        // routing, module-path derivation) is shared with `analyze_one_file` via
+        // `scope::emittable_scope`: a file outside the library/binary crate the
+        // ADR-049 qualname scheme names contributes nothing rather than minting a
+        // colliding `rust:module:<crate>` locator, and a Cargo binary target
+        // (main.rs alongside lib.rs, or src/bin/*.rs) routes to its own
+        // `<crate>@bin(<name>)` root rather than the library namespace.
         let Some((crate_name, module_path)) = emittable_scope(roots, &file, mounts) else {
             continue;
         };
@@ -158,53 +160,91 @@ pub fn build_symbol_table_with(
     }
 }
 
-/// Recursively collect every `.rs` file under `root`, skipping vendored /
-/// build / store directories the host also skips. Shared with
-/// [`discover_mounts`] so mount discovery sees exactly the file set the table
-/// build does (same symlink rules, same ignored dirs).
+/// Directories the HOST's source walk skips unconditionally
+/// (`loomweave-cli`'s `analyze::SKIP_DIRS`). Mirrored here so this plugin's
+/// init walk sees the same directory set the host dispatches from. Kept in
+/// lockstep with that list by hand — the two crates do not share a constant.
+const SKIP_DIRS: &[&str] = &[
+    ".weft",
+    ".git",
+    ".hg",
+    ".svn",
+    ".jj",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+];
+
+/// Collect every `.rs` file under `root` that the HOST would dispatch — i.e.
+/// honouring the SAME ignore policy the host's source walk applies before it
+/// decides which files are stored (`.gitignore` / `.ignore` / global gitignore /
+/// git-exclude, plus the `SKIP_DIRS` set), via the same `ignore` crate.
+///
+/// FINDING C (resolver/host source-set divergence): the init walk feeds the
+/// symbol table the resolver consults. If it walked the raw filesystem while the
+/// host walked an ignore-filtered set, a gitignored/generated `.rs` file could
+/// define a symbol a tracked file imports — the resolver would mark the
+/// reference *resolved* against that ignored symbol, then the host would DROP
+/// the edge (its target file was never stored), leaving neither a real edge nor
+/// an unresolved-call-site record. Mirroring the host's policy here keeps the
+/// resolver's view a subset of what the host actually stores, so a resolved
+/// reference always has a stored target. The plugin protocol carries only
+/// `project_root` (no dispatched file list — see `InitializeParams`), so this
+/// MIRRORS the host policy rather than consuming the dispatched set; the two
+/// `SKIP_DIRS` lists are kept in lockstep by hand.
+///
+/// Shared with [`discover_mounts`](crate::mounts::discover_mounts) so mount
+/// discovery sees exactly the file set the table build does (same ignore
+/// policy, same symlink rule).
 pub(crate) fn walk_rs_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    walk(root, &mut out);
-    out
-}
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        // Do NOT follow symlinked directories. The host's path-jail covers
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        // Do NOT follow directory symlinks. The host's path-jail covers
         // `analyze_file` paths but not this init walk; a symlinked dir is either
         // an out-of-tree escape (reads files outside the project) or a cycle
         // (re-collects in-tree files under an aliased path, double-minting ids).
-        // `DirEntry::file_type()` reports the link itself (it does NOT traverse),
-        // unlike `Path::is_dir()` which follows the link. Skip the entry when it
-        // IS a symlink, AND when its type cannot be determined: on an `Err` we
-        // must not fall through to `Path::is_dir()`, which would follow a
-        // symlink we failed to classify. Treat can-not-determine as do-not-recurse.
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_symlink() {
-            continue;
-        }
+        // The `ignore` crate's walker enforces this without per-entry file_type
+        // probing.
+        .follow_links(false)
+        // Match the host's `collect_source_files` filter set byte-for-byte:
+        // hidden files ARE walked (`hidden(false)` = do not skip them), but
+        // `.gitignore` / `.ignore` / global gitignore / git-exclude DO apply,
+        // and `require_git(false)` makes the gitignore rules apply even outside a
+        // git checkout (the testbed / vendored-tree case).
+        .hidden(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .require_git(false)
+        .filter_entry(|entry| !is_skipped_dir(entry));
+
+    for result in builder.build() {
+        // A per-entry error (unreadable dirent, ignored-path error) is skipped:
+        // the same silent-skip semantics the rest of the init walk already uses,
+        // and the host's own walk logs+counts these too. A file we cannot see
+        // contributes nothing rather than aborting the table build.
+        let Ok(entry) = result else { continue };
         let path = entry.path();
-        if path.is_dir() {
-            if !is_ignored(&path) {
-                walk(&path, out);
-            }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
+        if entry.file_type().is_some_and(|t| t.is_file())
+            && path.extension().and_then(|e| e.to_str()) == Some("rs")
+        {
+            out.push(path.to_path_buf());
         }
     }
+    out
 }
 
-/// Skip vendored / build / store directories (mirrors `crate_roots`).
-fn is_ignored(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("target" | ".git" | ".weft" | "node_modules")
-    )
+/// Skip the host's `SKIP_DIRS` directories (mirrors
+/// `loomweave-cli::analyze::is_skipped_dir`).
+fn is_skipped_dir(entry: &ignore::DirEntry) -> bool {
+    entry.file_type().is_some_and(|t| t.is_dir())
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| SKIP_DIRS.contains(&name))
 }
 
 #[cfg(test)]
@@ -267,20 +307,71 @@ mod tests {
     #[test]
     fn lib_and_main_in_one_crate_do_not_collide_on_the_crate_module() {
         // A crate shipping both `src/lib.rs` and `src/main.rs` has two crate
-        // roots sharing a source dir; both would resolve to the bare crate
-        // module path. ADR-049 makes `lib.rs` canonical, so `main.rs` is skipped
-        // and `rust:module:<crate>` is emitted exactly once.
+        // roots sharing a source dir; routing both to the bare crate module path
+        // would collide. ADR-049 makes `lib.rs` canonical for `rust:module:<crate>`;
+        // the binary entrypoint is NOT dropped (Finding A) — it routes to its own
+        // `<crate>@bin(<crate>)` root, so the bin's code stays in the graph while
+        // the crate module is emitted exactly once.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join("c/src")).unwrap();
         fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
         fs::write(root.join("c/src/lib.rs"), "pub fn lib_fn() {}\n").unwrap();
-        fs::write(root.join("c/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("c/src/main.rs"),
+            "fn run_app() {}\nfn main() {}\n",
+        )
+        .unwrap();
 
         let table = build_symbol_table(root);
         assert_eq!(table.duplicate_ids(), Vec::<String>::new());
+        // lib.rs is canonical for the bare crate module + lib items.
         assert!(table.contains_id("rust:module:c_crate"));
         assert!(table.contains_id("rust:function:c_crate.lib_fn"));
+        // main.rs's application code is preserved under the distinct bin root.
+        assert!(table.contains_id("rust:module:c_crate@bin(c_crate)"));
+        assert!(table.contains_id("rust:function:c_crate@bin(c_crate).run_app"));
+        assert!(table.contains_id("rust:function:c_crate@bin(c_crate).main"));
+    }
+
+    #[test]
+    fn src_bin_targets_stay_out_of_the_library_namespace() {
+        // Finding B: Cargo automatic binary targets under `src/bin/`. A
+        // `src/bin/tool.rs` must NOT land at `c_crate.bin.tool` (the library
+        // namespace, colliding with a real `mod bin`) — it routes to its own
+        // `c_crate@bin(tool)` root, distinct from the library's `c_crate.bin`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("c/src/bin")).unwrap();
+        fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+        // a REAL `mod bin` in the library — would collide with a naive route.
+        fs::write(
+            root.join("c/src/lib.rs"),
+            "pub mod bin {\n    pub fn real() {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("c/src/bin/tool.rs"),
+            "fn helper() {}\nfn main() {}\n",
+        )
+        .unwrap();
+
+        let table = build_symbol_table(root);
+        assert_eq!(
+            table.duplicate_ids(),
+            Vec::<String>::new(),
+            "the src/bin target must not collide with the library `mod bin`"
+        );
+        // The library's real `mod bin` keeps the dotted library path.
+        assert!(table.contains_id("rust:module:c_crate.bin"));
+        assert!(table.contains_id("rust:function:c_crate.bin.real"));
+        // The bin TARGET routes to its own `@bin(...)` root, NOT the library.
+        assert!(table.contains_id("rust:module:c_crate@bin(tool)"));
+        assert!(table.contains_id("rust:function:c_crate@bin(tool).helper"));
+        assert!(
+            !table.contains_id("rust:function:c_crate.bin.tool.helper"),
+            "bin target must not be folded into the library `bin` module"
+        );
     }
 
     #[test]
@@ -377,5 +468,40 @@ mod tests {
         assert!(table.iter_ids().all(|id| !id.contains("evil")));
         // The real in-project fn IS present (the walk still works).
         assert!(table.contains_id("rust:function:c_crate.f"));
+    }
+
+    #[test]
+    fn gitignored_rs_files_are_excluded_from_the_symbol_table() {
+        // FINDING C: the init walk must honour the same ignore policy the host's
+        // source walk applies before it decides which files are stored. A
+        // gitignored / generated `.rs` file is NEVER dispatched by the host, so
+        // its symbols must NOT enter the resolver's table — otherwise a tracked
+        // file's reference to such a symbol resolves against a target the host
+        // dropped, losing both the edge and its unresolved-call-site record.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("c/src")).unwrap();
+        fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+        fs::write(root.join("c/src/lib.rs"), "pub fn tracked() {}\n").unwrap();
+        // A generated file the host's `.gitignore`-honouring walk would skip.
+        fs::write(
+            root.join("c/src/generated.rs"),
+            "pub fn from_generated() {}\n",
+        )
+        .unwrap();
+        // .gitignore lives at the crate dir (the `ignore` crate reads it with
+        // `require_git(false)`, so no git checkout is needed).
+        fs::write(root.join("c/.gitignore"), "/src/generated.rs\n").unwrap();
+
+        let table = build_symbol_table(root);
+        // The tracked file's symbol IS present.
+        assert!(table.contains_id("rust:function:c_crate.tracked"));
+        // The gitignored file's symbol is NOT — the resolver's view is a subset
+        // of what the host stores, so a resolved reference always has a target.
+        assert!(
+            !table.contains_id("rust:function:c_crate.from_generated"),
+            "gitignored .rs symbol must not enter the resolver table (Finding C)"
+        );
+        assert!(table.iter_ids().all(|id| !id.contains("from_generated")));
     }
 }

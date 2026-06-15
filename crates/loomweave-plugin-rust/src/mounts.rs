@@ -64,7 +64,6 @@ use syn::Item;
 
 use crate::crate_roots::CrateRoots;
 use crate::extract::cfg_suffix;
-use crate::module_path::module_path_for;
 use crate::scope::crate_src_scope;
 use crate::spans::source_range_of;
 
@@ -91,7 +90,8 @@ impl ModMounts {
 
     /// The logical dotted module path of `file` under the mount overlay, or
     /// `None` when no mount covers it (caller falls back to
-    /// [`module_path_for`]): exact-file lookup first, then the longest
+    /// [`module_path_for`](crate::module_path::module_path_for)): exact-file
+    /// lookup first, then the longest
     /// matching subtree prefix with the remaining components rewritten onto
     /// the mount's logical path (a trailing `mod` stem contributes no
     /// segment, exactly as in the filesystem route).
@@ -112,7 +112,8 @@ impl ModMounts {
 
 /// Append `rel`'s components onto a mount's logical dotted path: directories
 /// verbatim, the final component by file stem, and a trailing `mod` stem
-/// contributing no segment (mirrors [`module_path_for`]'s collapse rule).
+/// contributing no segment (mirrors
+/// [`module_path_for`](crate::module_path::module_path_for)'s collapse rule).
 fn rewrite_remainder(base: &str, rel: &Path) -> String {
     let mut out = base.to_owned();
     let comps: Vec<_> = rel.components().collect();
@@ -144,8 +145,10 @@ pub fn discover_mounts(project_root: &Path, roots: &CrateRoots) -> ModMounts {
     let mut raw: Vec<RawMount> = Vec::new();
     for file in crate::symbol_table::walk_rs_files(project_root) {
         // A declaring file outside the emittable crate scope (tests/, benches/,
-        // a redundant main.rs, …) contributes no mounts, exactly as it
-        // contributes no entities.
+        // examples/, build.rs, …) contributes no mounts, exactly as it
+        // contributes no entities. Binary targets (main.rs, src/bin/*.rs) ARE in
+        // scope — a `#[path]` mount declared inside one is honoured (its target
+        // routes under the bin target's own `<crate>@bin(<name>)` namespace).
         let Some((_, src_root)) = crate_src_scope(roots, &file) else {
             continue;
         };
@@ -647,7 +650,12 @@ impl MountResolver<'_> {
     /// collection, so this is defensive).
     fn fs_logical(&self, file: &Path) -> Option<String> {
         let (crate_name, src_root) = crate_src_scope(self.roots, file)?;
-        Some(module_path_for(&crate_name, &src_root, file))
+        // Binary-target-aware: a Cargo bin target routes to its own
+        // `<crate>@bin(<name>)` root (NOT the library namespace), matching the
+        // emission path's `scoped_module_path`. This is the pure-filesystem
+        // default — no `#[path]` overlay is consulted (it does not apply to the
+        // filesystem-default arm), so this stays a non-recursive `&self` route.
+        Some(crate::scope::fs_module_path(&crate_name, &src_root, file))
     }
 }
 
