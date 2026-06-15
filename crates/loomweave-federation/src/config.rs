@@ -703,6 +703,13 @@ where
 pub struct FiligreeConfig {
     pub enabled: bool,
     pub base_url: String,
+    /// Optional Filigree project key the emit is scoped to. A shared Filigree
+    /// server hosting more than one project rejects an unscoped
+    /// `POST /api/v1/scan-results` with a `VALIDATION` 400 ("ambiguous
+    /// federation write in server mode"). When set, the scan-results emit pins
+    /// the project as `?project=<key>` — the same path-scoped dialect Wardline
+    /// uses (`/api/p/<key>/…`). Leave unset against a single-project base URL.
+    pub project: Option<String>,
     pub actor: String,
     /// Name of the environment variable holding the Filigree bearer token.
     /// Defaults to `WEFT_FEDERATION_TOKEN` (Weft-suite federation plumbing).
@@ -732,6 +739,7 @@ impl Default for FiligreeConfig {
         Self {
             enabled: false,
             base_url: "http://127.0.0.1:8766".to_owned(),
+            project: None,
             actor: "loomweave-mcp".to_owned(),
             token_env: "WEFT_FEDERATION_TOKEN".to_owned(),
             timeout_seconds: 5,

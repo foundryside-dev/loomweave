@@ -313,6 +313,9 @@ fn read_minted_federation_token(root: &Path) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct FiligreeHttpClient {
     base_url: String,
+    /// Optional Filigree project key pinned on the scan-results emit (see
+    /// [`FiligreeConfig::project`]). `None` → the unscoped single-project URL.
+    project: Option<String>,
     actor: String,
     token: Option<String>,
     client: reqwest::blocking::Client,
@@ -359,6 +362,7 @@ impl FiligreeHttpClient {
             .or_else(|| project_root.and_then(read_minted_federation_token));
         Ok(Some(Self {
             base_url: config.base_url.clone(),
+            project: config.project.clone(),
             actor: config.actor.clone(),
             token,
             client,
@@ -384,7 +388,7 @@ impl FiligreeHttpClient {
     ) -> Result<ScanResultsResponse, FiligreeClientError> {
         let mut http_request = self
             .client
-            .post(scan_results_url(&self.base_url))
+            .post(scan_results_url(&self.base_url, self.project.as_deref()))
             .header("accept", "application/json")
             .json(request);
         if !self.actor.trim().is_empty() {
@@ -929,6 +933,7 @@ mod tests {
         FiligreeConfig {
             enabled: true,
             base_url: "http://127.0.0.1:1".to_owned(),
+            project: None,
             actor: "loomweave-test".to_owned(),
             token_env: "WEFT_FEDERATION_TOKEN".to_owned(),
             timeout_seconds: 1,
@@ -1265,6 +1270,7 @@ mod tests {
         let config = FiligreeConfig {
             enabled: true,
             base_url: format!("http://{addr}"),
+            project: None,
             actor: "loomweave-test".to_owned(),
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 1,
@@ -1413,6 +1419,7 @@ mod tests {
         let config = FiligreeConfig {
             enabled: true,
             base_url: format!("http://{addr}"),
+            project: None,
             actor: "loomweave-test".to_owned(),
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 1,
@@ -1600,6 +1607,7 @@ mod tests {
         let config = FiligreeConfig {
             enabled: true,
             base_url: format!("http://{addr}"),
+            project: None,
             actor: "loomweave-test".to_owned(),
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 5,
@@ -1648,6 +1656,7 @@ mod tests {
         let config = FiligreeConfig {
             enabled: true,
             base_url: format!("http://{addr}"),
+            project: None,
             actor: "loomweave-test".to_owned(),
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 5,
@@ -1711,6 +1720,7 @@ mod tests {
         let config = FiligreeConfig {
             enabled: true,
             base_url: format!("http://{addr}"),
+            project: None,
             actor: "loomweave-test".to_owned(),
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 5,
@@ -1732,6 +1742,7 @@ mod tests {
         let config = FiligreeConfig {
             enabled: true,
             base_url: format!("http://{addr}"),
+            project: None,
             actor: "loomweave-test".to_owned(),
             token_env: "TEST_FILIGREE_TOKEN".to_owned(),
             timeout_seconds: 1,

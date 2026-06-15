@@ -3627,6 +3627,33 @@ async fn emit_findings_to_filigree(
     let rows = rows
         .into_iter()
         .map(federation_finding_for_emit)
+        .map(|mut row| {
+            // Filigree's scan-results intake requires project-relative finding
+            // paths; Loomweave stores absolute `source_file_path`s, so strip the
+            // project-root prefix before emit. An out-of-root path is left as-is
+            // (Filigree rejects it loudly, which beats silently rewriting it).
+            let rel = row
+                .source_file_path
+                .as_deref()
+                .map(|path| relativize_for_emit(project_root, path));
+            // Clear line numbers past EOF before emit. Loomweave can record a
+            // line beyond a file's last line for a syntax-error/degraded entity;
+            // Filigree's strict batch intake 400s the WHOLE batch on such a
+            // finding (its single-finding path merely clears them), so mirror
+            // that lenient clamp here.
+            if let Some(rel) = rel.as_deref() {
+                let (start, end) = clamp_lines_to_file(
+                    project_root,
+                    rel,
+                    row.source_line_start,
+                    row.source_line_end,
+                );
+                row.source_line_start = start;
+                row.source_line_end = end;
+            }
+            row.source_file_path = rel;
+            row
+        })
         .collect::<Vec<_>>();
 
     // In the Phase-8c (post-`CommitRun`, filtered) pass, anchor path-less
@@ -3636,7 +3663,10 @@ async fn emit_findings_to_filigree(
     // `metadata.loomweave.synthetic_anchor=true`. The Phase-8 pass passes `None`,
     // so during-run path-less findings (e.g. the weak-modularity subsystem fact)
     // keep their existing store-only treatment.
-    let default_path = rule_filter.map(|_| project_root.display().to_string());
+    // The synthetic-anchor fallback is the project root itself; emit it as the
+    // relative "." so it satisfies Filigree's project-relative path rule (an
+    // absolute project-root path is rejected the same as any other absolute path).
+    let default_path = rule_filter.map(|_| ".".to_owned());
 
     let batch = prepare_batch(
         &rows,
@@ -3673,6 +3703,43 @@ async fn emit_findings_to_filigree(
         mark_unseen,
     )
     .await
+}
+
+/// Strip the project-root prefix so a stored absolute `source_file_path` emits
+/// as the project-relative path Filigree's scan-results intake requires. A path
+/// that does not live under the root is returned unchanged (Filigree then
+/// rejects it loudly, which is preferable to silently rewriting it).
+fn relativize_for_emit(project_root: &Path, path: &str) -> String {
+    Path::new(path)
+        .strip_prefix(project_root)
+        .ok()
+        .and_then(|rel| rel.to_str())
+        .map_or_else(|| path.to_owned(), str::to_owned)
+}
+
+/// Clear a finding's line numbers when they fall past end-of-file, mirroring
+/// Filigree's lenient single-finding line-attribution (`scanner_reporting`).
+/// Loomweave can record a line beyond a file's last line for a
+/// syntax-error/degraded entity (the parser reports a position past EOF);
+/// Filigree's *strict batch* intake 400s the whole batch on such a finding, so
+/// clamp here. `line_start` past EOF clears both (no usable anchor); otherwise a
+/// `line_end` past EOF is dropped. Line counting matches Filigree's (`str::lines`
+/// counts a final unterminated line, like Python's file iteration). An unreadable
+/// file leaves the numbers untouched.
+fn clamp_lines_to_file(
+    project_root: &Path,
+    rel_path: &str,
+    line_start: Option<i64>,
+    line_end: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    let Ok(content) = fs::read_to_string(project_root.join(rel_path)) else {
+        return (line_start, line_end);
+    };
+    let count = i64::try_from(content.lines().count()).unwrap_or(i64::MAX);
+    if line_start.is_some_and(|start| start > count) {
+        return (None, None);
+    }
+    (line_start, line_end.filter(|&end| end <= count))
 }
 
 fn federation_finding_for_emit(row: loomweave_storage::FindingForEmitRow) -> FindingForEmit {
@@ -3718,7 +3785,7 @@ async fn post_findings_batch(
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
     }
-    let endpoint = scan_results_url(&resolved_cfg.base_url);
+    let endpoint = scan_results_url(&resolved_cfg.base_url, resolved_cfg.project.as_deref());
 
     // `reqwest::blocking` builds and drops its own inner tokio runtime; doing
     // that on a tokio worker — even inside `spawn_blocking`, which still carries
@@ -5737,6 +5804,51 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::fs;
+
+    #[test]
+    fn relativize_for_emit_strips_project_root_else_passes_through() {
+        let root = Path::new("/home/u/proj");
+        // Under-root absolute path → project-relative (Filigree's requirement).
+        assert_eq!(
+            relativize_for_emit(root, "/home/u/proj/specimen/a.py"),
+            "specimen/a.py"
+        );
+        // An out-of-root path is left untouched (Filigree rejects it loudly
+        // rather than us silently rewriting it into something wrong).
+        assert_eq!(
+            relativize_for_emit(root, "/etc/passwd"),
+            "/etc/passwd"
+        );
+    }
+
+    #[test]
+    fn clamp_lines_to_file_clears_positions_past_eof() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A 3-line file (no trailing newline) — `str::lines()` counts 3, matching
+        // Filigree's Python file-iteration line count.
+        fs::write(dir.path().join("three.py"), "a\nb\nc").expect("write");
+        // line_end past EOF is dropped; in-range line_start kept (the A4 case:
+        // a syntax-error finding reporting line_end 4 on a 3-line file).
+        assert_eq!(
+            clamp_lines_to_file(dir.path(), "three.py", Some(1), Some(4)),
+            (Some(1), None)
+        );
+        // line_start past EOF clears both (no usable anchor).
+        assert_eq!(
+            clamp_lines_to_file(dir.path(), "three.py", Some(9), Some(9)),
+            (None, None)
+        );
+        // In-range positions are preserved verbatim.
+        assert_eq!(
+            clamp_lines_to_file(dir.path(), "three.py", Some(2), Some(3)),
+            (Some(2), Some(3))
+        );
+        // An unreadable file leaves the positions untouched (no false clamp).
+        assert_eq!(
+            clamp_lines_to_file(dir.path(), "absent.py", Some(1), Some(99)),
+            (Some(1), Some(99))
+        );
+    }
 
     #[test]
     fn dedup_descriptors_keeps_one_per_locator_last_wins() {

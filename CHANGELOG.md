@@ -12,6 +12,16 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.1.0rc6] — 2026-06-15
+
+Sixth 1.1 release candidate. Makes the Loomweave→Filigree finding-emit seam work
+end-to-end for the first time against a real multi-project Filigree server —
+surfaced by the Lacuna dogfood, where emit was disabled by default and then,
+once enabled, posted to an unscoped endpoint with absolute paths and
+out-of-range line numbers, each rejected in turn. Also fixes the catalogue
+`scope` qualname-resolution gap. No package is published for release candidates.
+(Cargo SemVer `1.1.0-rc6`; Python wheels normalise to PEP 440 `1.1.0rc6`.)
+
 ### Added
 
 - **Doctor stale-port health probing.** `loomweave doctor --json` now probes
@@ -41,6 +51,22 @@ only when an incompatible change is made to that surface. See
 - **Storage coalescing flake stabilization.** Stabilized the cold inferred-call
   coalescing test with a gated provider so follower requests wait behind the
   leader instead of racing a timing delay.
+- **Loomweave→Filigree finding emit against a multi-project server.** The
+  scan-results emit now pins the configured project as `?project=<key>`
+  (`integrations.filigree.project`), so a shared Filigree server no longer
+  rejects it as an ambiguous server-mode write; emits project-relative finding
+  paths (stored absolute paths are stripped to the project root) instead of
+  absolute paths Filigree rejects; and clears finding line numbers that fall past
+  end-of-file before emit (mirroring Filigree's lenient single-finding
+  line-attribution), so a syntax-error/degraded finding no longer 400s the whole
+  batch. Together these let Loomweave findings (`LMWV-*`) reach Filigree's tracker
+  for the first time end-to-end.
+- **Catalogue `scope` qualname resolution.** A bare dotted `scope` argument
+  (`specimen`, `specimen.dead_code`) on `entity_dead_list`,
+  `module_circular_import_list`, `entity_coupling_hotspot_list`, and the other
+  scope-taking tools now resolves against entity qualnames (anchor + descendants)
+  instead of being misclassified as a path glob that silently matched nothing.
+  An unmatched token still falls back to a path glob.
 
 ## [1.1.0rc5] — 2026-06-13
 
