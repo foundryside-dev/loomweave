@@ -1233,10 +1233,16 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &db_path,
             &project_root,
             &run_id,
-            // `--resume` re-emits without marking the prior run's findings
-            // unseen (REQ-FINDING-05); a fresh run marks them unseen so a
-            // dropped finding transitions to `unseen_in_latest` on the peer.
-            !resume,
+            // `mark_unseen` sweeps findings this scan did NOT report as gone —
+            // only sound when the scan examined the whole corpus, i.e. it skipped
+            // no files (`skipped_files_total == 0`: a `--no-incremental` run or a
+            // first run with an empty prior index). An incremental run that
+            // skipped unchanged files has no authority to sweep their findings,
+            // and an incremental no-op would otherwise POST an empty batch with
+            // `mark_unseen=true` — which Filigree rejects 400 ("requires at least
+            // one finding or scanned path"). `--resume` never sweeps
+            // (REQ-FINDING-05).
+            !resume && skipped_files_total == 0,
             // Final/only completing batch for the during-run findings; the
             // Phase-8c follow-up (if any) is additive (`complete_scan_run=false`).
             true,
@@ -1503,7 +1509,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &db_path,
                 &project_root,
                 &run_id,
-                !resume,
+                // Runs that skipped files do not sweep (see Phase-8 note); only a
+                // run that examined the whole corpus may mark findings unseen.
+                !resume && skipped_files_total == 0,
                 false,
                 Some(POST_RUN_FINDING_RULES),
                 options.config_path.as_deref(),

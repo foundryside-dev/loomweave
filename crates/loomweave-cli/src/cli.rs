@@ -377,7 +377,9 @@ pub enum LlmConfigCommand {
         #[arg(long, value_name = "MODEL")]
         model_id: Option<String>,
 
-        /// Pin the Codex sidecar model (`llm_policy.codex_cli.model`).
+        /// Pin the Codex sidecar model (`llm_policy.codex_cli.model`). Use
+        /// `default` to explicitly accept the codex CLI's own default model
+        /// (acknowledges the floating-model cost; silences the unset warning).
         #[arg(long, value_name = "MODEL")]
         codex_model: Option<String>,
 

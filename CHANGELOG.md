@@ -12,6 +12,33 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.1.0rc8] — 2026-06-15
+
+Eighth 1.1 release candidate. Fixes a routine `loomweave analyze` (the default
+incremental mode) 400'ing its Filigree emit on an unchanged tree, and adds an
+explicit `"default"` opt-in for the codex sidecar model. No package is published
+for release candidates. (Cargo SemVer `1.1.0-rc8`; Python wheels normalise to PEP
+440 `1.1.0rc8`.)
+
+### Fixed
+
+- **Incremental `analyze` no longer 400s its Filigree emit.** `mark_unseen` (which
+  asks Filigree to sweep findings this scan did not report as gone) is now sent
+  `true` only when the scan examined the whole corpus (`skipped_files_total == 0`
+  — a `--no-incremental` run or a first run), not on every fresh run. An
+  incremental run that skipped unchanged files has no authority to sweep their
+  findings, and an incremental no-op would otherwise POST an empty batch with
+  `mark_unseen=true` — which Filigree rejects with `VALIDATION` 400 ("mark_unseen
+  requires at least one finding or scanned path"). `--resume` still never sweeps.
+
+### Added
+
+- **`codex_model = "default"` opt-in.** Setting `llm_policy.codex_cli.model` (or
+  `--codex-model`) to `"default"` (any case) explicitly accepts the codex CLI's
+  own default model — it acknowledges the floating-model cost instead of pinning
+  one, behaves as unset (no `--model` flag is passed), and silences the
+  "model is unset" config-check warning.
+
 ## [1.1.0rc7] — 2026-06-15
 
 Seventh 1.1 release candidate. Completes the loomweave→Filigree finding-emit work

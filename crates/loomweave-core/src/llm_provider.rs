@@ -703,7 +703,15 @@ impl CodexCliProvider {
             executable: config.executable,
             project_root: config.project_root,
             model_id: config.model_id,
-            model: config.model.filter(|model| !model.trim().is_empty()),
+            // `"default"` (any case) is an explicit opt-in to the codex CLI's own
+            // default model: the operator acknowledges the floating-model cost
+            // instead of pinning one, so it behaves like unset here — no `--model`
+            // flag is passed and codex picks. (The `config.rs` cost warning is
+            // likewise silenced because the value is set, not absent.)
+            model: config.model.filter(|model| {
+                let model = model.trim();
+                !model.is_empty() && !model.eq_ignore_ascii_case("default")
+            }),
             profile: config.profile.filter(|profile| !profile.trim().is_empty()),
             sandbox: config.sandbox,
             timeout: Duration::from_secs(config.timeout_seconds),
@@ -2426,6 +2434,51 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_default_model_behaves_as_unset() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fake = temp.path().join("codex");
+        fs::write(&fake, "#!/usr/bin/env bash\nexit 0\n").expect("write fake codex");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let cfg = |model: Option<&str>| CodexCliProviderConfig {
+            executable: fake.to_string_lossy().into_owned(),
+            project_root: temp.path().to_path_buf(),
+            model_id: "codex-cli-default".to_owned(),
+            model: model.map(str::to_owned),
+            profile: None,
+            sandbox: "read-only".to_owned(),
+            timeout_seconds: 60,
+        };
+        // `"default"` (any case) is an explicit opt-in to codex's own default —
+        // treated as unset, so no `--model` flag is ever passed.
+        assert!(
+            CodexCliProvider::from_config(cfg(Some("default")))
+                .unwrap()
+                .model
+                .is_none()
+        );
+        assert!(
+            CodexCliProvider::from_config(cfg(Some("  DEFAULT  ")))
+                .unwrap()
+                .model
+                .is_none()
+        );
+        // A real model name is preserved (pinned).
+        assert_eq!(
+            CodexCliProvider::from_config(cfg(Some("gpt-5-codex")))
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("gpt-5-codex")
+        );
+        // Unset stays unset.
+        assert!(CodexCliProvider::from_config(cfg(None)).unwrap().model.is_none());
     }
 
     #[tokio::test]

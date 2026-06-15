@@ -562,7 +562,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "loomweave-core"
-version = "1.1.0-rc7"
+version = "1.1.0-rc8"
 dependencies = [
  "async-trait",
  "fs2",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "loomweave-plugin-rust"
-version = "1.1.0-rc7"
+version = "1.1.0-rc8"
 dependencies = [
  "loomweave-core",
  "proc-macro2",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "loomweave-plugin-rust-dist"
-version = "1.1.0-rc7"
+version = "1.1.0-rc8"
 dependencies = [
  "loomweave-plugin-rust",
 ]

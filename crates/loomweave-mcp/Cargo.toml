@@ -12,9 +12,9 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
-loomweave-core = { path = "../loomweave-core", version = "1.1.0-rc7" }
-loomweave-federation = { path = "../loomweave-federation", version = "1.1.0-rc7" }
-loomweave-storage = { path = "../loomweave-storage", version = "1.1.0-rc7" }
+loomweave-core = { path = "../loomweave-core", version = "1.1.0-rc8" }
+loomweave-federation = { path = "../loomweave-federation", version = "1.1.0-rc8" }
+loomweave-storage = { path = "../loomweave-storage", version = "1.1.0-rc8" }
 reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
