@@ -61,3 +61,10 @@ CLAUDE.md
 
 # Filigree issue tracker
 .weft/
+
+# Developer config / local tooling — not part of the solution
+.agents/
+
+# Local tool/federation config — not part of the solution
+.mcp.json
+loomweave.yaml
