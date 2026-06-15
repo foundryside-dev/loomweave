@@ -621,14 +621,19 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // changed files pass through the per-source-file edge replacement boundary
     // before their current edge set is inserted.
     //
-    // Caveat (benign): a skipped file's core `file` entity keeps last run's
-    // `briefing_blocked` / `language` properties, which a full re-analysis would
-    // refresh. This can only go stale TOWARD blocked (a withheld briefing that
-    // could now be served — the conservative direction); a file that should
-    // NEWLY block changed by definition (the secret is a content change), so the
-    // whole-file hash re-dispatches it, and every file is scanned by `pre_ingest`
-    // before the partition — it cannot silently under-block.
-    // `--no-incremental` clears any such staleness.
+    // `briefing_blocked` on a skipped file IS reconciled every run
+    // (clarion-3c4ed8e9fb): the per-skipped-file loop below drives each skipped
+    // file's existing entity rows to the CURRENT pre-ingest secret-scan verdict
+    // (the scan is a full pass every run), SETTING the block when the scan still
+    // flags the file and CLEARING it when the scan no longer does (operator
+    // added a baseline, cleaned the secret, or used the override). This closes
+    // the operator baseline workflow (clarion-55fc5aa885 §I11): an unchanged
+    // file that was blocked on run 1 unblocks on run 2 after a baseline is added,
+    // without `--no-incremental`. The reconciliation is driven SOLELY from the
+    // secret-scan outcome, so it can never unblock a file the scanner still
+    // flags — the scanner remains the sole authority. (The skipped file's
+    // `language` and other plugin properties are still not refreshed; a full
+    // `--no-incremental` run rebuilds those.)
     //
     // Secret-bearing UNCHANGED files are skipped like any other
     // (weft-4165f1ed71, the analyze fixed point — they used to be carved out
@@ -828,7 +833,56 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 .get(&canonical.display().to_string())
                 .or_else(|| prior_anchor_by_file.get(&path.display().to_string()))
             {
-                secret_scan_outcome.seed_finding_anchor(canonical, anchor.clone());
+                secret_scan_outcome.seed_finding_anchor(canonical.clone(), anchor.clone());
+            }
+            // clarion-3c4ed8e9fb: a skipped file is never re-dispatched, so the
+            // plugin host never re-stamps `briefing_blocked` on its entities —
+            // they keep the PRIOR run's verdict. The pre-ingest secret scan is a
+            // FULL pass every run, so the CURRENT verdict is already known; drive
+            // the skipped file's existing rows to it (set when the scan blocks,
+            // CLEAR when the scan no longer blocks — baselined / cleaned /
+            // override). The scanner remains the SOLE authority: the verdict comes
+            // only from `briefing_blocks`, never from plugin output, and a file
+            // the scanner did not examine this run is left untouched. Changed
+            // files re-dispatch through the host and are reconciled there, so this
+            // is scoped to the skipped partition to avoid redundant writes.
+            if scanned_files.contains(&canonical) {
+                let reason = briefing_blocks
+                    .get(&canonical)
+                    .map(|r| r.as_str().to_owned());
+                match writer
+                    .send_wait(|ack| WriterCmd::ReconcileBriefingBlockForSourceFile {
+                        source_file_path: canonical.display().to_string(),
+                        reason,
+                        ack,
+                    })
+                    .await
+                {
+                    Ok(updated) if updated > 0 => {
+                        tracing::debug!(
+                            plugin_id = %plugin_id,
+                            file = %canonical.display(),
+                            updated,
+                            "reconciled briefing_blocked on skipped file to current secret-scan verdict"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(
+                            run_id = %run_id,
+                            file = %canonical.display(),
+                            error = %err,
+                            "briefing_blocked reconciliation for skipped file failed"
+                        );
+                        run_outcome = RunOutcome::HardFailed {
+                            reason: format!(
+                                "briefing_blocked reconciliation failed for {}: {err}",
+                                canonical.display()
+                            ),
+                        };
+                        break 'plugins;
+                    }
+                }
             }
             if let Some(key) = canonical_path_key(path)
                 && let Some(locators) = prior_locs_by_file.remove(&key)

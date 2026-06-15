@@ -184,6 +184,30 @@ pub enum WriterCmd {
         source_file_id: String,
         ack: Ack<()>,
     },
+    /// Reconcile the `briefing_blocked` marker on every entity row anchored to
+    /// one source file to the current pre-ingest secret-scan verdict
+    /// (clarion-3c4ed8e9fb). On an incremental run, an UNCHANGED file is skipped
+    /// and never re-dispatched through the plugin host, so its entities keep the
+    /// PRIOR run's `properties.briefing_blocked` — even though the secret scan is
+    /// a FULL pass every run and already knows the file's current verdict. This
+    /// command closes that gap for the skipped partition: when `reason` is
+    /// `Some`, it `json_set`s `properties.briefing_blocked` to that string; when
+    /// `None`, it `json_remove`s the key (baseline acknowledgement / cleaned
+    /// secret / override cleared the block). The `briefing_blocked` column is a
+    /// VIRTUAL generated column over `properties` (migration 0002), so editing
+    /// the JSON keeps it consistent with no separate write.
+    ///
+    /// `source_file_path` is the canonical-absolute path string entities store.
+    /// In-run write (requires an active `BeginRun`): the reconciliation must
+    /// land inside the run transaction so a failed run rolls it back. Drive it
+    /// SOLELY from the secret-scan outcome — the scanner is the sole authority
+    /// for `briefing_blocked` and this command never weakens that invariant.
+    /// Returns the number of entity rows updated.
+    ReconcileBriefingBlockForSourceFile {
+        source_file_path: String,
+        reason: Option<String>,
+        ack: Ack<usize>,
+    },
     /// Insert one finding. The writer initializes lifecycle status to `open`
     /// and leaves suppression / Filigree-link fields empty. Idempotent on
     /// `id` (ON CONFLICT DO UPDATE): a `--resume` re-walk regenerates the same

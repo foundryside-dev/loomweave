@@ -210,6 +210,20 @@ fn run_actor(
                 );
                 reply(ack, res);
             }
+            WriterCmd::ReconcileBriefingBlockForSourceFile {
+                source_file_path,
+                reason,
+                ack,
+            } => {
+                let res = reconcile_briefing_block_for_source_file(
+                    conn,
+                    &mut state,
+                    &source_file_path,
+                    reason.as_deref(),
+                    commits_observed,
+                );
+                reply(ack, res);
+            }
             WriterCmd::InsertFinding { finding, ack } => {
                 let res = insert_finding(conn, &mut state, &finding, commits_observed);
                 reply(ack, res);
@@ -991,6 +1005,60 @@ fn replace_anchored_edges_for_source_file(
     }
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
+}
+
+/// Reconcile `properties.briefing_blocked` on every entity anchored to one
+/// source file to the current secret-scan verdict (clarion-3c4ed8e9fb).
+///
+/// On an incremental run, an unchanged file is skipped before the plugin host
+/// re-stamps `briefing_blocked`, so its entities keep the prior run's verdict.
+/// The pre-ingest secret scan is a full pass every run, so the CURRENT verdict
+/// for the skipped file is known; this funnels that verdict onto the skipped
+/// file's existing rows. `reason = Some(_)` sets the marker; `reason = None`
+/// removes it (baselined / cleaned / override). Editing `properties` keeps the
+/// VIRTUAL generated `briefing_blocked` column consistent.
+///
+/// The UPDATE only touches rows that need it (the WHERE clause compares the
+/// generated column to the target), so a no-op verdict writes nothing — the
+/// reconciliation is scoped to the incrementally-skipped partition by the
+/// caller, and idempotent here. Returns the number of rows changed.
+fn reconcile_briefing_block_for_source_file(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    source_file_path: &str,
+    reason: Option<&str>,
+    commits_observed: &AtomicUsize,
+) -> Result<usize> {
+    if state.current_run.is_none() {
+        return Err(StorageError::WriterProtocol(
+            "ReconcileBriefingBlockForSourceFile received without a preceding BeginRun".to_owned(),
+        ));
+    }
+    if !state.in_tx {
+        begin_write_tx(conn, state)?;
+        state.in_tx = true;
+    }
+    let changed = if let Some(reason) = reason {
+        conn.execute(
+            "UPDATE entities \
+                SET properties = json_set(properties, '$.briefing_blocked', ?2) \
+              WHERE source_file_path = ?1 \
+                AND (briefing_blocked IS NULL OR briefing_blocked <> ?2)",
+            params![source_file_path, reason],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE entities \
+                SET properties = json_remove(properties, '$.briefing_blocked') \
+              WHERE source_file_path = ?1 \
+                AND briefing_blocked IS NOT NULL",
+            params![source_file_path],
+        )?
+    };
+    if changed > 0 {
+        bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    }
+    Ok(changed)
 }
 
 fn insert_finding(

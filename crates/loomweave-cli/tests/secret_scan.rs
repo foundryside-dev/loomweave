@@ -1257,6 +1257,172 @@ fn removed_secret_is_swept_on_incremental_run() {
     );
 }
 
+// ── clarion-3c4ed8e9fb: incremental baseline-add unblocks a skipped file ────────
+
+/// Failing-first regression for clarion-3c4ed8e9fb (clarion-55fc5aa885 §I11, the
+/// operator baseline workflow): run 1 analyzes an unacknowledged secret and
+/// blocks the file; the operator adds a `secrets-baseline.yaml` acknowledging the
+/// key; a PLAIN incremental run 2 must UNBLOCK the file — even though the file is
+/// byte-identical and therefore incrementally SKIPPED (never re-dispatched
+/// through the plugin host). Pre-fix the skipped file kept run 1's
+/// `briefing_blocked`, so it stayed withheld forever short of `--no-incremental`.
+/// The pre-ingest secret scan is a full pass every run, so the current verdict
+/// (now baseline-suppressed) is known and reconciled onto the skipped rows.
+#[test]
+fn baseline_added_after_block_unblocks_skipped_file_on_incremental_run() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let leaky = project.path().join("leaky.sec");
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    // Run 1 — no baseline yet: the file blocks. The plugin module entity plus the
+    // core file entity are both withheld.
+    analyze();
+    let blocked_before: i64 = conn(project.path())
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+               WHERE source_file_path LIKE '%leaky.sec' \
+                 AND json_extract(properties, '$.briefing_blocked') = 'secret_present'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_before, 2,
+        "run 1 must block both the plugin module entity and the core file entity"
+    );
+
+    // Operator acknowledges the example key in a baseline. This does NOT change
+    // leaky.sec's bytes, so run 2 incrementally SKIPS it.
+    let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
+    std::fs::write(
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
+        format!(
+            r#"
+version: "1.0"
+results:
+  "leaky.sec":
+    - type: "AWS Access Key"
+      hashed_secret: "{hashed_secret}"
+      line_number: 1
+      is_secret: false
+      justification: "Documented public AWS example key — false positive."
+"#
+        ),
+    )
+    .unwrap();
+
+    // Run 2 — plain incremental analyze. The file is skipped but must unblock.
+    analyze();
+    let stats = latest_run_stats_value(project.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "run 2 must incrementally skip the unchanged leaky.sec (the bug's trigger): {stats}"
+    );
+
+    let db = conn(project.path());
+    let blocked_after: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+               WHERE source_file_path LIKE '%leaky.sec' \
+                 AND json_extract(properties, '$.briefing_blocked') = 'secret_present'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_after, 0,
+        "baseline-added: a skipped file's entities must unblock to the current \
+         secret-scan verdict on a plain incremental run"
+    );
+    let baseline_hits: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-INFRA-SECRET-BASELINE-MATCH'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        baseline_hits >= 1,
+        "the baseline acknowledgement must emit a BASELINE-MATCH finding"
+    );
+}
+
+/// Inverse of the unblock fix: a file that NEWLY gains a secret (content change)
+/// must still block. A content change re-dispatches the file through the host
+/// (it is NOT skipped), so the host stamps the block directly — the
+/// reconciliation pass only touches the skipped partition and must not weaken
+/// this path. Locks the scanner-is-sole-authority invariant in the "toward
+/// blocked" direction.
+#[test]
+fn file_that_newly_gains_a_secret_still_blocks() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let target = project.path().join("target.sec");
+    std::fs::write(&target, b"nothing to see\n").unwrap();
+    // A never-changing companion so run 2 is genuinely incremental.
+    std::fs::write(project.path().join("mod_b.sec"), b"still clean\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    // Run 1 — clean: nothing blocked.
+    analyze();
+    let blocked_before: i64 = conn(project.path())
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+               WHERE source_file_path LIKE '%target.sec' \
+                 AND json_extract(properties, '$.briefing_blocked') IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_before, 0,
+        "run 1 (clean): target.sec must not block"
+    );
+
+    // Introduce a secret. The content change re-dispatches target.sec.
+    std::fs::write(&target, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+    analyze();
+    let stats = latest_run_stats_value(project.path());
+    assert!(
+        stats["skipped_files"].as_u64().unwrap_or(0) >= 1,
+        "run 2 must be incremental (mod_b.sec skipped): {stats}"
+    );
+    let blocked_after: i64 = conn(project.path())
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+               WHERE source_file_path LIKE '%target.sec' \
+                 AND json_extract(properties, '$.briefing_blocked') = 'secret_present'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_after, 2,
+        "a newly-secret-bearing file must block (plugin module + core file entity)"
+    );
+}
+
 /// Shared helper: the latest run's stats JSON (mirrors `analyze.rs`'s
 /// `latest_run_stats`, local to this suite).
 fn latest_run_stats_value(project_root: &std::path::Path) -> serde_json::Value {
