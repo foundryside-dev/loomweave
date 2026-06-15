@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-storage"
+description = "Loomweave storage: SQLite persistence (writer-actor + reader-pool), schema/migrations, summary cache, and SEI tokens."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

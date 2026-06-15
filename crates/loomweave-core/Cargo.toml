@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-core"
+description = "Loomweave core: entity-ID assembler, sandboxed JSON-RPC plugin host, manifest parser, and LLM/embedding provider traits."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

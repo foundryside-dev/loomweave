@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-mcp"
+description = "Loomweave MCP server: exposes the code-archaeology graph to consult-mode LLM agents."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-federation"
+description = "Loomweave federation: shared HTTP types and config for Filigree/Wardline sibling exchange."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

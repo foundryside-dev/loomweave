@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-plugin-rust"
+description = "Loomweave first-party Rust language plugin: JSON-RPC entity/edge extractor."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

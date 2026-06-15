@@ -185,6 +185,57 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-rust-plugin:
+    needs: [verify, assert-on-main]
+    name: Build loomweave-plugin-rust wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    # maturin bin-wheels for the Rust language plugin (packaging/rust-plugin-dist,
+    # [tool.maturin] bindings="bin"). The `loomweave` wheel pins
+    # loomweave-plugin-rust==<v>, so this MUST build+publish alongside the Python
+    # plugin or `pip install loomweave` fails resolution. Matrix mirrors
+    # build-wheels (Linux x86_64 + macOS aarch64).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: "2_28"
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            manylinux: auto
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11"
+
+      - name: build wheel (maturin)
+        # Reads packaging/rust-plugin-dist/pyproject.toml ([tool.maturin]
+        # bindings="bin"). manylinux container on Linux for broad installability.
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --manifest-path packaging/rust-plugin-dist/Cargo.toml
+
+      - name: smoke-check wheel carries the binary
+        run: |
+          set -euo pipefail
+          WHL=$(ls dist/loomweave_plugin_rust-*.whl | head -1)
+          echo "built: $WHL"
+          python -m zipfile -l "$WHL" | grep -E 'data/scripts/loomweave-plugin-rust' \
+            || { echo "::error::wheel $WHL missing data/scripts/loomweave-plugin-rust"; exit 1; }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: loomweave-plugin-rust-wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
   build-plugin:
     needs: [verify, assert-on-main]
     name: Build Python plugin sdist
@@ -291,10 +342,47 @@ jobs:
           attestations: true
           repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
 
+  publish-rust-plugin:
+    name: Publish loomweave-plugin-rust (first)
+    needs: [build-rust-plugin]
+    runs-on: ubuntu-latest
+    # Like publish-plugin: the Rust plugin must publish BEFORE loomweave so the
+    # cli wheel's loomweave-plugin-rust==<v> pin resolves on first release. Its
+    # own environment (pypi-plugin-rust) — PyPI forbids sharing a pending
+    # publisher across (repo, workflow, environment).
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.target_index == 'testpypi')
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'testpypi-plugin-rust' || 'pypi-plugin-rust' }}
+    permissions:
+      id-token: write
+    steps:
+      - name: download rust plugin wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: loomweave-plugin-rust-wheel-*
+          path: dl-rust-plugin
+          merge-multiple: true
+
+      - name: stage rust plugin package dir
+        run: |
+          set -euo pipefail
+          mkdir -p pkg-rust-plugin
+          cp dl-rust-plugin/*.whl pkg-rust-plugin/
+          ls -la pkg-rust-plugin
+
+      - name: publish loomweave-plugin-rust
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        with:
+          packages-dir: pkg-rust-plugin
+          attestations: true
+          repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+
   publish-loomweave:
-    name: Publish loomweave (after the plugin)
-    # `needs: publish-plugin` enforces plugin-first; build-wheels supplies the wheels.
-    needs: [build-wheels, publish-plugin]
+    name: Publish loomweave (after the plugins)
+    # Both plugins publish first so the cli wheel's ==<v> pins resolve;
+    # build-wheels supplies the loomweave wheels.
+    needs: [build-wheels, publish-plugin, publish-rust-plugin]
     runs-on: ubuntu-latest
     if: >-
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
@@ -323,6 +411,80 @@ jobs:
           packages-dir: pkg-loomweave
           attestations: true
           repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+
+  publish-crates:
+    name: Publish crates to crates.io
+    needs: [verify, assert-on-main]
+    runs-on: ubuntu-latest
+    # crates.io has no TestPyPI analogue, so this publishes ONLY on a pushed v*
+    # tag (verify-gated, on a commit asserted to be on main). cargo publish is
+    # idempotent here: an already-uploaded version counts as success, so a re-run
+    # after a partial failure is safe. Crates upload leaf -> root; each upload
+    # waits for the crates.io index before its dependents publish.
+    # loomweave-plugin-fixture is publish=false (test-only) and omitted.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; pkgs=json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"]=="loomweave-core"))')"
+          echo "Publishing workspace version $VERSION"
+
+          wait_for_registry() {
+            local crate=$1 tmpdir
+            echo "Waiting for $crate $VERSION in the crates.io index..."
+            for attempt in $(seq 1 20); do
+              tmpdir="$(mktemp -d)"
+              if (cd "$tmpdir" && cargo info "$crate@$VERSION" >/dev/null 2>&1); then
+                rm -rf "$tmpdir"; echo "$crate $VERSION visible"; return 0
+              fi
+              rm -rf "$tmpdir"
+              echo "$crate $VERSION not visible yet ($attempt/20); sleeping 30s"
+              sleep 30
+            done
+            echo "::error::$crate $VERSION did not appear in the crates.io index"
+            return 1
+          }
+
+          publish() {
+            local crate=$1 output status
+            echo "Publishing $crate..."
+            set +e
+            output="$(cargo publish -p "$crate" --no-verify 2>&1)"
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [ "$status" -eq 0 ]; then
+              echo "$crate published"
+              wait_for_registry "$crate"
+            elif grep -Eq "already uploaded|already exists|is already uploaded" <<<"$output"; then
+              echo "$crate already published, skipping"
+              wait_for_registry "$crate"
+            else
+              echo "::error::$crate failed to publish"
+              return "$status"
+            fi
+          }
+
+          publish loomweave-core
+          publish loomweave-scanner
+          publish loomweave-analysis
+          publish loomweave-storage
+          publish loomweave-federation
+          publish loomweave-plugin-rust
+          publish loomweave-mcp
+          publish loomweave-cli
 
   release:
     name: Create GitHub Release

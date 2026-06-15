@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-cli"
+description = "Loomweave: a code-archaeology tool that analyzes a codebase into a queryable entity/edge graph and serves it over MCP."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -46,7 +47,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
-loomweave-plugin-fixture = { path = "../loomweave-plugin-fixture", version = "1.1.0" }
+# Path-only (no version): loomweave-plugin-fixture is publish=false (test-only),
+# so the version pin is omitted — cargo strips path-only dev-deps when packaging
+# `loomweave` for crates.io, which would otherwise fail on the unpublished crate.
+loomweave-plugin-fixture = { path = "../loomweave-plugin-fixture" }
 rusqlite.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
