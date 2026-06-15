@@ -206,7 +206,14 @@ def main() -> int:
     parser.add_argument(
         "--max-b5-p95-ms",
         type=int,
-        default=int(os.environ.get("MAX_B5_P95_MS", "5000")),
+        # Coupled to the Python plugin's per-file reference budget
+        # PYRIGHT_FILE_TIMEOUT_SECS (pyright_session.py): a single file's
+        # resolution is capped at that budget, so the p95 over a stress corpus
+        # tracks it. The budget was raised 3s -> 10s for more-complete graphs on
+        # large, heavily-typed files, which lifts the p95 ceiling accordingly;
+        # this gate moves with it (budget + margin) and still catches a
+        # regression that blows past the per-file budget.
+        default=int(os.environ.get("MAX_B5_P95_MS", "12000")),
     )
     args = parser.parse_args()
     if args.self_test:
