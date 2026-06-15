@@ -6595,6 +6595,129 @@ mod tests {
         );
     }
 
+    // --- G1 conformance: the canonical weft-reason vocabulary lock ---
+    //
+    // Source of truth: contracts/weft-reason-vocab.json in the weft hub repo — the
+    // CLOSED set of 11 reason_classes, plus the carrier rule (every NON-clean result
+    // carries {reason_class, cause, fix} with fix MANDATORY; a clean result omits
+    // cause+fix). This test introspects this member's ACTUAL emitted reason
+    // vocabulary and asserts it is a SUBSET of those 11, and that the carrier rule
+    // holds on every shape. It FAILS if loomweave ever drifts: adds a reason_class
+    // outside the canonical set, or drops cause/fix from a non-clean carrier.
+
+    /// The canonical 11 reason_classes (closed set) from the G1 contract,
+    /// `contracts/weft-reason-vocab.json`. Kept inline (no shared runtime dep —
+    /// members stay independent repos and conform by this per-member test).
+    const CANONICAL_REASON_CLASSES: [&str; 11] = [
+        "clean",
+        "disabled",
+        "unresolved_input",
+        "rejected",
+        "dead_path",
+        "unreachable",
+        "misrouted",
+        "error",
+        "scheme_mismatch",
+        "stale",
+        "partial",
+    ];
+
+    /// Exercises every branch of `emit_reason_carrier` (the member's sole
+    /// reason-emitting surface) so the conformance test sees the FULL emitted
+    /// vocabulary, not a convenient subset. Add a row here whenever a new emit
+    /// shape is wired — the subset/carrier asserts below then cover it for free.
+    fn all_emitted_reason_carriers() -> Vec<EmitReason> {
+        let blobs = [
+            // disabled
+            serde_json::Value::Null,
+            // clean (true-negative emit)
+            serde_json::json!({ "status": "emitted", "warnings": [] }),
+            // clean (filtered no-op skip)
+            serde_json::json!({ "status": "skipped", "reason": "no_postrun_findings_with_path" }),
+            // partial (intake warnings)
+            serde_json::json!({ "status": "emitted", "warnings": ["w1", "w2"] }),
+            // unreachable (POST never landed)
+            serde_json::json!({ "status": "unreachable", "error": "connection refused" }),
+            // error (pre-wire skip)
+            serde_json::json!({ "status": "skipped", "reason": "flush_failed" }),
+            // error (unknown status / contract drift)
+            serde_json::json!({ "status": "bizarro" }),
+            // error (absent status)
+            serde_json::json!({ "emitted": 0 }),
+        ];
+        blobs.iter().map(emit_reason_carrier).collect()
+    }
+
+    #[test]
+    fn reason_vocab_is_subset_of_canonical_eleven() {
+        // INTROSPECT the actual emitted vocabulary and assert ⊆ the canonical 11.
+        // FAILS the instant a non-canonical reason_class string is emitted.
+        for carrier in all_emitted_reason_carriers() {
+            assert!(
+                CANONICAL_REASON_CLASSES.contains(&carrier.reason_class),
+                "reason_class {:?} is NOT one of the canonical 11 (G1 drift): {:?}",
+                carrier.reason_class,
+                CANONICAL_REASON_CLASSES,
+            );
+        }
+    }
+
+    #[test]
+    fn reason_carrier_rule_holds_on_every_shape() {
+        // CARRIER RULE (G1): every NON-clean result carries cause + fix (fix
+        // MANDATORY, non-empty); a clean result (clean-family: clean/disabled, the
+        // two trust:true|"capability off" classes that omit cause+fix) carries
+        // NEITHER. Verified on both the struct fields and the serialized JSON, so a
+        // consumer reading the wire sees the same contract.
+        let clean_family = ["clean", "disabled"];
+        for carrier in all_emitted_reason_carriers() {
+            let json = serde_json::to_value(&carrier).expect("carrier serializes");
+            if clean_family.contains(&carrier.reason_class) {
+                // clean-family: cause+fix OMITTED, both on the struct and the wire.
+                assert_eq!(
+                    carrier.cause, None,
+                    "{} is clean-family but carries a cause",
+                    carrier.reason_class
+                );
+                assert_eq!(
+                    carrier.fix, None,
+                    "{} is clean-family but carries a fix",
+                    carrier.reason_class
+                );
+                assert!(
+                    json.get("cause").is_none() && json.get("fix").is_none(),
+                    "{} serialized with a cause/fix key (must be omitted)",
+                    carrier.reason_class
+                );
+            } else {
+                // non-clean: cause + a MANDATORY, non-empty fix, on struct + wire.
+                let cause = carrier
+                    .cause
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("non-clean {} must carry a cause", carrier.reason_class));
+                let fix = carrier
+                    .fix
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("non-clean {} must carry a fix", carrier.reason_class));
+                assert!(
+                    !cause.is_empty(),
+                    "non-clean {} carries an empty cause",
+                    carrier.reason_class
+                );
+                assert!(
+                    !fix.is_empty(),
+                    "non-clean {} carries an empty fix (fix is MANDATORY)",
+                    carrier.reason_class
+                );
+                assert!(
+                    json["cause"].is_string() && json["fix"].is_string(),
+                    "non-clean {} must serialize cause+fix as strings on the wire",
+                    carrier.reason_class
+                );
+            }
+        }
+    }
+
     #[test]
     fn progress_reporter_is_noop_without_a_path() {
         // No progress file → no panics, no writes; the normal CLI path.
