@@ -583,9 +583,16 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     progress.set_total(source_files.len() as u64);
     progress.phase("analyzing", None, None);
 
-    let secret_scan_files = crate::secret_scan::collect_scan_files(&project_root, &source_files);
+    let secret_scan_walk = crate::secret_scan::collect_scan_files(&project_root, &source_files);
+    // Sidecar-walk skips are coverage holes the secret scan never examined; they
+    // gate the stale-finding sweep below exactly like `source_walk_skipped_entries`
+    // (a skipped sidecar must suppress the unbounded global sweep, or it would
+    // retire a still-open secret finding for an unexamined `.env`).
+    let secret_scan_sidecar_skipped = secret_scan_walk.sidecar_walk_skipped;
+    let secret_scan_files = secret_scan_walk.files;
     tracing::info!(
         file_count = secret_scan_files.len(),
+        sidecar_walk_skipped = secret_scan_sidecar_skipped,
         "secret scan file walk complete"
     );
     let mut secret_scan_outcome =
@@ -1579,6 +1586,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             //     run_id; the run still reaches `Completed`, so without this guard
             //     a single walk error would retire a whole unwalked subtree's
             //     still-reproducing findings ("never looked" ≠ "looked, fixed").
+            //   • secret_scan_sidecar_skipped == 0 — the SAME "never looked"
+            //     hazard, but for the secret-scan SIDECAR walk: an unreadable
+            //     `.env`/`*.env` only logs a skip; its skip is invisible to
+            //     `source_walk_skipped_entries`. This UNBOUNDED global sweep would
+            //     otherwise retire a prior open secret finding for that unexamined
+            //     sidecar BEFORE the rule-scoped secret sweep below applies its
+            //     `scanned_files` bound (the unexamined sidecar is not in
+            //     `scanned_files`, so the scoped sweep cannot rescue it).
             //   • !no_sei               — the SEI pass (entity-deleted /
             //     guidance-orphan facts) was skipped, so those findings were NOT
             //     refreshed this run and must not be mistaken for vanished.
@@ -1589,6 +1604,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             if !resume
                 && skipped_files_total == 0
                 && source_walk_skipped_entries == 0
+                && secret_scan_sidecar_skipped == 0
                 && !options.no_sei
             {
                 match writer
@@ -1633,6 +1649,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // (`scanned_files`, canonical-absolute — the form entities store):
             // a finding survives unless its anchor entity's source file was
             // re-examined.
+            // This `scanned_files` bound is also why this scoped sweep — unlike
+            // the unbounded global sweep above — needs no `secret_scan_sidecar_skipped`
+            // gate: a skipped `.env`/`*.env` is never added to `scanned_files`, so
+            // its finding is never a sweep candidate here in the first place.
             // Same lifecycle preservation + best-effort posture as above.
             if !resume && source_walk_skipped_entries == 0 {
                 let rule_ids: Vec<String> = crate::secret_scan::per_run_swept_rule_ids()

@@ -51,7 +51,8 @@ use crate::filigree::{
     ObservationCreateRequest,
 };
 use loomweave_storage::{
-    GuidanceProposal, GuidanceSheetInput, invalidate_summaries_for_sheet, upsert_guidance_sheet,
+    GuidanceProposal, GuidanceSheetInput, embeddings_db_path, invalidate_summaries_for_sheet,
+    upsert_guidance_sheet,
 };
 
 /// MCP protocol revision supported by the B.6 stdio server.
@@ -3349,7 +3350,10 @@ fn semantic_config_status_json(
     config: &McpConfig,
 ) -> Value {
     let semantic = &config.semantic_search;
-    let sidecar_path = project_root.join(".weft/loomweave/embeddings.db");
+    // Probe the override-aware store path (the SAME helper `EmbeddingStore::
+    // open_in_store_dir` writes to) so a `[loomweave].store_dir` relocation does
+    // not make a populated sidecar report as absent (read-vs-status parity).
+    let sidecar_path = embeddings_db_path(project_root);
     let sidecar_count = semantic_sidecar_count(&sidecar_path);
     let has_key = std::env::var(&semantic.api_key_env)
         .ok()
@@ -6814,6 +6818,56 @@ mod tests {
             loomweave_federation::config::SemanticProviderKind::LocalOpenAi
         );
         assert_eq!(saved.semantic_search.dimensions, 768);
+    }
+
+    #[test]
+    fn semantic_status_sidecar_path_follows_store_dir_override() {
+        // The semantic status probe must report the sidecar at the configured
+        // `[loomweave].store_dir`, not the hardcoded default — otherwise an
+        // operator with a relocated store sees a populated sidecar as absent
+        // (read-vs-status parity with `EmbeddingStore::open_in_store_dir`).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join(loomweave_core::store::WEFT_TOML),
+            "[loomweave]\nstore_dir = \"custom/store\"\n",
+        )
+        .unwrap();
+
+        // Populate a sidecar at the override location.
+        std::fs::create_dir_all(loomweave_core::store::store_dir(root)).unwrap();
+        let store = loomweave_storage::EmbeddingStore::open_in_store_dir(root).unwrap();
+        store
+            .upsert(
+                &loomweave_storage::EmbeddingKey {
+                    entity_id: "python:function:m.f".to_owned(),
+                    content_hash: "h".to_owned(),
+                    model_id: "model".to_owned(),
+                },
+                &[0.1, 0.2, 0.3],
+                0.0,
+                0,
+                "2026-06-15T00:00:00Z",
+            )
+            .unwrap();
+        drop(store);
+
+        let status = super::semantic_config_status_json(
+            &root.join("loomweave.yaml"),
+            root,
+            true,
+            &loomweave_federation::config::McpConfig::default(),
+        );
+        let sidecar = &status["embeddings_sidecar"];
+        assert_eq!(
+            sidecar["path"],
+            root.join("custom/store/embeddings.db")
+                .display()
+                .to_string(),
+            "status must probe the overridden store_dir, not the default path"
+        );
+        assert_eq!(sidecar["present"], true);
+        assert_eq!(sidecar["vector_count"], 1);
     }
 
     #[tokio::test]

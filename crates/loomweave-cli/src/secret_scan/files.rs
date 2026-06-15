@@ -18,18 +18,44 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-pub(crate) fn collect_scan_files(root: &Path, source_files: &[PathBuf]) -> Vec<PathBuf> {
+/// The secret-scan file set plus its coverage signal.
+///
+/// `sidecar_walk_skipped` counts `.env`/`*.env` sidecar-walk entries that could
+/// not be read (IO / permission / path error). It is **load-bearing for the
+/// stale-finding sweep gate**: a skipped sidecar means the secret scan did not
+/// examine that path, so the caller must NOT run the unbounded global stale
+/// sweep (it would retire a still-open secret finding for an *unexamined* file —
+/// "never looked" ≠ "looked, fixed"). The source-tree walk has its own skip
+/// counter (`source_walk_skipped_entries`); this is the sidecar-walk twin, which
+/// would otherwise be invisible to that gate (clarion / secret-scan coverage).
+pub(crate) struct ScanFileWalk {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) sidecar_walk_skipped: u64,
+}
+
+pub(crate) fn collect_scan_files(root: &Path, source_files: &[PathBuf]) -> ScanFileWalk {
     let mut out: BTreeSet<PathBuf> = source_files
         .iter()
         .map(|path| canonical_or_original(path))
         .collect();
-    for path in collect_secret_scan_sidecars(root) {
+    let sidecars = collect_secret_scan_sidecars(root);
+    for path in sidecars.files {
         out.insert(canonical_or_original(&path));
     }
-    out.into_iter().collect()
+    ScanFileWalk {
+        files: out.into_iter().collect(),
+        sidecar_walk_skipped: sidecars.sidecar_walk_skipped,
+    }
 }
 
-fn collect_secret_scan_sidecars(root: &Path) -> Vec<PathBuf> {
+/// Internal result of the sidecar-only walk: the discovered sidecar files plus
+/// the count of unreadable entries skipped during the walk.
+struct SidecarWalk {
+    files: Vec<PathBuf>,
+    sidecar_walk_skipped: u64,
+}
+
+fn collect_secret_scan_sidecars(root: &Path) -> SidecarWalk {
     let mut out = Vec::new();
     let mut skipped: u64 = 0;
     let mut builder = WalkBuilder::new(root);
@@ -75,7 +101,10 @@ fn collect_secret_scan_sidecars(root: &Path) -> Vec<PathBuf> {
             suffix = if skipped == 1 { "y" } else { "ies" },
         );
     }
-    out
+    SidecarWalk {
+        files: out,
+        sidecar_walk_skipped: skipped,
+    }
 }
 
 pub(super) fn is_secret_scan_sidecar(path: &Path) -> bool {
@@ -116,8 +145,9 @@ mod tests {
         write(root.join(".weft/loomweave/.env"), "TOKEN=skip\n");
         write(root.join("node_modules/.env"), "TOKEN=skip\n");
 
-        let files = collect_scan_files(root, &[root.join("src/app.py")]);
-        let rel = relative_names(root, files);
+        let walk = collect_scan_files(root, &[root.join("src/app.py")]);
+        assert_eq!(walk.sidecar_walk_skipped, 0, "no unreadable entries");
+        let rel = relative_names(root, walk.files);
 
         assert!(rel.contains(&".env".to_owned()));
         assert!(rel.contains(&".env.local".to_owned()));
@@ -141,10 +171,49 @@ mod tests {
         write(outside.join(".env"), "TOKEN=outside\n");
         std::os::unix::fs::symlink(&outside, root.join("linked")).expect("symlink");
 
-        let files = collect_scan_files(&root, &[]);
-        let rel = relative_names(&root, files);
+        let walk = collect_scan_files(&root, &[]);
+        let rel = relative_names(&root, walk.files);
 
         assert!(!rel.contains(&"linked/.env".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_walk_surfaces_skip_count_on_unreadable_subdir() {
+        // An unreadable directory makes the walker yield an Err entry: the walk
+        // must SURFACE that as `sidecar_walk_skipped > 0` (not just log it), so
+        // the analyze stale-finding gate can suppress the unbounded global sweep
+        // for the unexamined paths underneath ("never looked" ≠ "looked, clean").
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        write(root.join(".env"), "TOKEN=readable\n");
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("create locked dir");
+        write(locked.join(".env"), "TOKEN=unreadable\n");
+        // Drop all permissions so the walker cannot descend into `locked/`.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        // root bypasses permission bits, so the chmod-0 trick only blocks a
+        // non-root reader. Probe directly: if we can still enumerate the dir
+        // (running as root, or an exotic FS), the skip cannot trigger — skip the
+        // assertion rather than assert a precondition the platform won't honor.
+        let still_readable = std::fs::read_dir(&locked).is_ok();
+
+        let walk = collect_scan_files(root, &[]);
+        // Restore perms so the tempdir can be cleaned up.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore perms");
+
+        if still_readable {
+            return; // permission bits not enforced for this reader; nothing to assert.
+        }
+        assert!(
+            walk.sidecar_walk_skipped > 0,
+            "an unreadable subdir must surface as a non-zero skip count, not be swallowed"
+        );
     }
 
     fn write(path: PathBuf, content: &str) {

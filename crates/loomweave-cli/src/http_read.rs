@@ -59,13 +59,24 @@ static HTTP_ERROR_DISPATCH: LazyLock<tracing::Dispatch> = LazyLock::new(|| {
 /// graceful shutdown, error return, and panic-unwind in one place. Only
 /// SIGKILL can strand a stale file, which the read-side validation and the
 /// ADR-034 instance-ID guard tolerate (a stale file degrades, never corrupts).
+///
+/// The guard records the exact `port` this instance published and unlinks the
+/// file only while it still names that port (compare-and-delete). Two `serve`
+/// instances on one project share the file — the second auto-binds an ephemeral
+/// port and overwrites the first's value — so an unconditional unlink on exit
+/// would let one instance strand the *other, still-running* server's published
+/// port. See `loomweave_port::remove_published_port_if_matches`.
 struct PublishedPortGuard {
     project_root: PathBuf,
+    port: u16,
 }
 
 impl Drop for PublishedPortGuard {
     fn drop(&mut self) {
-        loomweave_federation::loomweave_port::remove_published_port(&self.project_root);
+        loomweave_federation::loomweave_port::remove_published_port_if_matches(
+            &self.project_root,
+            self.port,
+        );
     }
 }
 
@@ -410,6 +421,7 @@ fn run_http_read_server(
             } else {
                 Some(PublishedPortGuard {
                     project_root: project_root.clone(),
+                    port: local_addr.port(),
                 })
             }
         } else {

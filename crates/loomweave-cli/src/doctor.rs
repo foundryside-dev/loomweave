@@ -36,7 +36,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use loomweave_storage::StorageError;
-use loomweave_storage::schema::{CURRENT_SCHEMA_VERSION, verify_user_version};
+use loomweave_storage::schema::{
+    CURRENT_SCHEMA_VERSION, reject_unmigrated_for_read, verify_user_version,
+};
 
 use crate::hooks_settings::HookState;
 use crate::instructions::InstructionsState;
@@ -254,6 +256,11 @@ enum IndexDbHealth {
     Unreadable(String),
     /// DB opens cleanly but its `user_version` is newer than this build.
     FutureSchema { found: u32, current: u32 },
+    /// DB opens but `user_version = 0`: no Loomweave schema was ever applied —
+    /// an empty/auto-created file or an externally-produced `SQLite` file. The
+    /// read path (`reject_unmigrated_for_read`) refuses it, so `serve` would too
+    /// (review #8); doctor must not call this Healthy.
+    Unmigrated,
     /// DB opens and its schema version is within range of this build.
     Healthy,
 }
@@ -276,18 +283,30 @@ fn classify_index_db_health(project_root: &Path) -> IndexDbHealth {
     // ("NOT A SQLITE DB"); the corruption only surfaces at first read.
     // `verify_user_version` issues `PRAGMA user_version` — a cheap single-page
     // read that serves double duty as the corruption probe.
-    match verify_user_version(&conn) {
+    if let Err(err) = verify_user_version(&conn) {
+        return match err {
+            StorageError::FutureUserVersion { found, current } => {
+                IndexDbHealth::FutureSchema { found, current }
+            }
+            other => IndexDbHealth::Unreadable(other.to_string()),
+        };
+    }
+    // `verify_user_version` deliberately accepts `user_version = 0`, but the
+    // read-open path rejects it (`reject_unmigrated_for_read`): a header-valid
+    // empty/external SQLite file is not a Loomweave index, and `serve` refuses
+    // it. Mirror that gate here so doctor never reports Healthy a DB `serve`
+    // would turn away (review #8 / read-vs-doctor parity).
+    match reject_unmigrated_for_read(&conn) {
         Ok(()) => IndexDbHealth::Healthy,
-        Err(StorageError::FutureUserVersion { found, current }) => {
-            IndexDbHealth::FutureSchema { found, current }
-        }
+        Err(StorageError::UnmigratedIndex) => IndexDbHealth::Unmigrated,
         Err(err) => IndexDbHealth::Unreadable(err.to_string()),
     }
 }
 
 /// JSON-path check for tracked-index DB health.  Expands the former
-/// existence-only check with four distinct states: absent (warning),
-/// unreadable (problem), future-schema (problem), healthy (ok).
+/// existence-only check with five distinct states: absent (warning),
+/// unreadable (problem), unmigrated (problem), future-schema (problem),
+/// healthy (ok).
 fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
     match classify_index_db_health(project_root) {
         IndexDbHealth::Healthy => DoctorJsonCheck::ok(
@@ -303,6 +322,12 @@ fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
         IndexDbHealth::Unreadable(detail) => DoctorJsonCheck::problem(
             ".weft/loomweave.schema",
             format!("index exists but is unreadable: {detail}"),
+        ),
+        IndexDbHealth::Unmigrated => DoctorJsonCheck::problem(
+            ".weft/loomweave.schema",
+            "index file is present but unmigrated (user_version=0); not a Loomweave index — \
+             `serve` will refuse it. Run `loomweave install` + `loomweave analyze`"
+                .to_owned(),
         ),
         IndexDbHealth::FutureSchema { found, current } => DoctorJsonCheck::problem(
             ".weft/loomweave.schema",
@@ -330,6 +355,11 @@ fn check_loomweave_dir(project_root: &Path) -> Tally {
             Some(
                 "check permissions; if corrupt, remove .weft/loomweave/loomweave.db and re-analyze",
             ),
+        ),
+        IndexDbHealth::Unmigrated => problem(
+            "index file is present but unmigrated (user_version=0); not a Loomweave index — \
+             `serve` will refuse it",
+            Some("loomweave install --path . && loomweave analyze ."),
         ),
         IndexDbHealth::FutureSchema { found, current } => problem(
             &format!(
@@ -1527,6 +1557,71 @@ mod tests {
         assert_eq!(t.warnings, 0);
         let after = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(after, old, "current .gitignore must not be rewritten");
+    }
+
+    /// Open the canonical store DB and stamp `PRAGMA user_version = version`,
+    /// creating a real (header-valid) `SQLite` file at the store path.
+    fn write_db_with_user_version(root: &Path, version: u32) {
+        let db = loomweave_core::store::db_path(root);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+            .unwrap();
+    }
+
+    #[test]
+    fn classify_absent_when_no_db_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            classify_index_db_health(dir.path()),
+            IndexDbHealth::Absent
+        ));
+    }
+
+    #[test]
+    fn classify_healthy_at_current_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write_db_with_user_version(dir.path(), CURRENT_SCHEMA_VERSION);
+        assert!(matches!(
+            classify_index_db_health(dir.path()),
+            IndexDbHealth::Healthy
+        ));
+    }
+
+    #[test]
+    fn classify_unmigrated_when_user_version_is_zero() {
+        // A header-valid SQLite file that no migration ever stamped — the empty
+        // file the read pool would auto-create, or an externally-produced DB.
+        // The read path (`reject_unmigrated_for_read`) refuses it, so doctor
+        // must NOT report Healthy; it must mirror that refusal (review #8).
+        let dir = tempfile::tempdir().unwrap();
+        write_db_with_user_version(dir.path(), 0);
+        assert!(
+            matches!(
+                classify_index_db_health(dir.path()),
+                IndexDbHealth::Unmigrated
+            ),
+            "an unmigrated (user_version=0) index `serve` refuses must classify Unmigrated, \
+             not Healthy"
+        );
+        // And it must surface as a gate-failing problem in both renderers.
+        let json = check_loomweave_dir_json(dir.path());
+        assert_eq!(json.status, "problem");
+        let tally = check_loomweave_dir(dir.path());
+        assert_eq!(
+            tally.problems, 1,
+            "unmigrated index must fail the doctor gate"
+        );
+    }
+
+    #[test]
+    fn classify_future_schema_when_user_version_exceeds_build() {
+        let dir = tempfile::tempdir().unwrap();
+        write_db_with_user_version(dir.path(), CURRENT_SCHEMA_VERSION + 1);
+        assert!(matches!(
+            classify_index_db_health(dir.path()),
+            IndexDbHealth::FutureSchema { .. }
+        ));
     }
 
     /// A representative co-resident Filigree block (shape taken from the repo's

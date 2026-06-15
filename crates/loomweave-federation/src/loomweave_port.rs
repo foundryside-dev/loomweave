@@ -100,6 +100,32 @@ pub fn remove_published_port(project_root: &Path) {
     let _ = std::fs::remove_file(published_port_path(project_root));
 }
 
+/// Compare-and-delete: remove the published port file **only when it still
+/// names `port`**. Used by a `serve` instance's drop guard so it never unlinks
+/// a *different* live instance's published port.
+///
+/// Two `serve` instances on the same project both auto-bind: the first lands on
+/// the deterministic port, the second falls back to an OS-assigned ephemeral and
+/// **overwrites** the shared `ephemeral.port` with its own number. If either one
+/// then unlinks the file unconditionally on exit, discovery loses the *other,
+/// still-running* server's port. Gating the unlink on "the file still names the
+/// port I published" means a server only ever retracts its own publication; an
+/// instance whose value was already overwritten by a peer leaves the peer's file
+/// intact.
+///
+/// Read-then-delete is an unavoidable check-then-act: a peer could overwrite the
+/// file in the window between the read and the unlink, so we keep that window as
+/// tight as a single function call and accept the residual race. The only loss
+/// it can cause is a *stale* file — exactly what `read_published_port`
+/// validation + the ADR-034 instance-ID guard already tolerate (a stale file
+/// degrades, never corrupts). A missing file is a no-op (idempotent), like
+/// [`remove_published_port`].
+pub fn remove_published_port_if_matches(project_root: &Path, port: u16) {
+    if read_published_port(project_root) == Some(port) {
+        let _ = std::fs::remove_file(published_port_path(project_root));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +219,33 @@ mod tests {
         assert!(!published_port_path(dir.path()).exists());
         // Second remove on an absent file is a no-op, not an error.
         remove_published_port(dir.path());
+    }
+
+    #[test]
+    fn remove_if_matches_only_unlinks_own_port() {
+        let dir = tempfile::tempdir().unwrap();
+        // Instance A publishes its port, then instance B overwrites the shared
+        // file with its own (the two-serve ephemeral-fallback scenario).
+        publish_port(dir.path(), 9412).unwrap();
+        publish_port(dir.path(), 9999).unwrap();
+        assert_eq!(read_published_port(dir.path()), Some(9999));
+
+        // Instance A exits first: its guard must NOT clobber B's live file.
+        remove_published_port_if_matches(dir.path(), 9412);
+        assert_eq!(
+            read_published_port(dir.path()),
+            Some(9999),
+            "a non-matching port must leave the peer's published file intact"
+        );
+
+        // Instance B exits: its guard names the current value and unlinks it.
+        remove_published_port_if_matches(dir.path(), 9999);
+        assert!(
+            !published_port_path(dir.path()).exists(),
+            "the matching port retracts its own publication"
+        );
+
+        // Idempotent on an absent file.
+        remove_published_port_if_matches(dir.path(), 9999);
     }
 }

@@ -39,9 +39,11 @@ fn read_yaml(path: &Path) -> serde_json::Value {
 }
 
 /// Materialise a minimal healthy `SQLite` DB at the canonical store path so
-/// `check_loomweave_dir` reports healthy (not the absent warning). A freshly
-/// opened `SQLite` file has `user_version = 0`, which is <= the current schema
-/// version and is therefore accepted.
+/// `check_loomweave_dir` reports healthy (not the absent warning). The DB is
+/// **migrated** (`apply_migrations` stamps `PRAGMA user_version`), because the
+/// doctor health classifier mirrors the read-open path and refuses an
+/// *unmigrated* (`user_version = 0`) file — a freshly-opened `SQLite` file with no
+/// schema is not a Loomweave index, and `serve` would reject it (review #8).
 ///
 /// A real `.weft/loomweave/` (created by `install`) also carries the current
 /// `.gitignore`, so this completes the store with one too — otherwise the
@@ -52,7 +54,11 @@ fn read_yaml(path: &Path) -> serde_json::Value {
 fn write_healthy_db(root: &Path) {
     let store = root.join(".weft/loomweave");
     fs::create_dir_all(&store).unwrap();
-    Connection::open(store.join("loomweave.db")).expect("create minimal SQLite DB");
+    {
+        let mut conn = Connection::open(store.join("loomweave.db")).expect("create SQLite DB");
+        loomweave_storage::pragma::apply_write_pragmas(&conn).expect("write pragmas");
+        loomweave_storage::schema::apply_migrations(&mut conn).expect("migrate");
+    }
 
     let scratch = tempfile::tempdir().unwrap();
     install(&["install", "--all"], scratch.path());
@@ -755,8 +761,10 @@ fn doctor_index_health_absent_db_is_warning_gate_passes() {
 fn doctor_index_health_corrupt_db_is_problem_gate_fails() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
-    // Write a non-SQLite file at the DB path — must NOT be zero-length (a 0-byte
-    // file opens as a fresh db with user_version=0 and is healthy).
+    // Write a non-SQLite file at the DB path. (A 0-byte file would open as a
+    // fresh db with user_version=0, which now classifies Unmigrated — a problem
+    // — see `doctor_index_health_unmigrated_db_is_problem`; here we want the
+    // distinct *unreadable* classification.)
     let db_path = dir.path().join(".weft/loomweave/loomweave.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     fs::write(&db_path, b"this is not a sqlite database").unwrap();
@@ -794,6 +802,65 @@ fn doctor_index_health_corrupt_db_is_problem_gate_fails() {
     assert!(
         out.contains("✗") && out.contains("unreadable"),
         "corrupt DB must surface as a text-path problem: stdout:\n{out}"
+    );
+}
+
+/// (c0) DB present, opens, header-valid, but `user_version = 0` (never
+/// migrated) → problem (ok=false). The read-open path refuses such a file, so
+/// `serve` would too; doctor must not green-light a DB `serve` rejects (review
+/// #8 / read-vs-doctor parity). This is the regression for the prior false
+/// positive where an empty/external `SQLite` file was reported Healthy.
+#[test]
+fn doctor_index_health_unmigrated_db_is_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    let db_path = dir.path().join(".weft/loomweave/loomweave.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    // `install --all` may seed a migrated DB; remove it and drop a header-valid
+    // SQLite file with NO schema applied, so user_version stays 0 (the
+    // empty/external-file case the read path refuses).
+    let _ = fs::remove_file(&db_path);
+    {
+        let conn = Connection::open(&db_path).expect("create empty SQLite DB");
+        // Touch the file so the SQLite header is actually written to disk
+        // (a bare open of a new path is lazy until first write).
+        conn.execute_batch("PRAGMA user_version = 0;")
+            .expect("stamp user_version 0");
+    }
+
+    let (code, json) = doctor_json(dir.path(), false);
+    assert_eq!(code, 1, "an unmigrated index DB must fail the gate: {json}");
+    assert_eq!(
+        json["ok"], false,
+        "an unmigrated index DB must set ok=false: {json}"
+    );
+    let check = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == ".weft/loomweave.schema")
+        .expect(".weft/loomweave.schema check must be present");
+    assert_eq!(
+        check["status"], "problem",
+        ".weft/loomweave.schema must be a problem for an unmigrated DB: {check}"
+    );
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unmigrated"),
+        "problem message must say the index is unmigrated: {check}"
+    );
+
+    // Text path: problem → exit 1.
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "an unmigrated index DB must fail the text-path gate: stdout:\n{out}"
+    );
+    assert!(
+        out.contains("✗") && out.contains("unmigrated"),
+        "unmigrated DB must surface as a text-path problem: stdout:\n{out}"
     );
 }
 
@@ -861,8 +928,8 @@ fn doctor_index_health_future_schema_is_problem_with_version_in_message() {
 fn doctor_index_health_healthy_db_is_ok() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
-    // A freshly opened SQLite file has user_version=0, which is <= current and
-    // therefore accepted by verify_user_version.
+    // A migrated DB carries a non-zero user_version, which the classifier reports
+    // Healthy (the read-open path accepts it).
     write_healthy_db(dir.path());
 
     let (code, json) = doctor_json(dir.path(), false);
