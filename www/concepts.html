@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Concepts — Loomweave</title>
+<meta name="description" content="The entity model and the consult-mode MCP model: entities and kinds, the typed edge graph, locator-vs-SEI identity (the locator is the address, SEI is identity), subsystems, and why scope_excludes makes a negative result trustworthy.">
+<link rel="preload" href="fonts/SpaceGrotesk-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="preload" href="fonts/JetBrainsMono-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="stylesheet" href="colors_and_type.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip-link" href="#top">Skip to content</a>
+
+<header class="hub-header">
+  <a class="brand" href="index.html" aria-label="Loomweave — home">
+    <svg class="mark" width="26" height="26" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+      <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+    </svg>
+    <span class="wordmark">Loomweave</span>
+    <span class="path-hint">~/loomweave</span>
+  </a>
+  <nav class="hub-nav" aria-label="Primary">
+    <a href="index.html">Overview</a>
+    <a href="getting-started.html">Getting started</a>
+    <a href="concepts.html" aria-current="page">Concepts</a>
+    <a href="tools.html">MCP tools</a>
+    <a href="cli.html">CLI</a>
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">GitHub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+  <div class="page-head">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html">Loomweave</a><span class="sep">/</span><span aria-current="page">Concepts</span>
+    </nav>
+    <h1 class="page-title">Concepts</h1>
+    <p class="page-lede">Loomweave&rsquo;s job is to turn a tree of source files into a queryable graph of <strong>entities</strong> and <strong>edges</strong>, then serve it to a consult-mode agent. Everything an agent asks is answered against that graph.</p>
+  </div>
+
+  <div class="docmain">
+
+    <div class="onpage" aria-label="On this page">
+      <div class="t-label onpage-label">On this page</div>
+      <ul>
+        <li><a href="#entities">Entities &amp; kinds</a></li>
+        <li><a href="#identity">Locator vs. identity (SEI)</a></li>
+        <li><a href="#edges">The edge graph</a></li>
+        <li><a href="#subsystems">Subsystems</a></li>
+        <li><a href="#consult-loop">The consult model</a></li>
+        <li><a href="#scope-excludes">scope_excludes</a></li>
+        <li><a href="#enrich-only">Enrich-only by design</a></li>
+        <li><a href="#storage">Storage</a></li>
+      </ul>
+    </div>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="entities">Entities &amp; kinds</h2>
+      <p class="doc-p">An entity is a named thing Loomweave extracted from the source: a function, a class, a module, or a clustered <strong>subsystem</strong>. Every entity carries a 3-segment <strong>locator</strong>:</p>
+      <div class="code">
+        <div class="code-head"><span class="code-lang">locator — {plugin_id}:{kind}:{canonical_qualified_name}</span></div>
+<pre>python:function:auth.tokens.refresh
+python:class:http.client.Session
+python:module:auth.tokens</pre>
+      </div>
+      <p class="doc-p">The contract (ADR-003, ADR-022) is deliberate: the <strong>language plugin owns segments 1 and 3</strong> — the plugin id and the canonical qualified name — and the <strong>core never invents kinds</strong>. That keeps the address reproducible across runs and portable across tools.</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <caption>Entity kinds</caption>
+          <thead><tr><th>Kind</th><th class="wrap">What it is</th></tr></thead>
+          <tbody>
+            <tr><td><code>function</code></td><td class="wrap">A function or method, addressed by its qualified name</td></tr>
+            <tr><td><code>class</code></td><td class="wrap">A class definition</td></tr>
+            <tr><td><code>module</code></td><td class="wrap">A source module (file-level)</td></tr>
+            <tr><td><code>subsystem</code></td><td class="wrap">A cluster of modules, <em>produced</em> by Loomweave&rsquo;s clustering pass — derived, not extracted from source like the three above</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="doc-p"><strong>Three kinds are extracted</strong> directly from source (function, class, module); <code>subsystem</code> is a fourth, <em>derived</em> kind that Loomweave synthesises by clustering modules.</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="identity">Locator vs. identity — the locator is the address, SEI is identity</h2>
+      <p class="doc-p">The crucial distinction. The 3-segment locator above is derived from the name and module path — so a <strong>rename or a cross-module move changes it</strong>, and every binding keyed on the old string would be orphaned. The Weft suite once conflated identity with address; the qualname is a fine <em>address</em> and a terrible <em>identity</em>, because the operations developers do most — rename, move — change it.</p>
+      <p class="doc-p"><strong>ADR-038 separates the two.</strong> The locator is demoted to the <em>address</em>; <strong>SEI (Stable Entity Identity) is the identity</strong> — a durable id that survives a rename or move, minted and resolved by Loomweave as the suite&rsquo;s identity authority. A sibling product binds its facts to the SEI and trusts the link still names the same function tomorrow.</p>
+      <div class="facts">
+        <div class="fact">
+          <div class="t-label">Address</div>
+          <div class="fact-title">Locator <span class="t-code">{plugin}:{kind}:{qualname}</span></div>
+          <div class="fact-body">Human-legible, derived from name + path, reproducible per-run. Changes when the code is renamed or moved.</div>
+        </div>
+        <div class="fact thread-loomweave">
+          <div class="t-label">Identity</div>
+          <div class="fact-title">SEI — Stable Entity Identity</div>
+          <div class="fact-body">A durable surrogate that survives rename and move, with lineage. The thing cross-tool bindings key on. <span class="tag tag-ok">standard LOCKED · 2026-06-05</span></div>
+        </div>
+      </div>
+      <p class="doc-p">The <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/sei-standard.md" target="_blank" rel="noopener">SEI standard</a> is the suite-wide contract; Loomweave ADR-038 is its token form. Loomweave is the authority/implementer — Wardline, Filigree, Legis, and Charter are consumers that conform.</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="edges">The edge graph</h2>
+      <p class="doc-p">Entities are connected by typed edges:</p>
+      <div class="tbl-wrap">
+        <table class="ref">
+          <caption>Edges</caption>
+          <thead><tr><th>Edge</th><th class="wrap">Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>contains</code></td><td class="wrap">Structural nesting — a module contains its classes and functions</td></tr>
+            <tr><td><code>calls</code></td><td class="wrap">One function invokes another (execution flow)</td></tr>
+            <tr><td><code>references</code></td><td class="wrap">A symbol mentions another without calling it (not execution flow)</td></tr>
+            <tr><td><code>imports</code></td><td class="wrap">Module-to-module import (<code>imports_in</code> = who imports me, <code>imports_out</code> = what I import)</td></tr>
+            <tr><td><code>implements</code> / <code>derives</code></td><td class="wrap">Rust relation edges — a type implements a trait, or derives one via <code>#[derive(...)]</code></td></tr>
+            <tr><td><code>inherits_from</code> / <code>decorates</code></td><td class="wrap">Python relation edges — a class inherits from a base, or a decorator decorates a target</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="doc-p">The three headline relationships are <code>contains</code>, <code>calls</code>, and <code>references</code>; module <code>imports</code> rounds out the graph at module altitude. On top of those, the language plugins emit <strong>relation edges</strong> — <code>implements</code>/<code>derives</code> for Rust and <code>inherits_from</code>/<code>decorates</code> for Python — surfaced direction-explicit through <code>entity_relation_list</code>.</p>
+      <p class="doc-p"><code>calls</code> edges carry a <strong>confidence</strong>. The default surface is <code>resolved</code> — unambiguous static edges. Ambiguous static candidates and LLM-inferred edges are excluded unless a query explicitly asks for them, so a clean answer stays clean.</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="subsystems">Subsystems</h2>
+      <p class="doc-p">Beyond the raw graph, Loomweave clusters modules into <strong>subsystems</strong> and persists them as first-class entities. <code>subsystem_member_list(id)</code> lists a subsystem&rsquo;s modules; <code>entity_subsystem_get(id)</code> is the reverse — given any entity, find the subsystem it belongs to (a function resolves through its containing module).</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="consult-loop">The consult model — ask a tool, don&rsquo;t re-grep</h2>
+      <p class="doc-p">Loomweave is a <strong>consult-mode</strong> tool. It does not write your code or run your tests; it answers questions about the codebase so a coding agent doesn&rsquo;t re-derive the same structural facts on every turn.</p>
+      <p class="doc-p">Without Loomweave, an agent answering &ldquo;who calls this, and what does it touch?&rdquo; greps the tree, opens files, and reconstructs the call graph from scratch — every time, burning context. With Loomweave, the same question is a couple of tool calls against a graph that was already built once by <code>loomweave analyze</code>:</p>
+      <div class="code">
+        <div class="code-head"><span class="code-lang">the consult loop</span></div>
+<pre>agent ──▶ entity_at(file, line)               ──▶ "which entity is here?"
+      ──▶ entity_neighborhood_get(id)         ──▶ callers, callees, imports, refs
+      ──▶ entity_execution_path_list(id, n)   ──▶ bounded call paths
+      ──▶ summary(id)                         ──▶ one-paragraph explanation (lazy LLM)</pre>
+      </div>
+      <p class="doc-p">Each answer is structured, paginated where needed, and carries enough metadata (confidence, <code>scope_excludes</code>, freshness) for the agent to know how much to trust it.</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="scope-excludes">Why <code>scope_excludes</code> matters</h2>
+      <p class="doc-p">Static analysis has blind spots — calls made through an attribute receiver, for instance, can&rsquo;t always be resolved statically. Rather than silently dropping them, Loomweave&rsquo;s traversal results carry a <code>scope_excludes</code> block naming exactly what was <strong>not</strong> searched.</p>
+      <div class="note">
+        <div class="note-label">The honesty contract</div>
+        <div class="note-body">An empty <code>callers</code> list with <code>scope_excludes: ["attribute-receiver-calls"]</code> means &ldquo;none found among the edges I can see,&rdquo; <strong>never</strong> &ldquo;guaranteed nobody calls this.&rdquo; That distinction is what lets an agent reason safely about a negative result.</div>
+      </div>
+      <p class="doc-p">The same discipline governs confidence: graph-traversal tools return only <code>resolved</code> edges by default, and an empty section is never read as a guaranteed true negative.</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="enrich-only">Enrich-only by design</h2>
+      <p class="doc-p"><code>issues_for(id)</code> (the MCP <code>entity_issue_list</code>) reaches into Filigree, a sibling Weft product, to attach issues to an entity. That binding is strictly <strong>enrich-only</strong>: if Filigree is unavailable, the tool returns an <code>unavailable</code> envelope instead of failing the call, and Loomweave&rsquo;s own answers never depend on it.</p>
+      <p class="doc-p">This is the Weft federation axiom in practice — a sibling may <em>add</em> information to Loomweave&rsquo;s view, but is never <em>required</em> for Loomweave to make sense. See <a href="index.html#federation">Loomweave&rsquo;s role in the federation</a>.</p>
+    </section>
+
+    <section class="doc-section">
+      <h2 class="doc-h2" id="storage">Storage</h2>
+      <p class="doc-p">The whole graph is persisted to a project-local SQLite database at <code>.weft/loomweave/loomweave.db</code>, written by a single writer-actor with a reader pool (ADR-011). There is no mandatory cloud component: Loomweave is local-first, and the only network egress is the LLM provider during <code>summary(id)</code> calls.</p>
+    </section>
+
+  </div>
+</main>
+
+<footer class="hub-footer">
+  <svg class="mark" width="18" height="18" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+    <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+  </svg>
+  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus first-party Python and Rust language plugins.</span>
+  <nav class="foot-links" aria-label="Resources">
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">Source</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/sei-standard.md" target="_blank" rel="noopener">SEI standard</a>
+  </nav>
+  <a class="foot-org ext" href="https://foundryside.dev" target="_blank" rel="noopener" aria-label="part of Foundryside — foundryside.dev">
+    <svg class="mark" width="17" height="17" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 24 H27"/><path d="M11 24 V15"/><path d="M16 24 V10"/><path d="M21 24 V15"/></g>
+      <g fill="currentColor"><circle cx="11" cy="15" r="2.1"/><circle cx="16" cy="10" r="2.3"/><circle cx="21" cy="15" r="2.1"/></g>
+    </svg>
+    <span>part of Foundryside · foundryside.dev</span>
+  </a>
+  <span class="foot-meta">MIT · 2026</span>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>

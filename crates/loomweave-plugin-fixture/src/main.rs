@@ -5,18 +5,41 @@
 //! `PluginHost::spawn`.
 //!
 //! Fixture identity:
-//! - `plugin_id = "fixture"`, kind `"widget"`, rule-ID prefix `"LMWV-FIXTURE-"`
+//! - `plugin_id = "fixture"`, kinds `"widget"` (`file_scope`) and `"gadget"`,
+//!   rule-ID prefix `"LMWV-FIXTURE-"`
 //! - Responds to every `analyze_file` request with one entity:
 //!   `id = "fixture:widget:demo.sample"`, `kind = "widget"`,
 //!   `qualified_name = "demo.sample"`, `source.file_path` = the path sent in.
+//! - Additionally, every line of the file matching `gadget <name>` emits one
+//!   `fixture:gadget:<name>` entity anchored at that line. Content-driven, so
+//!   host tests can construct duplicate-locator shapes (the same gadget name
+//!   twice in one file, or shared across files) without extra env knobs
+//!   (clarion-b19fe90c3e).
 
 use std::io::{BufReader, Write};
+
+/// True when the named environment variable is set to exactly `"1"`.
+///
+/// Misbehaviour switches for hardening tests follow the pattern of the
+/// existing `LOOMWEAVE_FIXTURE_EXCEED_RLIMIT_AS` gate: checked at the
+/// dispatch site, opt-in only, and inert in every normal test run.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+/// Park forever without consuming CPU (hang simulation). The host's watchdog
+/// must kill us; sleeping in a loop survives spurious wakeups.
+fn hang_forever() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
 
 use loomweave_core::plugin::limits::ContentLengthCeiling;
 use loomweave_core::plugin::transport::{Frame, read_frame, write_frame};
 use loomweave_core::plugin::{
     AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, InitializeResult, JsonRpcVersion,
-    ResponseEnvelope, ResponsePayload, ShutdownResult,
+    ProtocolError, ResponseEnvelope, ResponsePayload, ShutdownResult,
 };
 use serde_json::Value;
 
@@ -66,6 +89,21 @@ fn main() {
 
         match method.as_str() {
             "initialize" => {
+                // Hang *before* responding: simulates a plugin that wedges
+                // during whole-repo work inside `initialize` (the Rust
+                // plugin's symbol-table build runs there). The host's
+                // handshake deadline must kill us.
+                if env_flag("LOOMWEAVE_FIXTURE_HANG_AT_INITIALIZE") {
+                    hang_forever();
+                }
+                // Protocol refusal: reply to `initialize` with a JSON-RPC
+                // ERROR response, then stay alive (parked, not exited). The
+                // host must kill+reap us itself — and its own SIGKILL must
+                // not be classified as an OOM event (clarion-371efa3e07).
+                if env_flag("LOOMWEAVE_FIXTURE_REFUSE_HANDSHAKE") {
+                    send_error(&mut writer, id, -32600, "fixture refuses handshake");
+                    hang_forever();
+                }
                 let result = InitializeResult {
                     name: "loomweave-plugin-fixture".to_owned(),
                     version: "0.1.0".to_owned(),
@@ -75,6 +113,20 @@ fn main() {
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }
             "analyze_file" => {
+                // CPU-spin before responding: simulates a busy-looping
+                // plugin (e.g. a pathological parse). The host's per-file
+                // watchdog must kill us — RLIMIT/breaker never fire because
+                // we neither allocate nor crash.
+                if env_flag("LOOMWEAVE_FIXTURE_SPIN_AT_ANALYZE") {
+                    loop {
+                        std::hint::spin_loop();
+                    }
+                }
+                // SIGABRT before responding: the real stack-overflow
+                // signature (Rust guard page → abort → signal 6).
+                if env_flag("LOOMWEAVE_FIXTURE_ABORT_AT_ANALYZE") {
+                    std::process::abort();
+                }
                 if std::env::var_os("LOOMWEAVE_FIXTURE_EXCEED_RLIMIT_AS").is_some() {
                     #[cfg(unix)]
                     exceed_rlimit_as();
@@ -98,7 +150,7 @@ fn main() {
                 };
                 let _ = params; // we already extracted file_path
 
-                let entity = serde_json::json!({
+                let widget = serde_json::json!({
                     "id": "fixture:widget:demo.sample",
                     "kind": "widget",
                     "qualified_name": "demo.sample",
@@ -106,8 +158,22 @@ fn main() {
                         "file_path": file_path
                     }
                 });
+                let mut entities = vec![widget];
+                // Misbehaviour switch (clarion-b19fe90c3e): re-emit the
+                // file_scope widget a second time from the SAME file — the
+                // plugin-bug shape of a duplicate locator.
+                if env_flag("LOOMWEAVE_FIXTURE_DUPLICATE_WIDGET") {
+                    let duplicate = entities[0].clone();
+                    entities.push(duplicate);
+                }
+                // Content-driven gadget emission: `gadget <name>` lines each
+                // emit one `fixture:gadget:<name>` entity anchored at that
+                // line. The line range gives the host a content hash, so the
+                // entity participates in the prior index (incremental-run
+                // shapes need that).
+                entities.extend(gadget_entities(&file_path));
                 let result = AnalyzeFileResult {
-                    entities: vec![entity],
+                    entities,
                     edges: vec![],
                     stats: AnalyzeFileStats::default(),
                     findings: vec![],
@@ -115,12 +181,64 @@ fn main() {
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }
             "shutdown" => {
+                // Hang *before* responding: simulates a plugin that goes
+                // silent at shutdown after the work completed. The host's
+                // shutdown deadline must kill us without failing the run.
+                if env_flag("LOOMWEAVE_FIXTURE_HANG_AT_SHUTDOWN") {
+                    hang_forever();
+                }
                 let result = ShutdownResult {};
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }
             _ => std::process::exit(1),
         }
     }
+}
+
+/// Parse `gadget <name>` lines out of the analysed file and build one
+/// `fixture:gadget:<name>` raw entity per line, carrying a one-line
+/// `source_range` so the host derives a content hash for it. An unreadable
+/// file yields no gadgets (the hardcoded widget still flows).
+fn gadget_entities(file_path: &str) -> Vec<Value> {
+    let Ok(content) = std::fs::read_to_string(file_path) else {
+        return Vec::new();
+    };
+    let mut gadgets = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let Some(rest) = line.strip_prefix("gadget ") else {
+            continue;
+        };
+        let Some(name) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let line_number = index + 1;
+        gadgets.push(serde_json::json!({
+            "id": format!("fixture:gadget:{name}"),
+            "kind": "gadget",
+            "qualified_name": name,
+            "source": {
+                "file_path": file_path,
+                "source_range": { "start_line": line_number, "end_line": line_number }
+            }
+        }));
+    }
+    gadgets
+}
+
+fn send_error(writer: &mut impl Write, id: i64, code: i64, message: &str) {
+    let env = ResponseEnvelope {
+        jsonrpc: JsonRpcVersion,
+        id,
+        payload: ResponsePayload::Error(ProtocolError {
+            code,
+            message: message.to_owned(),
+            data: None,
+        }),
+    };
+    let body = serde_json::to_vec(&env).expect("serialise error response");
+    let frame = Frame { body };
+    write_frame(writer, &frame).expect("write frame");
+    writer.flush().expect("flush");
 }
 
 fn send_result(writer: &mut impl Write, id: i64, result: Value) {

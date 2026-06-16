@@ -75,6 +75,15 @@ which loomweave                     # e.g. ~/.cargo/bin/loomweave
 which loomweave-plugin-python       # e.g. ~/.local/bin/loomweave-plugin-python
 ```
 
+Rust source is analysed by a separate first-party plugin: the
+`loomweave-plugin-rust` wheel/binary, shipped and installed independently of the
+Python plugin. It is discovered the same way — the host walks `$PATH` for
+`loomweave-plugin-*` executables (see the [`$PATH` discipline](#path-discipline)
+paragraph below), so `loomweave-plugin-rust` only needs to be on `$PATH` to be
+picked up. Install it when you intend to analyse a Rust tree; this walkthrough
+targets a Python project and uses only the Python plugin. See
+[Rust analysis: known limitations](./rust-known-limitations.md).
+
 ### Verifying release artifacts
 
 Tagged releases publish platform archives, SHA256 files, keyless cosign
@@ -99,9 +108,12 @@ The current 1.x release line deliberately does not publish to PyPI or crates.io.
 Release assets are the source of truth until public registries are introduced
 by a later ADR.
 
+<a id="path-discipline"></a>
 **`$PATH` discipline matters.** Loomweave's plugin host (per
 [ADR-002](../loomweave/adr/ADR-002-plugin-transport-json-rpc.md)) discovers
-plugins by walking `$PATH` for executables matching `loomweave-plugin-*`. If
+plugins by walking `$PATH` for executables matching `loomweave-plugin-*`
+(this is the generic mechanism for every language plugin, Python and Rust
+alike). If
 `pipx`'s install directory (`~/.local/bin/` on Linux, `~/Library/...` on
 macOS) is not on your shell's `$PATH`, `loomweave analyze` will exit
 **successfully** with status `skipped_no_plugins` and emit a `WARN no plugins
@@ -128,10 +140,10 @@ loomweave install
 loomweave analyze
 ```
 
-A bare `loomweave install` does everything: it initialises `.loomweave/`, installs
+A bare `loomweave install` does everything: it initialises `.weft/loomweave/`, installs
 the agent-orientation assets, writes Claude Code MCP config, and upserts the
 Codex MCP config (see [§3](#agent-orientation-installed-by-default)). If
-`.loomweave/` already exists, init is skipped and the other components are applied
+`.weft/loomweave/` already exists, init is skipped and the other components are applied
 idempotently; pass `--force` to wipe and reinitialise the index.
 
 Expected output (abridged):
@@ -149,7 +161,7 @@ analyze complete: run <uuid> ok (entities=NNN, edges=MMM)
 ```
 
 The first run on a tree of this size completes in well under a minute on
-typical hardware. The result lives at `.loomweave/loomweave.db` (a single SQLite
+typical hardware. The result lives at `.weft/loomweave/loomweave.db` (a single SQLite
 file) and is safe to commit to git — see
 [ADR-005](../loomweave/adr/ADR-005-loomweave-dir-tracking.md).
 
@@ -193,7 +205,7 @@ Pick whichever you have; the questions in step 4 are client-agnostic.
 
 A bare `loomweave install` already bundles these for consult-mode agents. The
 component flags exist for explicit partial installs (e.g. adding the skill to a
-project whose `.loomweave/` you do not want re-touched):
+project whose `.weft/loomweave/` you do not want re-touched):
 
 ```bash
 loomweave install --claude-code --path /tmp/requests-2.32.4  # Claude Code MCP only
@@ -248,6 +260,11 @@ llm_policy:
 prerequisites section above. Skip this block if you don't have a key; the
 other seventeen tools still work, only `summary` will return an "LLM disabled"
 envelope.
+
+Run `loomweave config check` after editing to confirm the effective state
+(provider, enabled, live, model) before starting `serve` — it flags the common
+mistakes (a provider left `enabled: false`, a missing key, or a misplaced key,
+which is now a hard parse error rather than a silent drop).
 
 ### The MCP tools
 
@@ -324,7 +341,7 @@ Expected behaviour:
 - `loomweave analyze` exits **0** with run status `completed`.
 - A `LMWV-SEC-SECRET-DETECTED` finding lands in `findings` with the message
   `AwsAccessKeyId detected in /tmp/requests-2.32.4/.env:1`. Inspect with
-  `sqlite3 .loomweave/loomweave.db "SELECT rule_id, message FROM findings
+  `sqlite3 .weft/loomweave/loomweave.db "SELECT rule_id, message FROM findings
   WHERE rule_id LIKE 'LMWV-SEC%';"`.
 - The `.env` file itself has no language entities (it's not Python), so
   the finding is anchored to the core-minted file entity rather than a
@@ -360,13 +377,30 @@ pipx ensurepath                     # writes the PATH update; restart shell
 Note: `loomweave analyze` deliberately exits **0** even when no plugins are
 discovered, so the run can be re-attempted without manual cleanup. The
 `WARN` line and the `skipped_no_plugins` run status are the operator-facing
-signals. A `loomweave doctor` subcommand that surfaces discovery state at exit
-is on the v2.0 roadmap; for v1.0 the diagnostic is the WARN line plus the
-`which loomweave-plugin-*` check above.
+signals. `loomweave doctor` (see [§3](#agent-orientation-installed-by-default))
+also surfaces plugin discovery state, reporting per-plugin presence for both the
+Python and Rust plugins; the WARN line plus the `which loomweave-plugin-*` check
+above remain the quickest manual diagnostic.
+
+### macOS: "loomweave cannot be opened because the developer cannot be verified"
+
+The release archives are not notarized (ADR-033 ships unsigned binaries), so
+macOS Gatekeeper quarantines the downloaded `loomweave` binary and refuses the
+first launch with a developer-verification error. Clear the quarantine
+attribute on the extracted binary before installing it:
+
+```bash
+xattr -d com.apple.quarantine ./loomweave-aarch64-apple-darwin/loomweave
+```
+
+Alternatively, approve it once from the GUI — attempt to run it, then
+**System Settings → Privacy & Security → "Open Anyway"**. Either is a one-time
+step per downloaded binary; a source build (the fallback under [§1](#1-install))
+is never quarantined. Notarized release artifacts are on the post-1.0 roadmap.
 
 ### "secret_present" block fires on a real file
 
-Add the file to `.loomweave/secrets-baseline.yaml` with a written justification
+Add the file to `.weft/loomweave/secrets-baseline.yaml` with a written justification
 (the schema requires it). Full procedure: [secret-scanning.md](./secret-scanning.md).
 
 ### `summary` returns an error citing budget or LLM provider

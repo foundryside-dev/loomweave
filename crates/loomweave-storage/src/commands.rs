@@ -184,6 +184,30 @@ pub enum WriterCmd {
         source_file_id: String,
         ack: Ack<()>,
     },
+    /// Reconcile the `briefing_blocked` marker on every entity row anchored to
+    /// one source file to the current pre-ingest secret-scan verdict
+    /// (clarion-3c4ed8e9fb). On an incremental run, an UNCHANGED file is skipped
+    /// and never re-dispatched through the plugin host, so its entities keep the
+    /// PRIOR run's `properties.briefing_blocked` — even though the secret scan is
+    /// a FULL pass every run and already knows the file's current verdict. This
+    /// command closes that gap for the skipped partition: when `reason` is
+    /// `Some`, it `json_set`s `properties.briefing_blocked` to that string; when
+    /// `None`, it `json_remove`s the key (baseline acknowledgement / cleaned
+    /// secret / override cleared the block). The `briefing_blocked` column is a
+    /// VIRTUAL generated column over `properties` (migration 0002), so editing
+    /// the JSON keeps it consistent with no separate write.
+    ///
+    /// `source_file_path` is the canonical-absolute path string entities store.
+    /// In-run write (requires an active `BeginRun`): the reconciliation must
+    /// land inside the run transaction so a failed run rolls it back. Drive it
+    /// SOLELY from the secret-scan outcome — the scanner is the sole authority
+    /// for `briefing_blocked` and this command never weakens that invariant.
+    /// Returns the number of entity rows updated.
+    ReconcileBriefingBlockForSourceFile {
+        source_file_path: String,
+        reason: Option<String>,
+        ack: Ack<usize>,
+    },
     /// Insert one finding. The writer initializes lifecycle status to `open`
     /// and leaves suppression / Filigree-link fields empty. Idempotent on
     /// `id` (ON CONFLICT DO UPDATE): a `--resume` re-walk regenerates the same
@@ -250,6 +274,45 @@ pub enum WriterCmd {
         entries: Vec<PriorIndexEntry>,
         recorded_at: String,
         ack: Ack<()>,
+    },
+    /// Retire findings the current run no longer reproduces (clarion-87c1eba2bd /
+    /// ADR-048): DELETE every `open`, Filigree-unlinked finding whose `run_id` is
+    /// not `current_run_id`. Mirrors the prior-index diff for findings, using the
+    /// `run_id` signal ADR-047 established (a reproduced finding carries the current
+    /// `run_id`; a vanished one keeps its prior one). PRESERVES lifecycle —
+    /// `filigree_issue_id`-linked or non-`open` findings are operator decisions
+    /// owned by the Filigree unseen/soft-archive path, never this sweep. The
+    /// caller gates this to a clean full pass (Completed, non-resume, fully
+    /// walked, non-`--no-sei`). Query-time write: it runs after `CommitRun` (no
+    /// active run transaction), best-effort, and never gates the run's own
+    /// outcome. Returns the number of rows deleted.
+    SweepStaleFindings {
+        current_run_id: String,
+        ack: Ack<usize>,
+    },
+    /// Rule-scoped stale-finding sweep (weft-7256739b31): retire stale `open`,
+    /// Filigree-unlinked findings of the named rules only. For rule families
+    /// whose producer is a FULL pass every run regardless of the incremental
+    /// file skip (the pre-ingest secret scan), so `run_id != current` means
+    /// "looked, no longer detected" even on a run the general sweep must skip.
+    /// Same lifecycle preservation and query-time-write posture as
+    /// [`WriterCmd::SweepStaleFindings`].
+    ///
+    /// `examined_source_files` scopes the sweep to files the producer actually
+    /// re-examined this run (L3): the "full pass" is full only over the
+    /// CURRENTLY-installed plugins' extension union, so uninstalling/disabling a
+    /// plugin between runs silently drops its files from the scan. Without this
+    /// scope, those files' still-valid findings would be retired as "looked,
+    /// clean" when they were never looked at again ("scope shrinkage" — the walk
+    /// raises no error, so the `source_walk_skipped_entries == 0` caller gate
+    /// does not catch it). A finding survives unless its anchor entity's
+    /// `source_file_path` is in this set. Canonical-absolute path strings,
+    /// matching the form entities store. An empty set retires nothing.
+    SweepStaleFindingsForRules {
+        current_run_id: String,
+        rule_ids: Vec<String>,
+        examined_source_files: Vec<String>,
+        ack: Ack<usize>,
     },
     /// Upsert one SEI binding (mint or carry) — Wave 1 / WS1 (ADR-038). A carry
     /// REPLACEs the binding's own row by SEI PK, moving `current_locator` in

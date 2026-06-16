@@ -36,147 +36,51 @@ permissions:
   contents: read
 
 jobs:
-  verify:
-    # Pre-release gate: must mirror ci.yml so a broken commit cannot reach the
-    # build/publish jobs. Duplicated rather than refactored into a reusable
-    # workflow on the eve of 1.0; that refactor is post-release scope.
-    name: Verify (pre-release gates)
+  # Release-only precondition: a real release (tag push) must point at a commit
+  # on main. A workflow_dispatch dry-run may run from any branch (it can only
+  # ever publish to TestPyPI — see the publish-* job `if`), so this is gated on
+  # event_name == 'push'. Kept here, not in verify.yml: it is a release policy
+  # check, not a CI gate, so it does not belong in the shared workflow. On a
+  # dispatch run it is skipped, which leaves dependent build jobs unblocked
+  # (a skipped `needs` does not fail dependents). clarion-c9f62eec7d.
+  assert-on-main:
+    name: Assert tagged commit is on main
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
 
       - name: Assert tagged commit is on main
-        # Only gates real releases (tag pushes). A workflow_dispatch dry-run can
-        # publish solely to TestPyPI (see publish-* job `if`), so it is allowed
-        # to run from any branch — letting the publish workflow itself be
-        # iterated/validated before it is merged to main.
-        if: github.event_name == 'push'
         run: |
           git fetch origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || \
             { echo "::error::tag does not point to a commit on main"; exit 1; }
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          key: release-verify
-
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-        with:
-          python-version: "3.11"
-
-      - name: cache pyright runtime
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-        with:
-          path: ~/.cache/pyright-python/
-          key: pyright-python-1.1.409-${{ runner.os }}
-
-      - name: rust fmt
-        run: cargo fmt --all -- --check
-
-      - name: migration retirement guard
-        run: |
-          python scripts/check-migration-retirement.py --self-test
-          python scripts/check-migration-retirement.py
-
-      - name: cross-workspace version lockstep
-        run: python scripts/check-workspace-version-lockstep.py
-
-      - name: pyright pin lockstep
-        run: |
-          python scripts/check-pyright-pin-lockstep.py --self-test
-          python scripts/check-pyright-pin-lockstep.py
-
-      - name: wardline version bounds
-        run: |
-          python scripts/check-wardline-version-bounds.py --self-test
-          python scripts/check-wardline-version-bounds.py
-
-      - name: entity-cap ADR/code lockstep
-        run: |
-          python scripts/check-entity-cap-lockstep.py --self-test
-          python scripts/check-entity-cap-lockstep.py
-
-      - name: rust clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: install cargo-nextest
-        uses: taiki-e/install-action@e310bff3ef77234d477d6bb655da153a5c49d1db
-
-      - name: rust build workspace bins
-        run: cargo build --workspace --bins
-
-      - name: rust nextest
-        run: cargo nextest run --workspace --all-features --no-tests=pass
-
-      - name: rust doc
-        run: cargo doc --workspace --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-      - name: install cargo-deny
-        uses: taiki-e/install-action@2e721ffcfc34740897fc3130e2dd782b1c136896
-
-      - name: cargo deny
-        run: cargo deny check
-
-      - name: check Python ontology version lockstep
-        run: |
-          python scripts/check-python-ontology-version.py --self-test
-          python scripts/check-python-ontology-version.py
-
-      - name: install uv
-        run: python -m pip install uv==0.10.2
-
-      - name: sync plugin (locked dev extras)
-        run: uv sync --project plugins/python --locked --extra dev
-
-      - name: audit locked Python dependencies
-        run: |
-          uv export --project plugins/python --locked --extra dev --no-emit-project \
-            --format requirements.txt \
-            --output-file /tmp/loomweave-python-dev-requirements.txt
-          uv run --project plugins/python --extra dev pip-audit \
-            -r /tmp/loomweave-python-dev-requirements.txt
-
-      - name: check B.4*/B.5 performance gates
-        run: uv run --project plugins/python --extra dev python scripts/check-b4-gate-result.py --run-b5-smoke
-
-      - name: ruff check
-        run: uv run --project plugins/python --extra dev ruff check plugins/python
-
-      - name: ruff format check
-        run: uv run --project plugins/python --extra dev ruff format --check plugins/python
-
-      - name: mypy
-        run: uv run --project plugins/python --extra dev mypy --strict plugins/python
-
-      - name: pytest
-        run: uv run --project plugins/python --extra dev pytest plugins/python
-
-      - name: install sqlite3 cli
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sqlite3
-
-      - name: walking skeleton (end-to-end)
-        run: bash tests/e2e/sprint_1_walking_skeleton.sh
-
-      - name: WP5 secret scanner smoke
-        run: CARGO_BUILD=0 bash tests/e2e/wp5_secret_scan.sh
-
-      - name: Sprint 2 MCP surface
-        run: CARGO_BUILD=0 bash tests/e2e/sprint_2_mcp_surface.sh
-
-      - name: Phase 3 subsystems
-        run: CARGO_BUILD=0 bash tests/e2e/phase3_subsystems.sh
+  # The full pre-release gate set (Linux + macOS, Rust + Python + e2e). This is
+  # the SAME reusable workflow ci.yml calls, so the pre-release gate can no
+  # longer drift from CI — it is identical by construction. Replaces the
+  # previously-duplicated `verify` + `verify-macos` jobs (V11-CI-01,
+  # clarion-c9f62eec7d). A broken commit still cannot reach build/publish: the
+  # build jobs `needs` this job, which fails if any inner gate fails.
+  verify:
+    name: Verify (pre-release gates)
+    uses: ./.github/workflows/verify.yml
 
   build-rust:
-    needs: [verify]
+    needs: [verify, assert-on-main]
+    # assert-on-main is push-only (skipped on workflow_dispatch). GitHub's
+    # default success() gate would then skip every job that needs it, so the
+    # manual dispatch dry-run would build nothing. Run when verify passed and
+    # assert-on-main either passed (tag push) or was skipped (dispatch); a verify
+    # failure, or a tag not on main (assert-on-main == failure), still blocks the
+    # build (Codex P2; clarion-c9f62eec7d).
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && (needs.assert-on-main.result == 'success'
+          || needs.assert-on-main.result == 'skipped')
     name: Build loomweave (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -242,7 +146,14 @@ jobs:
           retention-days: 7
 
   build-wheels:
-    needs: [verify]
+    needs: [verify, assert-on-main]
+    # Run on dispatch (assert-on-main skipped) and tag push; block on verify
+    # failure or a not-on-main tag. See build-rust for the full rationale.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && (needs.assert-on-main.result == 'success'
+          || needs.assert-on-main.result == 'skipped')
     name: Build loomweave wheel (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     # maturin bin-wheels for PyPI. Matrix mirrors `build-rust` (Linux x86_64 +
@@ -292,8 +203,73 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-rust-plugin:
+    needs: [verify, assert-on-main]
+    # Run on dispatch (assert-on-main skipped) and tag push; block on verify
+    # failure or a not-on-main tag. See build-rust for the full rationale.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && (needs.assert-on-main.result == 'success'
+          || needs.assert-on-main.result == 'skipped')
+    name: Build loomweave-plugin-rust wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    # maturin bin-wheels for the Rust language plugin (packaging/rust-plugin-dist,
+    # [tool.maturin] bindings="bin"). The `loomweave` wheel pins
+    # loomweave-plugin-rust==<v>, so this MUST build+publish alongside the Python
+    # plugin or `pip install loomweave` fails resolution. Matrix mirrors
+    # build-wheels (Linux x86_64 + macOS aarch64).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: "2_28"
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            manylinux: auto
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11"
+
+      - name: build wheel (maturin)
+        # Reads packaging/rust-plugin-dist/pyproject.toml ([tool.maturin]
+        # bindings="bin"). manylinux container on Linux for broad installability.
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --manifest-path packaging/rust-plugin-dist/Cargo.toml
+
+      - name: smoke-check wheel carries the binary
+        run: |
+          set -euo pipefail
+          WHL=$(ls dist/loomweave_plugin_rust-*.whl | head -1)
+          echo "built: $WHL"
+          python -m zipfile -l "$WHL" | grep -E 'data/scripts/loomweave-plugin-rust' \
+            || { echo "::error::wheel $WHL missing data/scripts/loomweave-plugin-rust"; exit 1; }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: loomweave-plugin-rust-wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
   build-plugin:
-    needs: [verify]
+    needs: [verify, assert-on-main]
+    # Run on dispatch (assert-on-main skipped) and tag push; block on verify
+    # failure or a not-on-main tag. See build-rust for the full rationale.
+    if: >-
+      !cancelled()
+      && needs.verify.result == 'success'
+      && (needs.assert-on-main.result == 'success'
+          || needs.assert-on-main.result == 'skipped')
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
@@ -398,10 +374,47 @@ jobs:
           attestations: true
           repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
 
+  publish-rust-plugin:
+    name: Publish loomweave-plugin-rust (first)
+    needs: [build-rust-plugin]
+    runs-on: ubuntu-latest
+    # Like publish-plugin: the Rust plugin must publish BEFORE loomweave so the
+    # cli wheel's loomweave-plugin-rust==<v> pin resolves on first release. Its
+    # own environment (pypi-plugin-rust) — PyPI forbids sharing a pending
+    # publisher across (repo, workflow, environment).
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.target_index == 'testpypi')
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'testpypi-plugin-rust' || 'pypi-plugin-rust' }}
+    permissions:
+      id-token: write
+    steps:
+      - name: download rust plugin wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: loomweave-plugin-rust-wheel-*
+          path: dl-rust-plugin
+          merge-multiple: true
+
+      - name: stage rust plugin package dir
+        run: |
+          set -euo pipefail
+          mkdir -p pkg-rust-plugin
+          cp dl-rust-plugin/*.whl pkg-rust-plugin/
+          ls -la pkg-rust-plugin
+
+      - name: publish loomweave-plugin-rust
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        with:
+          packages-dir: pkg-rust-plugin
+          attestations: true
+          repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+
   publish-loomweave:
-    name: Publish loomweave (after the plugin)
-    # `needs: publish-plugin` enforces plugin-first; build-wheels supplies the wheels.
-    needs: [build-wheels, publish-plugin]
+    name: Publish loomweave (after the plugins)
+    # Both plugins publish first so the cli wheel's ==<v> pins resolve;
+    # build-wheels supplies the loomweave wheels.
+    needs: [build-wheels, publish-plugin, publish-rust-plugin]
     runs-on: ubuntu-latest
     if: >-
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
@@ -430,6 +443,80 @@ jobs:
           packages-dir: pkg-loomweave
           attestations: true
           repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+
+  publish-crates:
+    name: Publish crates to crates.io
+    needs: [verify, assert-on-main]
+    runs-on: ubuntu-latest
+    # crates.io has no TestPyPI analogue, so this publishes ONLY on a pushed v*
+    # tag (verify-gated, on a commit asserted to be on main). cargo publish is
+    # idempotent here: an already-uploaded version counts as success, so a re-run
+    # after a partial failure is safe. Crates upload leaf -> root; each upload
+    # waits for the crates.io index before its dependents publish.
+    # loomweave-plugin-fixture is publish=false (test-only) and omitted.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; pkgs=json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"]=="loomweave-core"))')"
+          echo "Publishing workspace version $VERSION"
+
+          wait_for_registry() {
+            local crate=$1 tmpdir
+            echo "Waiting for $crate $VERSION in the crates.io index..."
+            for attempt in $(seq 1 20); do
+              tmpdir="$(mktemp -d)"
+              if (cd "$tmpdir" && cargo info "$crate@$VERSION" >/dev/null 2>&1); then
+                rm -rf "$tmpdir"; echo "$crate $VERSION visible"; return 0
+              fi
+              rm -rf "$tmpdir"
+              echo "$crate $VERSION not visible yet ($attempt/20); sleeping 30s"
+              sleep 30
+            done
+            echo "::error::$crate $VERSION did not appear in the crates.io index"
+            return 1
+          }
+
+          publish() {
+            local crate=$1 output status
+            echo "Publishing $crate..."
+            set +e
+            output="$(cargo publish -p "$crate" --no-verify 2>&1)"
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [ "$status" -eq 0 ]; then
+              echo "$crate published"
+              wait_for_registry "$crate"
+            elif grep -Eq "already uploaded|already exists|is already uploaded" <<<"$output"; then
+              echo "$crate already published, skipping"
+              wait_for_registry "$crate"
+            else
+              echo "::error::$crate failed to publish"
+              return "$status"
+            fi
+          }
+
+          publish loomweave-core
+          publish loomweave-scanner
+          publish loomweave-analysis
+          publish loomweave-storage
+          publish loomweave-federation
+          publish loomweave-plugin-rust
+          publish loomweave-mcp
+          publish loomweave-cli
 
   release:
     name: Create GitHub Release
@@ -466,7 +553,7 @@ jobs:
           # whose `sign-blob` requires a bundle and breaks the
           # --output-signature/--output-certificate flow ("create bundle file:
           # open :"). v2.5.2 is the version that signed the last good release
-          # (Clarion v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
+          # (Loomweave v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
           # separate follow-up.
           cosign-release: 'v2.5.2'
 
@@ -586,7 +673,7 @@ jobs:
           # whose `sign-blob` requires a bundle and breaks the
           # --output-signature/--output-certificate flow ("create bundle file:
           # open :"). v2.5.2 is the version that signed the last good release
-          # (Clarion v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
+          # (Loomweave v1.1.0). Porting sign-blob/verify-blob to cosign 3.x is a
           # separate follow-up.
           cosign-release: 'v2.5.2'
 

@@ -1,0 +1,7 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Filigree">
+  
+  <g stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+    <path d="M16 4 L28 16 L16 28 L4 16 Z"></path>
+    <path d="M16 11 L21 16 L16 21 L11 16 Z" fill="currentColor" stroke="none"></path>
+  </g>
+</svg>

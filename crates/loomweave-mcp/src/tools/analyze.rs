@@ -40,7 +40,7 @@ impl ServerState {
         };
 
         let run_id = uuid::Uuid::new_v4().to_string();
-        let runs_dir = self.project_root.join(".loomweave").join("runs");
+        let runs_dir = loomweave_core::store::store_dir(&self.project_root).join("runs");
         if let Err(err) = std::fs::create_dir_all(&runs_dir) {
             return Ok(tool_error_envelope(
                 McpErrorCode::IoError,
@@ -79,6 +79,7 @@ impl ServerState {
             &self.project_root,
             &run_id,
             &progress_path,
+            self.analyze_config_path.as_deref(),
             started_at,
         ) {
             Ok(handle) => handle,
@@ -218,7 +219,7 @@ impl ServerState {
 
         match outcome {
             CancelOutcome::Cancelled => {
-                let db_path = self.project_root.join(".loomweave").join("loomweave.db");
+                let db_path = loomweave_core::store::db_path(&self.project_root);
                 crate::analyze_runs::mark_run_cancelled_in_db(&db_path, &run_id, &now);
                 Ok(success_envelope(json!({
                     "run_id": run_id,

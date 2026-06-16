@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::SecretScanOutcome;
 
-const SECRET_DETECTED: &str = "LMWV-SEC-SECRET-DETECTED";
+pub(super) const SECRET_DETECTED: &str = "LMWV-SEC-SECRET-DETECTED";
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingFinding {
@@ -24,6 +24,13 @@ pub(super) struct PendingFinding {
     pub(super) confidence: FindingConfidence,
     pub(super) message: String,
     pub(super) evidence: serde_json::Value,
+    /// The finding's SITE discriminator — the stable "where" of the detection
+    /// (`file:line:detector` for a detection, `file` for a file-level fact),
+    /// deliberately EXCLUDING the detected value. The finding id is keyed on
+    /// (anchor entity, rule, site), so a rotated secret at the same site
+    /// upserts the same row instead of minting a duplicate
+    /// (weft-7256739b31 / dogfood-4 B10).
+    pub(super) site: String,
 }
 
 #[allow(dead_code)]
@@ -114,21 +121,7 @@ pub(crate) async fn emit_findings(
             finding_entity_id(&pending.file_path, entity_anchors).with_context(|| {
                 format!("anchor secret finding for {}", pending.file_path.display())
             })?;
-        // Deterministic, run-scoped id so a `--resume` re-walk regenerates the
-        // SAME id and `InsertFinding`'s upsert is idempotent (REQ-FINDING-05).
-        // A random UUID would instead create a duplicate finding row on every
-        // resume (the id never collides, so the upsert never fires). The digest
-        // covers the anchor entity, rule, and evidence (file + line + hashed
-        // secret), which uniquely identify a detection within a run.
-        let discriminator = blake3::hash(
-            format!(
-                "{entity_id}\u{0}{}\u{0}{}",
-                pending.rule_id, pending.evidence
-            )
-            .as_bytes(),
-        )
-        .to_hex();
-        let finding_id = format!("core:finding:{run_id}:secret:{discriminator}");
+        let finding_id = secret_finding_id(&entity_id, pending.rule_id, &pending.site);
         writer
             .send_wait(|ack| WriterCmd::InsertFinding {
                 finding: Box::new(FindingRecord {
@@ -160,6 +153,23 @@ pub(crate) async fn emit_findings(
     Ok(())
 }
 
+/// Deterministic, SITE-keyed finding id so re-analysis (and a `--resume`
+/// re-walk) regenerates the SAME id and `InsertFinding`'s upsert is idempotent
+/// across runs (REQ-FINDING-05; L1 / ADR-047). A random UUID would instead
+/// create a duplicate finding row on every run (the id never collides, so the
+/// upsert never fires). The digest covers the anchor entity, the rule, and the
+/// site (`file:line:detector`) — and deliberately NOT the detected value
+/// (`hashed_secret_hex`): keying on the evidence hash made a rotated secret at
+/// an unchanged site mint a NEW id each run while the stale row lingered
+/// (incremental runs gate the full-pass sweep off) — the dogfood-4 B10
+/// duplicate (weft-7256739b31). The current value still reaches the row via
+/// the upsert's `evidence = excluded.evidence` refresh.
+fn secret_finding_id(entity_id: &str, rule_id: &str, site: &str) -> String {
+    let discriminator =
+        blake3::hash(format!("{entity_id}\u{0}{rule_id}\u{0}{site}").as_bytes()).to_hex();
+    format!("core:finding:secret:{discriminator}")
+}
+
 pub(super) fn secret_detected_finding(file: &Path, detection: &Detection) -> PendingFinding {
     PendingFinding {
         file_path: file.to_path_buf(),
@@ -183,6 +193,12 @@ pub(super) fn secret_detected_finding(file: &Path, detection: &Detection) -> Pen
             "rule": detection.rule_id,
             "hashed_secret_hex": detection.hashed_secret.to_string(),
         }),
+        site: format!(
+            "{}:{}:{}",
+            file.display(),
+            detection.line_number,
+            detection.rule_id
+        ),
     }
 }
 
@@ -192,9 +208,53 @@ fn finding_entity_id(file_path: &Path, anchors: &BTreeMap<PathBuf, String>) -> O
 
 #[cfg(test)]
 mod tests {
-    use super::{FindingConfidence, finding_entity_id, secret_detected_finding};
+    use super::{FindingConfidence, finding_entity_id, secret_detected_finding, secret_finding_id};
     use loomweave_scanner::{DetectSecretsRule, Detection, HashedSecret, SecretCategory};
     use std::{collections::BTreeMap, path::PathBuf};
+
+    fn detection_at(line_number: u32, hashed: [u8; 20]) -> Detection {
+        Detection {
+            rule_id: "AWSKeyDetector",
+            detect_secrets_type: DetectSecretsRule::AwsAccessKey,
+            category: SecretCategory::CloudCredential,
+            byte_offset: 0,
+            line_number,
+            matched_len: 20,
+            hashed_secret: HashedSecret::from_bytes(hashed),
+        }
+    }
+
+    /// weft-7256739b31 (dogfood-4 B10): the finding id is keyed on the SITE —
+    /// anchor entity + rule + `file:line:detector` — and NOT on the detected
+    /// value. A rotated secret at an unchanged site must regenerate the SAME
+    /// id (so the upsert refreshes in place); a different line must not.
+    #[test]
+    fn finding_id_is_site_keyed_not_value_keyed() {
+        let file = PathBuf::from("/repo/specimen/policy_boundaries.py");
+        let original = secret_detected_finding(&file, &detection_at(41, [1u8; 20]));
+        let rotated = secret_detected_finding(&file, &detection_at(41, [2u8; 20]));
+        let moved = secret_detected_finding(&file, &detection_at(28, [1u8; 20]));
+
+        let id = |finding: &super::PendingFinding| {
+            secret_finding_id(
+                "python:module:specimen.policy_boundaries",
+                finding.rule_id,
+                &finding.site,
+            )
+        };
+        assert_eq!(
+            id(&original),
+            id(&rotated),
+            "same site, rotated value: identical id (upsert, not duplicate)"
+        );
+        assert_ne!(
+            id(&original),
+            id(&moved),
+            "a different line is a different site and a different finding"
+        );
+        // The rotated value still reaches the row through the evidence refresh.
+        assert_ne!(original.evidence, rotated.evidence);
+    }
 
     #[test]
     fn finding_entity_id_requires_exact_anchor_path() {

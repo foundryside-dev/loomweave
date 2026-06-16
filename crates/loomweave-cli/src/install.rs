@@ -1,16 +1,16 @@
-//! `loomweave install` — initialise .loomweave/ in the target directory.
+//! `loomweave install` — initialise .weft/loomweave/ in the target directory.
 //!
 //! Creates:
-//! - `.loomweave/loomweave.db`        (migrated)
-//! - `.loomweave/config.json`       (internal state stub)
-//! - `.loomweave/.gitignore`        (UQ-WP1-04 rules; ADR-005)
+//! - `.weft/loomweave/loomweave.db`        (migrated)
+//! - `.weft/loomweave/.gitignore`        (UQ-WP1-04 rules; ADR-005 — also the
+//!   store dir's tracked marker, so the dir stays committed)
 //! - `<path>/loomweave.yaml`        (user-edited config stub at project root;
 //!   see detailed-design.md §File layout)
 //!
 //! A bare `loomweave install` (no flags) does everything: init + MCP config +
-//! skills + hooks + local Weft integration bindings. If `.loomweave/` already
+//! skills + hooks + local Weft integration bindings. If `.weft/loomweave/` already
 //! exists, init is skipped and the idempotent components are still applied.
-//! Pass `--force` to wipe and reinitialise `.loomweave/`. Component flags and
+//! Pass `--force` to wipe and reinitialise `.weft/loomweave/`. Component flags and
 //! `--all` are still accepted for explicit partial installs.
 
 use std::fs;
@@ -21,67 +21,44 @@ use rusqlite::Connection;
 
 use loomweave_storage::{pragma, schema};
 
-const CONFIG_JSON_STUB: &str = r#"{
-    "schema_version": 1,
-    "last_run_id": null
-}
-"#;
+// The default `loomweave.yaml` lives in `crate::config` so `loomweave install`
+// and `loomweave config example` emit byte-identical content from a single
+// source of truth (it can never drift from what install writes).
+use crate::config::LOOMWEAVE_YAML_STUB;
 
-// NOTE: Do not use `\` line-continuation here — Rust strips both the newline
-// AND all leading whitespace on the continuation line, producing flat (and
-// therefore broken) YAML. Use raw newlines + explicit indentation.
-const LOOMWEAVE_YAML_STUB: &str = "# loomweave.yaml — user-edited config.
-# Do not delete this file: loomweave serve reads MCP, LLM, and integration
-# settings from here when present.
-version: 1
-llm_policy:
-  enabled: false
-  provider: openrouter
-  allow_live_provider: false
-  openrouter:
-    endpoint_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-    attribution:
-      referer: https://github.com/foundryside-dev/loomweave
-      title: Loomweave
-  codex_cli:
-    executable: codex
-    model: null
-    profile: null
-    sandbox: read-only
-    timeout_seconds: 300
-  claude_cli:
-    executable: claude
-    model: null
-    permission_mode: plan
-    tools: []
-    timeout_seconds: 300
-    max_turns: 2
-    no_session_persistence: true
-    exclude_dynamic_system_prompt_sections: true
-  model_id: anthropic/claude-sonnet-4.6
-  session_token_ceiling: 1000000
-  max_inferred_edges_per_caller: 8
-  cache_max_age_days: 180
-integrations:
-  filigree:
-    enabled: false
-    base_url: http://127.0.0.1:8766
-    actor: loomweave-mcp
-    token_env: FILIGREE_API_TOKEN
-    timeout_seconds: 5
-serve:
-  mcp:
-    enable_write_tools: false
-  http:
-    enabled: false
-    bind: 127.0.0.1:9111
-";
+/// Canonical contents of `.weft/loomweave/.gitignore`. The single source of
+/// truth: [`write_gitignore`] writes it verbatim on install, and
+/// `loomweave doctor --fix` compares the on-disk file against it and rewrites a
+/// stale/missing one to match — so the two paths provably converge. The file is
+/// wholly Loomweave-owned (private store dir), so a full-file compare + rewrite
+/// is correct; there is no user content to merge.
+pub(crate) const GITIGNORE_CONTENTS: &str = "\
+# Loomweave .gitignore — ADR-005 tracked-vs-excluded list
+# (the loomweave.db posture was reversed by C1 / weft-d822a7de2d).
+# Tracked (committed): .gitignore itself (the store dir's only tracked marker).
+# Excluded (ignored): the index DB itself, WAL sidecars, shadow DB, per-run
+#   logs, tmp scratch, the read-API live port discovery file, the per-project
+#   instance id, and the analyze advisory lock.
 
-const GITIGNORE_CONTENTS: &str = "\
-# Loomweave .gitignore — ADR-005 tracked-vs-excluded list.
-# Tracked (committed): loomweave.db, config.json, .gitignore itself.
-# Excluded (ignored): WAL sidecars, shadow DB, per-run logs, tmp scratch.
+# The index DB is a regenerable orientation CACHE, not committed analysis state
+# (ADR-005, reversed by C1 / weft-d822a7de2d). `loomweave analyze` rebuilds the
+# structural graph with no LLM calls, so it is cheap to regenerate; only the lazy
+# summary cache costs anything, and that is machine-local. Tracking it dirtied the
+# working tree on every analyze/scan and blocked legis signing of the project.
+# (Sharing summaries across a team is a future opt-in, not the default.)
+loomweave.db
+
+# Read-API live port discovery file (ADR-044): present only while serve runs,
+# rewritten per bind, loopback-only — a runtime artifact, never committed.
+ephemeral.port
+
+# Per-project instance fingerprint (loomweave serve) and the analyze advisory
+# lock (loomweave.lock, fs2). Both are process-/machine-local runtime state,
+# never durable: committing them stages a live lock + instance id, and the lock
+# is meaningless on another checkout (clarion-7381e6382d). `*.lock` also covers
+# any future lock sidecar.
+instance_id
+*.lock
 
 # SQLite write-ahead files never belong in the repo.
 *-wal
@@ -105,6 +82,11 @@ tmp/
 # raw LLM request/response log is excluded.
 logs/
 runs/*/log.jsonl
+
+# LLM lookup diagnostics (metadata-only traffic log + its rotation backup,
+# written by `loomweave serve`) — per-machine runtime telemetry, never
+# committed (weft-ac59e8e730).
+diagnostics/
 ";
 
 /// A single component selected by a partial `loomweave install`.
@@ -115,6 +97,7 @@ pub enum InstallComponent {
     Skills,
     CodexSkills,
     Hooks,
+    Instructions,
 }
 
 /// What `loomweave install` should do, resolved from the CLI flags.
@@ -131,7 +114,7 @@ pub enum InstallComponent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallPlan {
     /// Component flags without `--all`: apply the named components and do NOT
-    /// initialise `.loomweave/`. `from_components` only constructs this when at
+    /// initialise `.weft/loomweave/`. `from_components` only constructs this when at
     /// least one component is present.
     Components {
         claude_code: bool,
@@ -139,8 +122,9 @@ pub enum InstallPlan {
         skills: bool,
         codex_skills: bool,
         hooks: bool,
+        instructions: bool,
     },
-    /// No flags or `--all`: initialise `.loomweave/` + every integration.
+    /// No flags or `--all`: initialise `.weft/loomweave/` + every integration.
     All,
 }
 
@@ -160,11 +144,12 @@ impl InstallPlan {
                 skills: components.contains(&InstallComponent::Skills),
                 codex_skills: components.contains(&InstallComponent::CodexSkills),
                 hooks: components.contains(&InstallComponent::Hooks),
+                instructions: components.contains(&InstallComponent::Instructions),
             }
         }
     }
 
-    /// Whether to initialise `.loomweave/` (the index). True for `All`.
+    /// Whether to initialise `.weft/loomweave/` (the index). True for `All`.
     #[must_use]
     pub fn init_loomweave(self) -> bool {
         matches!(self, Self::All)
@@ -213,13 +198,27 @@ impl InstallPlan {
     pub fn hooks(self) -> bool {
         matches!(self, Self::All | Self::Components { hooks: true, .. })
     }
+
+    /// Whether to inject the agent-orientation block into `CLAUDE.md` /
+    /// `AGENTS.md`.
+    #[must_use]
+    pub fn instructions(self) -> bool {
+        matches!(
+            self,
+            Self::All
+                | Self::Components {
+                    instructions: true,
+                    ..
+                }
+        )
+    }
 }
 
 /// Run the `install` subcommand.
 ///
 /// # Errors
 ///
-/// Returns an error if `.loomweave/` already exists without `--force`, if the
+/// Returns an error if `.weft/loomweave/` already exists without `--force`, if the
 /// target directory cannot be canonicalised, or if any filesystem or database
 /// operation fails.
 pub fn run(
@@ -267,6 +266,10 @@ pub fn run(
         install_hooks(&project_root)?;
     }
 
+    if plan.instructions() {
+        install_instruction_blocks(&project_root)?;
+    }
+
     if matches!(plan, InstallPlan::All) {
         install_integration_bindings(&project_root)?;
     }
@@ -284,10 +287,11 @@ fn validate_plan(plan: InstallPlan) -> Result<()> {
         && !plan.skills()
         && !plan.codex_skills()
         && !plan.hooks()
+        && !plan.instructions()
     {
         bail!(
             "nothing to install: pass --claude-code, --codex, --skills, \
-             --codex-skills, --hooks, --all, \
+             --codex-skills, --hooks, --instructions, --all, \
              or run bare `loomweave install` to do everything."
         );
     }
@@ -295,23 +299,23 @@ fn validate_plan(plan: InstallPlan) -> Result<()> {
 }
 
 fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
-    let loomweave_dir = project_root.join(".loomweave");
+    let loomweave_dir = loomweave_core::store::store_dir(project_root);
     let exists = loomweave_dir.exists();
-    // `All` (including naked install) treats an existing .loomweave/ as
+    // `All` (including naked install) treats an existing .weft/loomweave/ as
     // already-initialised and skips re-init, still applying the idempotent
-    // components. A non-directory .loomweave is not a usable index, so refuse
+    // components. A non-directory .weft/loomweave is not a usable index, so refuse
     // rather than "succeed" with skills/hooks atop a project with no loomweave.db.
     // Component-only installs skip this block.
     if exists && !force {
         if !loomweave_dir.is_dir() {
             bail!(
-                "found a non-directory at {}; expected an initialised .loomweave/ \
+                "found a non-directory at {}; expected an initialised .weft/loomweave/ \
                  directory. Remove it (or pass --force) and re-run.",
                 loomweave_dir.display()
             );
         }
         println!(
-            "{} already initialised; skipping .loomweave/ init (pass --force to recreate).",
+            "{} already initialised; skipping .weft/loomweave/ init (pass --force to recreate).",
             loomweave_dir.display()
         );
         return Ok(());
@@ -321,11 +325,16 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
         // --force overwrite path.
         if !loomweave_dir.is_dir() {
             bail!(
-                "--force can only overwrite an existing .loomweave/ directory; \
+                "--force can only overwrite an existing .weft/loomweave/ directory; \
                  found non-directory at {}.",
                 loomweave_dir.display()
             );
         }
+        // A `weft.toml` `[loomweave].store_dir` override can point `store_dir`
+        // anywhere — `"."` (the project root), `".."` (an ancestor), or an
+        // arbitrary absolute dir. `--force`'s recursive delete must never wipe
+        // such a path, so validate that this is a Loomweave-owned store first.
+        ensure_safe_to_force_remove(&loomweave_dir, project_root)?;
         fs::remove_dir_all(&loomweave_dir)
             .with_context(|| format!("remove existing {}", loomweave_dir.display()))?;
     }
@@ -333,7 +342,7 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
     fs::create_dir_all(&loomweave_dir)
         .with_context(|| format!("mkdir {}", loomweave_dir.display()))?;
 
-    // Cleanup guard: if any post-mkdir step fails, remove .loomweave/ before
+    // Cleanup guard: if any post-mkdir step fails, remove .weft/loomweave/ before
     // bubbling the error so the next install attempt isn't blocked by the
     // "already exists" check (clarion-ed5017139f).
     if let Err(err) = populate_after_mkdir(&loomweave_dir, project_root) {
@@ -341,7 +350,7 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
             tracing::warn!(
                 loomweave_dir = %loomweave_dir.display(),
                 error = %cleanup_err,
-                "install failed and cleanup of partial .loomweave/ also failed; \
+                "install failed and cleanup of partial .weft/loomweave/ also failed; \
                  manual rm -rf may be required"
             );
         }
@@ -353,6 +362,48 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
         "loomweave install complete"
     );
     println!("Initialised {}", loomweave_dir.display());
+    Ok(())
+}
+
+/// Refuse `--force`'s recursive delete unless `loomweave_dir` is a Loomweave-owned
+/// store. A `weft.toml` `[loomweave].store_dir` override resolves to an arbitrary
+/// path (`"."` → project root, `".."` → an ancestor, or any absolute dir), so a
+/// blind `remove_dir_all` could wipe the project tree or an unrelated directory.
+///
+/// Two independent checks must both pass:
+/// 1. The store dir must not be the project root or an ancestor of it (canonical
+///    path comparison) — this alone defuses `store_dir = "."` / `".."`.
+/// 2. It must look like a Loomweave store: the canonical `.weft/loomweave`
+///    location, or a directory that actually holds a `loomweave.db`. An arbitrary
+///    absolute path or a misconfigured under-tree override is refused, not wiped.
+fn ensure_safe_to_force_remove(loomweave_dir: &Path, project_root: &Path) -> Result<()> {
+    let store_canon = loomweave_dir
+        .canonicalize()
+        .unwrap_or_else(|_| loomweave_dir.to_path_buf());
+    let root_canon = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    if root_canon == store_canon || root_canon.starts_with(&store_canon) {
+        bail!(
+            "--force refuses to delete {}: the configured store_dir is the project \
+             root or an ancestor of it. Fix [loomweave].store_dir in weft.toml.",
+            loomweave_dir.display()
+        );
+    }
+
+    let is_canonical_default = loomweave_dir
+        == project_root
+            .join(loomweave_core::store::WEFT_DIR)
+            .join(loomweave_core::store::MEMBER);
+    let holds_store_db = loomweave_dir.join("loomweave.db").is_file();
+    if !is_canonical_default && !holds_store_db {
+        bail!(
+            "--force refuses to delete {}: it does not look like a Loomweave store \
+             (no loomweave.db, and not the default .weft/loomweave path). Remove it \
+             manually if you intend to wipe it.",
+            loomweave_dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -429,6 +480,20 @@ fn install_hooks(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn install_instruction_blocks(project_root: &Path) -> Result<()> {
+    let report = crate::instructions::install_instructions(project_root)
+        .context("inject loomweave instructions into CLAUDE.md / AGENTS.md")?;
+    if report.changed {
+        println!(
+            "Injected loomweave instructions block into {}/{{CLAUDE,AGENTS}}.md",
+            project_root.display()
+        );
+    } else {
+        println!("loomweave instructions block already up to date");
+    }
+    Ok(())
+}
+
 fn install_integration_bindings(project_root: &Path) -> Result<()> {
     let changed = crate::integration_bindings::install_bindings(project_root)
         .context("install local Loomweave/Filigree/Wardline integration bindings")?;
@@ -444,13 +509,11 @@ fn populate_after_mkdir(loomweave_dir: &Path, project_root: &Path) -> Result<()>
     let db_path = loomweave_dir.join("loomweave.db");
     initialise_db(&db_path).context("initialise loomweave.db")?;
 
-    let config_path = loomweave_dir.join("config.json");
-    fs::write(&config_path, CONFIG_JSON_STUB)
-        .with_context(|| format!("write {}", config_path.display()))?;
-
-    let gitignore_path = loomweave_dir.join(".gitignore");
-    fs::write(&gitignore_path, GITIGNORE_CONTENTS)
-        .with_context(|| format!("write {}", gitignore_path.display()))?;
+    // No `config.json` stub: it carried `{schema_version, last_run_id}` that
+    // nothing ever read (weft emit incident 2026-06-10 — finishing the dead-write
+    // cleanup begun for wardline.yaml). The store dir stays committed via its
+    // own tracked `.gitignore`, so no marker file is needed.
+    write_gitignore(loomweave_dir)?;
 
     let yaml_path = project_root.join("loomweave.yaml");
     if yaml_path.exists() {
@@ -461,6 +524,34 @@ fn populate_after_mkdir(loomweave_dir: &Path, project_root: &Path) -> Result<()>
     } else {
         fs::write(&yaml_path, LOOMWEAVE_YAML_STUB)
             .with_context(|| format!("write {}", yaml_path.display()))?;
+    }
+    Ok(())
+}
+
+/// Write `<store_dir>/.gitignore` with the canonical [`GITIGNORE_CONTENTS`],
+/// atomically (temp + rename in the same directory) so a concurrent reader never
+/// sees a half-written file and a crash never truncates it. Shared by
+/// `loomweave install` (fresh init) and `loomweave doctor --fix` (stale/missing
+/// repair) so the template lives in exactly one place and both paths converge on
+/// byte-identical output.
+///
+/// # Errors
+///
+/// Returns an error if the store directory cannot be created, or if the temp
+/// write or rename fails.
+pub(crate) fn write_gitignore(store_dir: &Path) -> Result<()> {
+    fs::create_dir_all(store_dir).with_context(|| format!("mkdir {}", store_dir.display()))?;
+    let target = store_dir.join(".gitignore");
+    let temp = store_dir.join(format!(".gitignore.loomweave.tmp-{}", std::process::id()));
+    if let Err(err) = fs::write(&temp, GITIGNORE_CONTENTS)
+        .with_context(|| format!("write {}", temp.display()))
+        .and_then(|()| {
+            fs::rename(&temp, &target)
+                .with_context(|| format!("rename {} -> {}", temp.display(), target.display()))
+        })
+    {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
     }
     Ok(())
 }
@@ -488,6 +579,7 @@ mod tests {
         assert!(naked.skills());
         assert!(naked.codex_skills());
         assert!(naked.hooks());
+        assert!(naked.instructions());
 
         // --skills: skills only, no init.
         let skills = InstallPlan::from_components(false, &[InstallComponent::Skills]);
@@ -498,7 +590,8 @@ mod tests {
                 codex: false,
                 skills: true,
                 codex_skills: false,
-                hooks: false
+                hooks: false,
+                instructions: false
             }
         );
         assert!(!skills.init_loomweave());
@@ -507,6 +600,24 @@ mod tests {
         assert!(skills.skills());
         assert!(!skills.codex_skills());
         assert!(!skills.hooks());
+        assert!(!skills.instructions());
+
+        // --instructions: instruction blocks only, no init.
+        let instr = InstallPlan::from_components(false, &[InstallComponent::Instructions]);
+        assert_eq!(
+            instr,
+            InstallPlan::Components {
+                claude_code: false,
+                codex: false,
+                skills: false,
+                codex_skills: false,
+                hooks: false,
+                instructions: true
+            }
+        );
+        assert!(!instr.init_loomweave());
+        assert!(instr.instructions());
+        assert!(!instr.skills());
 
         // --hooks: hooks only, no init.
         let hooks = InstallPlan::from_components(false, &[InstallComponent::Hooks]);
@@ -517,7 +628,8 @@ mod tests {
                 codex: false,
                 skills: false,
                 codex_skills: false,
-                hooks: true
+                hooks: true,
+                instructions: false
             }
         );
         assert!(!hooks.init_loomweave());
@@ -536,6 +648,7 @@ mod tests {
         assert!(all.skills());
         assert!(all.codex_skills());
         assert!(all.hooks());
+        assert!(all.instructions());
 
         // Multiple component flags: selected components only, still no init.
         let both = InstallPlan::from_components(
@@ -546,6 +659,7 @@ mod tests {
                 InstallComponent::Skills,
                 InstallComponent::CodexSkills,
                 InstallComponent::Hooks,
+                InstallComponent::Instructions,
             ],
         );
         assert_eq!(
@@ -555,7 +669,8 @@ mod tests {
                 codex: true,
                 skills: true,
                 codex_skills: true,
-                hooks: true
+                hooks: true,
+                instructions: true
             }
         );
         assert!(!both.init_loomweave());
@@ -564,6 +679,7 @@ mod tests {
         assert!(both.skills());
         assert!(both.codex_skills());
         assert!(both.hooks());
+        assert!(both.instructions());
     }
 
     #[test]
@@ -579,12 +695,14 @@ mod tests {
             &[InstallComponent::Skills],
             &[InstallComponent::CodexSkills],
             &[InstallComponent::Hooks],
+            &[InstallComponent::Instructions],
             &[
                 InstallComponent::ClaudeCode,
                 InstallComponent::Codex,
                 InstallComponent::Skills,
                 InstallComponent::CodexSkills,
                 InstallComponent::Hooks,
+                InstallComponent::Instructions,
             ],
         ];
         for all in [false, true] {
@@ -596,7 +714,8 @@ mod tests {
                         || plan.codex()
                         || plan.skills()
                         || plan.codex_skills()
-                        || plan.hooks(),
+                        || plan.hooks()
+                        || plan.instructions(),
                     "from_components({all}, {components:?}) produced a do-nothing plan: {plan:?}"
                 );
             }

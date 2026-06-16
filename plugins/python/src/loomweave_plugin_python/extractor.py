@@ -3,7 +3,11 @@
 Walks a parsed Python file and emits one ``module`` entity per file plus
 one ``function`` entity per ``FunctionDef`` / ``AsyncFunctionDef`` and one
 ``class`` entity per ``ClassDef``. It also emits anchored scan-time
-``imports``, ``calls``, and ``references`` candidate edges.
+``imports``, ``calls``, ``references``, ``inherits_from``, and ``decorates``
+candidate edges. The last three share one resolution pass: base-class and
+decorator expressions become ``base`` / ``decorator`` relation sites in the
+same collector that gathers generic reference sites, and the site kind
+selects the emitted edge kind (see ``reference_resolver.ReferenceSiteKind``).
 
 Entity shape matches the Rust host's ``RawEntity`` + ``RawSource``
 contract (``crates/loomweave-core/src/plugin/host.rs:132-154``)::
@@ -40,6 +44,12 @@ Behaviour (B.2 §3 Q1 supersedes Sprint-1 UQ-WP3-11 for module entities):
   with ``parse_status="syntax_error"`` plus one stderr log line
   (UQ-WP3-02). The run continues; WP4-era findings can later attach a
   ``LMWV-PY-SYNTAX-ERROR`` annotation.
+- ``RecursionError``/``MemoryError`` from hostile or degenerate nesting
+  (deep BinOp/attribute chains, unary prefix runs) — whether raised by
+  ``ast.parse`` itself or by the post-parse walkers — → one degraded
+  module entity with ``parse_status="too_complex"`` plus a
+  ``LMWV-PY-TOO-COMPLEX`` plugin finding (clarion-f3eb3852d6; Rust
+  parse-guard parity, ADR-050). The plugin process survives.
 - Top-level ``__init__.py`` (where the dotted module name resolves to
   ``""``) is skipped with stderr; the entity-ID assembler rejects an
   empty ``canonical_qualified_name``.
@@ -85,6 +95,18 @@ if TYPE_CHECKING:
 
 _PLUGIN_ID = "python"
 _NOOP_CALL_RESOLVER = NoOpCallResolver()
+
+# Deep-nesting degradation (clarion-f3eb3852d6; Rust parse-guard parity,
+# ADR-050). CPython's tokenizer self-limits indentation (100) and paren
+# nesting (~200) as SyntaxError, but indentation-free deep ASTs (BinOp
+# chains, attribute chains, unary prefix runs) pass tokenization and blow
+# up later: ast.parse raises RecursionError ("during ast construction") or
+# MemoryError ("Parser stack overflowed"), and chains as shallow as ~350
+# nodes blow Python-level NodeVisitor recursion in the post-parse walkers
+# AFTER a clean parse. All three degrade to a `too_complex` module entity
+# plus this plugin finding — escaping would fail the whole plugin run at
+# the host's analyze_file boundary.
+FINDING_TOO_COMPLEX = "LMWV-PY-TOO-COMPLEX"
 _NOOP_REFERENCE_RESOLVER = NoOpReferenceResolver()
 
 
@@ -180,7 +202,7 @@ class RawEntity(TypedDict):
     qualified_name: str
     source: EntitySource
     parent_id: NotRequired[str]
-    parse_status: NotRequired[Literal["ok", "syntax_error"]]
+    parse_status: NotRequired[Literal["ok", "syntax_error", "too_complex"]]
     # entity_context evidence (clarion-460def6a51). Set on function/class
     # entities; omitted for modules. Rides the host's RawEntity `extra` flatten
     # into `properties_json`, so no host or storage schema change is needed.
@@ -323,7 +345,7 @@ def _build_module_entity(
     source: str,
     dotted_module: str,
     file_path: str,
-    parse_status: Literal["ok", "syntax_error"],
+    parse_status: Literal["ok", "syntax_error", "too_complex"],
     docstring: str | None = None,
 ) -> RawEntity:
     """Build the per-file module entity (Q1 + Q4 resolutions)."""
@@ -424,6 +446,17 @@ def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vo
             [],
             ExtractionStats(extractor_parse_latency_ms=parse_latency_ms),
         )
+    except (RecursionError, MemoryError) as exc:
+        # Deep AST construction (RecursionError) or PEG parser stack guard
+        # (MemoryError) — see FINDING_TOO_COMPLEX. Stack is unwound here.
+        return _too_complex_result(
+            source,
+            dotted_module,
+            file_path,
+            "parse",
+            exc,
+            _elapsed_ms(parse_started_ns),
+        )
     parse_latency_ms = _elapsed_ms(parse_started_ns)
 
     module_entity = _build_module_entity(
@@ -432,41 +465,97 @@ def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vo
     entities: list[RawEntity] = [module_entity]
     edges: list[RawEdge] = []
     function_ids: list[str] = []
-    walk_state = _WalkState(
-        seen_ids={module_entity["id"]},
-        file_path=file_path,
-        exported_names=_module_export_names(tree),
-        wardline_vocabulary=wardline_vocabulary,
-    )
-    _walk(
-        tree,
-        [tree],
-        dotted_module,
-        file_path,
-        module_entity["id"],
-        entities,
-        edges,
-        function_ids,
-        walk_state,
-    )
-    edges.extend(
-        _collect_import_edges(
-            source,
+    try:
+        walk_state = _WalkState(
+            seen_ids={module_entity["id"]},
+            file_path=file_path,
+            exported_names=_module_export_names(tree),
+            wardline_vocabulary=wardline_vocabulary,
+        )
+        _walk(
             tree,
+            [tree],
             dotted_module,
+            file_path,
             module_entity["id"],
-            is_package_module=is_package_module,
-        ),
-    )
-    reference_sites = _collect_reference_sites(source, tree, dotted_module, module_entity["id"])
-    call_stats = call_resolver.resolve_calls(file_path, function_ids)
-    reference_stats = reference_resolver.resolve_references(file_path, reference_sites)
+            entities,
+            edges,
+            function_ids,
+            walk_state,
+        )
+        edges.extend(
+            _collect_import_edges(
+                source,
+                tree,
+                dotted_module,
+                module_entity["id"],
+                is_package_module=is_package_module,
+            ),
+        )
+        reference_sites = _collect_reference_sites(source, tree, dotted_module, module_entity["id"])
+        call_stats = call_resolver.resolve_calls(file_path, function_ids)
+        reference_stats = reference_resolver.resolve_references(file_path, reference_sites)
+    except (RecursionError, MemoryError) as exc:
+        # A tree can parse cleanly (the C parser's limit is deeper than the
+        # Python recursion limit) and still blow the recursive NodeVisitor
+        # walkers / pyright function index at ~350+ nesting. Degrade the
+        # whole file: partially-walked entities/edges are discarded so the
+        # emission is all-or-nothing per file.
+        return _too_complex_result(
+            source,
+            dotted_module,
+            file_path,
+            "extract",
+            exc,
+            parse_latency_ms,
+            ast.get_docstring(tree),
+        )
     edges.extend(cast("list[RawEdge]", call_stats.edges))
     edges.extend(cast("list[RawEdge]", reference_stats.edges))
     stats = ExtractionStats.from_resolution_results(call_stats, reference_stats)
     stats.extractor_parse_latency_ms = parse_latency_ms
     stats.duplicate_entities_dropped_total = walk_state.duplicate_entities_dropped
     return ExtractResult(entities, edges, stats)
+
+
+def _too_complex_result(  # noqa: PLR0913 - degraded-path builder mirrors the syntax_error arm's inputs.
+    source: str,
+    dotted_module: str,
+    file_path: str,
+    phase: Literal["parse", "extract"],
+    exc: BaseException,
+    parse_latency_ms: int,
+    docstring: str | None = None,
+) -> ExtractResult:
+    """Degrade a nesting-bomb file to a `too_complex` module entity + finding.
+
+    Mirrors the Rust plugin's parse-guard degrade-to-finding pattern
+    (ADR-050): the file is ingested as a single degraded module entity, the
+    failure is visible as a `LMWV-PY-TOO-COMPLEX` plugin finding riding the
+    findings wire, and the plugin (and the host's run) survives.
+    """
+    sys.stderr.write(
+        f"loomweave-plugin-python: degrading {file_path}: nesting too complex "
+        f"during {phase} ({type(exc).__name__})\n",
+    )
+    stats = ExtractionStats(extractor_parse_latency_ms=parse_latency_ms)
+    stats.findings.append(
+        Finding(
+            subcode=FINDING_TOO_COMPLEX,
+            severity="warning",
+            message=(
+                f"{file_path}: source nesting too complex to extract "
+                f"({type(exc).__name__} during {phase}); file ingested as a "
+                "degraded module entity"
+            ),
+            metadata={"phase": phase, "exception": type(exc).__name__},
+        ),
+    )
+    return ExtractResult(
+        [_build_module_entity(source, dotted_module, file_path, "too_complex", docstring)],
+        [],
+        stats,
+    )
 
 
 def _elapsed_ms(started_ns: int) -> int:
@@ -710,6 +799,7 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
         if _has_overload_decorator(node):
             return
         function_id = self._entity_id_for_scope("function", node)
+        self._collect_decorator_sites(node, function_id)
         self.owner_stack.append(function_id)
         self.bound_stack.append(_scope_local_names(node))
         self._visit_function_signature(node)
@@ -722,6 +812,16 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         class_id = self._entity_id_for_scope("class", node)
+        self._collect_decorator_sites(node, class_id)
+        # Base expressions become `base` relation sites owned by the subclass
+        # (resolved into `inherits_from` edges). Call bases (`class X(make())`)
+        # are outside the relation envelope: the call's *result* is the base,
+        # so anchoring the callee would assert a false inheritance fact.
+        # Keyword arguments (`metaclass=...`) are likewise out of scope.
+        for base in node.bases:
+            anchor = _relation_anchor(base)
+            if anchor is not None:
+                self.sites.append(self._site_for_relation(anchor, class_id, "base"))
         self.owner_stack.append(class_id)
         self.bound_stack.append(_scope_local_names(node))
         self.parents.append(node)
@@ -793,6 +893,59 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
         )
         return entity_id(_PLUGIN_ID, kind, qualified_name)
 
+    def _collect_decorator_sites(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+        owner_id: str,
+    ) -> None:
+        """Emit one ``decorator`` relation site per reducible decorator.
+
+        ``owner_id`` is the *decorated* entity (the site owner); the resolver
+        inverts direction at edge construction so the stored edge reads
+        ``decorator decorates decorated`` (`from_id` = decorator entity).
+        Factory decorators (``@app.route("/x")``) reduce to the callee path —
+        the factory is the entity that decorates, its arguments are not part
+        of the relation token.
+        """
+        for decorator in node.decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            anchor = _relation_anchor(target)
+            if anchor is not None:
+                self.sites.append(self._site_for_relation(anchor, owner_id, "decorator"))
+
+    def _site_for_relation(
+        self,
+        anchor: ast.Name | ast.Attribute,
+        from_id: str,
+        kind: Literal["base", "decorator"],
+    ) -> ReferenceSite:
+        """Build a relation site anchored on the full dotted path token.
+
+        The anchored byte range covers the whole path (Rust parity: the
+        implemented-trait PATH's span in ``impl Tr for Foo``), while the
+        pyright query position lands on the *final* attribute segment so
+        ``helpers.Base`` resolves the class, not the module prefix.
+        """
+        start_line = anchor.lineno - 1
+        end_line = (anchor.end_lineno or anchor.lineno) - 1
+        end_col = anchor.end_col_offset if anchor.end_col_offset is not None else anchor.col_offset
+        if isinstance(anchor, ast.Attribute):
+            query_line = end_line
+            query_byte_col = end_col - len(anchor.attr.encode("utf-8"))
+        else:
+            query_line = start_line
+            query_byte_col = anchor.col_offset
+        return ReferenceSite(
+            from_id=from_id,
+            line=query_line,
+            character=_byte_col_to_lsp_character(self.source_lines[query_line], query_byte_col),
+            end_line=end_line,
+            end_character=_byte_col_to_lsp_character(self.source_lines[end_line], end_col),
+            source_byte_start=self.line_starts[start_line] + anchor.col_offset,
+            source_byte_end=self.line_starts[end_line] + end_col,
+            kind=kind,
+        )
+
     def _site_for_name(self, node: ast.Name) -> ReferenceSite:
         line = node.lineno - 1
         end_line = (node.end_lineno or node.lineno) - 1
@@ -809,6 +962,23 @@ class _ReferenceSiteCollector(ast.NodeVisitor):
             source_byte_end=source_byte_end,
             kind="annotation" if self.annotation_depth else "name",
         )
+
+
+def _relation_anchor(expr: ast.expr) -> ast.Name | ast.Attribute | None:
+    """Reduce a base/decorator expression to its resolvable path token.
+
+    ``Name`` and ``Attribute`` are the anchor itself; ``Subscript`` reduces to
+    its value (``Generic[T]`` → ``Generic``). Anything else (calls, literals,
+    conditional expressions) has no stable path token and yields no relation
+    site — the resolution-side precise-entity discipline would drop it anyway.
+    """
+    match expr:
+        case ast.Name() | ast.Attribute():
+            return expr
+        case ast.Subscript(value=value):
+            return _relation_anchor(value)
+        case _:
+            return None
 
 
 def _line_starts(source: str) -> tuple[int, ...]:

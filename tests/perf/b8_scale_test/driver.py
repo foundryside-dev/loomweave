@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """B.8 scale-test MCP driver.
 
-The driver assumes `loomweave analyze` has already produced `.loomweave/loomweave.db`
+The driver assumes `loomweave analyze` has already produced `.weft/loomweave/loomweave.db`
 for the project under test. It starts `loomweave serve`, sends Content-Length
 framed MCP requests, and writes JSON measurements for the B.8 result memo.
 """
@@ -423,7 +423,7 @@ def _rows(
 
 
 def discover_targets(project: Path) -> QueryTargets:
-    db_path = project / ".loomweave" / "loomweave.db"
+    db_path = project / ".weft" / "loomweave" / "loomweave.db"
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -786,7 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--project",
         type=Path,
         required=True,
-        help="Analyzed project root containing .loomweave/loomweave.db",
+        help="Analyzed project root containing .weft/loomweave/loomweave.db",
     )
     parser.add_argument(
         "--loomweave-bin", type=Path, default=Path("target/release/loomweave")

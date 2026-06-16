@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-storage"
+description = "Loomweave storage: SQLite persistence (writer-actor + reader-pool), schema/migrations, summary cache, and SEI tokens."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +12,7 @@ workspace = true
 
 [dependencies]
 blake3.workspace = true
-loomweave-core = { path = "../loomweave-core", version = "1.0.0" }
+loomweave-core = { path = "../loomweave-core", version = "1.1.0" }
 deadpool-sqlite.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

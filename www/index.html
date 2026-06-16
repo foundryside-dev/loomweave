@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Loomweave — code-archaeology &amp; the suite's identity authority</title>
+<meta name="description" content="Loomweave turns a codebase into a queryable, identity-stable structural graph an agent reads instead of grepping — and mints the SEI every cross-tool binding in the Weft Federation keys on. Rust core, 42+ consult-mode MCP tools, local-first.">
+<!-- Preload brand + product faces before first paint (kills the substitute-font flash). -->
+<link rel="preload" href="fonts/SpaceGrotesk-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="preload" href="fonts/JetBrainsMono-Variable.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="stylesheet" href="colors_and_type.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip-link" href="#top">Skip to content</a>
+
+<!-- ============================ HEADER ============================ -->
+<header class="hub-header">
+  <a class="brand" href="index.html" aria-label="Loomweave — home">
+    <svg class="mark" width="26" height="26" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+      <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+    </svg>
+    <span class="wordmark">Loomweave</span>
+    <span class="path-hint">~/loomweave</span>
+  </a>
+  <nav class="hub-nav" aria-label="Primary">
+    <a href="index.html" aria-current="page">Overview</a>
+    <a href="getting-started.html">Getting started</a>
+    <a href="concepts.html">Concepts</a>
+    <a href="tools.html">MCP tools</a>
+    <a href="cli.html">CLI</a>
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">GitHub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+  <!-- ============================ HERO ============================ -->
+  <section class="hero">
+    <div class="eyebrow">
+      <span class="dot dot-ready" aria-hidden="true"></span>
+      <span class="t-label">Rust core · 42+ MCP tools · local-first · v1.1.0</span>
+    </div>
+    <h1 class="hero-title">Read the codebase,<br>don&rsquo;t re-grep it.</h1>
+    <p class="t-body hero-lede">
+      Loomweave is a code-archaeology tool. It walks a codebase, extracts entities
+      (functions, classes, modules) and edges (<code class="t-inline-code">contains</code>,
+      <code class="t-inline-code">calls</code>, <code class="t-inline-code">references</code>,
+      <code class="t-inline-code">imports</code>, plus the relation edges
+      <code class="t-inline-code">implements</code>/<code class="t-inline-code">derives</code> (Rust)
+      and <code class="t-inline-code">inherits_from</code>/<code class="t-inline-code">decorates</code> (Python)),
+      and persists the structural graph to a local SQLite store. A consult-mode LLM agent
+      that would otherwise re-explore the tree on every question asks a
+      <strong>graph-aware tool</strong> instead.
+    </p>
+    <p class="hero-defining">
+      It is the federation&rsquo;s <em>map and its coordinate system</em>: it turns a codebase
+      into a queryable, identity-stable structural graph — and mints the <strong>SEI</strong>
+      every cross-tool binding keys on.
+    </p>
+
+    <div class="axiom">
+      <div class="t-label axiom-label">Why Loomweave is load-bearing for the suite</div>
+      <div class="axiom-text">
+        Loomweave is the Weft suite&rsquo;s <strong>identity authority</strong>. It mints,
+        persists, re-binds, and resolves <strong>SEI</strong> — the Stable Entity Identity
+        every cross-tool binding keys on, so a Filigree issue or a Wardline taint fact still
+        names the same function after a rename or move tomorrow.
+        <span class="tag tag-ok">SEI standard LOCKED · 2026-06-05</span>
+      </div>
+    </div>
+
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="getting-started.html">Get started &rarr;</a>
+      <a class="btn ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">View on GitHub</a>
+    </div>
+
+    <div class="hero-stats">
+      <div class="stat">
+        <span class="stat-label"><span class="stat-dot t-accent"></span>Consult-mode MCP tools</span>
+        <span class="stat-value">42+</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label"><span class="stat-dot t-ready"></span>Entity kinds extracted</span>
+        <span class="stat-value">3</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label"><span class="stat-dot t-loomweave"></span>Durable SEI per entity</span>
+        <span class="stat-value">1</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label"><span class="stat-dot t-muted"></span>Credentials to analyze</span>
+        <span class="stat-value">0</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ====================== WHAT LOOMWEAVE OWNS ====================== -->
+  <section class="section" id="owns">
+    <div class="t-label section-label">What Loomweave owns</div>
+    <p class="t-body section-lede">
+      Structural truth about the codebase — and, load-bearing for the whole suite, its
+      identity authority. Tool names, route shapes, and the entity-ID scheme are Loomweave&rsquo;s
+      to define.
+    </p>
+    <div class="owns-grid">
+      <div class="owns-card">
+        <p class="owns-name">Entity extraction</p>
+        <p class="owns-body">Functions, classes, modules — each addressed by the 3-segment locator <code>{plugin_id}:{kind}:{qualname}</code> the language plugin owns.</p>
+      </div>
+      <div class="owns-card">
+        <p class="owns-name">The edge graph</p>
+        <p class="owns-body"><code>contains</code>, <code>calls</code>, <code>references</code>, and module <code>imports</code>, plus the relation edges <code>implements</code>/<code>derives</code> (Rust) and <code>inherits_from</code>/<code>decorates</code> (Python) — typed edges, with <code>calls</code> carrying a resolution <code>confidence</code>.</p>
+      </div>
+      <div class="owns-card">
+        <p class="owns-name">Subsystem clustering</p>
+        <p class="owns-body">A clustering pass groups modules into <strong>subsystems</strong>, persisted as first-class entities you can navigate to and from.</p>
+      </div>
+      <div class="owns-card">
+        <p class="owns-name">Briefings &amp; guidance</p>
+        <p class="owns-body">Lazy one-entity-at-a-time LLM summaries, orientation packets, and operator-authored guidance sheets consult agents read.</p>
+      </div>
+      <div class="owns-card">
+        <p class="owns-name">content_hash</p>
+        <p class="owns-body">A BLAKE3 hash of each entity body — the drift signal every cross-tool binding checks against to know if it still points at the same code.</p>
+      </div>
+      <div class="owns-card is-keystone">
+        <p class="owns-name">SEI — minting, persistence, resolution, lineage</p>
+        <p class="owns-body">The keystone. Loomweave mints the durable <strong>Stable Entity Identity</strong>, persists it across re-analysis, re-binds it through renames and moves, and serves <code>resolve</code> / <code>lineage</code> for the suite.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ====================== QUICK START ====================== -->
+  <section class="section" id="quickstart">
+    <div class="t-label section-label">30-second quick start</div>
+    <p class="t-body section-lede">Install, walk the corpus, serve the graph. <code class="t-inline-code">analyze</code> needs no LLM credentials — it is the fastest way to verify the install end-to-end.</p>
+    <div class="code">
+      <div class="code-head"><span class="code-lang">bash</span></div>
+<pre><span class="cm"># install the binary + the Python language plugin from the GitHub Release</span>
+TAG=v1.1.0
+curl -L -o loomweave.tar.gz \
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf loomweave.tar.gz
+install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
+pipx install \
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-plugin-python-1.1.0.tar.gz"
+
+<span class="cm"># wire the agent, walk the corpus, serve the graph over MCP</span>
+loomweave install --path .   <span class="cm"># initialises .weft/loomweave/, wires the MCP client + skill + hook</span>
+loomweave analyze            <span class="cm"># extract entities + edges (no LLM credentials needed)</span>
+loomweave serve              <span class="cm"># expose the 42+-tool consult-mode MCP surface</span></pre>
+    </div>
+
+    <h2 class="doc-h2">A traversal answer, honest about its blind spots</h2>
+    <p class="t-body section-lede">Every graph-traversal result carries a <code class="t-inline-code">scope_excludes</code> block naming exactly what was <strong>not</strong> searched — so an empty result is &ldquo;none found among the edges I can see,&rdquo; never a guaranteed true negative.</p>
+    <div class="code">
+      <div class="code-head"><span class="code-lang">json — entity_neighborhood_get(id) (excerpt)</span></div>
+<pre>{
+  <span class="ky">"entity"</span>: <span class="st">"python:function:auth.tokens.refresh"</span>,
+  <span class="ky">"callers"</span>: [],
+  <span class="ky">"callees"</span>: [<span class="st">"python:function:auth.tokens._sign"</span>],
+  <span class="ky">"imports_in"</span>: [<span class="st">"python:module:auth.session"</span>],
+  <span class="ky">"confidence"</span>: <span class="st">"resolved"</span>,
+  <span class="ky">"scope_excludes"</span>: [<span class="st">"attribute-receiver-calls"</span>]
+}</pre>
+    </div>
+    <div class="note">
+      <div class="note-label">Reads as</div>
+      <div class="note-body">&ldquo;No <strong>resolved</strong> callers among the edges I can see; calls made through an attribute receiver were not searched.&rdquo; That distinction is what lets an agent reason safely about a negative result. See <a href="concepts.html#scope-excludes">Concepts → scope_excludes</a>.</div>
+    </div>
+  </section>
+
+  <!-- ====================== FEDERATION ROLE ====================== -->
+  <section class="weave" id="federation">
+    <h2 class="comp-title">Its role in the greater federation</h2>
+    <p class="t-body section-lede">
+      Loomweave is one member of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — an agent-first family of small, local-first developer tools. The federation runs on one axiom, and Loomweave is its identity authority.
+    </p>
+
+    <div class="axiom">
+      <div class="t-label axiom-label">The federation axiom</div>
+      <div class="axiom-text">
+        Each member is authoritative for one domain, solo-useful, meaningfully composable
+        pairwise, and <strong>enrich-only — never load-bearing</strong> — when composed.
+      </div>
+    </div>
+
+    <div class="facts">
+      <div class="fact thread-loomweave">
+        <div class="t-label">The connective tissue</div>
+        <div class="fact-title">SEI — Stable Entity Identity</div>
+        <div class="fact-body">One durable id per code entity, <strong>owned by Loomweave</strong>. Every cross-tool binding keys on it, so a link survives a rename tomorrow. The <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/sei-standard.md" target="_blank" rel="noopener">SEI standard</a> is the suite contract; Loomweave ADR-038 is the token form. <span class="tag tag-ok">LOCKED · 2026-06-05</span></div>
+      </div>
+      <div class="fact">
+        <div class="t-label">Identity vs. address</div>
+        <div class="fact-title">Locator is the <span class="t-code">address</span></div>
+        <div class="fact-body">The 3-segment <code class="t-inline-code">{plugin_id}:{kind}:{qualname}</code> is a fine address and a terrible identity — rename and move change it. ADR-038 demoted it to the locator and made <strong>SEI the identity</strong>.</div>
+      </div>
+    </div>
+
+    <div class="t-label section-label">Representative bindings — every one enrich-only</div>
+    <ul class="bindings">
+      <li><span class="b-name thread-loomweave">Loomweave</span> <span class="b-arrow">&harr;</span> <span class="b-name thread-filigree">Filigree</span> <span class="b-desc">entity &harr; issue, drift-aware via <span class="t-code">issues_for</span> / <span class="t-code">entity_issue_list</span></span></li>
+      <li><span class="b-name thread-wardline">Wardline</span> <span class="b-arrow">&rarr;</span> <span class="b-name thread-loomweave">Loomweave</span> <span class="b-desc">taint facts enrich the entity graph (Loomweave hosts the taint-fact store)</span></li>
+      <li><span class="b-name thread-legis">Legis</span> <span class="b-arrow">&rarr;</span> <span class="b-name thread-filigree">Filigree</span> <span class="b-desc">SEI-keyed sign-offs on issues</span></li>
+      <li><span class="b-name thread-charter">Charter</span> <span class="b-arrow">&rarr;</span> <span class="b-name thread-loomweave">Loomweave</span> <span class="b-desc">SEI consumer for trace links</span> <span class="tag tag-dim">planned · scaffold-state</span></li>
+    </ul>
+    <p class="t-meta weave-foot">Remove any sibling and Loomweave&rsquo;s own answers keep working — it builds its catalog whether any sibling is present or not. Full 5&times;5 matrix in <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/federation-map.md" target="_blank" rel="noopener">federation-map.md</a>; the identity contract in <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/sei-standard.md" target="_blank" rel="noopener">sei-standard.md</a>.</p>
+  </section>
+
+  <!-- ====================== EXPLORE / PAGE DIRECTORY ====================== -->
+  <section class="section" id="explore">
+    <div class="t-label section-label">Read on</div>
+    <div class="product-grid">
+      <a class="product-card thread-loomweave" href="getting-started.html">
+        <span class="product-head"><span class="product-name">Getting started</span></span>
+        <span class="product-domain">install &rarr; analyze &rarr; serve</span>
+        <span class="product-what">Install the binary and the Python and Rust language plugins, initialise a project, build the graph, and wire an MCP client. Everything but summaries runs with no credentials.</span>
+        <span class="product-link">Walkthrough &rarr;</span>
+      </a>
+      <a class="product-card thread-loomweave" href="concepts.html">
+        <span class="product-head"><span class="product-name">Concepts</span></span>
+        <span class="product-domain">the entity model &amp; the consult loop</span>
+        <span class="product-what">Entities, kinds, the edge graph, locator-vs-SEI identity, and why <code>scope_excludes</code> is the honesty that makes a negative result trustworthy.</span>
+        <span class="product-link">Read &rarr;</span>
+      </a>
+      <a class="product-card thread-loomweave" href="tools.html">
+        <span class="product-head"><span class="product-name">MCP tools</span></span>
+        <span class="product-domain">the 42+-tool consult surface</span>
+        <span class="product-what">The full MCP surface grouped by family: navigation, briefing, guidance/findings/federation context, analyze lifecycle, and faceted shortcuts.</span>
+        <span class="product-link">Reference &rarr;</span>
+      </a>
+      <a class="product-card thread-loomweave" href="cli.html">
+        <span class="product-head"><span class="product-name">CLI</span></span>
+        <span class="product-domain">install · analyze · serve · guidance · doctor</span>
+        <span class="product-what">The <code>loomweave</code> binary&rsquo;s small, focused command set, with every flag — including the agent-setup components and <code>sarif import</code>.</span>
+        <span class="product-link">Reference &rarr;</span>
+      </a>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============================ FOOTER ============================ -->
+<footer class="hub-footer">
+  <svg class="mark" width="18" height="18" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 5 V27"/><path d="M16 11 H24"/><path d="M16 21 H8"/></g>
+    <g fill="currentColor"><circle cx="16" cy="5" r="2.4"/><circle cx="24" cy="11" r="2.4"/><circle cx="8" cy="21" r="2.4"/><circle cx="16" cy="27" r="2.4"/></g>
+  </svg>
+  <span class="foot-note">Loomweave is part of the <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft Federation</a> — the suite&rsquo;s code-structure surface and its SEI identity authority. Installable and runnable: a single Rust binary plus first-party Python and Rust language plugins.</span>
+  <nav class="foot-links" aria-label="Resources">
+    <a class="ext" href="https://github.com/foundryside-dev/loomweave" target="_blank" rel="noopener">Source</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft" target="_blank" rel="noopener">Weft hub</a>
+    <a class="ext" href="https://github.com/foundryside-dev/weft/blob/main/sei-standard.md" target="_blank" rel="noopener">SEI standard</a>
+  </nav>
+  <a class="foot-org ext" href="https://foundryside.dev" target="_blank" rel="noopener" aria-label="part of Foundryside — foundryside.dev">
+    <svg class="mark" width="17" height="17" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 24 H27"/><path d="M11 24 V15"/><path d="M16 24 V10"/><path d="M21 24 V15"/>
+      </g>
+      <g fill="currentColor">
+        <circle cx="11" cy="15" r="2.1"/><circle cx="16" cy="10" r="2.3"/><circle cx="21" cy="15" r="2.1"/>
+      </g>
+    </svg>
+    <span>part of Foundryside · foundryside.dev</span>
+  </a>
+  <span class="foot-meta">MIT · 2026</span>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>

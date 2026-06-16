@@ -24,6 +24,12 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# loomweave-cli's dev-dependency on the publish=false test crate
+# loomweave-plugin-fixture is path-only (no version) so `cargo publish` strips
+# it when packaging loomweave for crates.io. A versionless path dep reads as a
+# "wildcard" to cargo-deny; allow it for local path deps only (registry
+# wildcards are still denied).
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

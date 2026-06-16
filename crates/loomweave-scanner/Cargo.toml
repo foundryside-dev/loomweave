@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-scanner"
+description = "Loomweave scanner: pre-ingest secret scanner (entropy + pattern + baseline)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

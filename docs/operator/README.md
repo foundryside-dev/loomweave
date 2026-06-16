@@ -10,7 +10,7 @@ Practical notes for configuring and running Loomweave.
 - [Coding-agent LLM providers](./coding-agent-llm-providers.md) — Codex CLI
   and Claude CLI as local-login alternatives to API-key provider wiring.
 - [Runtime topology](./runtime-topology.md) — supported `loomweave serve` and
-  `loomweave analyze` concurrency against one `.loomweave/loomweave.db`.
+  `loomweave analyze` concurrency against one `.weft/loomweave/loomweave.db`.
 - [Secret scanning](./secret-scanning.md) — pre-ingest scanner behavior,
   baseline false-positive workflow, override confirmation, and audit queries.
 - [Guidance](./guidance.md) — authoring guidance sheets with the `loomweave

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import ctypes
 import ctypes.util
+import errno
 import json
 import math
 import os
@@ -41,6 +42,8 @@ FINDING_PYRIGHT_POISON_FRAME = "LMWV-PY-PYRIGHT-POISON-FRAME"
 FINDING_PYRIGHT_INIT_TIMEOUT = "LMWV-PY-PYRIGHT-INIT-TIMEOUT"
 FINDING_PYRIGHT_UNAVAILABLE = "LMWV-PY-PYRIGHT-UNAVAILABLE"
 FINDING_PYRIGHT_INSTALL_FAILURE = "LMWV-PY-PYRIGHT-INSTALL-FAILURE"
+FINDING_PYRIGHT_SPAWN_DEFERRED = "LMWV-PY-PYRIGHT-SPAWN-DEFERRED"
+FINDING_PYRIGHT_RESOURCE_EXHAUSTED = "LMWV-PY-PYRIGHT-RESOURCE-EXHAUSTED"
 FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT = "LMWV-PY-CALL-RESOLUTION-TIMEOUT"
 FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT = "LMWV-PY-REFERENCE-RESOLUTION-TIMEOUT"
 FINDING_PYRIGHT_REFERENCE_SITE_CAP = "LMWV-PY-REFERENCE-SITE-CAP"
@@ -56,21 +59,44 @@ class PyrightRunState:
     consume ``ceil(N/25) * 3`` restarts instead of 3 for an entire analysis
     run. Pass the same ``PyrightRunState`` instance to every successive
     ``PyrightSession`` so the budget is enforced across the full run.
+
+    ``consecutive_spawn_deferrals`` tracks transient (resource-pressure) spawn
+    failures separately from the ``restart_count`` crash budget: it is reset to
+    zero on every successful spawn, so intermittent pressure never poisons the
+    run, while a sustained run of deferrals still terminates pyright once it
+    exceeds ``MAX_CONSECUTIVE_SPAWN_DEFERRALS``.
     """
 
     restart_count: int = 0
     disabled: bool = False
+    consecutive_spawn_deferrals: int = 0
 
 
 MAX_UNRESOLVED_CALLEE_EXPR_BYTES = 512
 MAX_PYRIGHT_RESTARTS_PER_RUN = 3
+# A spawn that fails with one of these errnos is a *transient* resource-pressure
+# condition (the host is momentarily out of process slots / memory), not a broken
+# install. EAGAIN in particular is what a busy workstation returns from fork(2)
+# when the per-UID RLIMIT_NPROC is hit. These are deferred-and-retried rather
+# than treated as a permanent install failure.
+_TRANSIENT_SPAWN_ERRNOS = frozenset({errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE})
+# Upper bound on *consecutive* transient spawn deferrals before pyright is
+# disabled for the run. Reset to zero on any successful spawn, so this only
+# fires under sustained pressure, never on an intermittent blip. A failed fork
+# costs microseconds, so retrying once per file across a large run is cheap.
+MAX_CONSECUTIVE_SPAWN_DEFERRALS = 50
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 PYRIGHT_CALL_TIMEOUT_SECS = 5.0
-PYRIGHT_FILE_TIMEOUT_SECS = 3.0
+# Per-file wall-clock budget for reference resolution. Large, heavily-typed
+# files (e.g. numpy/torch-vectorised ML code) can starve a tighter budget and
+# surface LMWV-PY-REFERENCE-RESOLUTION-TIMEOUT findings with edges left
+# unresolved. Such files are rare enough that the extra ceiling is worth the
+# more-complete graph.
+PYRIGHT_FILE_TIMEOUT_SECS = 10.0
 STDERR_TAIL_LIMIT = 65536
 PYRIGHT_EXCLUDE_PATTERNS = [
-    "**/.loomweave/**",
+    "**/.weft/**",
     "**/.git/**",
     "**/.hg/**",
     "**/.svn/**",
@@ -79,7 +105,7 @@ PYRIGHT_EXCLUDE_PATTERNS = [
     "**/__pycache__/**",
     "**/node_modules/**",
 ]
-PROJECT_LOCAL_EXTERNAL_DIRS = {".loomweave", ".git", ".hg", ".svn", ".jj", ".venv", "node_modules"}
+PROJECT_LOCAL_EXTERNAL_DIRS = {".weft", ".git", ".hg", ".svn", ".jj", ".venv", "node_modules"}
 
 
 if TYPE_CHECKING:
@@ -144,11 +170,23 @@ class _FunctionIndex:
 
 @dataclass
 class _ReferenceEdgeAccumulator:
+    kind: Literal["references", "inherits_from", "decorates"]
     from_id: str
     to_id: str
     source_byte_start: int
     source_byte_end: int
     candidates: set[str]
+
+
+# Site kind → emitted edge kind (clarion-43416be550). `name`/`annotation`
+# sites keep producing `references`; the two relation kinds map onto the
+# ontology kinds that were previously declared-but-dead for Python.
+_EDGE_KIND_BY_SITE_KIND: dict[str, Literal["references", "inherits_from", "decorates"]] = {
+    "name": "references",
+    "annotation": "references",
+    "base": "inherits_from",
+    "decorator": "decorates",
+}
 
 
 class PyrightSession:
@@ -484,7 +522,7 @@ class PyrightSession:
             },
         )
         try:
-            accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator] = {}
+            accumulators: dict[tuple[str, str, str], _ReferenceEdgeAccumulator] = {}
             lookup_cache: dict[
                 tuple[str, str, str, int, int, int, int], tuple[list[str], bool]
             ] = {}
@@ -518,6 +556,7 @@ class PyrightSession:
                                 deadline=deadline,
                             )
                             saw_external = saw_external or fallback_external
+                        candidate_ids = _filter_relation_candidates(site, candidate_ids)
                     except LspTimeoutError as exc:
                         self._record_finding(
                             FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
@@ -568,7 +607,13 @@ class PyrightSession:
             },
             self._budgeted_timeout(deadline),
         )
-        return self._target_ids_from_locations(result)
+        # Relation sites (base/decorator) resolve to precise entities only:
+        # the module-id coarse fallback would mint nonsense facts like
+        # "class inherits_from module" for aliased bases.
+        return self._target_ids_from_locations(
+            result,
+            precise_only=site.kind in ("base", "decorator"),
+        )
 
     def _deadline_for_file(self, path: Path) -> float:
         return self._file_deadlines.setdefault(
@@ -591,19 +636,32 @@ class PyrightSession:
     def _file_budget_expired(self, deadline: float) -> bool:
         return deadline - time.monotonic() <= 0
 
-    def _target_ids_from_locations(self, result: object) -> tuple[list[str], bool]:
+    def _target_ids_from_locations(
+        self,
+        result: object,
+        *,
+        precise_only: bool = False,
+    ) -> tuple[list[str], bool]:
         locations = result if isinstance(result, list) else [result]
         candidate_ids: set[str] = set()
         saw_external = False
         for location in locations:
-            target_id, external = self._target_id_from_location(location)
+            target_id, external = self._target_id_from_location(
+                location,
+                precise_only=precise_only,
+            )
             if external:
                 saw_external = True
             if target_id is not None:
                 candidate_ids.add(target_id)
         return sorted(candidate_ids), saw_external
 
-    def _target_id_from_location(self, location: object) -> tuple[str | None, bool]:
+    def _target_id_from_location(
+        self,
+        location: object,
+        *,
+        precise_only: bool = False,
+    ) -> tuple[str | None, bool]:
         if not isinstance(location, dict):
             return None, False
         raw_uri = location.get("uri")
@@ -625,6 +683,8 @@ class PyrightSession:
         key = _range_start_key(raw_range)
         if key is not None and key in target_index.entity_by_name_position:
             return target_index.entity_by_name_position[key], False
+        if precise_only:
+            return None, False
         return target_index.module_id, False
 
     def _ensure_process(self) -> bool:
@@ -711,14 +771,7 @@ class PyrightSession:
                 preexec_fn=preexec_fn,  # noqa: PLW1509
             )
         except OSError as exc:
-            self._run_state.disabled = True
-            self._record_finding(
-                FINDING_PYRIGHT_INSTALL_FAILURE,
-                "pyright-langserver failed to start",
-                executable=executable,
-                error=str(exc),
-            )
-            return False
+            return self._handle_spawn_oserror(exc, executable)
 
         self._process = process
         self._start_stderr_drain(process)
@@ -745,7 +798,56 @@ class PyrightSession:
                 process.kill()
                 process.wait(timeout=2)
             return False
+        # A clean spawn + handshake clears any accumulated transient-deferral
+        # pressure: the per-UID resource squeeze that caused earlier EAGAINs has
+        # eased, so the run is healthy again.
+        self._run_state.consecutive_spawn_deferrals = 0
         return True
+
+    def _handle_spawn_oserror(self, exc: OSError, executable: str) -> bool:
+        """Triage a ``subprocess.Popen`` failure into transient vs. permanent.
+
+        ``EAGAIN``/``ENOMEM``/``EMFILE``/``ENFILE`` are *transient*
+        resource-pressure errors: a busy host momentarily out of process slots,
+        memory, or file descriptors. The spawn is deferred — ``self._process``
+        stays ``None`` and ``disabled`` is left unset, so the next file retries a
+        fresh spawn — and only a sustained run of deferrals
+        (``MAX_CONSECUTIVE_SPAWN_DEFERRALS``) gives up. Any other errno (notably
+        ``ENOENT``/``EACCES``) is a genuine, permanent install defect and
+        disables pyright for the rest of the run.
+        """
+        if exc.errno in _TRANSIENT_SPAWN_ERRNOS:
+            self._run_state.consecutive_spawn_deferrals += 1
+            if self._run_state.consecutive_spawn_deferrals > MAX_CONSECUTIVE_SPAWN_DEFERRALS:
+                self._run_state.disabled = True
+                self._record_finding(
+                    FINDING_PYRIGHT_RESOURCE_EXHAUSTED,
+                    "pyright-langserver persistently unavailable under resource "
+                    "pressure; skipping call resolution",
+                    executable=executable,
+                    consecutive_spawn_deferrals=self._run_state.consecutive_spawn_deferrals,
+                    error=str(exc),
+                )
+                return False
+            # Emit one finding per pressure *episode* (the 0 -> 1 transition),
+            # not one per deferred file, so a busy run is not buried in findings.
+            if self._run_state.consecutive_spawn_deferrals == 1:
+                self._record_finding(
+                    FINDING_PYRIGHT_SPAWN_DEFERRED,
+                    "pyright-langserver spawn deferred under resource pressure; "
+                    "will retry on subsequent files",
+                    executable=executable,
+                    error=str(exc),
+                )
+            return False
+        self._run_state.disabled = True
+        self._record_finding(
+            FINDING_PYRIGHT_INSTALL_FAILURE,
+            "pyright-langserver failed to start",
+            executable=executable,
+            error=str(exc),
+        )
+        return False
 
     def _initialize(self) -> None:
         result = self._request(
@@ -1143,17 +1245,31 @@ def _has_overload_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> boo
 
 
 def _merge_reference_site(
-    accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator],
+    accumulators: dict[tuple[str, str, str], _ReferenceEdgeAccumulator],
     site: ReferenceSite,
     candidate_ids: Sequence[str],
 ) -> None:
+    """Fold one resolved site into the per-file edge accumulators.
+
+    The site kind selects the edge kind (``_EDGE_KIND_BY_SITE_KIND``).
+    ``decorator`` sites invert direction: the site owner is the *decorated*
+    entity, but the stored edge reads ``decorator decorates decorated``
+    (ADR-051: from_id = decorator entity, to_id = decorated entity), so the
+    resolved candidate becomes ``from_id``. Ambiguous candidates therefore
+    list alternative decorators (from-side) rather than alternative targets.
+    """
     sorted_candidates = sorted(set(candidate_ids))
-    to_id = sorted_candidates[0]
-    key = (site.from_id, to_id)
+    edge_kind = _EDGE_KIND_BY_SITE_KIND[site.kind]
+    if site.kind == "decorator":
+        from_id, to_id = sorted_candidates[0], site.from_id
+    else:
+        from_id, to_id = site.from_id, sorted_candidates[0]
+    key = (edge_kind, from_id, to_id)
     existing = accumulators.get(key)
     if existing is None:
         accumulators[key] = _ReferenceEdgeAccumulator(
-            from_id=site.from_id,
+            kind=edge_kind,
+            from_id=from_id,
             to_id=to_id,
             source_byte_start=site.source_byte_start,
             source_byte_end=site.source_byte_end,
@@ -1167,6 +1283,22 @@ def _merge_reference_site(
     ):
         existing.source_byte_start = site.source_byte_start
         existing.source_byte_end = site.source_byte_end
+
+
+def _filter_relation_candidates(site: ReferenceSite, candidate_ids: list[str]) -> list[str]:
+    """Apply the relation-site target discipline (Rust derives/implements parity).
+
+    ``inherits_from`` targets must be class entities — a base name resolving
+    to a function (factory alias, shadowing ``def``) is dropped rather than
+    stored as a class-inherits-function fact, mirroring the Rust resolver's
+    ``rust:trait:`` kind filter. Both relation kinds drop self-edges
+    (``class X(X)`` resolving the in-definition name to itself).
+    """
+    if site.kind == "base":
+        candidate_ids = [cid for cid in candidate_ids if cid.startswith("python:class:")]
+    if site.kind in ("base", "decorator"):
+        candidate_ids = [cid for cid in candidate_ids if cid != site.from_id]
+    return candidate_ids
 
 
 def _reference_lookup_cache_key(
@@ -1186,7 +1318,7 @@ def _reference_lookup_cache_key(
 
 
 def _sorted_reference_accumulators(
-    accumulators: dict[tuple[str, str], _ReferenceEdgeAccumulator],
+    accumulators: dict[tuple[str, str, str], _ReferenceEdgeAccumulator],
 ) -> list[_ReferenceEdgeAccumulator]:
     return sorted(
         accumulators.values(),
@@ -1204,7 +1336,7 @@ def _reference_accumulator_to_edge(
 ) -> ReferencesRawEdge:
     candidates = sorted(accumulator.candidates)
     edge: ReferencesRawEdge = {
-        "kind": "references",
+        "kind": accumulator.kind,
         "from_id": accumulator.from_id,
         "to_id": accumulator.to_id,
         "source_byte_start": accumulator.source_byte_start,

@@ -1,3 +1,18 @@
+# Bound every test's wall-clock so `cargo nextest run --workspace` always
+# *completes* (and reports) instead of hanging. The pre-existing emission tests
+# tracked by clarion-1d405be546 hang indefinitely; without a cap the literal CI
+# command (CLAUDE.md "Build, test, lint") can never run clean, forcing a
+# "green via family-exclusion" caveat. With the cap, a hung test is terminated
+# and reported as a timeout failure — honestly red, fast — and clarion-1d405be546
+# remains its owner's bug to fix (the cap does not fix it).
+#
+# `terminate-after` counts `period`s: a test slow past `period` is warned (SLOW),
+# and killed after `period * terminate-after`. The period sits well above the
+# slowest legitimate test (the single-threaded serve-http integration tests) with
+# CI-runner headroom, so only a genuine hang trips it.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
+
 [test-groups]
 serve-http = { max-threads = 1 }
 

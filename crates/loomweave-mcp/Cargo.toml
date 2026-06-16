@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-mcp"
+description = "Loomweave MCP server: exposes the code-archaeology graph to consult-mode LLM agents."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,9 +13,9 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
-loomweave-core = { path = "../loomweave-core", version = "1.0.0" }
-loomweave-federation = { path = "../loomweave-federation", version = "1.0.0" }
-loomweave-storage = { path = "../loomweave-storage", version = "1.0.0" }
+loomweave-core = { path = "../loomweave-core", version = "1.1.0" }
+loomweave-federation = { path = "../loomweave-federation", version = "1.1.0" }
+loomweave-storage = { path = "../loomweave-storage", version = "1.1.0" }
 reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

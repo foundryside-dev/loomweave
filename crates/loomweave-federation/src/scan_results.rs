@@ -257,10 +257,19 @@ pub fn parse_scan_results_response(body: &str) -> Result<ScanResultsResponse, se
     serde_json::from_str(body)
 }
 
-/// The scan-results intake URL for a Filigree base URL.
+/// The scan-results intake URL for a Filigree base URL. When `project` is
+/// `Some(non-empty)` the project is pinned as a `?project=<key>` query —
+/// required against a shared, multi-project Filigree server, which rejects an
+/// unscoped `POST /api/v1/scan-results` with `VALIDATION` 400 ("ambiguous
+/// federation write in server mode"). An unset/blank project yields the classic
+/// single-project endpoint unchanged.
 #[must_use]
-pub fn scan_results_url(base_url: &str) -> String {
-    format!("{}/api/v1/scan-results", base_url.trim_end_matches('/'))
+pub fn scan_results_url(base_url: &str, project: Option<&str>) -> String {
+    let base = format!("{}/api/v1/scan-results", base_url.trim_end_matches('/'));
+    match project.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) => format!("{base}?project={key}"),
+        None => base,
+    }
 }
 
 /// The retention-sweep URL for a Filigree base URL (REQ-FINDING-06,
@@ -315,7 +324,7 @@ mod tests {
 
     fn defect_row() -> FindingForEmit {
         FindingForEmit {
-            id: "core:finding:run-1:circular".to_owned(),
+            id: "core:finding:circular".to_owned(),
             rule_id: "LMWV-PY-STRUCTURE-001".to_owned(),
             kind: "defect".to_owned(),
             severity: "WARN".to_owned(),
@@ -463,7 +472,7 @@ mod tests {
     fn prepare_batch_counts_emitted_and_skipped() {
         let emitted = defect_row();
         let mut skipped = defect_row();
-        skipped.id = "core:finding:run-1:weak-modularity".to_owned();
+        skipped.id = "core:finding:weak-modularity".to_owned();
         skipped.entity_id = "core:subsystem:abcd".to_owned();
         skipped.source_file_path = None;
 
@@ -567,13 +576,24 @@ mod tests {
 
     #[test]
     fn builds_scan_results_url() {
+        // Unscoped (single-project base URL): trailing slash trimmed, no query.
         assert_eq!(
-            scan_results_url("http://127.0.0.1:8542/"),
+            scan_results_url("http://127.0.0.1:8542/", None),
             "http://127.0.0.1:8542/api/v1/scan-results"
         );
         assert_eq!(
-            scan_results_url("http://127.0.0.1:8542"),
+            scan_results_url("http://127.0.0.1:8542", None),
             "http://127.0.0.1:8542/api/v1/scan-results"
+        );
+        // Blank/whitespace project is treated as unset (no dangling `?project=`).
+        assert_eq!(
+            scan_results_url("http://127.0.0.1:8542", Some("  ")),
+            "http://127.0.0.1:8542/api/v1/scan-results"
+        );
+        // Pinned project: required against a shared multi-project server.
+        assert_eq!(
+            scan_results_url("http://127.0.0.1:8749", Some("lacuna")),
+            "http://127.0.0.1:8749/api/v1/scan-results?project=lacuna"
         );
     }
 

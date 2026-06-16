@@ -10,15 +10,16 @@ use serde_json::{Value, json};
 use loomweave_storage::{
     ReferenceDirection, StorageError, ancestor_chain, call_edges_from, call_edges_targeting,
     child_entity_ids, entities_containing_line, entity_by_id, has_any_alive_binding,
-    normalize_source_path,
+    live_unresolved_call_sites_exist, normalize_source_path, resolve_entity_ref,
 };
 
 use crate::{
     ORIENTATION_PACK_MAX_NEIGHBORS, ORIENTATION_PACK_PATH_DEPTH, OrientationCore, ParamError,
-    PathTraversal, ServerState, call_graph_scope_excludes, callee_json, caller_json,
-    cap_neighbor_list, compact_execution_paths, entity_context_json, entity_json, import_neighbors,
-    orientation_suggested_reads, path_truncation_reason, reference_neighbors_for, required_i64,
-    storage_retryable, success_envelope_with_truncation, tool_error_envelope,
+    PathTraversal, ServerState, callee_json, caller_json, cap_neighbor_list,
+    compact_execution_paths, entity_context_json, entity_json, import_neighbors,
+    navigation_scope_excludes, orientation_suggested_reads, path_truncation_reason,
+    reference_neighbors_for, relation_neighbors, required_i64, storage_retryable, success_envelope,
+    success_envelope_with_truncation, tool_error_envelope, unresolved_match_fields,
 };
 
 impl ServerState {
@@ -79,7 +80,7 @@ impl ServerState {
                     (candidates.first().cloned(), candidates)
                 } else {
                     let id = entity_id_arg.as_deref().unwrap_or_default();
-                    match entity_by_id(conn, id)? {
+                    match resolve_entity_ref(conn, id)? {
                         Some(entity) => (Some(entity.clone()), vec![entity]),
                         None => (None, Vec::new()),
                     }
@@ -92,8 +93,10 @@ impl ServerState {
                     "degraded": snapshot.degraded(),
                     "scan_truncated": snapshot.scan_truncated(),
                 });
-                let staleness_stale =
-                    matches!(snapshot.staleness(), crate::snapshot::Staleness::Stale);
+                let staleness_stale = matches!(
+                    snapshot.staleness(),
+                    crate::snapshot::Staleness::Stale | crate::snapshot::Staleness::StaleWorktree
+                );
                 // Whether this index has any alive SEI bindings (REQ-C-04 /
                 // ADR-038). Degrades to `false` on a pre-SEI database.
                 let sei_populated = has_any_alive_binding(conn).unwrap_or(false);
@@ -116,8 +119,28 @@ impl ServerState {
                         sei_populated,
                         neighbors_omitted: serde_json::Map::new(),
                         paths_truncation_reason: None,
+                        briefing_blocked: None,
                     });
                 };
+
+                // Refuse to build a pack for a briefing-blocked primary
+                // (clarion-307668e2be): no identity, no surrounding structure —
+                // mirroring the federation read API (ADR-034). Resolved here, in
+                // the reader closure, so the post-closure path can short-circuit.
+                if let Some(reason) = crate::briefing_block_reason(&entity) {
+                    return Ok(OrientationCore {
+                        primary_id: None,
+                        primary_kind: None,
+                        lookup_was_id: query_line.is_none(),
+                        packet: Value::Null,
+                        freshness,
+                        staleness_stale,
+                        sei_populated,
+                        neighbors_omitted: serde_json::Map::new(),
+                        paths_truncation_reason: None,
+                        briefing_blocked: Some(reason),
+                    });
+                }
 
                 let ancestors = ancestor_chain(conn, &entity.id)?;
                 let entity_context = entity_context_json(
@@ -168,6 +191,10 @@ impl ServerState {
                     reference_neighbors_for(conn, &entity, ReferenceDirection::Out)?;
                 let imports_in = import_neighbors(conn, &entity.id, ReferenceDirection::In)?;
                 let imports_out = import_neighbors(conn, &entity.id, ReferenceDirection::Out)?;
+                let rels_in =
+                    relation_neighbors(conn, &entity.id, ReferenceDirection::In, confidence)?;
+                let rels_out =
+                    relation_neighbors(conn, &entity.id, ReferenceDirection::Out, confidence)?;
 
                 let cap = ORIENTATION_PACK_MAX_NEIGHBORS;
                 let (callers, callers_omitted) = cap_neighbor_list(callers_all, cap);
@@ -177,8 +204,14 @@ impl ServerState {
                 let (references_out, refs_out_omitted) = cap_neighbor_list(refs_out, cap);
                 let (imports_in, imports_in_omitted) = cap_neighbor_list(imports_in, cap);
                 let (imports_out, imports_out_omitted) = cap_neighbor_list(imports_out, cap);
+                let (relations_in, relations_in_omitted) = cap_neighbor_list(rels_in, cap);
+                let (relations_out, relations_out_omitted) = cap_neighbor_list(rels_out, cap);
 
-                let scope_excludes = call_graph_scope_excludes(confidence);
+                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
+                let scope_excludes = navigation_scope_excludes(confidence, live_unresolved);
+                // Honesty fields for the `callers` bucket (clarion-df87b4f381).
+                let (unresolved_name_matches, next_action) =
+                    unresolved_match_fields(conn, &entity)?;
 
                 let neighbors = json!({
                     "callers": callers,
@@ -192,6 +225,12 @@ impl ServerState {
                     "references_rolled_up": references_rolled_up,
                     "imports_in": imports_in,
                     "imports_out": imports_out,
+                    // Kind-tagged relation edges (ADR-051): inherits_from /
+                    // decorates / implements / derives.
+                    "relations_in": relations_in,
+                    "relations_out": relations_out,
+                    "unresolved_name_matches": unresolved_name_matches,
+                    "next_action": next_action,
                     "scope_excludes": scope_excludes,
                 });
 
@@ -228,6 +267,8 @@ impl ServerState {
                     ("references_out", refs_out_omitted),
                     ("imports_in", imports_in_omitted),
                     ("imports_out", imports_out_omitted),
+                    ("relations_in", relations_in_omitted),
+                    ("relations_out", relations_out_omitted),
                 ] {
                     neighbors_omitted.insert(key.to_owned(), json!(omitted));
                 }
@@ -248,6 +289,7 @@ impl ServerState {
                     sei_populated,
                     neighbors_omitted,
                     paths_truncation_reason: paths_truncation_reason.map(str::to_owned),
+                    briefing_blocked: None,
                 })
             })
             .await;
@@ -262,6 +304,18 @@ impl ServerState {
                 ));
             }
         };
+
+        // A briefing-blocked primary is refused before any structure is built —
+        // no identity, no neighbors, no paths (clarion-307668e2be). Checked ahead
+        // of the not-found branch: the blocked core carries `primary_id: None`.
+        if let Some(reason) = &core.briefing_blocked {
+            return Ok(success_envelope(json!({
+                "available": false,
+                "briefing_blocked": reason,
+                "remediation": crate::briefing_block_remediation(reason),
+                "primary_entity": Value::Null,
+            })));
+        }
 
         // An `entity`-id lookup that resolved to nothing is a hard error; a
         // file/line lookup that spans nothing degrades to a no_match packet.

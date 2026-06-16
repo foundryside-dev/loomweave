@@ -55,7 +55,7 @@ flowchart LR
     Loomweave -.->|"observations"| Filigree
     Filigree -.->|"triage state<br/>(read-only)"| Loomweave
 
-    Wardline -->|"wardline.yaml<br/>+ fingerprint + exceptions<br/>+ SARIF baseline"| Loomweave
+    Wardline -->|"taint facts + findings<br/>(qualname-reconciled)"| Loomweave
     Wardline -->|"REGISTRY<br/>(direct import)"| Loomweave
     Wardline -.->|"SARIF → Filigree<br/>via loomweave sarif import (v0.1)"| Filigree
 
@@ -84,7 +84,7 @@ flowchart TB
         PyPlugin["loomweave-plugin-python<br/><i>LSP-style JSON-RPC</i>"]
     end
 
-    Store[("`.loomweave/loomweave.db`<br/>SQLite WAL<br/><i>committed to git</i>")]
+    Store[("`.weft/loomweave/loomweave.db`<br/>SQLite WAL<br/><i>committed to git</i>")]
 
     Analyze -.->|"spawn per run"| PyPlugin
     Serve -.->|"spawn on demand<br/>for consult queries"| PyPlugin
@@ -100,7 +100,7 @@ flowchart TB
 | Mode | Surface | Purpose | v0.1 status |
 |---|---|---|---|
 | MCP-for-LLM | `loomweave serve` over stdio | First-class product surface — consult-mode agents hold a cursor, navigate the graph, emit observations to Filigree | Primary |
-| Catalog artefacts | `loomweave analyze` writes `.loomweave/catalog.json` + per-subsystem markdown | "I want to read the output" cases | v1.1 (deferred — Sprint 2 amendment §3 removed boxes B.4/B.5; see [REQ-ARTEFACT-01](requirements.md#req-artefact-01--json-catalog-output) / [REQ-ARTEFACT-02](requirements.md#req-artefact-02--per-subsystem-markdown--top-level-index)) |
+| Catalog artefacts | `loomweave analyze` writes `.weft/loomweave/catalog.json` + per-subsystem markdown | "I want to read the output" cases | v1.1 (deferred — Sprint 2 amendment §3 removed boxes B.4/B.5; see [REQ-ARTEFACT-01](requirements.md#req-artefact-01--json-catalog-output) / [REQ-ARTEFACT-02](requirements.md#req-artefact-02--per-subsystem-markdown--top-level-index)) |
 | Semi-dynamic wiki | HTML served by `loomweave serve` | Live finding list, in-browser guidance editing, consult entry points | v1.1 (deferred — NG-13) |
 
 ### Boundary contracts with the Weft siblings
@@ -108,7 +108,7 @@ flowchart TB
 Loomweave's integration posture is **enrich-only**. Loomweave works standalone (NFR-RELIABILITY-02's `--no-filigree` and `--no-wardline`); with siblings present, Loomweave's briefings, guidance, and findings gain context. No sibling is required for Loomweave's own data to be coherent.
 
 - **Filigree** (enrich-only). Loomweave emits findings and observations to Filigree; Loomweave reads Filigree's triage state (`REQ-BRIEFING-05`) to enrich briefings. Filigree's absence degrades Loomweave to local-only finding writes — semantics intact, convenience reduced.
-- **Wardline** (enrich-only). Loomweave ingests `wardline.yaml` + overlays + fingerprint + exceptions at analyse time; imports `wardline.core.registry.REGISTRY` at plugin startup. Wardline's absence degrades Loomweave's annotations to "confidence_basis: loomweave_augmentation" — Loomweave still extracts what the code declares, it just doesn't cross-check against Wardline's canonical vocabulary.
+- **Wardline** (enrich-only). Loomweave carries Wardline's taint facts and qualname-reconciled findings, and reads the NG-25 decorator-vocabulary descriptor (`.weft/wardline/vocabulary.yaml`) as a plain on-disk file at extract time. Wardline's absence degrades Loomweave's annotations to "confidence_basis: loomweave_augmentation" — Loomweave still extracts what the code declares, it just doesn't cross-check against Wardline's canonical vocabulary. *(The original `wardline.yaml` + overlays + fingerprint + exceptions ingest described here was retired 2026-06-11 — Wardline never produced that format; see requirements.md REQ-GUIDANCE-04 retirement note, clarion-7c9336163e.)*
 - **Shuttle** (not yet). Scope explicitly disclaimed (NG-07). Loomweave does not execute changes.
 
 ### What Loomweave is NOT
@@ -191,7 +191,7 @@ Each plugin declares its ontology at startup. The manifest is the contract betwe
 Key fields:
 - `plugin_id` — the namespace for this plugin's emissions (e.g., `python`, `java`, `core`)
 - `kinds` — every entity kind the plugin can emit; the v1.0 Python plugin declares only `function`, `class`, and `module`
-- `edge_kinds` — plugin-defined edge kinds; the v1.0 Python plugin declares only `contains`, `calls`, `references`, and `imports`. Core reserves `guides`, `emits_finding`, `in_subsystem`, and core-owned containment/source anchors.
+- `edge_kinds` — plugin-defined edge kinds; the Python plugin declares `contains`, `calls`, `references`, `imports`, `inherits_from`, and `decorates` (ontology 0.8.0). Core reserves `guides`, `emits_finding`, `in_subsystem`, and core-owned containment/source anchors.
 - `tags` — declared tag vocabulary
 - `capabilities` — boolean flags per capability (`calls`, `imports`, `inherits_from`, ...) with `confidence_basis` per capability (`ast_match`, `name_match`, `loomweave_augmentation`, ...)
 - `supported_rule_ids` — rule IDs this plugin may emit, namespaced by prefix
@@ -210,11 +210,11 @@ hash-pinning are deferred (NG-16).
 
 The Python plugin is the v0.1 validating plugin and the reference implementation of the manifest contract.
 
-**Parser dispatch**. The plugin parses with the standard-library `ast` module — there is **no tree-sitter and no LibCST dependency**. Structural extraction (`function` / `class` / `module` entities, qualnames, and `imports` edges) walks the `ast` tree directly. Decorator source ranges are retained in entity definition metadata, but decorator semantics are not emitted as edges in v1.0. Call-graph and reference resolution is delegated to a managed **pyright** subprocess session (`PyrightSession`, recycled every 25 files), which serves as both the call resolver and the reference resolver. There is no `LMWV-PY-PARTIAL-PARSE` fallback path.
+**Parser dispatch**. The plugin parses with the standard-library `ast` module — there is **no tree-sitter and no LibCST dependency**. Structural extraction (`function` / `class` / `module` entities, qualnames, and `imports` edges) walks the `ast` tree directly. Decorator source ranges are retained in entity definition metadata, and base-class / decorator expressions are collected as relation sites that resolve into anchored `inherits_from` / `decorates` edges (ontology 0.8.0, clarion-43416be550). Call-graph and reference resolution is delegated to a managed **pyright** subprocess session (`PyrightSession`, recycled every 25 files), which serves as both the call resolver and the reference resolver. There is no `LMWV-PY-PARTIAL-PARSE` fallback path.
 
 **Import extraction** (REQ-PLUGIN-05). `imports` edges are emitted from `import` / `from ... import` statements via the `ast` walk. Relative imports are normalized against the current module, `__init__.py` collapses to the package module name, `TYPE_CHECKING`-guarded imports carry `properties.type_only = true`, and function-local imports carry `properties.scope = "function"`. Graph algorithms filter those properties when they need runtime-only imports. Calls and references that pyright cannot resolve are recorded as **unresolved call / reference sites** (counted in run stats; unresolved *call* sites persist to `entity_unresolved_call_sites` for query-time inferred dispatch) rather than dropped. The plugin does **not** mint `python:unresolved:*` placeholder entities and does not emit `alias_of` edges for package re-exports in v1.0.
 
-**Decorator detection** (REQ-PLUGIN-06). Decorator semantics are deferred in v1.0. The extractor includes decorator lines in function/class source spans for navigation, but the manifest does not declare `decorated_by`, Wardline tags, or Wardline-aware capability, and the plugin emits no decorator edges, decorator arguments, or alias-resolved decorator facts.
+**Decorator detection** (REQ-PLUGIN-06). The extractor includes decorator lines in function/class source spans for navigation and emits anchored `decorates` edges (decorator → decorated; ontology 0.8.0). Decorator expressions reduce to their dotted path token — factory-call arguments are not extracted — and resolve to precise in-project entities only (external/builtin decorators, aliases, and self-references yield no edge). Stacking order and decorator arguments are not represented; alias-resolved decorator facts are not emitted.
 
 **Serial-or-parallel posture**. v0.1 is serial within the plugin (one file at a time). Parallelism happens at the core level (multiple plugins, multiple LLM calls). Parallelism inside the plugin is deferred to v0.2.
 
@@ -425,20 +425,20 @@ flowchart LR
 
 **Why not a single giant transaction**: Long transactions pin the WAL, prevent checkpoints from completing, and produce unbounded WAL growth. Per-batch transactions are the industry-standard posture for this workload.
 
-**Writer-actor vs. shadow-DB**. The writer-actor model is the v0.1 default. A shadow-DB alternative (`loomweave analyze --shadow-db` writes to `.loomweave/loomweave.db.new`, atomic-renames on completion) is available for users wanting zero-stale reads from a concurrent `loomweave serve` during long analyze runs. See ADR-011.
+**Writer-actor vs. shadow-DB**. The writer-actor model is the v0.1 default. A shadow-DB alternative (`loomweave analyze --shadow-db` writes to `.weft/loomweave/loomweave.db.new`, atomic-renames on completion) is available for users wanting zero-stale reads from a concurrent `loomweave serve` during long analyze runs. See ADR-011.
 
 ### Crash safety
 
 SQLite WAL + writer-actor transactions + explicit `PRAGMA synchronous=NORMAL`
 give crash-safe storage semantics: a SIGKILL during analyze must not corrupt
-`.loomweave/loomweave.db`, and committed rows survive. Per ADR-041, v1.x
+`.weft/loomweave/loomweave.db`, and committed rows survive. Per ADR-041, v1.x
 `loomweave analyze --resume <run_id>` reopens the existing run id and re-walks
 idempotently; it does not read `checkpoints.jsonl` or continue from a phase/file
 checkpoint.
 
 ### Git-friendly storage
 
-`.loomweave/loomweave.db` is committable to git (NFR-OPS-03). SQLite files diff poorly — Loomweave ships two features to handle this:
+`.weft/loomweave/loomweave.db` is committable to git (NFR-OPS-03). SQLite files diff poorly — Loomweave ships two features to handle this:
 
 1. **Textual export**: `loomweave db export --textual <out_dir>` produces deterministic JSON-lines dumps of entities, edges, guidance, findings. Sorted by id / (kind, from, to) so a one-entity change produces a one-line diff. Summary cache is excluded (rebuilds cheaply on next run).
 
@@ -447,9 +447,8 @@ checkpoint.
 ### File layout
 
 ```
-<project>/.loomweave/
+<project>/.weft/loomweave/
     loomweave.db              # main store (plus WAL files beside it)
-    config.json             # schema version, last run IDs
     loomweave.log             # process log
     runs/<run_id>/          # per-run artefacts (config snapshot, log.jsonl, stats.json, partial.json)
     .gitignore              # default-excludes runs/*/log.jsonl
@@ -694,22 +693,22 @@ flowchart TB
 | CLI | `loomweave guidance list [--for-entity <id>]` / `--stale` / `--expired` |
 | MCP | `propose_guidance(entity_id, content, match_rules)` — produces a Filigree **observation**, not a sheet |
 | CLI | `loomweave guidance promote <filigree_obs_id>` — promotes observation to sheet |
-| Wardline | Automatic on every `loomweave analyze` with `wardline.yaml` present |
+| Wardline | ~~Automatic on every `loomweave analyze` with `wardline.yaml` present~~ — retired 2026-06-11 (clarion-7c9336163e; Wardline never produced the manifest) |
 | Export / import | `loomweave guidance export --to <dir>` / `loomweave guidance import <dir>` |
 
 The `propose_guidance` → observation → explicit promote flow is the v0.1 defence against guidance-poisoning via adversarial LLM output (`NFR-SEC-02`). A single compromised LLM call cannot poison every future prompt because promotion requires operator action.
 
 ### Wardline-derived guidance
 
-On every `loomweave analyze` run with `wardline.yaml` present:
+> **Retired 2026-06-11** (clarion-7c9336163e). The design below assumed Wardline publishes a `wardline.yaml` manifest carrying tiers / boundary contracts / annotation groups. Wardline never produced that format (verified against its HEAD and full history; its config is `weft.toml [wardline]`, its vocabulary artifact is the NG-25 decorator descriptor). The ingest, the derived-sheet generator, and the `LMWV-FACT-GUIDANCE-STALE` drift finding were dormant on every real project and have been removed. Historical sketch retained below for the record.
+
+*Original (historical) text*: On every `loomweave analyze` run with `wardline.yaml` present:
 
 - **Per declared tier assignment** → module-scope sheet: "This module contains declared Tier-N entities (list). Summaries should reflect Tier-N posture."
 - **Per boundary contract** → subsystem-scope sheet: "Data crossing boundary `<contract>` carries Tier N; downstream users must not …"
 - **Per annotation group in use** → project-scope sheet referencing wardline's §7 paragraph for that group.
 
-All auto-generated sheets tagged `provenance: wardline_derived`, `pinned: true`. Regenerated every analyse; user-edited overrides preserved by ID and marked `provenance: wardline_derived_overridden`.
-
-Drift between `wardline.yaml` and derived guidance (Wardline runs at commit cadence; Loomweave at batch cadence) surfaces as `LMWV-FACT-GUIDANCE-STALE` finding.
+All auto-generated sheets tagged `provenance: wardline_derived`, `pinned: true`. Regenerated every analyse; user-edited overrides preserved by ID and marked `provenance: wardline_derived_overridden`. Drift between `wardline.yaml` and derived guidance surfaces as `LMWV-FACT-GUIDANCE-STALE` finding.
 
 ### Staleness signals tied to code churn
 
@@ -769,11 +768,11 @@ The scope lens shapes neighbour queries without changing their signatures:
 
 ### Tool catalogue by category
 
-> **The MCP server registers 35 tools** (`loomweave-mcp/src/lib.rs::list_tools`). The categories below name the actual shipped tools, not the original aspirational cursor-based catalogue. The earlier 8-tool subset has been superseded as WP4/WP5 navigation, catalog filters, and analyze-control tools landed; the tools are **stateless and id-based** (no `goto`/`back`/`zoom` cursor session), so an agent passes an `EntityId` (obtained from `find_entity` / `entity_at`) into each call. Tools that produce LLM summaries remain on-demand per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md).
+> **The MCP server defines 42 tools** (`loomweave-mcp/src/lib.rs::list_tools` — the `tools_list_exposes_exact_docstrings` test pins the exact count and order). Five of them (`entity_summary_get`, `analyze_start`, `analyze_cancel`, `propose_guidance`, `promote_guidance`) are write-gated: they are *registered* only under `serve.mcp.enable_write_tools: true`, so the default read-only policy advertises 37. The categories below name the actual shipped tools, not the original aspirational cursor-based catalogue. The earlier 8-tool subset has been superseded as WP4/WP5 navigation, catalog filters, and analyze-control tools landed; the tools are **stateless and id-based** (no `goto`/`back`/`zoom` cursor session), so an agent passes an `EntityId` (obtained from `find_entity` / `entity_at`) into each call. Tools that produce LLM summaries remain on-demand per [ADR-030](../adr/ADR-030-on-demand-summary-scope.md).
 
 **Location & lookup**: `entity_at(file, line)`, `find_entity(pattern)`, `source_for_entity(id)`, `orientation_pack(...)`, `project_status()`
 
-**Graph navigation**: `callers_of(id, confidence)`, `call_sites(id)`, `execution_paths_from(id, max_depth, confidence)`, `neighborhood(id, confidence)`, `what_tests_this(id)`
+**Graph navigation**: `callers_of(id, confidence)`, `call_sites(id)`, `execution_paths_from(id, max_depth, confidence)`, `neighborhood(id, confidence)`, `entity_relation_list(id, direction, kind?, confidence)` — the relation-edge read surface (`inherits_from`/`decorates`/`implements`/`derives`, direction semantics per [ADR-051](../adr/ADR-051-relation-edge-direction-and-anchor.md)), `what_tests_this(id)`
 
 **Subsystems**: `subsystem_members(id)`, `subsystem_of(id)`
 
@@ -841,7 +840,7 @@ Write-effect tools (`emit_observation`, `promote_observation`, `propose_guidance
 
 - Created on MCP `initialize` (≤100ms, NFR-PERF-02).
 - Default idle timeout: 1 hour.
-- State persisted to `.loomweave/sessions/<id>.json` for reconnection.
+- State persisted to `.weft/loomweave/sessions/<id>.json` for reconnection.
 - Admin surface: `loomweave sessions list` / `loomweave sessions close <id>`.
 
 ---
@@ -948,9 +947,9 @@ Loomweave → `metadata.loomweave.*`. Wardline SARIF-translated findings → `me
 
 | File | v0.1 ingest | Use |
 |---|---|---|
-| `wardline.yaml` + overlays | YES | Tier declarations, boundary contracts, group assignments → entity `WardlineMeta` + auto-derived guidance |
-| `wardline.fingerprint.json` | YES | Per-function annotation hash + qualname → `WardlineMeta.annotation_hash`, `wardline_qualname` |
-| `wardline.exceptions.json` | YES | Active exceptions → entities tagged `wardline.excepted` |
+| `wardline.yaml` + overlays | ~~YES~~ retired | Was: tier/boundary/group declarations → `WardlineMeta` + auto-derived guidance. Wardline never produced this file; ingest removed 2026-06-11 (clarion-7c9336163e) |
+| `wardline.fingerprint.json` | ~~YES~~ retired | Was part of the same manifest-bundle ingest; removed with it 2026-06-11 (clarion-7c9336163e) |
+| `wardline.exceptions.json` | ~~YES~~ retired | Was part of the same manifest-bundle ingest; removed with it 2026-06-11 (clarion-7c9336163e) |
 | `wardline.sarif.baseline.json` | YES (read-only) | Source for SARIF→Filigree translator |
 | Other Wardline state files (compliance, conformance, perimeter, retrospective) | NO (v0.2) | Not yet relevant to Loomweave's catalog shape |
 
@@ -1077,7 +1076,7 @@ Security is a first-class concern in v0.1 because Loomweave sends source code to
 | Prompt injection via source | Critical | Adversarial docstrings / comments → briefing field values → future-prompt poisoning via cache | Schema validation + untrusted-content delimiters + `knowledge_basis: static_only` |
 | Guidance poisoning via LLM-proposed sheets | High | `propose_guidance` MCP tool promotes attacker text into prompts | Manual promotion gate — proposals create observations, not sheets |
 | HTTP API reachable by other local processes | Medium | `loomweave serve` on shared dev host / container | ADR-014 registry-backend API is unauthenticated but loopback-only by default; non-loopback binds are refused unless explicitly allowed and protected by operator-managed access control. |
-| DB tampering via committed `.loomweave/loomweave.db` | Medium | Bad actor edits DB, commits, poisons teammate briefings | Content-hash cross-check on load (v0.2); `loomweave db verify` CLI |
+| DB tampering via committed `.weft/loomweave/loomweave.db` | Medium | Bad actor edits DB, commits, poisons teammate briefings | Content-hash cross-check on load (v0.2); `loomweave db verify` CLI |
 | LLM audit-log leakage via git | Medium | `runs/<run_id>/log.jsonl` contains request/response bodies | Default-excluded from git |
 | Personal API key charged when committing team DB | Medium (operator) | Developer commits DB generated with personal key | Operator guidance; `--audit-key` hint |
 | Plugin subprocess compromise | Medium | Malicious third-party plugin reads source or exhausts host resources | Hybrid authority per ADR-021: path jail, Content-Length ceiling, entity-count cap, per-plugin `prlimit` RSS. Full syscall sandbox + plugin hash-pinning deferred to v0.2 (NG-16) |
@@ -1090,7 +1089,7 @@ Before any file content reaches the LLM (Phases 4, 5, 6), Loomweave runs a pre-i
 - **Scope**: every file in `analysis.include` is scanned; exclusion globs apply *after* scanning (excluded files never reach the LLM regardless).
 - **Policy on finding**:
   - Unredacted secret → `LMWV-SEC-SECRET-DETECTED` (severity: ERROR) + **block LLM dispatch for that file**. Entities in the file still land in the store with summaries marked `briefing_blocked: secret_present`.
-  - False-positive whitelist: `.loomweave/secrets-baseline.yaml` (same format as `detect-secrets`' baseline; committable and reviewable).
+  - False-positive whitelist: `.weft/loomweave/secrets-baseline.yaml` (same format as `detect-secrets`' baseline; committable and reviewable).
   - Override: `loomweave analyze --allow-unredacted-secrets` requires explicit confirmation prompt and records the override in `stats.json`.
 - **Coverage**: high-entropy strings, common API key patterns (AWS, GitHub, Anthropic, Stripe, etc.), RSA private key headers, JWT-looking tokens.
 
@@ -1138,9 +1137,9 @@ Findings feed Filigree via the normal exchange. Security-focused operators can `
 
 Some risks sit outside Loomweave's code but inside the operator's responsibility:
 
-- **Use project-scoped API keys, not personal ones, when committing the DB**. Briefings in `.loomweave/loomweave.db` were paid for by whoever ran analyze; a teammate pulling your committed DB benefits from calls your personal key paid for. Use an Anthropic project key, not your personal key.
+- **Use project-scoped API keys, not personal ones, when committing the DB**. Briefings in `.weft/loomweave/loomweave.db` were paid for by whoever ran analyze; a teammate pulling your committed DB benefits from calls your personal key paid for. Use an Anthropic project key, not your personal key.
 - **Rotate tokens when a committed DB exposes a stale model's output**. If the DB was generated with a leaked or exposed API key, the token is already used; briefings aren't themselves secret but the key's usage fingerprint is.
-- **Review `.loomweave/.gitignore` before first commit**. Default excludes `runs/*/log.jsonl` (raw LLM request/response bodies); opting in to commit logs ships source excerpts to the repo — a choice, not an oversight.
+- **Review `.weft/loomweave/.gitignore` before first commit**. Default excludes `runs/*/log.jsonl` (raw LLM request/response bodies); opting in to commit logs ships source excerpts to the repo — a choice, not an oversight.
 
 Operator-guidance documentation lives in the detailed-design §10 for procedural depth.
 
@@ -1225,7 +1224,7 @@ The parallel listing in [detailed-design.md §11](./detailed-design.md#11-archit
 | ADR-002 | Plugin transport: Content-Length framed JSON-RPC 2.0 subprocess | Accepted | P0 | Binary-safe framing, resumability after crash, alignment with LSP patterns. Alternatives: newline-delimited JSON (unsafe for content with embedded newlines), Wasm (too early for plugin authoring ergonomics), embedded Python (couples core to Python runtime). |
 | ADR-003 | Entity ID scheme: symbolic canonical-name; file path as property; EntityAlias v0.2 | Accepted | P0 | Cross-tool identity must survive file moves. Path-embedded IDs silently detach every reference; symbolic IDs survive 80% case (file move without rename). Rename tracking via EntityAlias deferred; manual `--repair-aliases` workaround in v0.1. |
 | ADR-004 | Finding-exchange format: Filigree-native intake; `metadata.loomweave.*` nesting | Accepted | P0 | Filigree's `POST /api/v1/scan-results` is production path; SARIF requires either translation or Filigree-side work. Nesting convention under `metadata` dict (verified verbatim preservation) avoids silent drops of extension fields. |
-| ADR-005 | `.loomweave/` git-committable by default; DB included, run logs excluded | To author | P1 | Shared-analysis-state story benefits small teams; run logs may contain source excerpts appropriate to Anthropic but not git. Default-exclude run logs via `.gitignore`; opt-in to commit. |
+| ADR-005 | `.weft/loomweave/` git-committable by default; DB included, run logs excluded | To author | P1 | Shared-analysis-state story benefits small teams; run logs may contain source excerpts appropriate to Anthropic but not git. Default-exclude run logs via `.gitignore`; opt-in to commit. |
 | [ADR-006](../adr/ADR-006-clustering-algorithm.md), [ADR-032](../adr/ADR-032-weighted-components-clustering-fallback.md) | Clustering algorithm: Leiden (with weighted-components fallback) on imports + calls subgraph | Accepted | P0 | Leiden's connected-community guarantee fixes disconnected-cluster defects. Directed, weighted (reference_count); module-level. `weighted_components` is the deterministic fallback selectable via config when a local component cut is preferred. Modularity score recorded, not enforced (v0.1); weak threshold is reported via finding. |
 | [ADR-007](../adr/ADR-007-summary-cache-key.md) | Summary cache key design: `(entity_id, content_hash, prompt_template_id, model_tier, guidance_fingerprint)` + TTL backstop + churn-eager invalidation | Accepted | P0 | Full 5-part key captures all syntactic staleness paths; TTL backstop (180d default) bounds semantic staleness the key alone doesn't see; churn-eager invalidation on `LMWV-FACT-GUIDANCE-CHURN-STALE` makes stale-guidance pressure visible via cost. Neighborhood-drift flag (`stale_semantic: true`) rather than forced miss preserves NFR-COST-02's 95% hit-rate target. Block C1 spike validates the assumption. |
 | ADR-008 | (Superseded by ADR-014.) | Superseded | — | Initial Filigree file-registry displacement design was "feature flag"; recon showed it's schema surgery. See ADR-014. |
@@ -1233,7 +1232,7 @@ The parallel listing in [detailed-design.md §11](./detailed-design.md#11-archit
 | ADR-010 | MCP as first-class surface — lock-in cost vs ecosystem reach | To author | P2 | Anthropic's MCP standard is the ecosystem's current centre of gravity for LLM tool integrations; lock-in cost is acknowledged but the ecosystem reach outweighs it for v0.1. Strategic review at v0.3+. |
 | [ADR-011](../adr/ADR-011-writer-actor-concurrency.md) | Writer-actor concurrency model (vs shadow-DB swap) | Accepted | P0 | Single writer actor + per-N-files transactions (default N=50) is the committed shape; `--shadow-db` opt-in for zero-stale-read scenarios. Design-review §2.2 CRITICAL flag retires. SQLite-concurrency-under-load assumption named as v0.2 validation task (`NG-28` proposed). |
 | [ADR-012](../adr/ADR-012-http-auth-default.md) | Historical HTTP read-API auth proposal: UDS default with TCP+token fallback | Superseded for ADR-014 registry-backend API | P0 | ADR-014 now owns the registry-backend HTTP read API posture: unauthenticated loopback-only by default, non-loopback refused unless explicitly allowed and protected externally. ADR-012 remains context for the earlier broad HTTP API proposal. |
-| [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner with LLM-dispatch block | Accepted | P0 | Rust-native port of detect-secrets rule set (preserves NFR-OPS-04 single-binary). File-level block on detection; structural extraction preserved; briefings marked `briefing_blocked: secret_present`. `.loomweave/secrets-baseline.yaml` for false-positives. `--allow-unredacted-secrets` requires TTY confirm OR explicit `--confirm-allow-unredacted-secrets=yes-i-understand` in CI. |
+| [ADR-013](../adr/ADR-013-pre-ingest-secret-scanner.md) | Pre-ingest secret scanner with LLM-dispatch block | Accepted | P0 | Rust-native port of detect-secrets rule set (preserves NFR-OPS-04 single-binary). File-level block on detection; structural extraction preserved; briefings marked `briefing_blocked: secret_present`. `.weft/loomweave/secrets-baseline.yaml` for false-positives. `--allow-unredacted-secrets` requires TTY confirm OR explicit `--confirm-allow-unredacted-secrets=yes-i-understand` in CI. |
 | [ADR-014](../adr/ADR-014-filigree-registry-backend.md) | Filigree `registry_backend` flag + pluggable `RegistryProtocol` — schema surgery, not config flip | Accepted | P0 | Four NOT-NULL foreign keys on `file_records(id)` + three auto-create paths require a real interface, not a flag. Loomweave's shadow-registry fallback preserves v0.1 shipability when Filigree hasn't landed the surgery. |
 | [ADR-015](../adr/ADR-015-wardline-filigree-emission.md) | Wardline→Filigree emission ownership: Loomweave-side SARIF translator (v0.1), native Wardline POST (v0.2) | Accepted | P0 | Wardline has no HTTP client today (`integration-recon:339`); adding one is a refactor not on the v0.1 timeline. Loomweave-side translator ships independently; translator stays permanent for Semgrep / CodeQL / etc. `weft.md` §5 asterisk 1 retires when native emitter lands. Revision trigger: Block C2 spike showing emitter is ≤1 day of work promotes to v0.1. |
 | [ADR-016](../adr/ADR-016-observation-transport.md) | Observation transport: `filigree mcp` subprocess spawn (v0.1); `POST /api/v1/observations` HTTP (v0.2) | Accepted | P0 | Per Q1 scope commitment, observation HTTP transport deferred to v0.2. v0.1 emits via Loomweave spawning `filigree mcp` subprocess and calling existing `create_observation` MCP tool over stdio. v0.2 HTTP endpoint is the retirement trigger; capability probe detects via `HEAD /api/v1/observations`. |

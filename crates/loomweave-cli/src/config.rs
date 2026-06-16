@@ -3,7 +3,508 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use loomweave_analysis::ClusterAlgorithm;
+use loomweave_federation::config::{
+    LlmConfigEditResult, LlmConfigPatch, LlmProviderKind, McpConfig, ProviderSelection,
+    SemanticConfigEditResult, SemanticConfigPatch, SemanticProviderKind, select_provider_with_env,
+    update_llm_config_file, update_semantic_config_file,
+};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+
+// NOTE: Do not use `\` line-continuation in this string — Rust strips both the
+// newline AND all leading whitespace on the continuation line, producing flat
+// (and therefore broken) YAML. Use raw newlines + explicit indentation.
+//
+// This is the single source of truth for the default `loomweave.yaml`: both
+// `loomweave install` (writes it on init) and `loomweave config example` (prints
+// it) use this exact text, so they can never drift. A round-trip test
+// (`stub_parses_under_deny_unknown_fields`) asserts it parses cleanly under the
+// config structs' `deny_unknown_fields` — guarding against stub↔struct drift.
+pub(crate) const LOOMWEAVE_YAML_STUB: &str = "# loomweave.yaml — user-edited config.
+# Do not delete this file: loomweave serve reads MCP, LLM, and integration
+# settings from here when present. Validate it any time with `loomweave config check`.
+version: 1
+# --- LLM summaries (entity_summary_get) --------------------------------------
+# OFF by default. To enable LIVE summaries:
+#   1. set both enabled: true AND allow_live_provider: true below; then
+#   2. either keep provider: openrouter and export the key named by
+#      openrouter.api_key_env (default OPENROUTER_API_KEY), OR switch provider to
+#      claude_sidecar / codex_sidecar to drive a locally-authenticated
+#      coding-agent CLI (canonical values: claude_cli / codex_cli)
+#      (no API key stored in this file).
+# `loomweave config llm set --enable --allow-live --provider codex_sidecar
+# --enable-write-tools` updates these fields without hand-editing.
+# `loomweave config check` prints the resulting effective state and any warnings.
+llm_policy:
+  enabled: false
+  provider: openrouter
+  allow_live_provider: false
+  openrouter:
+    endpoint_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    attribution:
+      referer: https://github.com/foundryside-dev/loomweave
+      title: Loomweave
+  codex_cli:
+    executable: codex
+    model: null
+    profile: null
+    sandbox: read-only
+    timeout_seconds: 300
+  claude_cli:
+    executable: claude
+    model: null
+    permission_mode: plan
+    tools: []
+    timeout_seconds: 300
+    max_turns: 2
+    no_session_persistence: true
+    exclude_dynamic_system_prompt_sections: true
+  model_id: anthropic/claude-sonnet-4.6
+  session_token_ceiling: 1000000
+  max_inferred_edges_per_caller: 8
+  cache_max_age_days: 180
+# --- Semantic search embeddings (entity_semantic_search_list) ----------------
+# OFF by default. To enable local semantic ranking:
+#   1. run a local OpenAI-compatible embeddings server on loopback; then
+#   2. run:
+#      loomweave config semantic set --enable --provider local_openai \
+#        --endpoint-url http://127.0.0.1:11434/v1 \
+#        --model-id nomic-embed-text --dimensions 768
+#   3. rerun `loomweave analyze` to populate .weft/loomweave/embeddings.db.
+# Hosted OpenAI-compatible APIs use provider: api, allow_live_provider: true,
+# and api_key_env naming the API key env var.
+semantic_search:
+  enabled: false
+  provider: local_openai
+  allow_live_provider: false
+  endpoint_url: http://127.0.0.1:11434/v1
+  model_id: nomic-embed-text
+  dimensions: 768
+  api_key_env: OPENAI_API_KEY
+  timeout_seconds: 60
+  session_token_ceiling: 5000000
+integrations:
+  filigree:
+    enabled: false
+    base_url: http://127.0.0.1:8766
+    actor: loomweave-mcp
+    token_env: WEFT_FEDERATION_TOKEN
+    timeout_seconds: 5
+serve:
+  mcp:
+    enable_write_tools: false
+  http:
+    enabled: false
+    # The read-API port is auto-selected per project (deterministic, with an
+    # ephemeral fallback) and published to .weft/loomweave/ephemeral.port while
+    # serving. Set `bind:` explicitly only to pin a fixed port (ADR-044).
+";
+
+/// Dispatch `loomweave config <subcommand>`.
+pub(crate) fn run(command: crate::cli::ConfigCommand) -> Result<()> {
+    match command {
+        crate::cli::ConfigCommand::Example { provider } => run_example(provider.as_deref()),
+        crate::cli::ConfigCommand::Check { path, config } => run_check(&path, config.as_deref()),
+        crate::cli::ConfigCommand::Llm { command } => run_llm(command),
+        crate::cli::ConfigCommand::Semantic { command } => run_semantic(command),
+    }
+}
+
+fn run_llm(command: crate::cli::LlmConfigCommand) -> Result<()> {
+    match command {
+        crate::cli::LlmConfigCommand::Status { path, config } => {
+            run_check(&path, config.as_deref())
+        }
+        crate::cli::LlmConfigCommand::Set {
+            path,
+            config,
+            enable,
+            disable,
+            allow_live,
+            disallow_live,
+            enable_write_tools,
+            disable_write_tools,
+            provider,
+            model_id,
+            codex_model,
+            claude_model,
+            openrouter_api_key_env,
+            openrouter_endpoint_url,
+        } => {
+            let config_path = config.unwrap_or_else(|| path.join("loomweave.yaml"));
+            let patch = LlmConfigPatch {
+                enabled: bool_patch(enable, disable, "--enable", "--disable")?,
+                provider: provider
+                    .as_deref()
+                    .map(LlmProviderKind::parse)
+                    .transpose()?,
+                allow_live_provider: bool_patch(
+                    allow_live,
+                    disallow_live,
+                    "--allow-live",
+                    "--disallow-live",
+                )?,
+                enable_write_tools: bool_patch(
+                    enable_write_tools,
+                    disable_write_tools,
+                    "--enable-write-tools",
+                    "--disable-write-tools",
+                )?,
+                model_id,
+                codex_model,
+                claude_model,
+                openrouter_api_key_env,
+                openrouter_endpoint_url,
+            };
+            ensure_patch_non_empty(&patch)?;
+            let result = update_llm_config_file(&config_path, &patch)
+                .with_context(|| format!("update {}", config_path.display()))?;
+            print_llm_edit_result(&result);
+            Ok(())
+        }
+    }
+}
+
+fn run_semantic(command: crate::cli::SemanticConfigCommand) -> Result<()> {
+    match command {
+        crate::cli::SemanticConfigCommand::Status { path, config } => {
+            run_semantic_status(&path, config.as_deref())
+        }
+        crate::cli::SemanticConfigCommand::Set {
+            path,
+            config,
+            enable,
+            disable,
+            provider,
+            allow_live,
+            disallow_live,
+            model_id,
+            dimensions,
+            endpoint_url,
+            api_key_env,
+            timeout_seconds,
+            session_token_ceiling,
+        } => {
+            let config_path = config.unwrap_or_else(|| path.join("loomweave.yaml"));
+            let patch = SemanticConfigPatch {
+                enabled: bool_patch(enable, disable, "--enable", "--disable")?,
+                provider: provider
+                    .as_deref()
+                    .map(SemanticProviderKind::parse)
+                    .transpose()?,
+                allow_live_provider: bool_patch(
+                    allow_live,
+                    disallow_live,
+                    "--allow-live",
+                    "--disallow-live",
+                )?,
+                model_id,
+                dimensions,
+                endpoint_url,
+                api_key_env,
+                timeout_seconds,
+                session_token_ceiling,
+            };
+            ensure_semantic_patch_non_empty(&patch)?;
+            let result = update_semantic_config_file(&config_path, &patch)
+                .with_context(|| format!("update {}", config_path.display()))?;
+            print_semantic_edit_result(&path, &result);
+            Ok(())
+        }
+    }
+}
+
+fn bool_patch(
+    enabled: bool,
+    disabled: bool,
+    enable_flag: &str,
+    disable_flag: &str,
+) -> Result<Option<bool>> {
+    if enabled && disabled {
+        bail!("{enable_flag} conflicts with {disable_flag}");
+    }
+    Ok(match (enabled, disabled) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
+        (true, true) => unreachable!("checked above"),
+    })
+}
+
+fn ensure_patch_non_empty(patch: &LlmConfigPatch) -> Result<()> {
+    ensure!(
+        patch.enabled.is_some()
+            || patch.provider.is_some()
+            || patch.allow_live_provider.is_some()
+            || patch.enable_write_tools.is_some()
+            || patch.model_id.is_some()
+            || patch.codex_model.is_some()
+            || patch.claude_model.is_some()
+            || patch.openrouter_api_key_env.is_some()
+            || patch.openrouter_endpoint_url.is_some(),
+        "no LLM config changes requested"
+    );
+    Ok(())
+}
+
+fn ensure_semantic_patch_non_empty(patch: &SemanticConfigPatch) -> Result<()> {
+    ensure!(
+        patch.enabled.is_some()
+            || patch.provider.is_some()
+            || patch.allow_live_provider.is_some()
+            || patch.model_id.is_some()
+            || patch.dimensions.is_some()
+            || patch.endpoint_url.is_some()
+            || patch.api_key_env.is_some()
+            || patch.timeout_seconds.is_some()
+            || patch.session_token_ceiling.is_some(),
+        "no semantic search config changes requested"
+    );
+    Ok(())
+}
+
+fn print_llm_edit_result(result: &LlmConfigEditResult) {
+    println!("Updated:               {}", result.path);
+    println!("Created:               {}", result.created);
+    println!("LLM enabled:           {}", result.config.llm.enabled);
+    println!(
+        "Provider (configured): {}",
+        result.config.llm.provider.as_str()
+    );
+    println!(
+        "allow_live_provider:   {}",
+        result.config.llm.allow_live_provider
+    );
+    println!(
+        "Effective model:       {}",
+        result.config.llm.effective_model_label()
+    );
+    println!(
+        "MCP write tools:       {}",
+        result.config.serve.mcp.enable_write_tools
+    );
+}
+
+fn print_semantic_edit_result(project_root: &Path, result: &SemanticConfigEditResult) {
+    println!("Updated:                {}", result.path);
+    println!("Created:                {}", result.created);
+    print_semantic_status_fields(project_root, &result.config);
+    println!("Analyze required:       true");
+    println!("Restart required:       true");
+}
+
+/// Print the annotated default `loomweave.yaml`, optionally pre-selecting the
+/// active LLM provider block.
+fn run_example(provider: Option<&str>) -> Result<()> {
+    // Route `--provider` through the SAME `LlmProviderKind::parse` the YAML/serde
+    // path and the MCP schema use (L9), so every alias they accept
+    // (open_router / codex / claude_code / recording / …) is accepted here too
+    // instead of a hand-maintained closed set that silently drifted out of sync.
+    let yaml = match provider {
+        None => LOOMWEAVE_YAML_STUB.to_owned(),
+        Some(value) => {
+            let kind = LlmProviderKind::parse(value).map_err(|err| {
+                anyhow::anyhow!(
+                    "unknown --provider {value:?}: {err}; accepted values match \
+                     `llm_policy.provider` (openrouter, codex_cli, claude_cli, recording, \
+                     and their aliases)"
+                )
+            })?;
+            // The stub already carries every provider sub-block, so selecting a
+            // provider is just swapping the active `provider:` line to the
+            // canonical spelling for the parsed kind.
+            LOOMWEAVE_YAML_STUB.replacen(
+                "  provider: openrouter",
+                &format!("  provider: {}", kind.as_str()),
+                1,
+            )
+        }
+    };
+    print!("{yaml}");
+    Ok(())
+}
+
+/// Parse + validate `loomweave.yaml` and print the effective LLM provider state.
+/// A parse/validate failure bubbles as an error (non-zero exit); a
+/// provider-selection error (e.g. live provider with a missing API key) is a
+/// real misconfiguration and also exits non-zero, after printing the diagnosis.
+fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
+    let default_path = path.join("loomweave.yaml");
+    let config_path = explicit_config.unwrap_or(&default_path);
+    let (config, source) = if config_path.exists() {
+        let config = McpConfig::from_path(config_path)
+            .with_context(|| format!("parse {}", config_path.display()))?;
+        (config, config_path.display().to_string())
+    } else {
+        (
+            McpConfig::default(),
+            "(absent — built-in defaults in effect)".to_owned(),
+        )
+    };
+
+    let selection = select_provider_with_env(&config, |name| std::env::var(name).ok());
+
+    println!("loomweave.yaml:        {source}");
+    println!("LLM enabled:           {}", config.llm.enabled);
+    println!("Provider (configured): {}", config.llm.provider.as_str());
+    println!("allow_live_provider:   {}", config.llm.allow_live_provider);
+    println!(
+        "Effective model:       {}",
+        config.llm.effective_model_label()
+    );
+    match &selection {
+        Ok(sel) => {
+            let live = matches!(
+                sel,
+                ProviderSelection::OpenRouter { .. }
+                    | ProviderSelection::CodexCli
+                    | ProviderSelection::ClaudeCli
+            );
+            println!(
+                "Live:                  {}",
+                if live {
+                    "yes — entity_summary_get will dispatch to the provider"
+                } else {
+                    "no — entity_summary_get is cache-only"
+                }
+            );
+        }
+        Err(err) => println!("Live:                  error — {err}"),
+    }
+
+    let warnings = config.llm_warnings();
+    if warnings.is_empty() {
+        println!("\nNo warnings.");
+    } else {
+        println!("\nWarnings:");
+        for warning in &warnings {
+            println!("  - {warning}");
+        }
+    }
+
+    if selection.is_err() {
+        std::process::exit(1);
+    }
+    println!();
+    print_semantic_status_fields(path, &config);
+    Ok(())
+}
+
+fn run_semantic_status(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
+    let default_path = path.join("loomweave.yaml");
+    let config_path = explicit_config.unwrap_or(&default_path);
+    let (config, source) = if config_path.exists() {
+        let config = McpConfig::from_path(config_path)
+            .with_context(|| format!("parse {}", config_path.display()))?;
+        (config, config_path.display().to_string())
+    } else {
+        (
+            McpConfig::default(),
+            "(absent — built-in defaults in effect)".to_owned(),
+        )
+    };
+    println!("loomweave.yaml:         {source}");
+    print_semantic_status_fields(path, &config);
+    Ok(())
+}
+
+fn print_semantic_status_fields(project_root: &Path, config: &McpConfig) {
+    let semantic = &config.semantic_search;
+    // Probe the SAME path `populate_semantic_embeddings` writes to
+    // (`EmbeddingStore::open_in_store_dir`): the override-aware store helper, so a
+    // `[loomweave].store_dir` relocation does not make a populated sidecar read as
+    // "absent" here (clarion / read-vs-status parity).
+    let sidecar = loomweave_storage::embeddings_db_path(project_root);
+    let count = embedding_sidecar_count(&sidecar);
+    let has_key = std::env::var(&semantic.api_key_env)
+        .ok()
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let provider_available = semantic_provider_available(semantic, has_key).unwrap_or(false);
+    println!("Semantic enabled:       {}", semantic.enabled);
+    println!("Semantic provider:      {}", semantic.provider.as_str());
+    println!("allow_live_provider:    {}", semantic.allow_live_provider);
+    println!("Endpoint URL:           {}", semantic.endpoint_url);
+    println!("Embedding model:        {}", semantic.model_id);
+    println!("Dimensions:             {}", semantic.dimensions);
+    println!(
+        "API key env:            {} ({})",
+        semantic.api_key_env,
+        if has_key { "set" } else { "unset" }
+    );
+    println!("Embeddings sidecar:     {}", sidecar.display());
+    match count {
+        Ok(Some(count)) => println!("Sidecar vectors:        {count}"),
+        Ok(None) => println!("Sidecar vectors:        absent"),
+        Err(ref err) => println!("Sidecar vectors:        unavailable — {err}"),
+    }
+    println!("Provider available:     {provider_available}");
+    println!(
+        "Next action:            {}",
+        semantic_next_action(semantic, has_key, count.ok().flatten())
+    );
+}
+
+fn semantic_provider_available(
+    semantic: &loomweave_federation::config::SemanticSearchConfig,
+    has_key: bool,
+) -> Result<bool> {
+    if !semantic.enabled {
+        return Ok(false);
+    }
+    match semantic.provider {
+        SemanticProviderKind::Api => Ok(semantic.allow_live_provider && has_key),
+        SemanticProviderKind::LocalOpenAi => {
+            semantic
+                .validate_endpoint_trust()
+                .context("validate local semantic endpoint")?;
+            Ok(true)
+        }
+    }
+}
+
+fn semantic_next_action(
+    semantic: &loomweave_federation::config::SemanticSearchConfig,
+    has_key: bool,
+    sidecar_count: Option<i64>,
+) -> String {
+    if !semantic.enabled {
+        return "enable semantic search, then run `loomweave analyze`".to_owned();
+    }
+    match semantic.provider {
+        SemanticProviderKind::Api if !semantic.allow_live_provider => {
+            return "set semantic_search.allow_live_provider: true for hosted API calls".to_owned();
+        }
+        SemanticProviderKind::Api if !has_key => {
+            return format!("export ${} before analyzing", semantic.api_key_env);
+        }
+        SemanticProviderKind::LocalOpenAi if sidecar_count.unwrap_or(0) == 0 => {
+            return format!(
+                "start the local embeddings server at {}, then run `loomweave analyze`",
+                semantic.endpoint_url
+            );
+        }
+        SemanticProviderKind::Api | SemanticProviderKind::LocalOpenAi => {}
+    }
+    if sidecar_count.unwrap_or(0) == 0 {
+        "run `loomweave analyze` to populate semantic embeddings".to_owned()
+    } else {
+        "reconnect/restart `loomweave serve` after config changes; semantic search can use the sidecar".to_owned()
+    }
+}
+
+fn embedding_sidecar_count(path: &Path) -> Result<Option<i64>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    conn.query_row("SELECT COUNT(*) FROM entity_embeddings", [], |row| {
+        row.get(0)
+    })
+    .optional()
+    .with_context(|| format!("count vectors in {}", path.display()))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -136,5 +637,83 @@ impl ClusteringWeightBy {
         match self {
             ClusteringWeightBy::ReferenceCount => "reference_count",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LOOMWEAVE_YAML_STUB;
+    use loomweave_federation::config::McpConfig;
+
+    #[test]
+    fn stub_parses_under_deny_unknown_fields() {
+        // The default loomweave.yaml `install` writes (and `config example`
+        // prints) must parse cleanly through the config structs, which now use
+        // deny_unknown_fields. This guards against the stub drifting from the
+        // structs — a drift would otherwise ship a config the binary rejects.
+        let config = McpConfig::from_yaml_str(LOOMWEAVE_YAML_STUB)
+            .expect("install stub must parse under deny_unknown_fields");
+        assert_eq!(config.version, 1);
+        assert!(
+            !config.llm.enabled,
+            "stub ships with LLM disabled by default"
+        );
+        assert!(!config.serve.mcp.enable_write_tools);
+    }
+
+    #[test]
+    fn stub_also_parses_via_analyze_config() {
+        // install/analyze read the same file through AnalyzeConfig (clustering
+        // only); confirm the stub round-trips there too.
+        super::AnalyzeConfig::from_yaml_str(LOOMWEAVE_YAML_STUB)
+            .expect("install stub must parse as analyze config");
+    }
+
+    #[test]
+    fn semantic_sidecar_status_follows_store_dir_override() {
+        // A `[loomweave].store_dir` relocation moves the embeddings sidecar
+        // (`populate_semantic_embeddings` writes via `open_in_store_dir`). The
+        // status probe must follow it: probing the hardcoded default
+        // `.weft/loomweave/embeddings.db` would report "absent" for an operator
+        // with a custom store even though vectors exist.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join(loomweave_core::store::WEFT_TOML),
+            "[loomweave]\nstore_dir = \"custom/store\"\n",
+        )
+        .unwrap();
+
+        // Nothing at the default location; a populated sidecar at the override.
+        assert_eq!(
+            super::embedding_sidecar_count(&root.join(".weft/loomweave/embeddings.db")).unwrap(),
+            None,
+            "the default location must be empty under an override"
+        );
+        std::fs::create_dir_all(loomweave_core::store::store_dir(root)).unwrap();
+        let store = loomweave_storage::EmbeddingStore::open_in_store_dir(root).unwrap();
+        store
+            .upsert(
+                &loomweave_storage::EmbeddingKey {
+                    entity_id: "python:function:m.f".to_owned(),
+                    content_hash: "h".to_owned(),
+                    model_id: "model".to_owned(),
+                },
+                &[0.1, 0.2, 0.3],
+                0.0,
+                0,
+                "2026-06-15T00:00:00Z",
+            )
+            .unwrap();
+        drop(store);
+
+        // The status probe (now override-aware) finds the populated sidecar.
+        let probed = loomweave_storage::embeddings_db_path(root);
+        assert_eq!(probed, root.join("custom/store/embeddings.db"));
+        assert_eq!(
+            super::embedding_sidecar_count(&probed).unwrap(),
+            Some(1),
+            "status probe must count the sidecar at the overridden store_dir"
+        );
     }
 }

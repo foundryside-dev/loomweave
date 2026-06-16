@@ -6,58 +6,54 @@
 //! hook never has to handle an error. Degrade, but don't go quiet: a real query
 //! failure is `tracing::warn!`-logged before it folds, so a populated index
 //! reporting 0 leaves a trace (run with `RUST_LOG=warn`).
+//!
+//! **Freshness is DERIVED, not computed here** (convention C-12,
+//! weft-4165f1ed71): the snapshot calls the same
+//! `index_diff::compute_freshness` oracle `index_diff_get` reports,
+//! and maps its verdict onto [`Staleness`]. The former mtime/structural
+//! detector — which watched the *parents* of ingested paths and could wedge a
+//! project to permanent `Stale` via `$HOME` churn whenever the project-anchor
+//! entity carried the project root as its source path — is gone; the two
+//! surfaces can no longer disagree.
 
-use std::collections::BTreeSet;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::Path;
 
 use rusqlite::Connection;
 use serde::Serialize;
 
-/// Freshness of the `.loomweave/` index relative to the source files Loomweave
-/// ingested. See the plan's Decision Point (b) for the algorithm.
+use crate::index_diff::FreshnessOverall;
+
+/// Freshness of the `.weft/loomweave/` index relative to the source files Loomweave
+/// ingested — the snapshot-side rendering of the single freshness oracle
+/// (`index_diff::compute_freshness`, C-12 / weft-4165f1ed71).
 ///
-/// Freshness combines two passes over the files recorded in
-/// `entities.source_file_path` (clarion-e687941a8c):
-///
-/// 1. **Structural drift** — added / removed / renamed source files. Adding or
-///    removing a directory entry bumps the *parent directory's* mtime, so a
-///    watched source directory whose mtime is newer than the latest run means
-///    its file set changed since analyze, even when no ingested file's own
-///    mtime did. This is a conservative nudge: unrelated churn in a source
-///    directory (Python's `__pycache__`, an editor's swap/backup file, a
-///    `.DS_Store`) also bumps its mtime and can therefore report [`Stale`]
-///    when no tracked source actually changed. The watch set is the *direct
-///    parents* of ingested files, so an addition/removal in any directory that
-///    is not such a parent goes undetected — always including the project root
-///    itself, which is deliberately never watched (`analyze` writes `.loomweave/`
-///    under it, which would otherwise wedge every check to a permanent Stale).
-/// 2. **In-place modification** — an ingested file edited since the run. This
-///    needs one `stat` per file and is bounded by `MAX_MODIFICATION_STAT_FILES`
-///    so `loomweave hook session-start` stays cheap on large repos
-///    (clarion-93465ff89e); the structural pass runs first and short-circuits
-///    the common "repo changed" case before any file is stat-ed.
-///
-/// The verdict is a best-effort nudge, not a guarantee.
-///
-/// [`Fresh`]: Staleness::Fresh
-/// [`Stale`]: Staleness::Stale
+/// The oracle's channels: commit mismatch (analyzed commit vs HEAD), HEAD
+/// committer date vs analyze time, per-file mtime/existence stats over the
+/// ingested files (bounded, directory paths skipped), staged changes touching
+/// indexed paths, and the ADR-045 untracked-source scan. The verdict is a
+/// best-effort nudge, not a guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Staleness {
     /// No completed analyze run has ever been recorded.
     NeverAnalyzed,
-    /// The index is out of date: a watched source directory's mtime is newer
-    /// than the latest run (a file was added / removed / renamed), an ingested
-    /// file was modified or deleted since the run, or both. See the type-level
-    /// note for the conservative-nudge caveat.
+    /// The index is out of date: the oracle reported drift — commit mismatch,
+    /// HEAD newer than the analyze, an ingested file modified or deleted since
+    /// the run, or a staged change touching an indexed path.
     Stale,
-    /// No structural drift in a watched directory and no ingested file newer
-    /// than (or missing since) the latest run. Subject to the bounded
-    /// modification scan and the unwatched-project-root caveat in the
-    /// type-level note.
+    /// No drift signal fired over any observation channel.
     Fresh,
+    /// Every other channel found the index fresh, but the working tree
+    /// contains untracked source of an already-indexed file type that the
+    /// index has never seen — e.g. a brand-new top-level module
+    /// (clarion-26c7e52027). Detected via a hardened, ignore-aware
+    /// `git ls-files --others` scoped to ingested extensions (ADR-045); the raw
+    /// signal is on [`ProjectSnapshot::worktree_dirty`]. Returned in place of
+    /// [`Fresh`] only when that worktree signal is positive — so it never fires
+    /// outside a git work tree, and a non-source untracked file never triggers it.
+    ///
+    /// [`Fresh`]: Staleness::Fresh
+    StaleWorktree,
     /// A completed run exists, but no ingested entity has a resolvable
     /// `source_file_path` to stat — there is *nothing to compare against*, so
     /// freshness is neither Fresh nor Stale. A normal outcome (e.g. a project
@@ -66,9 +62,10 @@ pub enum Staleness {
     ///
     /// [`Unknown`]: Staleness::Unknown
     NoSourcePaths,
-    /// Could not determine because a query/parse/stat *failed* — degrade, don't
-    /// fail (and log). Strictly the error fold: "nothing to compare" is
-    /// [`NoSourcePaths`], not `Unknown`.
+    /// Could not determine because a query/parse/stat *failed* or every
+    /// observation channel was blind — degrade, don't fail (and log).
+    /// "Nothing to compare" with a completed run is [`NoSourcePaths`], not
+    /// `Unknown`.
     ///
     /// [`NoSourcePaths`]: Staleness::NoSourcePaths
     Unknown,
@@ -94,6 +91,40 @@ pub struct ProjectSnapshot {
     staleness: Staleness,
     /// Latest run `completed_at` (ISO-8601) if any, else `None`.
     last_analyzed_at: Option<String>,
+    /// The git commit HEAD pointed at when the latest completed run was analyzed
+    /// (`runs.analyzed_at_commit`), if Loomweave captured one — `None` for a run
+    /// analyzed outside a git work tree, or before WS9 began recording it.
+    /// Surfaced so the `loomweave://context` resource and the session-start
+    /// banner can state *which commit* the index reflects. It is descriptive, not
+    /// a freshness signal: a [`Staleness::Fresh`] verdict is only ever fresh
+    /// relative to the ingested source files' mtimes — never a claim that HEAD or
+    /// the working tree still matches this commit (clarion-26c7e52027). The
+    /// `project_status_get` tool already reports the same value as `git_sha`.
+    ///
+    /// [`Fresh`]: Staleness::Fresh
+    indexed_at_commit: Option<String>,
+    /// Whether the working tree holds untracked source of an already-indexed file
+    /// type that the index does not reflect — the signal behind
+    /// [`Staleness::StaleWorktree`] (clarion-26c7e52027, ADR-045). `Some(true)` =
+    /// un-indexed source present; `Some(false)` = a git work tree with none;
+    /// `None` = not a git work tree, git unavailable, or nothing ingested to scope
+    /// against (the check is moot). Computed via a hardened, hash-free
+    /// `git ls-files --others --exclude-standard` filtered to ingested file
+    /// extensions, so an untracked non-source file (a scratch `notes.txt`) never
+    /// flags it, and the untrusted-corpus posture is preserved (no working-tree
+    /// hashing — see [`loomweave_core::list_untracked_files`]).
+    ///
+    /// **Scope (N5): UNTRACKED source only.** This flag deliberately does NOT
+    /// cover a MODIFIED already-tracked source file. Detecting modified-tracked
+    /// state (`git diff` / `git status --porcelain`) hashes working-tree content,
+    /// reintroducing exactly the corpus-controlled code-exec vector the hardening
+    /// avoids by using `ls-files --others` (which only lists paths) — so it is
+    /// declined. A modified *indexed* file is already caught by the mtime
+    /// modification scan ([`Staleness::Stale`]), so the staleness verdict reflects
+    /// mid-dev edits even though this boolean does not. The consumer-facing
+    /// `project_status_get.worktree_dirty_note` states this so a signing/freshness
+    /// gate keys on `staleness`, not on this flag alone.
+    worktree_dirty: Option<bool>,
     /// `true` when this snapshot was produced from a *failure* rather than a
     /// healthy read: at least one backing SQL query failed unexpectedly and was
     /// folded to a safe default (a count to `0`, the run lookup to `None`, or
@@ -119,7 +150,7 @@ pub struct ProjectSnapshot {
 }
 
 impl ProjectSnapshot {
-    /// Whether a readable `.loomweave/loomweave.db` was found. When `false`, every
+    /// Whether a readable `.weft/loomweave/loomweave.db` was found. When `false`, every
     /// count is `0` and `staleness` is [`Staleness::NeverAnalyzed`].
     #[must_use]
     pub fn db_present(&self) -> bool {
@@ -161,6 +192,21 @@ impl ProjectSnapshot {
         self.last_analyzed_at.as_deref()
     }
 
+    /// The commit the latest completed run was analyzed at, if captured — see the
+    /// field note. `None` when never analyzed, analyzed outside a git repo, or the
+    /// `analyzed_at_commit` column is NULL.
+    #[must_use]
+    pub fn indexed_at_commit(&self) -> Option<&str> {
+        self.indexed_at_commit.as_deref()
+    }
+
+    /// Whether the working tree holds untracked source the index has not seen —
+    /// see the field note. `None` outside a git work tree / with nothing ingested.
+    #[must_use]
+    pub fn worktree_dirty(&self) -> Option<bool> {
+        self.worktree_dirty
+    }
+
     /// `true` when this snapshot was folded from a backing-query failure — see
     /// the field-level note for the precise contract.
     #[must_use]
@@ -182,6 +228,11 @@ impl ProjectSnapshot {
 ///
 /// `db_present` is always `true` here (the caller opened the connection); the
 /// `false` case is produced by the caller when the db file is missing.
+///
+/// The staleness verdict DERIVES from the single freshness oracle
+/// (`index_diff::compute_freshness`) — the same code path
+/// `index_diff_get` reports — so the two surfaces cannot disagree (C-12,
+/// weft-4165f1ed71).
 #[must_use]
 pub fn project_snapshot(conn: &Connection, project_root: &Path) -> ProjectSnapshot {
     // Accumulates any SQL-machinery failure folded below into a wire-visible
@@ -196,15 +247,53 @@ pub fn project_snapshot(conn: &Connection, project_root: &Path) -> ProjectSnapsh
     );
     let finding_count = scalar_count(conn, "SELECT COUNT(*) FROM findings", &mut degraded);
 
-    let last_analyzed_at = latest_completed_run(conn, &mut degraded);
-    let mut scan_truncated = false;
-    let staleness = compute_staleness(
-        conn,
-        project_root,
-        last_analyzed_at.as_deref(),
-        &mut degraded,
-        &mut scan_truncated,
-    );
+    let (last_analyzed_at, indexed_at_commit, staleness, worktree_dirty, scan_truncated) =
+        match crate::index_diff::read_index_state(conn) {
+            Ok(state) => {
+                // Git facts are gathered read-only and fail-soft (hardened
+                // against the untrusted corpus); blocking is fine here — every
+                // caller of project_snapshot already tolerates per-file stats.
+                let git = crate::index_diff::gather_git_facts(project_root);
+                let untracked = crate::index_diff::compute_untracked_source(conn, project_root);
+                let verdict =
+                    crate::index_diff::compute_freshness(project_root, &state, &git, untracked);
+                if !verdict.analyzed_time_parsed {
+                    // A completed run whose timestamp cannot be parsed is a
+                    // data/machinery fault: the mtime channel is blind. The
+                    // existence/git channels still ran, so the verdict stands —
+                    // but the read is flagged degraded.
+                    degraded = true;
+                }
+                let staleness = match verdict.overall {
+                    FreshnessOverall::NeverAnalyzed => Staleness::NeverAnalyzed,
+                    FreshnessOverall::Drift => Staleness::Stale,
+                    FreshnessOverall::StaleWorktree => Staleness::StaleWorktree,
+                    // A completed run with no resolvable source file to stat:
+                    // nothing to compare, NOT an error (clarion-22add08e98) —
+                    // whether the remaining (git) channels were blind (Unknown)
+                    // or quietly clean (Fresh).
+                    FreshnessOverall::Fresh | FreshnessOverall::Unknown
+                        if state.files.is_empty() =>
+                    {
+                        Staleness::NoSourcePaths
+                    }
+                    FreshnessOverall::Fresh => Staleness::Fresh,
+                    FreshnessOverall::Unknown => Staleness::Unknown,
+                };
+                (
+                    state.analyzed_at,
+                    state.analyzed_commit,
+                    staleness,
+                    verdict.untracked_source,
+                    verdict.file_drift.stat_scan_truncated,
+                )
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "loomweave snapshot index-state read failed");
+                degraded = true;
+                (None, None, Staleness::Unknown, None, false)
+            }
+        };
 
     ProjectSnapshot {
         db_present: true,
@@ -213,6 +302,8 @@ pub fn project_snapshot(conn: &Connection, project_root: &Path) -> ProjectSnapsh
         finding_count,
         staleness,
         last_analyzed_at,
+        indexed_at_commit,
+        worktree_dirty,
         degraded,
         scan_truncated,
     }
@@ -228,6 +319,8 @@ pub fn missing_db_snapshot() -> ProjectSnapshot {
         finding_count: 0,
         staleness: Staleness::NeverAnalyzed,
         last_analyzed_at: None,
+        indexed_at_commit: None,
+        worktree_dirty: None,
         degraded: false,
         scan_truncated: false,
     }
@@ -249,6 +342,8 @@ pub fn unreadable_db_snapshot() -> ProjectSnapshot {
         finding_count: 0,
         staleness: Staleness::Unknown,
         last_analyzed_at: None,
+        indexed_at_commit: None,
+        worktree_dirty: None,
         degraded: true,
         scan_truncated: false,
     }
@@ -267,195 +362,6 @@ fn scalar_count(conn: &Connection, sql: &str, degraded: &mut bool) -> i64 {
     }
 }
 
-/// Look up the latest completed run's `completed_at`. `QueryReturnedNoRows` is a
-/// normal "never analyzed" outcome and does *not* degrade; any other error is a
-/// machinery failure that folds to `None` and sets `*degraded`.
-fn latest_completed_run(conn: &Connection, degraded: &mut bool) -> Option<String> {
-    match conn.query_row(
-        "SELECT completed_at FROM runs \
-         WHERE completed_at IS NOT NULL AND status = 'completed' \
-         ORDER BY completed_at DESC LIMIT 1",
-        [],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(s) => Some(s),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(err) => {
-            tracing::warn!(error = %err, "loomweave latest-completed-run query failed");
-            *degraded = true;
-            None
-        }
-    }
-}
-
-/// Upper bound on per-file `stat` syscalls in one staleness check — a backstop
-/// against pathological repositories. In-place modification detection
-/// inherently needs one `stat` per ingested file, and `loomweave hook
-/// session-start` runs at the top of every agent session, so an unbounded scan
-/// is O(files) syscalls per session start (clarion-93465ff89e). Structural
-/// drift (added / removed / renamed files) is detected first and *exhaustively*
-/// from directory mtimes — O(dirs) ≪ O(files) — which also short-circuits the
-/// common "repo changed since analyze" case before any file is stat-ed. Only a
-/// genuinely-fresh repo falls through to the bounded per-file scan; if it
-/// exceeds this cap the overflow is logged and pure in-place edits to files
-/// past the cap may report [`Staleness::Fresh`] until the next analyze. Sized
-/// well above realistic targets (the elspeth corpus, ~425k LOC, is a few
-/// thousand files) so no real project is sampled — the cap only bites a
-/// pathological monorepo.
-const MAX_MODIFICATION_STAT_FILES: usize = 20_000;
-
-fn compute_staleness(
-    conn: &Connection,
-    project_root: &Path,
-    last_analyzed_at: Option<&str>,
-    degraded: &mut bool,
-    scan_truncated: &mut bool,
-) -> Staleness {
-    let Some(run_iso) = last_analyzed_at else {
-        return Staleness::NeverAnalyzed;
-    };
-    let Some(run_time) = parse_iso8601_to_systemtime(run_iso) else {
-        // A run timestamp we can't parse is a data/machinery fault, not an
-        // environmental one — mark degraded alongside the Unknown verdict.
-        *degraded = true;
-        return Staleness::Unknown;
-    };
-
-    let Some((files, dirs)) = ingested_files_and_dirs(conn, project_root, degraded) else {
-        // A query/prepare failure already set `degraded` and folds to Unknown.
-        return Staleness::Unknown;
-    };
-
-    // (1) Structural drift: any watched source directory newer than the run
-    // means a file was added / removed / renamed in it. Exhaustive over dirs
-    // and far cheaper than the per-file scan, so it runs first.
-    if directory_structural_drift(&dirs, run_time) {
-        return Staleness::Stale;
-    }
-
-    // (2) In-place modification: one stat per ingested file, bounded.
-    match file_modification_drift(&files, run_time, scan_truncated) {
-        Some(staleness) => staleness,
-        None => {
-            if files.is_empty() {
-                // A completed run with no resolvable source file to stat:
-                // nothing to compare, NOT an error. Kept distinct from the
-                // error folds so `Unknown` means strictly "a query/parse/stat
-                // failed" (clarion-22add08e98).
-                Staleness::NoSourcePaths
-            } else {
-                Staleness::Fresh
-            }
-        }
-    }
-}
-
-/// Resolve every distinct ingested `source_file_path` to an absolute path, and
-/// collect the distinct parent directories to watch for structural drift. The
-/// project root itself is deliberately excluded from the watch set: `analyze`
-/// writes `.loomweave/loomweave.db` under it, so the root's mtime is always newer
-/// than the run and would wedge every check to a permanent false [`Stale`]
-/// (the footgun the type-level note records). Returns `None` only on a
-/// query/prepare failure, having set `*degraded`.
-///
-/// [`Stale`]: Staleness::Stale
-fn ingested_files_and_dirs(
-    conn: &Connection,
-    project_root: &Path,
-    degraded: &mut bool,
-) -> Option<(Vec<PathBuf>, BTreeSet<PathBuf>)> {
-    let mut stmt = match conn.prepare(
-        "SELECT DISTINCT source_file_path FROM entities \
-         WHERE source_file_path IS NOT NULL",
-    ) {
-        Ok(stmt) => stmt,
-        Err(err) => {
-            tracing::warn!(error = %err, "loomweave staleness source-path query failed");
-            *degraded = true;
-            return None;
-        }
-    };
-    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-        *degraded = true;
-        return None;
-    };
-
-    let mut files = Vec::new();
-    let mut dirs = BTreeSet::new();
-    for rel in rows.flatten() {
-        let abs = if Path::new(&rel).is_absolute() {
-            PathBuf::from(&rel)
-        } else {
-            project_root.join(&rel)
-        };
-        if let Some(parent) = abs.parent()
-            && parent != project_root
-        {
-            dirs.insert(parent.to_path_buf());
-        }
-        files.push(abs);
-    }
-    Some((files, dirs))
-}
-
-/// `true` if any watched directory's mtime is newer than the run, or a watched
-/// directory is gone (a removed package) — both are structural drift. Other
-/// dir-stat errors are environmental and skipped (best-effort, never degrade).
-fn directory_structural_drift(dirs: &BTreeSet<PathBuf>, run_time: SystemTime) -> bool {
-    dirs.iter()
-        .any(|dir| match dir.metadata().and_then(|m| m.modified()) {
-            Ok(mtime) => mtime > run_time,
-            Err(err) => err.kind() == ErrorKind::NotFound,
-        })
-}
-
-/// Scan up to [`MAX_MODIFICATION_STAT_FILES`] ingested files for in-place
-/// edits. Returns `Some(Stale)` on the first file newer-than or deleted-since
-/// the run, `Some(Unknown)` on a non-`NotFound` stat error (environmental, not
-/// degraded), or `None` when every stat-ed file is older than the run (the
-/// caller decides Fresh vs. `NoSourcePaths`). A deleted ingested file
-/// (`NotFound`) is staleness, not an error (clarion-e687941a8c) — the
-/// structural pass usually catches it via the parent directory first, but a
-/// top-level deletion (parent is the unwatched project root) lands here.
-fn file_modification_drift(
-    files: &[PathBuf],
-    run_time: SystemTime,
-    scan_truncated: &mut bool,
-) -> Option<Staleness> {
-    for abs in files.iter().take(MAX_MODIFICATION_STAT_FILES) {
-        match abs.metadata().and_then(|m| m.modified()) {
-            Ok(mtime) if mtime > run_time => return Some(Staleness::Stale),
-            Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => return Some(Staleness::Stale),
-            Err(_) => return Some(Staleness::Unknown),
-        }
-    }
-    // Reached only when no drift was found in the scanned prefix. If the index
-    // has more files than the cap, the resulting `Fresh` verdict is bounded:
-    // record it on the snapshot (not just the log) so a consumer can tell a
-    // proven-fresh index from a fresh-as-far-as-scanned one (clarion-e687941a8c).
-    if files.len() > MAX_MODIFICATION_STAT_FILES {
-        *scan_truncated = true;
-        tracing::warn!(
-            ingested_files = files.len(),
-            cap = MAX_MODIFICATION_STAT_FILES,
-            "loomweave staleness: ingested-file count exceeds the modification-scan cap; \
-             in-place edits beyond the cap may go unnoticed until the next analyze"
-        );
-    }
-    None
-}
-
-/// Parse a strict RFC3339 UTC timestamp (the format
-/// `strftime('%Y-%m-%dT%H:%M:%fZ','now')` writes into `runs.completed_at`) to a
-/// `SystemTime`. Returns `None` on any deviation.
-fn parse_iso8601_to_systemtime(iso: &str) -> Option<SystemTime> {
-    use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc3339;
-    let odt = OffsetDateTime::parse(iso, &Rfc3339).ok()?;
-    Some(SystemTime::from(odt))
-}
-
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
@@ -464,9 +370,14 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{
-        MAX_MODIFICATION_STAT_FILES, Staleness, file_modification_drift, project_snapshot,
-    };
+    use super::{Staleness, project_snapshot};
+
+    /// Parse a strict RFC3339 timestamp to a `SystemTime` (test fixture clock).
+    fn iso_to_systemtime(iso: &str) -> std::time::SystemTime {
+        use time::OffsetDateTime;
+        use time::format_description::well_known::Rfc3339;
+        OffsetDateTime::parse(iso, &Rfc3339).unwrap().into()
+    }
 
     // `apply_write_pragmas` enforces ADR-011's WAL journal-mode invariant, which
     // an in-memory connection cannot satisfy (`journal_mode=memory`). Back the
@@ -614,45 +525,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scan_truncated_set_when_file_count_exceeds_cap_without_drift() {
-        // Drive the bounded modification scan directly: one real, old file
-        // repeated past the cap. The surplus entries are never stat-ed (the
-        // scan stops at the cap), but their presence means the resulting
-        // no-drift verdict is bounded — exactly the false-negative risk the
-        // flag warns about (clarion-e687941a8c). Repeating one path keeps the
-        // test cheap instead of materialising 20k files.
-        let dir = tempfile::tempdir().unwrap();
-        let old = dir.path().join("old.py");
-        std::fs::write(&old, "x = 1\n").unwrap();
-        // A run a year in the future: the file is unambiguously older, so every
-        // scanned stat is Fresh and the loop runs to the cap.
-        let run_time = std::time::SystemTime::now() + Duration::from_secs(60 * 60 * 24 * 365);
-        let files = vec![old; MAX_MODIFICATION_STAT_FILES + 1];
-
-        let mut scan_truncated = false;
-        let verdict = file_modification_drift(&files, run_time, &mut scan_truncated);
-        assert_eq!(verdict, None, "no drift among the scanned prefix");
-        assert!(
-            scan_truncated,
-            "exceeding the per-check stat cap must set scan_truncated"
-        );
-    }
-
-    // `compute_staleness` folds: (a) an unparseable run timestamp → Unknown +
-    // degraded; (b) a completed run with no resolvable source path →
-    // NoSourcePaths (never degraded, clarion-22add08e98); (c) a *non*-NotFound
-    // stat error → Unknown (environmental, never degraded). A deleted ingested
-    // file (NotFound) is no longer (c) — it now reports Stale
+    // Verdict folds (now derived from the index_diff oracle, C-12 /
+    // weft-4165f1ed71): (a) an unparseable run timestamp is a data/machinery
+    // fault → degraded, while the clock-free channels (file existence, git)
+    // still drive the verdict; (b) a completed run with no resolvable source
+    // path → NoSourcePaths (never degraded, clarion-22add08e98); (c) a
+    // *non*-NotFound stat error → Unknown (environmental, never degraded). A
+    // deleted ingested file (NotFound) is staleness, not (c)
     // (clarion-e687941a8c). `non_notfound_stat_error_folds_to_unknown_not_stale`
     // covers (c); the tests below lock (a) and (b).
 
     #[test]
-    fn unknown_and_degraded_when_run_timestamp_unparseable() {
-        // (a) An unparseable `completed_at` is a data/machinery fault: Unknown
-        // staleness AND degraded. (`completed_at` is plain TEXT — no format
-        // CHECK — so a garbage value is insertable.)
+    fn degraded_when_run_timestamp_unparseable_and_clock_free_channels_still_verdict() {
+        // (a) An unparseable `completed_at` is a data/machinery fault: degraded.
+        // (`completed_at` is plain TEXT — no format CHECK — so a garbage value
+        // is insertable.) The mtime channel is blind, but the oracle's
+        // clock-free channels still run: the recorded source file EXISTS (so a
+        // stat succeeded and nothing fired) → the verdict is an honest Fresh,
+        // with `degraded` flagging the broken clock. (Pre-C-12 this folded to
+        // a blanket Unknown.)
         let (_dir, conn) = migrated_conn();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
         insert_entity(&conn, "python:module:a", "module", Some("a.py"));
         conn.execute(
             "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
@@ -661,12 +555,12 @@ mod tests {
         )
         .unwrap();
 
-        let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
-        assert_eq!(snap.staleness, Staleness::Unknown, "{snap:?}");
+        let snap = project_snapshot(&conn, dir.path());
         assert!(
             snap.degraded,
             "an unparseable run timestamp is a machinery fault: {snap:?}"
         );
+        assert_eq!(snap.staleness, Staleness::Fresh, "{snap:?}");
         // The raw (unparseable) value is still surfaced verbatim as last_analyzed_at.
         assert_eq!(snap.last_analyzed_at.as_deref(), Some("not-a-timestamp"));
     }
@@ -781,14 +675,16 @@ mod tests {
     }
 
     #[test]
-    fn added_file_in_watched_dir_reports_stale_via_directory_mtime() {
-        // A brand-new file the last analyze never ingested is invisible to the
-        // per-file scan (it is absent from `entities`), but adding it bumped its
-        // parent directory's mtime — which the structural pass catches. Pin the
-        // ingested file OLDER than the run and the directory NEWER, so ONLY the
-        // structural pass can produce Stale: if detection regressed to files
-        // alone this would wrongly report Fresh (clarion-e687941a8c).
-        use super::parse_iso8601_to_systemtime;
+    fn parent_dir_churn_is_not_staleness_outside_git() {
+        // C-12 / weft-4165f1ed71: the former structural-drift channel inferred
+        // staleness from a watched directory's mtime — the exact false-positive
+        // engine behind dogfood-4 B1 (`$HOME` churn wedged lacuna to permanent
+        // "stale" via the project-anchor entity's root path). The verdict now
+        // derives from the index_diff oracle, which has no dir-mtime channel:
+        // an ingested file older than the run, in a directory whose mtime is
+        // newer, is FRESH outside a git work tree. (Inside one, an added
+        // sibling surfaces as untracked source → StaleWorktree — see
+        // `untracked_source_in_git_repo_reports_stale_worktree`.)
         let (_dir, conn) = migrated_conn();
         let root = tempfile::tempdir().unwrap();
         let pkg = root.path().join("pkg");
@@ -797,10 +693,10 @@ mod tests {
         std::fs::write(&a, "x = 1\n").unwrap();
 
         let run_iso = "2026-06-15T00:00:00.000Z";
-        let run_time = parse_iso8601_to_systemtime(run_iso).unwrap();
+        let run_time = iso_to_systemtime(run_iso);
         let day = std::time::Duration::from_secs(86_400);
         set_mtime(&a, run_time - day); // ingested file untouched since the run
-        set_mtime(&pkg, run_time + day); // a sibling file was added after the run
+        set_mtime(&pkg, run_time + day); // directory churned after the run
 
         insert_entity(&conn, "python:module:pkg.a", "module", Some("pkg/a.py"));
         conn.execute(
@@ -811,10 +707,52 @@ mod tests {
         .unwrap();
 
         let snap = project_snapshot(&conn, root.path());
-        assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
-        assert!(
-            !snap.degraded,
-            "structural drift is environmental, not degraded: {snap:?}"
+        assert_eq!(
+            snap.staleness,
+            Staleness::Fresh,
+            "directory mtime churn must not read as staleness: {snap:?}"
+        );
+        assert!(!snap.degraded, "{snap:?}");
+    }
+
+    #[test]
+    fn project_anchor_directory_path_is_not_staleness() {
+        // The lacuna B1 driver (weft-4165f1ed71): the synthetic project anchor
+        // entity records `source_file_path = <project root>` — a DIRECTORY.
+        // A directory mtime (bumped by any direct child create/delete, e.g.
+        // a scratch file at the root) is not a file-modification signal; the
+        // oracle skips non-file paths. The verdict must stay Fresh even when
+        // the root dir's mtime is newer than the run.
+        let (_dir, conn) = migrated_conn();
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a.py");
+        std::fs::write(&a, "x = 1\n").unwrap();
+
+        let run_iso = "2026-06-15T00:00:00.000Z";
+        let run_time = iso_to_systemtime(run_iso);
+        let day = std::time::Duration::from_secs(86_400);
+        set_mtime(&a, run_time - day);
+
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        insert_entity(
+            &conn,
+            "core:project:proj",
+            "project",
+            Some(root.path().to_str().unwrap()),
+        );
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', ?1, ?1, '{}', '{}', 'completed')",
+            rusqlite::params![run_iso],
+        )
+        .unwrap();
+        set_mtime(root.path(), run_time + day); // root dir churned after the run
+
+        let snap = project_snapshot(&conn, root.path());
+        assert_eq!(
+            snap.staleness,
+            Staleness::Fresh,
+            "a directory-valued source path must be skipped, not read as modified: {snap:?}"
         );
     }
 
@@ -854,5 +792,185 @@ mod tests {
         let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
         let json = serde_json::to_value(&snap).unwrap();
         assert_eq!(json["degraded"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn indexed_at_commit_is_surfaced_and_serialized_when_the_run_recorded_one() {
+        // `project_status_get` already reports the analyzed commit as `git_sha`;
+        // the snapshot (loomweave://context + the session-start banner) must carry
+        // the same value so a Fresh verdict can name the commit it reflects
+        // (clarion-26c7e52027).
+        let (_dir, conn) = migrated_conn();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status, analyzed_at_commit) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed', 'abc123def456')",
+            [],
+        )
+        .unwrap();
+
+        let snap = project_snapshot(&conn, dir.path());
+        assert_eq!(snap.indexed_at_commit(), Some("abc123def456"), "{snap:?}");
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(
+            json["indexed_at_commit"],
+            serde_json::Value::String("abc123def456".into())
+        );
+    }
+
+    #[test]
+    fn indexed_at_commit_is_none_when_run_analyzed_outside_a_git_repo() {
+        // `analyzed_at_commit` is independently nullable: a run outside a git work
+        // tree records NULL, and the snapshot must report None — never a fabricated
+        // or empty commit.
+        let (_dir, conn) = migrated_conn();
+        insert_entity(&conn, "python:module:a", "module", Some("a.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        let snap = project_snapshot(&conn, std::path::Path::new("/tmp"));
+        assert_eq!(snap.indexed_at_commit(), None, "{snap:?}");
+    }
+
+    #[test]
+    fn new_top_level_directory_is_a_known_fresh_blind_spot() {
+        // Documents (and regression-locks) the conservative-nudge limitation the
+        // honest banner now discloses (clarion-26c7e52027). The watch set is the
+        // *direct parents of ingested files* and the project root is deliberately
+        // unwatched, so a brand-new top-level directory full of never-ingested
+        // source is invisible to BOTH the structural-drift and per-file passes —
+        // the verdict stays Fresh. This is the exact dogfood scenario (new
+        // specimen modules read as "fresh"). Detecting it would need working-tree
+        // git, which the untrusted-corpus posture (hardened_git) blocks; until
+        // then the banner tells the agent to re-analyze after adding modules.
+        let (_dir, conn) = migrated_conn();
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let a = pkg.join("a.py");
+        std::fs::write(&a, "x = 1\n").unwrap();
+
+        let run_iso = "2026-06-15T00:00:00.000Z";
+        let run_time = iso_to_systemtime(run_iso);
+        let day = std::time::Duration::from_secs(86_400);
+        set_mtime(&a, run_time - day); // ingested file untouched since the run
+        set_mtime(&pkg, run_time - day); // its watched parent untouched too
+
+        insert_entity(&conn, "python:module:pkg.a", "module", Some("pkg/a.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', ?1, ?1, '{}', '{}', 'completed')",
+            rusqlite::params![run_iso],
+        )
+        .unwrap();
+
+        // Add a brand-new top-level package AFTER the run. Its parent is the
+        // (unwatched) project root, so nothing in the watch set changed.
+        let newpkg = root.path().join("newpkg");
+        std::fs::create_dir(&newpkg).unwrap();
+        let hub = newpkg.join("hub.py");
+        std::fs::write(&hub, "y = 2\n").unwrap();
+        set_mtime(&hub, run_time + day);
+
+        let snap = project_snapshot(&conn, root.path());
+        // The mtime/structural passes can't see the new top-level dir, AND this
+        // tempdir is not a git work tree, so the worktree-source check returns
+        // None (nothing to detect with). Verdict stays Fresh — the mtime blind
+        // spot the banner caveat covers. In a GIT repo this same scenario flips to
+        // StaleWorktree (see `untracked_source_in_git_repo_reports_stale_worktree`).
+        assert_eq!(snap.staleness, Staleness::Fresh, "{snap:?}");
+        assert_eq!(
+            snap.worktree_dirty, None,
+            "outside a git work tree, worktree_dirty must be None: {snap:?}"
+        );
+    }
+
+    /// `git init` + commit `files` in `root`; returns `false` (caller skips) if
+    /// git is unavailable on the host. Committing keeps the seeded source OUT of
+    /// the untracked set so a clean baseline really is clean.
+    fn git_init_with_committed(root: &std::path::Path, files: &[(&str, &str)]) -> bool {
+        use std::process::Command;
+        let run = |args: &[&str]| -> bool {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if !run(&["init", "-q"]) {
+            return false;
+        }
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        for (name, body) in files {
+            std::fs::write(root.join(name), body).unwrap();
+        }
+        if !files.is_empty() {
+            run(&["add", "."]);
+            run(&["commit", "-q", "-m", "init"]);
+        }
+        true
+    }
+
+    #[test]
+    fn untracked_source_in_git_repo_reports_stale_worktree() {
+        // The dogfood scenario (clarion-26c7e52027, ADR-045): an index that is
+        // mtime-fresh but with a brand-new untracked source module the structural
+        // pass cannot reach. In a git work tree the hardened `ls-files --others`
+        // check (scoped to ingested `.py`) catches it and the verdict is honest:
+        // StaleWorktree, with worktree_dirty = Some(true).
+        let (_dir, conn) = migrated_conn();
+        let root = tempfile::tempdir().unwrap();
+        if !git_init_with_committed(root.path(), &[("demo.py", "x = 1\n")]) {
+            return; // git unavailable on host → skip (mechanism covered in core)
+        }
+        insert_entity(&conn, "python:module:demo", "module", Some("demo.py"));
+        // Far-future run → every ingested file is mtime-fresh.
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        // Brand-new untracked source the index never saw.
+        std::fs::write(root.path().join("hub.py"), "y = 2\n").unwrap();
+
+        let snap = project_snapshot(&conn, root.path());
+        assert_eq!(snap.staleness, Staleness::StaleWorktree, "{snap:?}");
+        assert_eq!(snap.worktree_dirty, Some(true), "{snap:?}");
+    }
+
+    #[test]
+    fn untracked_non_source_in_git_repo_stays_fresh() {
+        // False-positive guard: an untracked file whose extension Loomweave does
+        // not ingest (a scratch notes.txt) must NOT flag the index dirty. The
+        // extension scoping is what keeps the signal honest.
+        let (_dir, conn) = migrated_conn();
+        let root = tempfile::tempdir().unwrap();
+        if !git_init_with_committed(root.path(), &[("demo.py", "x = 1\n")]) {
+            return;
+        }
+        insert_entity(&conn, "python:module:demo", "module", Some("demo.py"));
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        // Untracked, but NOT a source extension the index uses.
+        std::fs::write(root.path().join("notes.txt"), "scratch\n").unwrap();
+
+        let snap = project_snapshot(&conn, root.path());
+        assert_eq!(
+            snap.staleness,
+            Staleness::Fresh,
+            "an untracked non-source file must not flip the verdict: {snap:?}"
+        );
+        assert_eq!(snap.worktree_dirty, Some(false), "{snap:?}");
     }
 }

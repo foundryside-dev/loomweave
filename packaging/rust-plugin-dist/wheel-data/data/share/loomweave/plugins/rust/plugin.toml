@@ -1,0 +1,73 @@
+[plugin]
+name = "loomweave-plugin-rust"
+plugin_id = "rust"
+version = "1.1.0"
+protocol_version = "1.0"
+# Bare basename per ADR-021 — the host refuses any path component. This is the
+# DISCOVERY name; the cargo artifact is `loomweave-rust-plugin` (off-glob).
+executable = "loomweave-plugin-rust"
+language = "rust"
+extensions = ["rs"]
+
+[capabilities.runtime]
+# Measured basis (ADR-035, Task 14 dogfood gate over this 8-crate workspace,
+# 2836 entities): peak RSS ~20 MB for the whole-workspace init-time symbol-table
+# build (the heaviest path — `analyze_file` parses a single file); max 288
+# entities in one file (loomweave-mcp/src/lib.rs). Envelopes carry headroom for
+# larger workspaces / files.
+# Sprint-3 scale QA (2026-06-10, ADR-050 amendment 1): RLIMIT_AS is an
+# ADDRESS-SPACE cap, not RSS — at 128 MiB the plugin SIGABRTs (alloc failure)
+# on rust-analyzer@587ce15e (~29k entities, peak RSS ~119 MiB); at 1024 MiB it
+# completes. 512 MiB gives ~4x headroom over the largest measured corpus while
+# still bounding a runaway parse.
+expected_max_rss_mb = 512
+expected_entities_per_file = 512
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+# Phase 1a starter kinds + Phase 1b leaf kinds + the `impl` entity (Task 5,
+# ADR-027 MINOR bump). The 10-kind set is complete.
+entity_kinds = [
+    "module",
+    "struct",
+    "function",
+    "enum",
+    "trait",
+    "type_alias",
+    "const",
+    "static",
+    "macro",
+    "impl",
+]
+# The core auto-emits the file->module `contains` edge for file_scope entities.
+# `imports` (Task 7), `implements` (Task 8), and `calls` (Phase 2) are anchored
+# resolving edges; a manifest-only kind would be host-dropped
+# (`undeclared_edge_kind`) and a writer-only kind would be manifest-rejected, so
+# each must be declared here. `calls` is an existing host/writer-accepted kind
+# (the Python plugin already emits it) — the Rust plugin is a new emitter of it.
+edge_kinds = ["contains", "imports", "implements", "calls", "derives", "references"]
+rule_id_prefix = "LMWV-RUST-"
+# 0.4.0: additive edge kinds `imports` + `implements` (ADR-027 MINOR). `calls`
+# (Phase 2) shipped intra-version as a further additive edge kind — no bump, as
+# no gate enforces the Rust plugin ontology_version (every check-*.py confirmed).
+# 0.5.0: additive edge kinds `derives` + `references` (Phase 2 completion,
+# plan 2026-06-10 — ADR-027 MINOR).
+# Lockstep with the `serve.rs` handshake constant.
+ontology_version = "0.5.0"
+
+[ontology.roles]
+file_scope = ["module"]
+callable = ["function"]
+syntax_degraded_module = ["module"]
+
+[signature]
+schema_version = 1
+
+[signature.schemas.function]
+v = 1
+fields = ["params", "return_ann", "generics"]
+
+[signature.schemas.struct]
+v = 1
+fields = ["fields"]

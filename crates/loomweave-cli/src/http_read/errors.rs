@@ -77,13 +77,13 @@ pub(crate) fn classify_read_error(err: &StorageError) -> ReadError {
         // 500 here is defensive — in practice the HTTP API does not open
         // its own writer, but the reader pool can encounter the same file
         // header mismatches and we want a clear distinct response code.
-        StorageError::ForeignDatabase { .. } | StorageError::FutureUserVersion { .. } => {
-            ReadError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: ErrorCode::StorageError,
-                message: "file lookup storage rejected database header",
-            }
-        }
+        StorageError::ForeignDatabase { .. }
+        | StorageError::FutureUserVersion { .. }
+        | StorageError::UnmigratedIndex => ReadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ErrorCode::StorageError,
+            message: "file lookup storage rejected database header",
+        },
         StorageError::PoolInteract(_)
         | StorageError::WriterGone
         | StorageError::WriterProtocol(_)

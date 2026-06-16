@@ -1,6 +1,6 @@
 //! `loomweave guidance` authoring CLI integration tests (WS6 / REQ-GUIDANCE-03).
 //!
-//! Drives the real binary end-to-end against a seeded `.loomweave/loomweave.db`:
+//! Drives the real binary end-to-end against a seeded `.weft/loomweave/loomweave.db`:
 //! create (via `--content`), show, list (incl. `--for-entity`), edit (via a
 //! fake `$EDITOR`), and delete. Verifies the written `properties` JSON matches
 //! the shape the MCP read path consumes.
@@ -23,10 +23,10 @@ fn loomweave_bin() -> Command {
     cmd
 }
 
-/// Seed a real `.loomweave/loomweave.db` with the schema and one code entity (so
+/// Seed a real `.weft/loomweave/loomweave.db` with the schema and one code entity (so
 /// `--for-entity` has a target to match).
 fn seed_db(root: &std::path::Path) {
-    let loomweave_dir = root.join(".loomweave");
+    let loomweave_dir = root.join(".weft/loomweave");
     std::fs::create_dir_all(&loomweave_dir).expect("mkdir .loomweave");
     let db_path = loomweave_dir.join("loomweave.db");
     let mut conn = Connection::open(&db_path).expect("open db");
@@ -59,7 +59,7 @@ fn seed_db(root: &std::path::Path) {
 }
 
 fn properties(root: &std::path::Path, id: &str) -> Value {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("reopen db");
     let raw: String = conn
         .query_row(
@@ -76,7 +76,7 @@ fn properties(root: &std::path::Path, id: &str) -> Value {
 /// for the `--expired` / `--stale` filter tests). Bypasses the CLI `create` path
 /// deliberately — these tests exercise `list`, not authoring.
 fn seed_sheet(root: &std::path::Path, slug: &str, properties: &Value) {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("open db for seed_sheet");
     let id = format!("core:guidance:{slug}");
     conn.execute(
@@ -555,7 +555,7 @@ fn create_normalizes_and_validates_expires() {
 
     // Proxy the read path: a future expiry must NOT be lexically < now, i.e. the
     // sheet is not treated as already expired.
-    let db_path = dir.path().join(".loomweave").join("loomweave.db");
+    let db_path = dir.path().join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).unwrap();
     let now: String = conn
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
@@ -737,7 +737,7 @@ fn edit_without_editor_set_fails_cleanly() {
 /// Seed one `summary_cache` row for the given entity (the column shape
 /// `analyze` and the cache writer use).
 fn seed_summary_cache(root: &std::path::Path, entity_id: &str) {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("open db");
     conn.execute(
         "INSERT INTO summary_cache \
@@ -752,7 +752,7 @@ fn seed_summary_cache(root: &std::path::Path, entity_id: &str) {
 }
 
 fn summary_cache_count(root: &std::path::Path, entity_id: &str) -> i64 {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("open db");
     conn.query_row(
         "SELECT COUNT(*) FROM summary_cache WHERE entity_id = ?1",
@@ -942,7 +942,7 @@ fn import_from(root: &std::path::Path, from_dir: &std::path::Path) {
 
 /// Fetch a guidance sheet's (name, properties) tuple, or None if absent.
 fn sheet_fields(root: &std::path::Path, id: &str) -> Option<(String, Value)> {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("reopen db");
     conn.query_row(
         "SELECT name, properties FROM entities WHERE id = ?1 AND kind = 'guidance'",
@@ -1105,7 +1105,7 @@ fn import_is_idempotent() {
     assert_eq!(first, second, "re-import is a content no-op");
 
     // Exactly one sheet, not duplicated.
-    let db_path = dst.path().join(".loomweave").join("loomweave.db");
+    let db_path = dst.path().join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).unwrap();
     let count: i64 = conn
         .query_row(
@@ -1222,7 +1222,7 @@ fn import_rejects_code_entity_id_and_leaves_entity_intact() {
 /// Fetch the raw (name, kind, `plugin_id`, properties) tuple for ANY entity (not
 /// just guidance), or None.
 fn sheet_props_raw(root: &std::path::Path, id: &str) -> Option<(String, String, String, String)> {
-    let db_path = root.join(".loomweave").join("loomweave.db");
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("reopen db");
     conn.query_row(
         "SELECT name, kind, plugin_id, properties FROM entities WHERE id = ?1",
@@ -1244,7 +1244,7 @@ fn import_invalidates_union_of_old_and_new_matches() {
 
     // Seed a `class` entity too, so an OLD `kind:class` rule has a target.
     {
-        let db_path = dst.path().join(".loomweave").join("loomweave.db");
+        let db_path = dst.path().join(".weft/loomweave").join("loomweave.db");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
@@ -1328,7 +1328,7 @@ fn delete_invalidates_guides_edge_target() {
     // Manually wire a `guides` edge (no authoring path creates one today) and a
     // cache row on the target.
     {
-        let db_path = dir.path().join(".loomweave").join("loomweave.db");
+        let db_path = dir.path().join(".weft/loomweave").join("loomweave.db");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES \
@@ -1432,7 +1432,7 @@ fn import_rejects_guidance_id_with_path_separator() {
 fn export_flattens_legacy_guidance_id_path_separators() {
     let src = tempfile::tempdir().unwrap();
     seed_db(src.path());
-    let db_path = src.path().join(".loomweave").join("loomweave.db");
+    let db_path = src.path().join(".weft/loomweave").join("loomweave.db");
     let conn = Connection::open(&db_path).expect("open db");
     conn.execute(
         "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
@@ -1511,4 +1511,136 @@ fn import_is_partial_but_safe_when_a_later_file_is_malformed() {
         sheet_fields(dst.path(), "core:guidance:aaa-good").is_some(),
         "a sheet committed before the malformed file survives the abort"
     );
+}
+
+// ── On-spine entity binding at create time (SEI doctrine / ADR-029) ───────────
+//
+// CLI `guidance create` is the operator twin of MCP `propose_guidance`. The MCP
+// path resolves a pasted SEI to the canonical locator at entry
+// (clarion-d76e7f7267) so the stored rule binds to a live entity. These tests
+// assert the CLI now has the same property: an `entity:` / `subsystem:` rule
+// whose id is a SEI is bound to the locator before the write, a plain locator is
+// stored unchanged (existing callers unaffected), and an unresolvable id aborts
+// the create with an `unresolved_input` error — writing NOTHING.
+
+/// Seed an alive `sei_bindings` row binding `sei` to `locator`, so
+/// `resolve_entity_ref(sei)` returns the locator's entity row.
+fn seed_sei(root: &std::path::Path, sei: &str, locator: &str) {
+    let db_path = root.join(".weft/loomweave").join("loomweave.db");
+    let conn = Connection::open(&db_path).expect("open db for seed_sei");
+    conn.execute(
+        "INSERT INTO sei_bindings \
+         (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at) \
+         VALUES (?1, ?2, 'bh', 's', 'alive', 'run-seed', 'run-seed', \
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        rusqlite::params![sei, locator],
+    )
+    .expect("seed sei binding");
+}
+
+#[test]
+fn create_binds_entity_rule_sei_to_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    let locator = "python:function:auth.tokens.refresh";
+    let sei = "loomweave:eid:deadbeefdeadbeefdeadbeefdeadbeef";
+    seed_sei(dir.path(), sei, locator);
+
+    // Paste the SEI as the entity-rule value, exactly as an agent might.
+    loomweave_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "function"])
+        .args(["--name", "sei-bound"])
+        .args(["--match", &format!("entity:{sei}")])
+        .args(["--content", "Bound via a pasted SEI."])
+        .assert()
+        .success();
+
+    let props = properties(dir.path(), "core:guidance:sei-bound");
+    let rules = props["match_rules"].as_array().unwrap();
+    // The stored rule carries the resolved LOCATOR, not the pasted SEI — so the
+    // read path's exact-match `id == entities.id` compare can actually fire.
+    assert_eq!(
+        rules[0],
+        serde_json::json!({"type": "entity", "id": locator}),
+        "entity rule must be rewritten to the canonical locator (on-spine)"
+    );
+
+    // End-to-end: the sheet now matches the entity through the bound rule.
+    let filtered = loomweave_bin()
+        .args(["guidance", "list"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--for-entity", locator])
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&filtered.get_output().stdout).contains("core:guidance:sei-bound"),
+        "SEI-bound sheet must match its entity via the resolved locator"
+    );
+}
+
+#[test]
+fn create_preserves_plain_locator_entity_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    let locator = "python:function:auth.tokens.refresh";
+
+    // A literal locator (the existing-caller shape) must pass through unchanged.
+    loomweave_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "function"])
+        .args(["--name", "locator-bound"])
+        .args(["--match", &format!("entity:{locator}")])
+        .args(["--content", "Bound via a literal locator."])
+        .assert()
+        .success();
+
+    let props = properties(dir.path(), "core:guidance:locator-bound");
+    let rules = props["match_rules"].as_array().unwrap();
+    assert_eq!(
+        rules[0],
+        serde_json::json!({"type": "entity", "id": locator}),
+        "a literal locator must be stored verbatim (non-breaking)"
+    );
+}
+
+#[test]
+fn create_rejects_unresolvable_entity_rule_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_db(dir.path());
+    // A SEI with no alive binding — the off-spine input we must refuse.
+    let orphan_sei = "loomweave:eid:00000000000000000000000000000000";
+
+    let assert = loomweave_bin()
+        .args(["guidance", "create"])
+        .args(["--path"])
+        .arg(dir.path())
+        .args(["--scope-level", "function"])
+        .args(["--name", "should-not-exist"])
+        .args(["--match", &format!("entity:{orphan_sei}")])
+        .args(["--content", "This must never be written."])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("unresolved_input"),
+        "must surface the unresolved_input contract: {stderr}"
+    );
+
+    // Honesty: NOTHING was written — no unbound-but-looks-bound sheet.
+    let db_path = dir.path().join(".weft/loomweave").join("loomweave.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = ?1",
+            rusqlite::params!["core:guidance:should-not-exist"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "a non-resolving input must create NOTHING");
 }

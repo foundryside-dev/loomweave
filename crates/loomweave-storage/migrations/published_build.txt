@@ -1,0 +1,9 @@
+# ADR-024 in-place migration-retirement marker (clarion-b20448b3ac).
+#
+# Names the first externally-published build whose 0001_initial_schema.sql is
+# frozen. 0001 has been byte-identical since this tag (verified: `git diff
+# v1.0.0 HEAD -- .../0001_initial_schema.sql` is empty), and every schema change
+# since has been an additive 0002+ migration. With this marker present,
+# scripts/check-migration-retirement.py fails if 0001 ever diverges from this
+# ref — later schema changes must be additive migrations, never in-place edits.
+v1.0.0

@@ -10,8 +10,12 @@ For local-login alternatives that avoid API keys in Loomweave config, see
 
 ## Configure Loomweave
 
-`loomweave install` writes a default `loomweave.yaml` with LLMs disabled. To enable
-live OpenRouter calls, set a concrete model ID and opt in explicitly:
+`loomweave install` writes a default `loomweave.yaml` with LLMs disabled. Print a
+fresh annotated example any time with `loomweave config example` (or
+`loomweave config example --provider claude_cli`), and after editing, run
+`loomweave config check` to see the *effective* provider/live/model state and any
+warnings (e.g. a provider configured but left `enabled: false`). To enable live
+OpenRouter calls, set a concrete model ID and opt in explicitly:
 
 ```yaml
 llm_policy:

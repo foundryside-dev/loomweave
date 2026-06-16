@@ -42,7 +42,7 @@ impl Serialize for InstanceId {
 }
 
 pub fn load_or_create(project_root: &Path) -> Result<InstanceId> {
-    let path = project_root.join(".loomweave").join(INSTANCE_ID_FILE);
+    let path = loomweave_core::store::store_dir(project_root).join(INSTANCE_ID_FILE);
     match fs::read_to_string(&path) {
         Ok(raw) => read_existing_instance_id(&path, &raw),
         Err(err) if err.kind() == io::ErrorKind::NotFound => create_instance_id(&path),

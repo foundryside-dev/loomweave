@@ -8,6 +8,7 @@ pub mod cache;
 pub mod commands;
 pub mod embeddings;
 pub mod error;
+pub mod findings;
 pub mod glob;
 pub mod guidance;
 pub mod pragma;
@@ -34,6 +35,7 @@ pub use commands::{
 };
 pub use embeddings::{EmbeddingKey, EmbeddingStore, StoredEmbedding, embeddings_db_path};
 pub use error::{Result, StorageError};
+pub use findings::sweep_stale_findings;
 pub use glob::glob_match;
 pub use guidance::{
     GUIDANCE_PROPOSAL_MARKER, GuidanceProposal, GuidanceSheet, GuidanceSheetInput, MatchFacts,
@@ -48,17 +50,22 @@ pub use prior_index::{
 };
 pub use query::{
     CallEdgeMatch, CanonicalProjectPath, ContainedEntities, EntityRow, EntitySubsystem,
-    EntityVisibility, FindingForEmitRow, ModuleDependencyEdge, ReferenceDirection,
-    ReferenceEdgeMatch, ResolvedFile, ResolvedFileCatalogEntry, RolledUpReferenceEdge,
-    SubsystemMember, UnresolvedCallSiteRow, ancestor_chain, call_edges_from, call_edges_targeting,
-    candidate_entities_for_unresolved_sites, child_entity_ids, contained_entity_ids,
-    containing_module_id, current_file_hash, entities_by_churn, entities_by_kind, entities_by_tag,
-    entities_containing_line, entities_with_wardline_facts, entity_at_line,
-    entity_briefing_block_reason, entity_by_id, entity_visibility, existing_entity_ids,
-    find_entities, findings_for_emit, import_edges_for_entity, module_dependency_edges,
-    module_reference_rollup, normalize_source_path, reference_edges_for_entity, resolve_file,
-    resolve_file_catalog_entry, subsystem_for_member, subsystem_members, subsystem_of_entity,
-    unresolved_call_sites_for_caller, unresolved_callers_for_target,
+    EntityVisibility, FindingForEmitRow, ModuleDependencyEdge, PRE_INGEST_SECRET_SCAN_RULE_IDS,
+    RELATION_EDGE_KINDS, ReferenceDirection, ReferenceEdgeMatch, RelationEdgeMatch, ResolvedFile,
+    ResolvedFileCatalogEntry, RolledUpReferenceEdge, SubsystemMember, UnresolvedCallSiteRow,
+    ancestor_chain, call_edges_from, call_edges_targeting, candidate_entities_for_unresolved_sites,
+    child_entity_ids, contained_entity_ids, containing_module_id, current_file_hash, edge_total,
+    entities_by_churn, entities_by_kind, entities_by_tag, entities_containing_line,
+    entities_targeted_by_unresolved_call_sites, entities_with_wardline_facts, entity_at_line,
+    entity_briefing_block_reason, entity_by_id, entity_ids_in_namespace, entity_total,
+    entity_visibility, existing_entity_ids, find_entities, findings_for_emit,
+    import_edges_for_entity, known_entity_kinds, known_entity_tags,
+    live_unresolved_call_sites_exist, module_dependency_edges, module_reference_rollup,
+    normalize_source_path, preferred_finding_anchor_by_file, reference_edges_for_entity,
+    relation_edges_for_entity, resolve_entity_ref, resolve_file, resolve_file_catalog_entry,
+    stored_secret_finding_anchor_by_file, subsystem_for_member, subsystem_members,
+    subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
+    unresolved_caller_count_for_target, unresolved_callers_for_target,
 };
 pub use reader::ReaderPool;
 pub use retry::{RetryPolicy, begin_immediate};
@@ -74,7 +81,8 @@ pub use sei::{
 pub use unresolved::{UnresolvedCallSiteRecord, replace_unresolved_call_sites_for_caller};
 pub use wardline_taint::{
     Resolution, TaintFact, TaintFactRow, get_taint_facts, get_taint_facts_by_sei,
-    resolve_wardline_qualname, resolve_wardline_qualnames, seis_for_locators, upsert_taint_fact,
+    resolve_qualnames_all_kinds, resolve_wardline_qualname, resolve_wardline_qualnames,
+    resolve_wardline_qualnames_for_plugin, seis_for_locators, upsert_taint_fact,
 };
 pub use writer::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, Writer, known_scan_time_edge_kinds,

@@ -18,9 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 use ignore::{DirEntry, WalkBuilder};
 use rusqlite::Connection;
+use serde::Serialize;
 use time::{OffsetDateTime, macros::format_description};
 use uuid::Uuid;
 
+use loomweave_core::plugin::host::FINDING_PLUGIN_ABORTED;
 use loomweave_core::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, CrashLoopBreaker, CrashLoopState,
     DiscoveredPlugin, EmbeddingProvider, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding,
@@ -45,6 +47,9 @@ use loomweave_federation::scan_results::{
 
 use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
+use duplicate_guard::{DUPLICATE_LOCATOR_RULE_ID, DuplicateLocatorGuard};
+
+mod duplicate_guard;
 use loomweave_analysis::{
     ClusterAlgorithm, ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules,
 };
@@ -78,10 +83,6 @@ const GUIDANCE_EXPIRED_RULE_ID: &str = "LMWV-FACT-GUIDANCE-EXPIRED";
 /// churn-history pipeline (clarion-997c93ec4e) populates `git_churn_count`.
 const GUIDANCE_CHURN_STALE_RULE_ID: &str = "LMWV-FACT-GUIDANCE-CHURN-STALE";
 
-/// REQ-GUIDANCE-05 (WS6 T4): a Wardline-derived guidance sheet was preserved as
-/// an operator override while `wardline.yaml` changed underneath it.
-const GUIDANCE_STALE_RULE_ID: &str = "LMWV-FACT-GUIDANCE-STALE";
-
 /// Aggregate `git_churn_count` (summed over a sheet's matched entities) at or above
 /// which a non-pinned sheet is flagged `LMWV-FACT-GUIDANCE-CHURN-STALE`.
 const CHURN_STALE_THRESHOLD: i64 = 50;
@@ -113,7 +114,6 @@ const POST_RUN_FINDING_RULES: &[&str] = &[
     GUIDANCE_ORPHAN_RULE_ID,
     GUIDANCE_EXPIRED_RULE_ID,
     GUIDANCE_CHURN_STALE_RULE_ID,
-    GUIDANCE_STALE_RULE_ID,
     TIER_MIXING_RULE_ID,
     TIER_UNANIMOUS_RULE_ID,
 ];
@@ -297,6 +297,10 @@ impl Drop for ProgressHeartbeatGuard {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+// A flat bag of resolved CLI options (each field mirrors one `analyze` flag), not
+// a state machine — the bools are independent toggles, so the pedantic
+// excessive-bools lint does not apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnalyzeOptions {
     pub(crate) config_path: Option<PathBuf>,
@@ -327,13 +331,19 @@ pub(crate) struct AnalyzeOptions {
     /// working-tree window stays on the shell source, so an unset/unreachable
     /// `legis` leaves behaviour byte-identical to pre-WS9. `None` ⇒ shell only.
     pub(crate) legis_url: Option<String>,
+    /// `--json`: after the human-readable completion line, emit an additive
+    /// structured-output block (graph totals + the TYPED `weft-reason` carrier for
+    /// the Filigree emit seam) for machine consumers (the seam-health roll-up / L2
+    /// strategic view / tag-board feed), so they read a `reason_class` they can
+    /// switch on instead of grepping the completion line (G3 / PDR-0023).
+    pub(crate) json: bool,
 }
 
 /// Run the analyze command against `project_path` with resolved CLI options.
 ///
 /// # Errors
 ///
-/// Returns an error if the target directory does not exist, has no `.loomweave/`
+/// Returns an error if the target directory does not exist, has no `.weft/loomweave/`
 /// directory, if analyze config is invalid, or if the writer actor fails to
 /// start or process commands.
 #[allow(clippy::too_many_lines)]
@@ -347,10 +357,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let project_root = project_path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise path {}", project_path.display()))?;
-    let loomweave_dir = project_root.join(".loomweave");
+    let loomweave_dir = loomweave_core::store::store_dir(&project_root);
     if !loomweave_dir.exists() {
         bail!(
-            "{} has no .loomweave/ directory. Run `loomweave install` first.",
+            "{} has no .weft/loomweave/ store. Run `loomweave install` first.",
             project_root.display()
         );
     }
@@ -573,9 +583,16 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     progress.set_total(source_files.len() as u64);
     progress.phase("analyzing", None, None);
 
-    let secret_scan_files = crate::secret_scan::collect_scan_files(&project_root, &source_files);
+    let secret_scan_walk = crate::secret_scan::collect_scan_files(&project_root, &source_files);
+    // Sidecar-walk skips are coverage holes the secret scan never examined; they
+    // gate the stale-finding sweep below exactly like `source_walk_skipped_entries`
+    // (a skipped sidecar must suppress the unbounded global sweep, or it would
+    // retire a still-open secret finding for an unexamined `.env`).
+    let secret_scan_sidecar_skipped = secret_scan_walk.sidecar_walk_skipped;
+    let secret_scan_files = secret_scan_walk.files;
     tracing::info!(
         file_count = secret_scan_files.len(),
+        sidecar_walk_skipped = secret_scan_sidecar_skipped,
         "secret scan file walk complete"
     );
     let mut secret_scan_outcome =
@@ -604,44 +621,75 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // changed files pass through the per-source-file edge replacement boundary
     // before their current edge set is inserted.
     //
-    // Caveat (benign): a skipped file's core `file` entity keeps last run's
-    // `briefing_blocked` / `language` properties, which a full re-analysis would
-    // refresh. This can only go stale TOWARD blocked (a withheld briefing that
-    // could now be served — the conservative direction); a file that should
-    // NEWLY block is either secret-bearing (carved out of skip below) or scanned
-    // by `pre_ingest` before the partition, so it cannot silently under-block.
-    // `--no-incremental` clears any such staleness.
+    // `briefing_blocked` on a skipped file IS reconciled every run
+    // (clarion-3c4ed8e9fb): the per-skipped-file loop below drives each skipped
+    // file's existing entity rows to the CURRENT pre-ingest secret-scan verdict
+    // (the scan is a full pass every run), SETTING the block when the scan still
+    // flags the file and CLEARING it when the scan no longer does (operator
+    // added a baseline, cleaned the secret, or used the override). This closes
+    // the operator baseline workflow (clarion-55fc5aa885 §I11): an unchanged
+    // file that was blocked on run 1 unblocks on run 2 after a baseline is added,
+    // without `--no-incremental`. The reconciliation is driven SOLELY from the
+    // secret-scan outcome, so it can never unblock a file the scanner still
+    // flags — the scanner remains the sole authority. (The skipped file's
+    // `language` and other plugin properties are still not refreshed; a full
+    // `--no-incremental` run rebuilds those.)
+    //
+    // Secret-bearing UNCHANGED files are skipped like any other
+    // (weft-4165f1ed71, the analyze fixed point — they used to be carved out
+    // because their finding anchor could only be resolved from entities emitted
+    // in the same run, re-processing one file forever). Their pre-ingest
+    // findings re-anchor through `prior_anchor_by_file`: the preferred anchor
+    // entity (module first) resolved from the already-committed rows, seeded
+    // into the scan outcome for every skipped file below.
     let incremental = !options.no_incremental;
-    let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot) = if incremental {
-        match Connection::open(&db_path) {
-            Ok(conn) => {
-                let files = loomweave_storage::previously_analyzed_files(&conn).unwrap_or_default();
-                let locs = loomweave_storage::prior_locators_by_file(&conn).unwrap_or_default();
-                let snapshot = loomweave_storage::load_prior_index(&conn).unwrap_or_default();
-                (files, locs, snapshot)
+    let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot, prior_anchor_by_file) =
+        if incremental {
+            match Connection::open(&db_path) {
+                Ok(conn) => {
+                    let files =
+                        loomweave_storage::previously_analyzed_files(&conn).unwrap_or_default();
+                    let locs = loomweave_storage::prior_locators_by_file(&conn).unwrap_or_default();
+                    let snapshot = loomweave_storage::load_prior_index(&conn).unwrap_or_default();
+                    // Anchor continuity for a skipped secret-bearing file
+                    // (weft-4165f1ed71). Read the entity_id the prior run ACTUALLY
+                    // keyed its secret finding to (L1: ground truth from the
+                    // `findings` rows), and only fall back to the module/plugin/core
+                    // re-derivation heuristic for files with no prior secret finding
+                    // (first-time anchors, which cannot duplicate). The heuristic
+                    // diverges from the in-run `remember_finding_anchors` tie-break on
+                    // same-rank candidates (Rust inline `mod` blocks), which would
+                    // flip the anchor-keyed finding id and mint a duplicate row.
+                    let mut anchors = loomweave_storage::preferred_finding_anchor_by_file(&conn)
+                        .unwrap_or_default();
+                    anchors.extend(
+                        loomweave_storage::stored_secret_finding_anchor_by_file(&conn)
+                            .unwrap_or_default(),
+                    );
+                    (files, locs, snapshot, anchors)
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "incremental skip disabled: cannot open read connection");
+                    (
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                    )
+                }
             }
-            Err(err) => {
-                tracing::warn!(error = %err, "incremental skip disabled: cannot open read connection");
-                (HashMap::new(), HashMap::new(), HashMap::new())
-            }
-        }
-    } else {
-        (HashMap::new(), HashMap::new(), HashMap::new())
-    };
+        } else {
+            (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
     // Locators of skipped-unchanged entities — fed into the SEI matcher's
     // current-locator union AND re-appended to the prior-index rebuild below.
     let mut retained_locators: HashSet<String> = HashSet::new();
     let mut skipped_files_total: u64 = 0;
-    // Files with an active secret finding must NEVER be skipped: the finding
-    // anchors to the plugin entity emitted only when the file is analysed, so
-    // skipping it would re-anchor to the core `file` entity and duplicate the
-    // finding (REQ-FINDING-05 determinism). The set is small (files containing
-    // secrets) and canonicalised with the same helper the anchor logic uses.
-    let secret_finding_files: HashSet<PathBuf> = secret_scan_outcome
-        .finding_files()
-        .iter()
-        .map(|f| crate::secret_scan::canonical_or_original(f))
-        .collect();
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
@@ -663,6 +711,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut references_skipped_external_total: u64 = 0;
     let mut references_skipped_cap_total: u64 = 0;
     let mut imports_skipped_external_total: u64 = 0;
+    // Anchored resolving edges (`imports`/`implements`) whose endpoints were
+    // never stored this run — dropped-and-counted by the seen-entity-set gate
+    // (D1 external / D2 gitignored-superset / D3 mid-run staleness). Flushing
+    // such an edge would FK-HardFail the whole run (`edges.to_id` is
+    // `NOT NULL REFERENCES entities(id)` with FKs on); the gate trades the edge
+    // for a counter so the run still completes.
+    let mut plugin_edges_dropped_unseen_total: u64 = 0;
     let mut unresolved_reference_sites_total: u64 = 0;
     let mut pyright_latency = P95Accumulator::default();
     let mut pyright_index_parse_latency = P95Accumulator::default();
@@ -699,7 +754,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &started_at,
         ));
     }
+    let handshake_timeout = plugin_handshake_timeout();
     let file_timeout = plugin_file_timeout();
+    let shutdown_timeout = plugin_shutdown_timeout();
     let briefing_blocks = secret_scan_outcome.briefing_blocks_shared();
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
@@ -729,19 +786,104 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
 
         // Wave 2 / T3.1: partition into files to re-analyse (changed, new,
-        // unhashable → fail toward work, or carrying a secret finding whose
-        // anchor must stay stable) and files to skip (whole-file hash identical to
-        // the prior run). Each skipped file's prior entities stay in the DB; we
-        // record their locators for the matcher union and re-append their
-        // prior-index rows so the rebuilt snapshot keeps them.
-        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
-            plugin_files.into_iter().partition(|path| {
-                secret_finding_files.contains(&crate::secret_scan::canonical_or_original(path))
-                    || file_needs_reanalysis(&project_root, path, &prior_file_hashes)
-            });
+        // unhashable → fail toward work) and files to skip (whole-file hash
+        // identical to the prior run). Each skipped file's prior entities stay
+        // in the DB; we record their locators for the matcher union and
+        // re-append their prior-index rows so the rebuilt snapshot keeps them.
+        // A secret-bearing UNCHANGED file skips too (weft-4165f1ed71): its
+        // finding anchor is seeded from the committed rows below, so the skip
+        // no longer re-anchors (and thereby duplicates) the finding.
+        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) = plugin_files
+            .into_iter()
+            .partition(|path| file_needs_reanalysis(&project_root, path, &prior_file_hashes));
+        // Locators of THIS plugin's skipped-unchanged entities. These rows stay in
+        // the committed DB untouched this run (they are guarded against orphan
+        // deletion via `retained_locators` below — see the SEI matcher's
+        // current-locator union), so they are exactly the endpoints an anchored
+        // edge from a CHANGED file may resolve against even though the host never
+        // re-dispatched the file that owns them. Seeding them into
+        // `seen_plugin_entity_ids` (below) lets such an edge drain ready instead of
+        // being dropped-and-counted as if its endpoint were never stored. We seed
+        // ONLY skipped-file locators (never the full prior index): a CHANGED file
+        // that drops a symbol does NOT re-emit it this run, and — crucially —
+        // because it was re-dispatched its locator is absent from THIS set, so an
+        // edge into that now-dead symbol still drops. Seeding from the full prior
+        // index instead would mark the dropped symbol seen (its row lingers —
+        // `entities` is cumulative) and resurrect a stale edge to a symbol the
+        // source no longer defines.
+        let mut skipped_file_entity_ids: Vec<String> = Vec::new();
+        // id → owning canonical source path for entities anchored in this
+        // plugin's skipped-unchanged files. These rows survive the run
+        // untouched, so a RE-ANALYZED file emitting one of these ids is a
+        // genuine cross-run locator collision (clarion-b19fe90c3e) — the old
+        // file still claims it. A genuine move never lands here: the moved-from
+        // file either changed (re-dispatched, so not skipped) or vanished (its
+        // entities are orphan-deleted by the SEI pass). Full runs leave this
+        // empty.
+        let mut skipped_locator_owners: BTreeMap<String, String> = BTreeMap::new();
         for path in &skipped_files {
             skipped_files_total += 1;
             progress.file_skipped_unchanged(&plugin_id, &path.to_string_lossy());
+            // Anchor continuity for the pre-ingest secret scan
+            // (weft-4165f1ed71): this file is not dispatched, so no plugin
+            // entity registers an anchor this run — resolve the same anchor the
+            // analysed run used (module-preferred) from the committed rows.
+            let canonical = crate::secret_scan::canonical_or_original(path);
+            if let Some(anchor) = prior_anchor_by_file
+                .get(&canonical.display().to_string())
+                .or_else(|| prior_anchor_by_file.get(&path.display().to_string()))
+            {
+                secret_scan_outcome.seed_finding_anchor(canonical.clone(), anchor.clone());
+            }
+            // clarion-3c4ed8e9fb: a skipped file is never re-dispatched, so the
+            // plugin host never re-stamps `briefing_blocked` on its entities —
+            // they keep the PRIOR run's verdict. The pre-ingest secret scan is a
+            // FULL pass every run, so the CURRENT verdict is already known; drive
+            // the skipped file's existing rows to it (set when the scan blocks,
+            // CLEAR when the scan no longer blocks — baselined / cleaned /
+            // override). The scanner remains the SOLE authority: the verdict comes
+            // only from `briefing_blocks`, never from plugin output, and a file
+            // the scanner did not examine this run is left untouched. Changed
+            // files re-dispatch through the host and are reconciled there, so this
+            // is scoped to the skipped partition to avoid redundant writes.
+            if scanned_files.contains(&canonical) {
+                let reason = briefing_blocks
+                    .get(&canonical)
+                    .map(|r| r.as_str().to_owned());
+                match writer
+                    .send_wait(|ack| WriterCmd::ReconcileBriefingBlockForSourceFile {
+                        source_file_path: canonical.display().to_string(),
+                        reason,
+                        ack,
+                    })
+                    .await
+                {
+                    Ok(updated) if updated > 0 => {
+                        tracing::debug!(
+                            plugin_id = %plugin_id,
+                            file = %canonical.display(),
+                            updated,
+                            "reconciled briefing_blocked on skipped file to current secret-scan verdict"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(
+                            run_id = %run_id,
+                            file = %canonical.display(),
+                            error = %err,
+                            "briefing_blocked reconciliation for skipped file failed"
+                        );
+                        run_outcome = RunOutcome::HardFailed {
+                            reason: format!(
+                                "briefing_blocked reconciliation failed for {}: {err}",
+                                canonical.display()
+                            ),
+                        };
+                        break 'plugins;
+                    }
+                }
+            }
             if let Some(key) = canonical_path_key(path)
                 && let Some(locators) = prior_locs_by_file.remove(&key)
             {
@@ -749,6 +891,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     if let Some(entry) = prior_index_snapshot.get(&locator) {
                         prior_index_entries.push(entry.clone());
                     }
+                    skipped_locator_owners.insert(locator.clone(), key.clone());
+                    skipped_file_entity_ids.push(locator.clone());
                     retained_locators.insert(locator);
                 }
             }
@@ -781,6 +925,31 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let scanned_files_clone = Arc::clone(&scanned_files);
         let progress_clone = Arc::clone(&progress);
 
+        // Seed the dual-declaration claim set with the file_scope (module)
+        // entity ids anchored in this plugin's SKIPPED files. A module id can
+        // legitimately be emitted by more than one file (clarion-6ec7317628:
+        // tokio's inline `pub(crate) mod unix {}` facade in `process/mod.rs`
+        // colliding with the path-derived module of `process/unix/mod.rs`).
+        // The first emitter claims the `file -> module` contains edge and the
+        // matching `parent_id` (ADR-026 dual encoding); later emitters are
+        // suppressed. On an incremental run the claim owner may be a SKIPPED
+        // file whose stored edge survives untouched — seeding its module ids
+        // here keeps a re-analyzed duplicate emitter from minting a second
+        // contains parent against the surviving one. The owner==anchor
+        // invariant holds because the claiming emission is the only one whose
+        // entity record is stored, so a skipped file's locator list names
+        // exactly the modules it owns. Full runs seed empty.
+        let claim_kind_roles = PluginKindRoles::from_manifest(&plugin.manifest);
+        let prior_file_scope_claims: BTreeSet<String> = skipped_file_entity_ids
+            .iter()
+            .filter(|id| {
+                id.split(':')
+                    .nth(1)
+                    .is_some_and(|kind| claim_kind_roles.is_file_scope(kind))
+            })
+            .cloned()
+            .collect();
+
         let (batch_tx, mut batch_rx) =
             tokio::sync::mpsc::channel(PLUGIN_FILE_BATCH_CHANNEL_CAPACITY);
         let join_handle = tokio::task::spawn_blocking(move || {
@@ -793,7 +962,11 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &briefing_blocks_clone,
                 &scanned_files_clone,
                 &progress_clone,
+                handshake_timeout,
                 file_timeout,
+                shutdown_timeout,
+                prior_file_scope_claims,
+                skipped_locator_owners,
                 &batch_tx,
             )
         });
@@ -801,7 +974,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let mut insert_err: Option<anyhow::Error> = None;
         let mut plugin_entity_count: u64 = 0;
         let mut plugin_edge_count: u64 = 0;
-        let mut seen_plugin_entity_ids: BTreeSet<String> = BTreeSet::new();
+        // Seed the seen-entity gate with this plugin's skipped-file entity ids: an
+        // anchored edge from a re-analyzed file into an UNCHANGED file's entity must
+        // drain ready (its endpoint exists in the committed DB and survives this
+        // run), not be dropped at end-of-plugin. Full runs have no skipped files, so
+        // this is empty and behaviour is unchanged.
+        let mut seen_plugin_entity_ids: BTreeSet<String> =
+            skipped_file_entity_ids.into_iter().collect();
         let mut pending_plugin_edges: Vec<DescribedEdgeRecord> = Vec::new();
         while let Some(message) = batch_rx.recv().await {
             if insert_err.is_some() {
@@ -876,21 +1055,16 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     match persist_plugin_edges(&writer, ready_edges).await {
                         Ok(edge_count) => {
                             plugin_edge_count += edge_count;
-                            if !pending_plugin_edges.is_empty() {
-                                match persist_plugin_edges(
-                                    &writer,
-                                    std::mem::take(&mut pending_plugin_edges),
-                                )
-                                .await
-                                {
-                                    Ok(edge_count) => {
-                                        plugin_edge_count += edge_count;
-                                    }
-                                    Err(e) => {
-                                        insert_err = Some(e);
-                                    }
-                                }
-                            }
+                            // `DeferredImportEdges` is this plugin's LAST message
+                            // (`seen_plugin_entity_ids`/`pending_plugin_edges` are
+                            // re-initialised per plugin at the top of the `'plugins`
+                            // loop), so whatever is still pending after the final
+                            // drain has an endpoint the host never stored. Such an
+                            // edge cannot FK-resolve — flushing it would HardFail
+                            // the whole run. Drop it and COUNT it (never silently
+                            // lose, never downgrade-to-Inferred); the run completes.
+                            plugin_edges_dropped_unseen_total +=
+                                drop_unready_plugin_edges(&mut pending_plugin_edges);
                         }
                         Err(e) => {
                             insert_err = Some(e);
@@ -1130,10 +1304,16 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &db_path,
             &project_root,
             &run_id,
-            // `--resume` re-emits without marking the prior run's findings
-            // unseen (REQ-FINDING-05); a fresh run marks them unseen so a
-            // dropped finding transitions to `unseen_in_latest` on the peer.
-            !resume,
+            // `mark_unseen` sweeps findings this scan did NOT report as gone —
+            // only sound when the scan examined the whole corpus, i.e. it skipped
+            // no files (`skipped_files_total == 0`: a `--no-incremental` run or a
+            // first run with an empty prior index). An incremental run that
+            // skipped unchanged files has no authority to sweep their findings,
+            // and an incremental no-op would otherwise POST an empty batch with
+            // `mark_unseen=true` — which Filigree rejects 400 ("requires at least
+            // one finding or scanned path"). `--resume` never sweeps
+            // (REQ-FINDING-05).
+            !resume && skipped_files_total == 0,
             // Final/only completing batch for the during-run findings; the
             // Phase-8c follow-up (if any) is additive (`complete_scan_run=false`).
             true,
@@ -1145,6 +1325,19 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     } else {
         serde_json::Value::Null
     };
+    // Capture the degraded-emit marker BEFORE `filigree_emission` is moved into the
+    // `stats.json` blob below. The durable blob records the full emit outcome; this
+    // marker is the loud, stdout-facing distillation a caller gates on without
+    // reading the DB. A clean (emitted / disabled / true-negative) emit yields
+    // `None` and the completion line stays unchanged (PDR-0023 honesty invariant).
+    let primary_emit_marker = emit_status_marker(&filigree_emission);
+    // The TYPED `weft-reason` carrier for the same emit blob (G3): the
+    // structured-output sibling of the substring marker above, read from the same
+    // source so the two never disagree on which shapes are clean vs degraded.
+    let primary_emit_reason = emit_reason_carrier(&filigree_emission);
+    // The Phase-8c (post-commit) emit, captured in the Completed arm below.
+    let mut postrun_emit_marker: Option<String> = None;
+    let mut postrun_emit_reason: Option<EmitReason> = None;
 
     // Phase 8b (WP9-B, REQ-FINDING-06): `--prune-unseen` retention sweep. Runs
     // after emission for the same non-hard-failed outcomes, so a fresh run's
@@ -1199,6 +1392,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "plugin_edges_dropped_unseen_total": plugin_edges_dropped_unseen_total,
                 "source_walk_skipped_entries": source_walk_skipped_entries,
                 "source_walk_error_samples": source_walk_error_samples,
                 "source_walk_errors_omitted": source_walk_errors_omitted,
@@ -1315,25 +1509,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     "tier-subsystem findings skipped (run already committed successfully)"
                 ),
             }
-            // REQ-GUIDANCE-04: when `wardline.yaml` is present, keep the
-            // generated guidance sheets in sync before evaluating guidance
-            // staleness. Operator edits are preserved as
-            // `wardline_derived_overridden`, so the following staleness pass can
-            // surface manifest drift instead of overwriting human review.
-            match crate::wardline_guidance::sync_wardline_guidance(&db_path, &project_root) {
-                Ok(stats) if stats.generated > 0 || stats.overridden > 0 => tracing::info!(
-                    run_id = %run_id,
-                    wardline_guidance_generated = stats.generated,
-                    wardline_guidance_overridden = stats.overridden,
-                    "Wardline-derived guidance synced"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    run_id = %run_id,
-                    error = %e,
-                    "Wardline-derived guidance skipped (run already committed successfully)"
-                ),
-            }
             let mcp_config = load_mcp_config(&project_root, options.config_path.as_deref());
             match crate::serve::build_embedding_provider(&mcp_config.semantic_search, |name| {
                 std::env::var(name).ok()
@@ -1418,7 +1593,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &db_path,
                 &project_root,
                 &run_id,
-                !resume,
+                // Runs that skipped files do not sweep (see Phase-8 note); only a
+                // run that examined the whole corpus may mark findings unseen.
+                !resume && skipped_files_total == 0,
                 false,
                 Some(POST_RUN_FINDING_RULES),
                 options.config_path.as_deref(),
@@ -1437,6 +1614,131 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 ),
                 _ => {}
             }
+            // Surface a degraded Phase-8c emit on the completion line too (rolled up
+            // with the Phase-8 marker at summary time): a post-commit emit that
+            // never reached Filigree is the same dead-seam family as the during-run
+            // one and must not exit-0-silent.
+            postrun_emit_marker = emit_status_marker(&postrun_emission);
+            postrun_emit_reason = Some(emit_reason_carrier(&postrun_emission));
+            // Stale-finding sweep (clarion-87c1eba2bd / ADR-048): retire findings
+            // whose code no longer reproduces them. Runs LAST in the Completed arm
+            // — after every during-run `InsertFinding` AND every post-commit
+            // `PersistPostRunFinding` pass (SEI deletion, tier, guidance) — so a
+            // reproduced finding already carries the current run_id and only a
+            // genuinely-vanished finding keeps an older one. Gated to a CLEAN FULL
+            // PASS so `run_id <> current` unambiguously means "the current run
+            // walked this finding's file and stopped reproducing it":
+            //   • !resume               — a `--resume` run REUSES the prior run_id
+            //     (its not-yet-re-emitted findings already match current, so the
+            //     run_id signal can't distinguish them — never sweep on resume).
+            //   • skipped_files == 0    — an incremental run leaves unchanged
+            //     files' findings at their PRIOR run_id; sweeping them would
+            //     wrongly retire still-reproducing findings.
+            //   • source_walk_skipped_entries == 0 — a file/dir that ERRORED
+            //     during the source walk (IO / permission / path-jail) was never
+            //     read, so its findings were not re-emitted and keep a prior
+            //     run_id; the run still reaches `Completed`, so without this guard
+            //     a single walk error would retire a whole unwalked subtree's
+            //     still-reproducing findings ("never looked" ≠ "looked, fixed").
+            //   • secret_scan_sidecar_skipped == 0 — the SAME "never looked"
+            //     hazard, but for the secret-scan SIDECAR walk: an unreadable
+            //     `.env`/`*.env` only logs a skip; its skip is invisible to
+            //     `source_walk_skipped_entries`. This UNBOUNDED global sweep would
+            //     otherwise retire a prior open secret finding for that unexamined
+            //     sidecar BEFORE the rule-scoped secret sweep below applies its
+            //     `scanned_files` bound (the unexamined sidecar is not in
+            //     `scanned_files`, so the scoped sweep cannot rescue it).
+            //   • !no_sei               — the SEI pass (entity-deleted /
+            //     guidance-orphan facts) was skipped, so those findings were NOT
+            //     refreshed this run and must not be mistaken for vanished.
+            // Best-effort + enrich-only like the SEI/tier/guidance passes above: a
+            // failure logs and never un-commits the already-durable graph. Findings
+            // linger until the next clean full analyze — accepted (findings are
+            // regenerable current-state, ADR-047).
+            if !resume
+                && skipped_files_total == 0
+                && source_walk_skipped_entries == 0
+                && secret_scan_sidecar_skipped == 0
+                && !options.no_sei
+            {
+                match writer
+                    .send_wait(|ack| WriterCmd::SweepStaleFindings {
+                        current_run_id: run_id.clone(),
+                        ack,
+                    })
+                    .await
+                {
+                    Ok(retired) if retired > 0 => tracing::info!(
+                        run_id = %run_id,
+                        stale_findings_retired = retired,
+                        "stale-finding sweep retired findings whose code no longer reproduces"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "stale-finding sweep skipped (run already committed successfully)"
+                    ),
+                }
+            }
+            // Rule-scoped sweep for the secret-scan rule family
+            // (weft-7256739b31 / dogfood-4 B10). The pre-ingest secret scan is a
+            // FULL pass every run — every source file and sidecar, BEFORE the
+            // incremental skip partition — so its findings are fully re-emitted
+            // each completed run and "run_id != current" unambiguously means
+            // "scanned, no longer detected". That lets these rules be swept on
+            // the incremental runs the general sweep above must skip (where
+            // stale secret rows otherwise accumulate forever). Gated on:
+            //   • !resume — a resume reuses the prior run_id, so the run_id
+            //     signal cannot distinguish re-emitted from vanished;
+            //   • source_walk_skipped_entries == 0 — an unwalked file was never
+            //     handed to the scan, so its rows were not re-emitted
+            //     ("never looked" ≠ "looked, clean").
+            // The scan's "full pass" is full only over the CURRENTLY-installed
+            // plugins' extension union, so uninstalling/disabling a plugin
+            // between runs silently drops its files from the scan WITHOUT any
+            // walk error — `source_walk_skipped_entries` stays 0, so that gate
+            // cannot catch this scope shrinkage (L3). We therefore additionally
+            // bound the sweep to the files the scan actually examined this run
+            // (`scanned_files`, canonical-absolute — the form entities store):
+            // a finding survives unless its anchor entity's source file was
+            // re-examined.
+            // This `scanned_files` bound is also why this scoped sweep — unlike
+            // the unbounded global sweep above — needs no `secret_scan_sidecar_skipped`
+            // gate: a skipped `.env`/`*.env` is never added to `scanned_files`, so
+            // its finding is never a sweep candidate here in the first place.
+            // Same lifecycle preservation + best-effort posture as above.
+            if !resume && source_walk_skipped_entries == 0 {
+                let rule_ids: Vec<String> = crate::secret_scan::per_run_swept_rule_ids()
+                    .iter()
+                    .map(|&rule| rule.to_owned())
+                    .collect();
+                let examined_source_files: Vec<String> = scanned_files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                match writer
+                    .send_wait(|ack| WriterCmd::SweepStaleFindingsForRules {
+                        current_run_id: run_id.clone(),
+                        rule_ids,
+                        examined_source_files,
+                        ack,
+                    })
+                    .await
+                {
+                    Ok(retired) if retired > 0 => tracing::info!(
+                        run_id = %run_id,
+                        stale_secret_findings_retired = retired,
+                        "scoped sweep retired secret-scan findings the full pre-ingest scan no longer reproduces"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "scoped secret-finding sweep skipped (run already committed successfully)"
+                    ),
+                }
+            }
         }
         RunOutcome::SoftFailed { reason } => {
             // Commit entities inserted by healthy plugins AND mark the run
@@ -1454,6 +1756,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "plugin_edges_dropped_unseen_total": plugin_edges_dropped_unseen_total,
                 "source_walk_skipped_entries": source_walk_skipped_entries,
                 "source_walk_error_samples": source_walk_error_samples,
                 "source_walk_errors_omitted": source_walk_errors_omitted,
@@ -1513,10 +1816,90 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         bail!("analyze run {run_id} failed — {reason}");
     }
 
-    println!(
-        "analyze complete: run {run_id} completed \
-         ({total_entity_count} entities, {total_edge_count} edges)"
-    );
+    // Report the WHOLE-GRAPH totals (the same numbers `project_status` and the
+    // session-start hook show), not this run's insert delta. The delta is
+    // misleadingly small on incremental runs that skip unchanged files — it
+    // counts only the phase3 subsystems re-emitted — so an operator could read
+    // it as the graph having shrunk. Fall back to the run delta only if the
+    // post-commit count read fails, so a cosmetic hiccup never masks a
+    // successful run.
+    // Roll the Phase-8 + Phase-8c emit outcomes into one completion-line marker.
+    // `None` for a clean emit (the line is byte-identical to pre-PDR-0023); a loud
+    // `emit:<status>(reason)` for a dead/partial/skipped-pre-wire seam so the
+    // best-effort emit can no longer swallow a total failure as a confident exit-0.
+    let emit_marker = combined_emit_marker(primary_emit_marker, postrun_emit_marker);
+    // The typed sibling of `emit_marker` (G3): rolled up the same way for the
+    // structured `--json` block, so a typed consumer reads a `reason_class` it can
+    // switch on instead of grepping the completion line's substring.
+    let emit_reason = combined_emit_reason(primary_emit_reason, postrun_emit_reason);
+    let emit_suffix = emit_marker
+        .as_deref()
+        .map_or_else(String::new, |m| format!("; {m}"));
+    // Resolve the whole-graph totals once: both the human completion line and the
+    // structured `--json` block report the SAME numbers. `None` ⇒ the totals read
+    // failed and we fall back to this run's insert delta (a cosmetic hiccup never
+    // masks a successful run).
+    let graph_totals = match Connection::open(&db_path) {
+        Ok(conn) => match (
+            loomweave_storage::entity_total(&conn),
+            loomweave_storage::subsystem_total(&conn),
+            loomweave_storage::edge_total(&conn),
+        ) {
+            (Ok(entities), Ok(subsystems), Ok(edges)) => Some((entities, subsystems, edges)),
+            _ => None,
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "analyze complete: graph-total read failed; reporting run delta"
+            );
+            None
+        }
+    };
+    let summary = match graph_totals {
+        Some((entities, subsystems, edges)) => format_analyze_complete(
+            &run_id,
+            entities,
+            subsystems,
+            edges,
+            skipped_files_total,
+            emit_marker.as_deref(),
+        ),
+        None => format!(
+            "analyze complete: run {run_id} completed \
+             ({total_entity_count} entities, {total_edge_count} edges){emit_suffix}"
+        ),
+    };
+    println!("{summary}");
+    // Additive structured-output surface (G3 / PDR-0023). The human line above is
+    // unchanged for interactive use; `--json` adds a machine-readable block whose
+    // emit outcome is a TYPED `weft-reason` carrier (not a stdout substring), for
+    // the seam-health roll-up / L2 strategic view / tag-board feed. Falls back to
+    // the run delta when the whole-graph read failed, matching the human line.
+    if options.json {
+        let (entities, subsystems, edges) = graph_totals.unwrap_or((
+            i64::try_from(total_entity_count).unwrap_or(i64::MAX),
+            0,
+            i64::try_from(total_edge_count).unwrap_or(i64::MAX),
+        ));
+        let payload = AnalyzeJsonOutput {
+            run_id: &run_id,
+            entities,
+            subsystems,
+            edges,
+            skipped_files: skipped_files_total,
+            emit: emit_reason,
+        };
+        // A serialization failure here must not mask an otherwise-successful run;
+        // surface it on stderr and continue (the human line already printed).
+        match serde_json::to_string_pretty(&payload) {
+            Ok(json) => println!("{json}"),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "analyze complete: structured --json output could not be serialized"
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -1545,6 +1928,286 @@ struct PlannedSeiWrite {
 /// there and violate the `ux_sei_alive_locator` partial unique index. The
 /// `BTreeMap` also yields the deterministic, locator-sorted processing order the
 /// cross-entity carry dedup in [`run_sei_mint_pass`] relies on.
+/// Render the operator-facing `analyze complete` summary line.
+///
+/// Reports the **whole-graph** totals (entities incl. subsystems, edges) — the
+/// same numbers `project_status` and the session-start hook show — rather than
+/// the per-run insert delta, which is misleadingly small on incremental runs
+/// that skip unchanged files. When unchanged files were skipped, the line is
+/// annotated so an operator does not mistake a fast incremental pass for a graph
+/// that shrank.
+fn format_analyze_complete(
+    run_id: &str,
+    entities: i64,
+    subsystems: i64,
+    edges: i64,
+    skipped_files: u64,
+    emit_marker: Option<&str>,
+) -> String {
+    let incremental = if skipped_files > 0 {
+        let noun = if skipped_files == 1 { "file" } else { "files" };
+        format!("; incremental: {skipped_files} unchanged {noun} skipped")
+    } else {
+        String::new()
+    };
+    // A degraded Filigree emit rides on the completion line so a caller gating on
+    // `analyze` stdout (not the durable `stats.json` blob) can see the dead/partial
+    // seam without re-deriving it. A healthy, disabled, or clean-true-negative emit
+    // adds nothing — only a degraded emit is loud (PDR-0023 honesty invariant).
+    let emit = emit_marker.map_or_else(String::new, |m| format!("; {m}"));
+    format!(
+        "analyze complete: run {run_id} completed \
+         (graph: {entities} entities incl. {subsystems} subsystems, {edges} edges{incremental}){emit}"
+    )
+}
+
+/// Classify a `filigree_emission` stats blob into a loud, machine-readable
+/// completion-line marker for a DEGRADED emit, or `None` when the emit was clean.
+///
+/// The blob is the same one folded into `stats.json` ([`emit_findings_to_filigree`]
+/// / [`post_findings_batch`] / [`unreachable_stats`]). Three blob shapes are clean
+/// and intentionally produce NO marker — they must stay byte-distinguishable from a
+/// degraded emit and from each other (PDR-0023):
+///   • disabled         — `Null` (integration off, or `emit_findings=false`);
+///   • clean true-negative — `status:"emitted"` with no intake warnings (a real
+///     emit, whether of zero or many findings — zero findings emitted because there
+///     were zero findings is success, not degradation);
+///   • a `skipped` filtered (Phase-8c) no-op — nothing emittable remained.
+/// Every other shape is degraded and surfaced with a `reason`:
+///   • `emit:unreachable(...)` — the POST never landed (outage / transport / panic);
+///   • `emit:partial(N warnings)` — the POST landed but Filigree rejected/coerced
+///     some findings (per-finding intake warnings) — a partial ingest that the bare
+///     `status:"emitted"` would otherwise read as full success;
+///   • `emit:skipped(reason)` — a pre-POST skip that is NOT the clean filtered no-op
+///     (a flush/read/open failure swallowed before the wire — the same family as the
+///     dead-for-weeks seam: an emit that never even reached the network).
+fn emit_status_marker(emission: &serde_json::Value) -> Option<String> {
+    if emission.is_null() {
+        return None;
+    }
+    let status = emission.get("status").and_then(serde_json::Value::as_str);
+    match status {
+        Some("emitted") => {
+            let warnings = emission
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            (warnings > 0).then(|| {
+                let noun = if warnings == 1 { "warning" } else { "warnings" };
+                format!("emit:partial ({warnings} intake {noun})")
+            })
+        }
+        Some("unreachable") => {
+            let reason = emission
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unreachable");
+            Some(format!("emit:unreachable ({reason})"))
+        }
+        Some("skipped") => {
+            let reason = emission
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("skipped");
+            // The filtered (Phase-8c) "nothing emittable remained" skip is a clean
+            // true-negative, not a degraded seam — emit nothing for it. Every other
+            // skip is a pre-wire failure (flush/read/open) the run must not bury.
+            (reason != "no_postrun_findings_with_path").then(|| format!("emit:skipped ({reason})"))
+        }
+        // An unknown/absent status string is itself a contract drift — surface it
+        // rather than silently reading it as clean.
+        _ => Some(format!(
+            "emit:degraded (unrecognized status {})",
+            status.unwrap_or("<missing>")
+        )),
+    }
+}
+
+/// Combine the Phase-8 and (optional) Phase-8c emit markers into the single,
+/// worst-case completion-line marker. The during-run (Phase-8) emit is the primary
+/// seam; a degraded Phase-8c (post-commit) emit also surfaces, but the primary
+/// marker wins when both degrade (one loud marker is enough for a caller to gate).
+fn combined_emit_marker(primary: Option<String>, postrun: Option<String>) -> Option<String> {
+    primary.or(postrun)
+}
+
+/// The typed `weft-reason` carrier for the Filigree emit seam (PDR-0023 / G3 /
+/// `weft-reason-contract-G1`). The human-readable completion-line marker
+/// ([`emit_status_marker`]) is a *substring* — a typed consumer (the seam-health
+/// Layer-3 roll-up, the L2 strategic-view MCP, the tag-board feed) needs to switch
+/// on a machine-readable class, not grep stdout. This is the typed sibling of that
+/// marker: it reads the *same* `filigree_emission` blob and lands the outcome on
+/// the canonical 11-class vocab.
+///
+/// A `clean` carrier omits `cause`/`fix` (the empty is earned and complete, and a
+/// present-but-`clean` carrier is never ambiguous with a forgotten one); every
+/// non-`clean` class carries both a `cause` (what mechanically happened) and a
+/// recruiting `fix` (the action that gets the caller what they wanted) — `fix` is
+/// MANDATORY on the non-clean classes per the contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EmitReason {
+    /// One of the canonical 11 `reason_class` strings.
+    reason_class: &'static str,
+    /// CAUSE — what mechanically happened. Omitted only on `clean`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<String>,
+    /// FIX — the recruiting action. Omitted only on `clean`; present on every
+    /// non-`clean` class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<String>,
+}
+
+impl EmitReason {
+    /// A clean, earned true-negative (or a disabled integration): no cause/fix.
+    fn clean(reason_class: &'static str) -> Self {
+        Self {
+            reason_class,
+            cause: None,
+            fix: None,
+        }
+    }
+
+    /// A non-clean class: cause + a mandatory recruiting fix.
+    fn degraded(
+        reason_class: &'static str,
+        cause: impl Into<String>,
+        fix: impl Into<String>,
+    ) -> Self {
+        Self {
+            reason_class,
+            cause: Some(cause.into()),
+            fix: Some(fix.into()),
+        }
+    }
+}
+
+/// Map a `filigree_emission` stats blob onto the canonical `weft-reason` vocab as a
+/// TYPED carrier (not a stdout substring). The blob is the same one classified by
+/// [`emit_status_marker`] for the human line; the two stay in lock-step on which
+/// shapes are clean vs degraded, but this returns a class a consumer can switch on.
+///
+/// The marker-string → `reason_class` mapping, each justified against the contract:
+///   • `Null` (integration off / `emit_findings=false`)        → `disabled`
+///     — not on, not a failure; no cause/fix (clean-family).
+///   • `status:"emitted"`, no intake warnings                  → `clean`
+///     — a real emit of zero-or-many findings is success, the earned true-negative.
+///   • `status:"emitted"` WITH intake warnings                 → `partial`
+///     — the POST landed but Filigree rejected/coerced some findings; an incomplete
+///       ingest the bare `emitted` would read as full success (qualified-trust).
+///   • `status:"unreachable"` (POST never landed)              → `unreachable`
+///     — outage / transport / panic at the producer→consumer wire.
+///   • `status:"skipped"`, `no_postrun_findings_with_path`     → `clean`
+///     — the Phase-8c filtered no-op: nothing emittable remained. A true-negative.
+///   • `status:"skipped"`, any other reason                    → `error`
+///     — a pre-wire flush/read/open failure swallowed before the network. NOT
+///       `unreachable` (the wire was never reached) and NOT `dead_path` (the seam is
+///       wired, an internal step failed): it is an internal pre-wire error, the loud
+///       catch-all for "something broke before we could emit". Justified as `error`
+///       over `unreachable` because the failure is on OUR side of the socket.
+///   • unrecognized / absent `status`                          → `error`
+///     — contract drift; the loud catch-all, never silently read as clean.
+fn emit_reason_carrier(emission: &serde_json::Value) -> EmitReason {
+    if emission.is_null() {
+        return EmitReason::clean("disabled");
+    }
+    let status = emission.get("status").and_then(serde_json::Value::as_str);
+    match status {
+        Some("emitted") => {
+            let warnings = emission
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            if warnings == 0 {
+                EmitReason::clean("clean")
+            } else {
+                let noun = if warnings == 1 { "warning" } else { "warnings" };
+                EmitReason::degraded(
+                    "partial",
+                    format!(
+                        "Filigree accepted the batch but flagged {warnings} intake {noun} \
+                         (findings rejected or coerced)"
+                    ),
+                    "inspect filigree_emission.warnings in stats.json; fix the flagged \
+                     fields and re-emit to complete the ingest",
+                )
+            }
+        }
+        Some("unreachable") => {
+            let reason = emission
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unreachable");
+            EmitReason::degraded(
+                "unreachable",
+                format!("the findings POST never landed: {reason}"),
+                "check the Filigree endpoint is up and reachable, then re-run analyze \
+                 (or `analyze --resume RUN_ID`) to re-emit",
+            )
+        }
+        Some("skipped") => {
+            let reason = emission
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("skipped");
+            if reason == "no_postrun_findings_with_path" {
+                // The Phase-8c filtered no-op is a clean true-negative — nothing
+                // emittable remained — not a degraded seam.
+                EmitReason::clean("clean")
+            } else {
+                EmitReason::degraded(
+                    "error",
+                    format!("emit aborted before the wire (pre-POST failure: {reason})"),
+                    "check the analyze logs for the flush/read/open failure behind \
+                     this skip, then re-run analyze to re-emit",
+                )
+            }
+        }
+        // An unknown/absent status string is itself a contract drift — the loud
+        // catch-all, never silently read as clean.
+        other => EmitReason::degraded(
+            "error",
+            format!(
+                "unrecognized Filigree emit status {}",
+                other.unwrap_or("<missing>")
+            ),
+            "(contract drift) report the unexpected emit status to the weft hub",
+        ),
+    }
+}
+
+/// Combine the Phase-8 (during-run) and (optional) Phase-8c (post-commit) typed
+/// emit carriers into the single, worst-case carrier for the structured block.
+/// Mirrors [`combined_emit_marker`]: the primary seam wins when both are non-clean
+/// (one loud carrier is enough for a consumer to gate); otherwise a non-clean
+/// post-run carrier surfaces over a clean primary, so a degraded Phase-8c emit is
+/// never masked by a clean during-run one.
+fn combined_emit_reason(primary: EmitReason, postrun: Option<EmitReason>) -> EmitReason {
+    if primary.reason_class != "clean" && primary.reason_class != "disabled" {
+        return primary;
+    }
+    match postrun {
+        Some(p) if p.reason_class != "clean" && p.reason_class != "disabled" => p,
+        // Both clean/disabled: keep the primary (it carries the during-run posture;
+        // `disabled` beats `clean` only when the primary itself was disabled).
+        _ => primary,
+    }
+}
+
+/// The additive structured-output payload emitted by `analyze --json`: the
+/// whole-graph totals plus the TYPED emit carrier. The human-readable completion
+/// line is still printed for interactive use; this block is the machine-readable
+/// surface a typed consumer reads instead of grepping stdout (G3).
+#[derive(Debug, Serialize)]
+struct AnalyzeJsonOutput<'a> {
+    run_id: &'a str,
+    entities: i64,
+    subsystems: i64,
+    edges: i64,
+    skipped_files: u64,
+    /// The typed `weft-reason` carrier for the Filigree emit seam.
+    emit: EmitReason,
+}
+
 fn dedup_descriptors_by_locator(descriptors: Vec<NewEntityDescriptor>) -> Vec<NewEntityDescriptor> {
     descriptors
         .into_iter()
@@ -1900,11 +2563,11 @@ async fn emit_deletion_findings(
 }
 
 /// Build a `LMWV-FACT-ENTITY-DELETED` finding anchored to the deleted entity's own
-/// (never-pruned) row. The id is deterministic and run-scoped so a `--resume`
+/// (never-pruned) row. The id is deterministic and content-keyed so re-analysis (and `--resume`)
 /// re-walk regenerates the same id and `InsertFinding`'s upsert is idempotent.
 fn entity_deleted_finding(entity_id: &str, run_id: &str, now: &str) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:entity-deleted:{entity_id}"),
+        id: format!("core:finding:entity-deleted:{entity_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -1934,7 +2597,7 @@ fn guidance_orphan_finding(
     now: &str,
 ) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-orphan:{guidance_id}:{deleted_entity_id}"),
+        id: format!("core:finding:guidance-orphan:{guidance_id}:{deleted_entity_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -1971,8 +2634,6 @@ fn guidance_orphan_finding(
 /// - **`LMWV-FACT-GUIDANCE-CHURN-STALE`** — the aggregate `git_churn_count` over the
 ///   sheet's matched entities meets the staleness threshold (asymmetric: 20 for
 ///   `pinned` sheets, 50 otherwise).
-/// - **`LMWV-FACT-GUIDANCE-STALE`** — a Wardline-derived override still carries
-///   the old `wardline.yaml` manifest hash after the manifest changed.
 ///
 /// Runs post-`CommitRun`, unconditionally (NOT gated on the SEI pass or on
 /// deletions) — see the call site. Deterministic: sheets in
@@ -1987,11 +2648,6 @@ fn guidance_orphan_finding(
 /// deliberately unused here because no real delta is computable.
 enum PendingGuidanceStaleness {
     Expired(String),
-    WardlineStale {
-        sheet_id: String,
-        stored_manifest_hash: String,
-        current_manifest_hash: String,
-    },
     ChurnStale {
         sheet_id: String,
         agg: i64,
@@ -2004,7 +2660,6 @@ fn plan_guidance_staleness_findings(
     project_root: &Path,
     now: &str,
 ) -> anyhow::Result<Vec<PendingGuidanceStaleness>> {
-    let current_wardline_hash = crate::wardline_guidance::current_manifest_hash(project_root)?;
     let conn = Connection::open(db_path)
         .context("open read connection for guidance-staleness findings")?;
     let canonical_root = project_root
@@ -2040,21 +2695,6 @@ fn plan_guidance_staleness_findings(
             && expires < now
         {
             plan.push(PendingGuidanceStaleness::Expired(sheet.id.clone()));
-        }
-
-        if let Some(current_hash) = current_wardline_hash.as_deref()
-            && crate::wardline_guidance::is_wardline_derived(&sheet.properties)
-            && let Some(stored_hash) = sheet
-                .properties
-                .get("wardline_manifest_hash")
-                .and_then(serde_json::Value::as_str)
-            && stored_hash != current_hash
-        {
-            plan.push(PendingGuidanceStaleness::WardlineStale {
-                sheet_id: sheet.id.clone(),
-                stored_manifest_hash: stored_hash.to_owned(),
-                current_manifest_hash: current_hash.to_owned(),
-            });
         }
 
         // CHURN-STALE: aggregate churn over matched entities vs asymmetric
@@ -2117,17 +2757,6 @@ async fn emit_guidance_staleness_findings(
             PendingGuidanceStaleness::Expired(sheet_id) => {
                 guidance_expired_finding(sheet_id, run_id, now)
             }
-            PendingGuidanceStaleness::WardlineStale {
-                sheet_id,
-                stored_manifest_hash,
-                current_manifest_hash,
-            } => guidance_stale_finding(
-                sheet_id,
-                stored_manifest_hash,
-                current_manifest_hash,
-                run_id,
-                now,
-            ),
             PendingGuidanceStaleness::ChurnStale {
                 sheet_id,
                 agg,
@@ -2152,7 +2781,7 @@ async fn emit_guidance_staleness_findings(
 /// Run-scoped, deterministic id; INFO, confidence 1.0.
 fn guidance_expired_finding(guidance_id: &str, run_id: &str, now: &str) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-expired:{guidance_id}"),
+        id: format!("core:finding:guidance-expired:{guidance_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2173,42 +2802,6 @@ fn guidance_expired_finding(guidance_id: &str, run_id: &str, now: &str) -> Findi
     }
 }
 
-fn guidance_stale_finding(
-    guidance_id: &str,
-    stored_manifest_hash: &str,
-    current_manifest_hash: &str,
-    run_id: &str,
-    now: &str,
-) -> FindingRecord {
-    FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-stale:{guidance_id}"),
-        tool: "loomweave".to_owned(),
-        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-        run_id: run_id.to_owned(),
-        rule_id: GUIDANCE_STALE_RULE_ID.to_owned(),
-        kind: "fact".to_owned(),
-        severity: "WARN".to_owned(),
-        confidence: Some(1.0),
-        confidence_basis: Some("Wardline manifest hash drift".to_owned()),
-        entity_id: guidance_id.to_owned(),
-        related_entities_json: "[]".to_owned(),
-        message: format!(
-            "Wardline-derived guidance sheet {guidance_id} is stale relative to wardline.yaml"
-        ),
-        evidence_json: serde_json::json!({
-            "guidance_id": guidance_id,
-            "stored_manifest_hash": stored_manifest_hash,
-            "current_manifest_hash": current_manifest_hash,
-        })
-        .to_string(),
-        properties_json: "{}".to_owned(),
-        supports_json: "[]".to_owned(),
-        supported_by_json: "[]".to_owned(),
-        created_at: now.to_owned(),
-        updated_at: now.to_owned(),
-    }
-}
-
 /// Build a `LMWV-FACT-GUIDANCE-CHURN-STALE` finding anchored to the sheet, carrying
 /// the matched entities (sorted) as related ids and the aggregate churn +
 /// threshold as evidence. Run-scoped, deterministic id; WARN, confidence 0.7
@@ -2221,7 +2814,7 @@ fn guidance_churn_stale_finding(
     now: &str,
 ) -> FindingRecord {
     FindingRecord {
-        id: format!("core:finding:{run_id}:guidance-churn-stale:{guidance_id}"),
+        id: format!("core:finding:guidance-churn-stale:{guidance_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2353,7 +2946,7 @@ async fn emit_tier_subsystem_findings(
 
 /// Build a `LMWV-FACT-TIER-SUBSYSTEM-MIXING` finding anchored to the subsystem,
 /// carrying its tier-bearing members as related ids and the tier distribution as
-/// evidence. Members are pre-sorted by the caller; the id is run-scoped.
+/// evidence. Members are pre-sorted by the caller; the id is content-keyed.
 fn tier_mixing_finding(
     subsystem_id: &str,
     members: &[(String, String)],
@@ -2367,7 +2960,7 @@ fn tier_mixing_finding(
         *tier_counts.entry(tier.as_str()).or_default() += 1;
     }
     FindingRecord {
-        id: format!("core:finding:{run_id}:tier-mixing:{subsystem_id}"),
+        id: format!("core:finding:tier-mixing:{subsystem_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2403,7 +2996,7 @@ fn tier_unanimous_finding(
 ) -> FindingRecord {
     let member_ids: Vec<&str> = members.iter().map(|(id, _)| id.as_str()).collect();
     FindingRecord {
-        id: format!("core:finding:{run_id}:tier-unanimous:{subsystem_id}"),
+        id: format!("core:finding:tier-unanimous:{subsystem_id}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2760,7 +3353,7 @@ async fn insert_weak_modularity_finding(
         .map(|subsystem| subsystem.id.clone())
         .collect::<Vec<_>>();
     let now = iso8601_now();
-    let finding_id = format!("core:finding:{run_id}:weak-modularity");
+    let finding_id = "core:finding:weak-modularity".to_owned();
     let related_entities_json = serde_json::to_string(&subsystem_ids)
         .context("serialize weak modularity related_entities")?;
     writer
@@ -2810,7 +3403,7 @@ async fn insert_weak_modularity_finding(
 /// The finding anchors to the degraded entity itself (the plugin still emits one
 /// manifest-declared degraded-syntax entity for a syntax-failed file), so no
 /// synthetic anchor is needed.
-/// The id is deterministic and run-scoped so a `--resume` re-walk regenerates the
+/// The id is deterministic and content-keyed so re-analysis (and `--resume`) re-walk regenerates the
 /// same id and `InsertFinding`'s upsert is idempotent (REQ-FINDING-05).
 fn syntax_error_finding(
     record: &EntityRecord,
@@ -2830,7 +3423,7 @@ fn syntax_error_finding(
         return None;
     }
     Some(FindingRecord {
-        id: format!("core:finding:{run_id}:syntax-error:{}", record.id),
+        id: format!("core:finding:syntax-error:{}", record.id),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -2900,7 +3493,14 @@ async fn ensure_project_anchor(
         short_name: name,
         parent_id: None,
         source_file_id: None,
-        source_file_path: Some(project_root.display().to_string()),
+        // Deliberately NO source_file_path (weft-4165f1ed71): the anchor is the
+        // project itself, not a source file. Recording the project ROOT
+        // DIRECTORY here put a directory into every freshness stat scan — and
+        // its PARENT (e.g. $HOME) into the former structural watch set — which
+        // wedged the staleness flag to a permanent false "stale". The read side
+        // also skips directory paths defensively for stores written before
+        // this fix.
+        source_file_path: None,
         source_byte_start: None,
         source_byte_end: None,
         source_line_start: None,
@@ -2951,6 +3551,49 @@ fn plugin_file_timeout() -> std::time::Duration {
         )
 }
 
+/// Handshake (`initialize`) deadline (ADR-050). ADR-035 tuning: basis — a
+/// plugin may legitimately do whole-repo work inside `initialize` (the Rust
+/// plugin builds its symbol table there; at syn's ~40 MB/s parse throughput,
+/// 300 s covers a ~10 M-LOC repo), so this budget scales with repo size, not
+/// per-file work; override — env `LOOMWEAVE_PLUGIN_HANDSHAKE_TIMEOUT_MS`;
+/// retune — raise if a legitimate repo trips it in practice.
+const DEFAULT_PLUGIN_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Resolve the handshake timeout, honouring the env override.
+fn plugin_handshake_timeout() -> std::time::Duration {
+    std::env::var("LOOMWEAVE_PLUGIN_HANDSHAKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(
+            DEFAULT_PLUGIN_HANDSHAKE_TIMEOUT,
+            std::time::Duration::from_millis,
+        )
+}
+
+/// Subcode for a plugin that went silent at `shutdown` after the work
+/// completed (ADR-050 D7). WARN, never ERROR: the entities are durable and
+/// the run outcome is unchanged — only the plugin's exit etiquette failed.
+const PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID: &str = "LMWV-INFRA-PLUGIN-SHUTDOWN-TIMEOUT";
+
+/// Shutdown (`shutdown`/`exit`) deadline (ADR-050). ADR-035 tuning: basis —
+/// after the file loop there is no legitimate work left; shutdown is pure
+/// exit etiquette, and a healthy plugin acknowledges within milliseconds, so
+/// 10 s is generous for a loaded machine; override — env
+/// `LOOMWEAVE_PLUGIN_SHUTDOWN_TIMEOUT_MS`; retune — raise if a legitimate
+/// plugin needs longer to flush state at exit.
+const DEFAULT_PLUGIN_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolve the shutdown timeout, honouring the env override.
+fn plugin_shutdown_timeout() -> std::time::Duration {
+    std::env::var("LOOMWEAVE_PLUGIN_SHUTDOWN_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(
+            DEFAULT_PLUGIN_SHUTDOWN_TIMEOUT,
+            std::time::Duration::from_millis,
+        )
+}
+
 /// Map a host-layer subcode to an ADR-017 severity. Crash / kill / OOM / timeout
 /// are `ERROR` (the plugin or a file was lost); drop-and-continue diagnostics
 /// (malformed/undeclared/oversize) are `WARN`.
@@ -2959,8 +3602,15 @@ fn infra_severity(subcode: &str) -> &'static str {
         INFRA_CRASH_RULE_ID
         | PLUGIN_TIMEOUT_RULE_ID
         | FINDING_DISABLED_CRASH_LOOP
+        | FINDING_PLUGIN_ABORTED
+        // A duplicate locator is silent last-write-wins data loss in the
+        // store (clarion-b19fe90c3e) — an ERROR even though the run completes.
+        | DUPLICATE_LOCATOR_RULE_ID
         | "LMWV-INFRA-PLUGIN-OOM-KILLED"
         | "LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE" => "ERROR",
+        // The default WARN arm deliberately covers
+        // `PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID`: a shutdown timeout is exit
+        // etiquette, never lost work (ADR-050 D7).
         _ => "WARN",
     }
 }
@@ -2985,7 +3635,7 @@ fn host_finding_to_record(
     })
     .to_string();
     FindingRecord {
-        id: format!("core:finding:{run_id}:infra:{discriminator}"),
+        id: format!("core:finding:infra:{discriminator}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -3052,7 +3702,7 @@ fn crash_finding_record(
 ) -> FindingRecord {
     let discriminator = blake3::hash(format!("{plugin_id}\u{0}{reason}").as_bytes()).to_hex();
     FindingRecord {
-        id: format!("core:finding:{run_id}:crash:{discriminator}"),
+        id: format!("core:finding:crash:{discriminator}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -3086,7 +3736,7 @@ fn source_walk_finding_record(
         blake3::hash(format!("{}\u{0}{skipped_entries}", project_root.display()).as_bytes())
             .to_hex();
     FindingRecord {
-        id: format!("core:finding:{run_id}:source-walk:{discriminator}"),
+        id: format!("core:finding:source-walk:{discriminator}"),
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -3171,7 +3821,7 @@ async fn populate_semantic_embeddings(
 
     let conn = Connection::open(db_path)
         .with_context(|| format!("open Loomweave database {}", db_path.display()))?;
-    let store = EmbeddingStore::open_in_loomweave_dir(project_root)
+    let store = EmbeddingStore::open_in_store_dir(project_root)
         .map_err(|err| anyhow::anyhow!("{err}"))
         .context("open semantic embedding sidecar")?;
     let pending = semantic_embedding_candidates(&conn, &store, &model_id, &mut stats)?;
@@ -3392,16 +4042,52 @@ async fn emit_findings_to_filigree(
     let rows = rows
         .into_iter()
         .map(federation_finding_for_emit)
+        .map(|mut row| {
+            // Filigree's scan-results intake requires project-relative finding
+            // paths; Loomweave stores absolute `source_file_path`s, so strip the
+            // project-root prefix before emit. An out-of-root path is left as-is
+            // (Filigree rejects it loudly, which beats silently rewriting it). A
+            // path equal to the project root relativizes to "" — that is a
+            // project-anchored (file-less) finding, not a real file location, so
+            // drop it to `None` (path-less → skipped) rather than emit an empty
+            // path Filigree rejects.
+            let rel = row
+                .source_file_path
+                .as_deref()
+                .map(|path| relativize_for_emit(project_root, path))
+                .filter(|rel| !rel.is_empty());
+            // Clear line numbers past EOF before emit. Loomweave can record a
+            // line beyond a file's last line for a syntax-error/degraded entity;
+            // Filigree's strict batch intake 400s the WHOLE batch on such a
+            // finding (its single-finding path merely clears them), so mirror
+            // that lenient clamp here.
+            if let Some(rel) = rel.as_deref() {
+                let (start, end) = clamp_lines_to_file(
+                    project_root,
+                    rel,
+                    row.source_line_start,
+                    row.source_line_end,
+                );
+                row.source_line_start = start;
+                row.source_line_end = end;
+            }
+            row.source_file_path = rel;
+            row
+        })
         .collect::<Vec<_>>();
 
-    // In the Phase-8c (post-`CommitRun`, filtered) pass, anchor path-less
-    // synthetic-entity findings — the subsystem-anchored tier facts — to the
-    // project root (mirroring the `core:project:*` finding anchor) so they POST
-    // rather than being dropped as `skipped_no_path`. The wire layer flags these
-    // `metadata.loomweave.synthetic_anchor=true`. The Phase-8 pass passes `None`,
-    // so during-run path-less findings (e.g. the weak-modularity subsystem fact)
-    // keep their existing store-only treatment.
-    let default_path = rule_filter.map(|_| project_root.display().to_string());
+    // Path-less findings have no real file to anchor to, and Filigree's
+    // scan-results intake rejects every synthetic stand-in: an absolute project
+    // root (absolute paths rejected), AND the relative "." — its
+    // `_normalize_scan_path` collapses "." to "", rejected as "path is empty
+    // after normalization". There is no valid project-level path, so a path-less
+    // finding is skipped (`skipped_no_path` — surfaced, never silently dropped)
+    // rather than forced under a bogus path that 400s the whole batch. The
+    // file-anchored defects still reach Filigree: `lw-duplicate-locator` now
+    // carries an `anchor_file_path` (see `duplicate_guard`) so it resolves to a
+    // real file instead of the file-less project anchor. Genuinely project-level
+    // facts (e.g. the weak-modularity subsystem fact) stay store-only by design.
+    let default_path = None;
 
     let batch = prepare_batch(
         &rows,
@@ -3438,6 +4124,43 @@ async fn emit_findings_to_filigree(
         mark_unseen,
     )
     .await
+}
+
+/// Strip the project-root prefix so a stored absolute `source_file_path` emits
+/// as the project-relative path Filigree's scan-results intake requires. A path
+/// that does not live under the root is returned unchanged (Filigree then
+/// rejects it loudly, which is preferable to silently rewriting it).
+fn relativize_for_emit(project_root: &Path, path: &str) -> String {
+    Path::new(path)
+        .strip_prefix(project_root)
+        .ok()
+        .and_then(|rel| rel.to_str())
+        .map_or_else(|| path.to_owned(), str::to_owned)
+}
+
+/// Clear a finding's line numbers when they fall past end-of-file, mirroring
+/// Filigree's lenient single-finding line-attribution (`scanner_reporting`).
+/// Loomweave can record a line beyond a file's last line for a
+/// syntax-error/degraded entity (the parser reports a position past EOF);
+/// Filigree's *strict batch* intake 400s the whole batch on such a finding, so
+/// clamp here. `line_start` past EOF clears both (no usable anchor); otherwise a
+/// `line_end` past EOF is dropped. Line counting matches Filigree's (`str::lines`
+/// counts a final unterminated line, like Python's file iteration). An unreadable
+/// file leaves the numbers untouched.
+fn clamp_lines_to_file(
+    project_root: &Path,
+    rel_path: &str,
+    line_start: Option<i64>,
+    line_end: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    let Ok(content) = fs::read_to_string(project_root.join(rel_path)) else {
+        return (line_start, line_end);
+    };
+    let count = i64::try_from(content.lines().count()).unwrap_or(i64::MAX);
+    if line_start.is_some_and(|start| start > count) {
+        return (None, None);
+    }
+    (line_start, line_end.filter(|&end| end <= count))
 }
 
 fn federation_finding_for_emit(row: loomweave_storage::FindingForEmitRow) -> FindingForEmit {
@@ -3477,12 +4200,13 @@ async fn post_findings_batch(
 
     // Resolve the live Filigree URL (ephemeral port over stale config), the same
     // resolution `loomweave serve` and `project_status` use.
-    let resolution = resolve_filigree_url(filigree_cfg, project_root);
+    let resolution =
+        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
     }
-    let endpoint = scan_results_url(&resolved_cfg.base_url);
+    let endpoint = scan_results_url(&resolved_cfg.base_url, resolved_cfg.project.as_deref());
 
     // `reqwest::blocking` builds and drops its own inner tokio runtime; doing
     // that on a tokio worker — even inside `spawn_blocking`, which still carries
@@ -3491,10 +4215,15 @@ async fn post_findings_batch(
     // runtime, and join it off the async executor.
     let request = batch.request;
     let thread_cfg = resolved_cfg;
+    let thread_root = project_root.to_path_buf();
     let worker = std::thread::spawn(move || -> Result<ScanResultsResponse, String> {
-        let client = FiligreeHttpClient::from_config(&thread_cfg, |name| std::env::var(name).ok())
-            .map_err(|err| format!("build Filigree client: {err}"))?
-            .ok_or_else(|| "Filigree integration disabled".to_owned())?;
+        let client = FiligreeHttpClient::from_config_with_project_root(
+            &thread_cfg,
+            |name| std::env::var(name).ok(),
+            Some(&thread_root),
+        )
+        .map_err(|err| format!("build Filigree client: {err}"))?
+        .ok_or_else(|| "Filigree integration disabled".to_owned())?;
         client
             .post_scan_results(&request)
             .map_err(|err| err.to_string())
@@ -3616,7 +4345,8 @@ async fn prune_unseen_findings_in_filigree(
 
     // Resolve the live Filigree URL (ephemeral port over stale config), the
     // same resolution emission uses.
-    let resolution = resolve_filigree_url(filigree_cfg, project_root);
+    let resolution =
+        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -3631,10 +4361,15 @@ async fn prune_unseen_findings_in_filigree(
     // Same blocking-reqwest-on-a-plain-OS-thread dance as emission: build → POST
     // → drop the client off the tokio executor so the inner runtime drop is safe.
     let thread_cfg = resolved_cfg;
+    let thread_root = project_root.to_path_buf();
     let worker = std::thread::spawn(move || -> Result<CleanStaleResponse, String> {
-        let client = FiligreeHttpClient::from_config(&thread_cfg, |name| std::env::var(name).ok())
-            .map_err(|err| format!("build Filigree client: {err}"))?
-            .ok_or_else(|| "Filigree integration disabled".to_owned())?;
+        let client = FiligreeHttpClient::from_config_with_project_root(
+            &thread_cfg,
+            |name| std::env::var(name).ok(),
+            Some(&thread_root),
+        )
+        .map_err(|err| format!("build Filigree client: {err}"))?
+        .ok_or_else(|| "Filigree integration disabled".to_owned())?;
         client
             .post_clean_stale(&request)
             .map_err(|err| err.to_string())
@@ -4063,6 +4798,23 @@ fn drain_ready_plugin_edges(
     ready
 }
 
+/// End-of-plugin reconciliation of the pending anchored-edge buffer: every edge
+/// still pending after the last [`drain_ready_plugin_edges`] call has a `from_id`
+/// or `to_id` the host never stored this run (external target, gitignored-file
+/// superset, or mid-run staleness — D1/D2/D3). Such an edge can NEVER FK-resolve:
+/// `edges.to_id`/`from_id` are `NOT NULL REFERENCES entities(id)` with FKs on, so
+/// an `INSERT` of it hard-fails the whole run. Drop the whole buffer and return
+/// the count (drop-AND-count — never silently lose; never downgrade to Inferred,
+/// which the writer rejects on anchored edges). Behaviour-preserving for the
+/// Python plugin: its surviving `imports` targets are plugin-emitted file-scope
+/// modules in `seen_plugin_entity_ids`, so they drain ready and the buffer is
+/// empty here (a no-op).
+fn drop_unready_plugin_edges(pending_edges: &mut Vec<DescribedEdgeRecord>) -> u64 {
+    let dropped = u64::try_from(pending_edges.len()).unwrap_or(u64::MAX);
+    pending_edges.clear();
+    dropped
+}
+
 #[derive(Debug, Default)]
 struct BatchStats {
     unresolved_call_sites_total: u64,
@@ -4084,19 +4836,37 @@ struct PendingUnresolvedCallSites {
     sites: Vec<UnresolvedCallSiteRecord>,
 }
 
-/// Per-file analysis-timeout watchdog (REQ-ANALYZE-06, `LMWV-PY-TIMEOUT`).
+/// Plugin lifecycle phase a watchdog deadline guards.
 ///
-/// `analyze_file` blocks on a synchronous read of the plugin's stdout, which has
-/// no read deadline. The watchdog runs on its own thread holding a shared handle
-/// to the child process (the reader lives in the *host*, a separate value, so
-/// killing the child unblocks the read without touching the host). The main
-/// thread `arm`s before each `analyze_file` and `disarm`s after; if the deadline
-/// passes while armed, the watchdog kills the child and records the timeout.
+/// `Handshake` covers the blocking `initialize` exchange (a plugin may do
+/// whole-repo work there — the Rust plugin builds its symbol table inside
+/// `initialize`); `File` covers each `analyze_file`; `Shutdown` covers the
+/// best-effort `shutdown`/`exit` exchange after the file loop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WatchdogPhase {
+    Handshake,
+    File,
+    Shutdown,
+}
+
+/// Plugin lifecycle-timeout watchdog (REQ-ANALYZE-06, `LMWV-PY-TIMEOUT`).
+///
+/// Every plugin exchange blocks on a synchronous read of the plugin's stdout,
+/// which has no read deadline. The watchdog runs on its own thread holding a
+/// shared handle to the child process (the reader lives in the *host*, a
+/// separate value, so killing the child unblocks the read without touching the
+/// host). The main thread `arm`s before each blocking exchange — naming the
+/// lifecycle [`WatchdogPhase`] being guarded — and `disarm`s after; if the
+/// deadline passes while armed, the watchdog kills the child and records which
+/// phase timed out.
 struct PluginWatchdog {
-    /// Active deadline, or `None` when disarmed. Guarded so `disarm` and the
-    /// watchdog's fire-check observe a consistent value (no kill-after-disarm).
-    deadline: std::sync::Mutex<Option<std::time::Instant>>,
-    timed_out: std::sync::atomic::AtomicBool,
+    /// Active deadline plus the phase it guards, or `None` when disarmed.
+    /// Guarded so `disarm` and the watchdog's fire-check observe a consistent
+    /// value (no kill-after-disarm).
+    deadline: std::sync::Mutex<Option<(std::time::Instant, WatchdogPhase)>>,
+    /// First phase whose deadline expired, or `None` if no timeout fired.
+    /// First-wins: the first expiry is the one that broke the run.
+    timed_out: std::sync::Mutex<Option<WatchdogPhase>>,
     stop: std::sync::atomic::AtomicBool,
 }
 
@@ -4104,22 +4874,46 @@ impl PluginWatchdog {
     fn new() -> Self {
         Self {
             deadline: std::sync::Mutex::new(None),
-            timed_out: std::sync::atomic::AtomicBool::new(false),
+            timed_out: std::sync::Mutex::new(None),
             stop: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn arm(&self, timeout: std::time::Duration) {
+    fn arm(&self, timeout: std::time::Duration, phase: WatchdogPhase) {
         *self.deadline.lock().expect("watchdog deadline poisoned") =
-            Some(std::time::Instant::now() + timeout);
+            Some((std::time::Instant::now() + timeout, phase));
     }
 
     fn disarm(&self) {
         *self.deadline.lock().expect("watchdog deadline poisoned") = None;
     }
 
-    fn did_time_out(&self) -> bool {
-        self.timed_out.load(Ordering::SeqCst)
+    /// Phase whose deadline expired first, or `None` if no timeout fired.
+    fn timed_out_phase(&self) -> Option<WatchdogPhase> {
+        *self.timed_out.lock().expect("watchdog timed_out poisoned")
+    }
+
+    /// Fire-check: if the armed deadline has passed, disarm (kill at most
+    /// once per arm), record the phase (first expiry wins), and return the
+    /// phase so the watchdog thread kills the child.
+    fn expire_if_due(&self) -> Option<WatchdogPhase> {
+        let expired = {
+            let mut guard = self.deadline.lock().expect("watchdog deadline poisoned");
+            match *guard {
+                Some((deadline, phase)) if std::time::Instant::now() >= deadline => {
+                    *guard = None; // disarm so we kill at most once
+                    Some(phase)
+                }
+                _ => None,
+            }
+        };
+        if let Some(phase) = expired {
+            let mut recorded = self.timed_out.lock().expect("watchdog timed_out poisoned");
+            if recorded.is_none() {
+                *recorded = Some(phase);
+            }
+        }
+        expired
     }
 
     fn request_stop(&self) {
@@ -4127,9 +4921,10 @@ impl PluginWatchdog {
     }
 }
 
-/// Spawn the watchdog thread. It polls the shared deadline; on expiry it flips
-/// `timed_out`, clears the deadline (kill at most once), and kills the child.
-/// Returns the join handle so the caller can stop + join before reaping.
+/// Spawn the watchdog thread. It polls the shared deadline; on expiry it
+/// records the timed-out phase, clears the deadline (kill at most once), and
+/// kills the child. Returns the join handle so the caller can stop + join
+/// before reaping.
 fn spawn_plugin_watchdog(
     watchdog: Arc<PluginWatchdog>,
     child: Arc<std::sync::Mutex<std::process::Child>>,
@@ -4138,24 +4933,11 @@ fn spawn_plugin_watchdog(
     std::thread::spawn(move || {
         while !watchdog.stop.load(Ordering::SeqCst) {
             std::thread::sleep(PLUGIN_WATCHDOG_POLL_INTERVAL);
-            let expired = {
-                let mut guard = watchdog
-                    .deadline
-                    .lock()
-                    .expect("watchdog deadline poisoned");
-                match *guard {
-                    Some(deadline) if std::time::Instant::now() >= deadline => {
-                        *guard = None; // disarm so we kill at most once
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if expired {
-                watchdog.timed_out.store(true, Ordering::SeqCst);
+            if let Some(phase) = watchdog.expire_if_due() {
                 tracing::warn!(
                     plugin_id = %plugin_id,
-                    "plugin exceeded per-file analysis timeout; killing child",
+                    phase = ?phase,
+                    "plugin exceeded lifecycle deadline; killing child",
                 );
                 if let Ok(mut c) = child.lock() {
                     let _ = c.kill();
@@ -4185,30 +4967,33 @@ fn run_plugin_blocking(
     briefing_blocks: &Arc<BTreeMap<PathBuf, loomweave_core::BriefingBlockReason>>,
     scanned_source_files: &Arc<BTreeSet<PathBuf>>,
     progress: &ProgressReporter,
+    handshake_timeout: std::time::Duration,
     file_timeout: std::time::Duration,
+    shutdown_timeout: std::time::Duration,
+    prior_file_scope_claims: BTreeSet<String>,
+    skipped_locator_owners: BTreeMap<String, String>,
     batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
 ) -> Result<BatchResult, PluginRunError> {
     use loomweave_core::PluginHost;
 
     let manifest_language = manifest.plugin.language.clone();
     let kind_roles = PluginKindRoles::from_manifest(&manifest);
-    let (mut host, child) =
-        PluginHost::spawn(manifest, project_root, executable).map_err(|e| match e {
+    let (mut host, child) = PluginHost::spawn_unhandshaken(manifest, project_root, executable)
+        .map_err(|e| match e {
             HostError::Spawn(msg) => {
                 PluginRunError::new(format!("failed to spawn plugin {plugin_id}: {msg}"))
             }
-            HostError::Handshake(ref me) => {
-                PluginRunError::new(format!("plugin {plugin_id} refused handshake: {me}"))
-            }
-            other => {
-                PluginRunError::new(format!("plugin {plugin_id} spawn/handshake error: {other}"))
-            }
+            other => PluginRunError::new(format!("plugin {plugin_id} spawn error: {other}")),
         })?;
     host.set_briefing_blocks(Arc::clone(briefing_blocks));
     host.set_scanned_source_files(Arc::clone(scanned_source_files));
 
-    // Per-file analysis-timeout watchdog (REQ-ANALYZE-06). Shares the child
+    // Lifecycle-timeout watchdog (REQ-ANALYZE-06, ADR-050). Shares the child
     // handle so it can kill a hung plugin and unblock the synchronous read.
+    // Started BEFORE the handshake: a plugin may do whole-repo work inside
+    // `initialize` (the Rust plugin builds its symbol table there), and a
+    // hung handshake would otherwise wedge the run record and the analyze
+    // advisory lock forever.
     let child = Arc::new(std::sync::Mutex::new(child));
     let watchdog = Arc::new(PluginWatchdog::new());
     let watchdog_handle = spawn_plugin_watchdog(
@@ -4217,9 +5002,88 @@ fn run_plugin_blocking(
         plugin_id.to_owned(),
     );
 
+    // Handshake under its own wall-clock deadline. `spawn_unhandshaken`'s
+    // contract: the caller owns kill+reap on handshake failure (Child::Drop
+    // does not reap on Unix) — preserved here CLI-side via
+    // `reap_and_classify_exit`.
+    watchdog.arm(handshake_timeout, WatchdogPhase::Handshake);
+    let handshake_result = host.handshake();
+    watchdog.disarm();
+    if let Err(handshake_err) = handshake_result {
+        watchdog.request_stop();
+        let _ = watchdog_handle.join();
+        let handshake_timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::Handshake);
+        let mut child = Arc::try_unwrap(child)
+            .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
+            .into_inner()
+            .expect("child mutex poisoned");
+        // clarion-371efa3e07: check whether the child had ALREADY exited
+        // before we kill it. A child that died on its own mid-handshake
+        // (e.g. a real RLIMIT_AS OOM kill during `initialize`) must stay
+        // honestly classified; a child that is still alive — a protocol
+        // refusal, for instance — is about to receive OUR SIGKILL, which
+        // must not be misreported as an OOM event (the handshake-failure
+        // reason already tells the operator story).
+        let child_already_exited = matches!(child.try_wait(), Ok(Some(_)));
+        let _ = child.kill();
+        let mut findings = host.take_findings();
+        drop(host);
+        let reason = if handshake_timed_out {
+            let reason = format!(
+                "plugin {plugin_id} exceeded the handshake timeout ({} ms) and was killed",
+                handshake_timeout.as_millis()
+            );
+            findings.push(plugin_timeout_finding(
+                plugin_id,
+                "handshake",
+                handshake_timeout,
+                reason.clone(),
+            ));
+            reason
+        } else {
+            match handshake_err {
+                HostError::Handshake(ref me) => {
+                    format!("plugin {plugin_id} refused handshake: {me}")
+                }
+                other => format!("plugin {plugin_id} spawn/handshake error: {other}"),
+            }
+        };
+        // Suppress kill-classification when the watchdog fired OR when the
+        // child was still alive and the kill above is the host's own
+        // (clarion-371efa3e07).
+        reap_and_classify_exit(
+            &mut child,
+            plugin_id,
+            &mut findings,
+            handshake_timed_out || !child_already_exited,
+        );
+        return Err(PluginRunError::with_findings(reason, findings));
+    }
+
     let mut dispatch_findings: Vec<HostFinding> = Vec::new();
     let work_result: Result<(), String> = (|| {
         let mut file_scope_entity_ids: BTreeSet<String> = BTreeSet::new();
+        // Dual-declaration claims (clarion-6ec7317628): a file_scope (module)
+        // entity id may be emitted by MORE THAN ONE file — e.g. an inline
+        // `mod sub { ... }` facade in one file colliding with the path-derived
+        // module of `sub/mod.rs`. ADR-026's dual encoding allows exactly ONE
+        // `file -> module` contains parent per entity, so the FIRST emitter
+        // claims it (record + parent_id + contains edge); later emitters are
+        // suppressed entirely, keeping the entity anchored at — and parented
+        // to — its claim owner. Pre-seeded with module ids owned by this
+        // plugin's skipped-unchanged files, whose stored claim survives this
+        // run untouched.
+        let mut file_scope_claims: BTreeSet<String> = prior_file_scope_claims;
+        // Duplicate-locator alarm (clarion-b19fe90c3e): tracks id → first-seen
+        // source path across ALL of this plugin's emissions this run, plus the
+        // skipped-unchanged owners for the cross-run rule. Detection only —
+        // the writer's ON CONFLICT upsert still applies and the run outcome
+        // is unchanged.
+        let mut duplicate_guard = DuplicateLocatorGuard::new(skipped_locator_owners);
+        // Every stored in-project entity id (any kind), accumulated across all
+        // files so the deferred import-filter can retain edges whose target is a
+        // non-module item — function / struct / const / trait (clarion-d1e3dc67dc).
+        let mut all_entity_ids: BTreeSet<String> = BTreeSet::new();
         let mut deferred_import_edges: Vec<(String, EdgeRecord)> = Vec::new();
         for file in files {
             let file_display = file.to_string_lossy().into_owned();
@@ -4240,7 +5104,7 @@ fn run_plugin_blocking(
                     continue;
                 }
             };
-            watchdog.arm(file_timeout);
+            watchdog.arm(file_timeout, WatchdogPhase::File);
             let analyze_outcome = host.analyze_file(&dispatch_file);
             watchdog.disarm();
             drop(heartbeat_guard);
@@ -4281,6 +5145,41 @@ fn run_plugin_blocking(
             file_entities.push((file_entity_id.clone(), file_record));
             for entity in &entities {
                 let id_str = entity.id.to_string();
+                // First-claim-wins for file_scope entities: a duplicate
+                // emission of an already-claimed module id (dual declaration,
+                // clarion-6ec7317628) is dropped wholesale — no record, no
+                // signature, no second `file -> module` contains edge — so the
+                // claim owner's `parent_id` keeps agreeing with the single
+                // stored contains edge (ADR-026). The id is already in the
+                // claim owner's batch (or survives from a skipped file), so
+                // edges referencing it still drain through the seen-set gate.
+                if kind_roles.is_file_scope(&entity.kind)
+                    && !file_scope_claims.insert(id_str.clone())
+                {
+                    // Carve-out boundary (clarion-b19fe90c3e): a cross-file
+                    // dual claim is the reconciled, legitimate shape and stays
+                    // silent; a SAME-file re-emission is a plugin bug and is
+                    // flagged as a duplicate locator.
+                    if let Some(finding) = duplicate_guard
+                        .record_suppressed_file_scope(&id_str, &entity.source_file_path)
+                    {
+                        dispatch_findings.push(finding);
+                    }
+                    tracing::debug!(
+                        plugin_id = %plugin_id,
+                        entity_id = %id_str,
+                        file = %dispatch_file.display(),
+                        "suppressing duplicate file_scope emission; first claim wins",
+                    );
+                    continue;
+                }
+                if let Some(finding) = duplicate_guard.record(
+                    &id_str,
+                    &entity.source_file_path,
+                    kind_roles.is_file_scope(&entity.kind),
+                ) {
+                    dispatch_findings.push(finding);
+                }
                 // Capture the plugin-declared SEI signature (ADR-038 REQ-C-01),
                 // canonicalised for stable string-equality comparison. The core
                 // never interprets the JSON — it only re-serialises the value.
@@ -4306,6 +5205,7 @@ fn run_plugin_blocking(
                         core_file_contains_edge(&file_entity_id, entity.id.as_str()),
                     ));
                 }
+                all_entity_ids.insert(id_str.clone());
                 file_entities.push((id_str.clone(), record.clone()));
             }
             let unresolved_for_file = map_unresolved_call_sites_for_file(
@@ -4343,6 +5243,7 @@ fn run_plugin_blocking(
         }
         let imports_skipped_external = filter_external_import_edges_by_module_ids(
             &file_scope_entity_ids,
+            &all_entity_ids,
             &mut deferred_import_edges,
         );
         batch_tx
@@ -4354,15 +5255,11 @@ fn run_plugin_blocking(
         Ok(())
     })();
 
-    // Stop and join the watchdog before reaping so it no longer holds the child
-    // handle (lets us reclaim the owned `Child` for the reap path).
-    watchdog.request_stop();
-    let _ = watchdog_handle.join();
-    let timed_out = watchdog.did_time_out();
-    let mut child = Arc::try_unwrap(child)
-        .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
-        .into_inner()
-        .expect("child mutex poisoned");
+    // Read the file-loop verdict BEFORE arming the shutdown deadline: the
+    // watchdog records the FIRST expired phase, so a `Shutdown` record can
+    // only exist when no earlier phase fired (and shutdown only runs on the
+    // Ok path anyway).
+    let timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::File);
 
     // A timeout forces the failure branch: the watchdog already killed the child,
     // so any in-flight read failed (or, in a near-deadline race, a stale Ok no
@@ -4376,23 +5273,42 @@ fn run_plugin_blocking(
         work_result
     };
 
-    // Try a graceful shutdown on the happy path; on error, skip straight to
-    // kill — the plugin's behaviour is already untrusted. `analyze_file`
-    // already issues `shutdown`/`exit` before returning PathEscapeBreaker or
-    // EntityCap errors, so calling `host.shutdown()` again there would write
-    // to a closed pipe; that's why we only call it on Ok.
+    // Try a graceful shutdown on the happy path, under its own wall-clock
+    // deadline (ADR-050 D7): the watchdog is still alive here, so a plugin
+    // that goes silent at `shutdown` is killed, the blocked read unblocks,
+    // and the etiquette failure surfaces as a WARN finding below — the run
+    // outcome is unchanged. On error, skip straight to kill — the plugin's
+    // behaviour is already untrusted. `analyze_file` already issues
+    // `shutdown`/`exit` before returning PathEscapeBreaker or EntityCap
+    // errors, so calling `host.shutdown()` again there would write to a
+    // closed pipe; that's why we only call it on Ok.
     if work_result.is_ok() {
-        if let Err(e) = host.shutdown() {
+        watchdog.arm(shutdown_timeout, WatchdogPhase::Shutdown);
+        let shutdown_result = host.shutdown();
+        watchdog.disarm();
+        if let Err(e) = shutdown_result {
             tracing::warn!(
                 plugin_id = %plugin_id,
                 error = %e,
                 "best-effort host shutdown failed; falling back to kill()",
             );
-            let _ = child.kill();
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+            }
         }
-    } else {
-        let _ = child.kill();
+    } else if let Ok(mut c) = child.lock() {
+        let _ = c.kill();
     }
+
+    // Stop and join the watchdog before reaping so it no longer holds the child
+    // handle (lets us reclaim the owned `Child` for the reap path).
+    watchdog.request_stop();
+    let _ = watchdog_handle.join();
+    let shutdown_timed_out = watchdog.timed_out_phase() == Some(WatchdogPhase::Shutdown);
+    let mut child = Arc::try_unwrap(child)
+        .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
+        .into_inner()
+        .expect("child mutex poisoned");
 
     let mut findings = host.take_findings();
     findings.extend(dispatch_findings);
@@ -4402,24 +5318,47 @@ fn run_plugin_blocking(
     // visible. Add a LMWV-PY-TIMEOUT host finding; it rides out through
     // PluginRunError.findings and is persisted by the run's crash path.
     if timed_out {
+        findings.push(plugin_timeout_finding(
+            plugin_id,
+            "file",
+            file_timeout,
+            format!(
+                "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
+                file_timeout.as_millis()
+            ),
+        ));
+    }
+
+    // ADR-050 D7: a shutdown timeout is visible (WARN) but does NOT touch
+    // `work_result` — the entities are durable, only exit etiquette failed.
+    // It rides the Ok path, so it never ticks the crash-loop breaker.
+    if shutdown_timed_out {
         let mut metadata = BTreeMap::new();
         metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
         metadata.insert(
             "timeout_ms".to_owned(),
-            file_timeout.as_millis().to_string(),
+            shutdown_timeout.as_millis().to_string(),
         );
         findings.push(HostFinding {
-            subcode: PLUGIN_TIMEOUT_RULE_ID.to_owned(),
+            subcode: PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID.to_owned(),
             message: format!(
-                "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) and was killed",
-                file_timeout.as_millis()
+                "plugin {plugin_id} exceeded the shutdown timeout ({} ms) and was killed; \
+                 analysis results are unaffected",
+                shutdown_timeout.as_millis()
             ),
             metadata,
         });
     }
 
-    // Reap unconditionally. `Child::Drop` does not wait on Unix.
-    reap_and_classify_exit(&mut child, plugin_id, &mut findings);
+    // Reap unconditionally. `Child::Drop` does not wait on Unix. When any
+    // lifecycle deadline fired, the SIGKILL in the exit status is the
+    // watchdog's own — suppress the OOM classification (ADR-050).
+    reap_and_classify_exit(
+        &mut child,
+        plugin_id,
+        &mut findings,
+        watchdog.timed_out_phase().is_some(),
+    );
 
     match work_result {
         Ok(()) => Ok(BatchResult { findings }),
@@ -4427,20 +5366,54 @@ fn run_plugin_blocking(
     }
 }
 
-/// Wait on the child, inspect its exit status, and append an OOM finding if
-/// the signal is consistent with `RLIMIT_AS` enforcement (ADR-021 §2d).
+/// Build the `LMWV-PY-TIMEOUT` host finding for a lifecycle-deadline kill
+/// (ADR-050). `phase` names the [`WatchdogPhase`] that fired (`"handshake"` /
+/// `"file"`) so a consumer can tell a hung `initialize` from a hung
+/// `analyze_file` without parsing the message.
+fn plugin_timeout_finding(
+    plugin_id: &str,
+    phase: &str,
+    timeout: std::time::Duration,
+    message: String,
+) -> HostFinding {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("plugin_id".to_owned(), plugin_id.to_owned());
+    metadata.insert("phase".to_owned(), phase.to_owned());
+    metadata.insert("timeout_ms".to_owned(), timeout.as_millis().to_string());
+    HostFinding {
+        subcode: PLUGIN_TIMEOUT_RULE_ID.to_owned(),
+        message,
+        metadata,
+    }
+}
+
+/// Wait on the child, inspect its exit status, and append a classification
+/// finding for abnormal terminations (ADR-050):
 ///
-/// Linux kernel behaviour on `RLIMIT_AS` violation varies: typical signatures
-/// are SIGKILL (OOM-killer path) and SIGSEGV (map/allocation failure that the
-/// plugin did not handle). Both are treated as likely memory-limit events.
+/// - SIGABRT (6) → [`HostFinding::aborted`] — the stack-overflow / explicit
+///   `abort()` signature; always reported.
+/// - SIGKILL (9) / SIGSEGV (11) → [`HostFinding::oom_killed`] — the observed
+///   `RLIMIT_AS` signatures (ADR-021 §2d; kernel behaviour varies between
+///   the OOM-killer path and an unhandled map failure) — UNLESS
+///   `suppress_kill_classification` is set: when the lifecycle watchdog
+///   already killed the child, the SIGKILL is the host's own and reporting
+///   it as an OOM event would double-report a single timeout.
+///
 /// Other signals or non-zero exit codes get a warn log but no finding — the
 /// cause is ambiguous without more bookkeeping.
 fn reap_and_classify_exit(
     child: &mut std::process::Child,
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
+    suppress_kill_classification: bool,
 ) {
-    reap_and_classify_exit_with_timeout(child, plugin_id, findings, PLUGIN_REAP_TIMEOUT);
+    reap_and_classify_exit_with_timeout(
+        child,
+        plugin_id,
+        findings,
+        PLUGIN_REAP_TIMEOUT,
+        suppress_kill_classification,
+    );
 }
 
 const PLUGIN_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -4451,9 +5424,12 @@ fn reap_and_classify_exit_with_timeout(
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
     timeout: std::time::Duration,
+    suppress_kill_classification: bool,
 ) {
     match wait_child_with_timeout(child, timeout) {
-        Ok(Some(status)) => classify_child_exit_status(status, plugin_id, findings),
+        Ok(Some(status)) => {
+            classify_child_exit_status(status, plugin_id, findings, suppress_kill_classification);
+        }
         Ok(None) => {
             tracing::warn!(
                 plugin_id = %plugin_id,
@@ -4511,6 +5487,7 @@ fn classify_child_exit_status(
     status: std::process::ExitStatus,
     plugin_id: &str,
     findings: &mut Vec<HostFinding>,
+    suppress_kill_classification: bool,
 ) {
     if status.success() {
         return;
@@ -4524,9 +5501,17 @@ fn classify_child_exit_status(
                 signal,
                 "plugin terminated by signal",
             );
+            // SIGABRT (6) is the stack-overflow / explicit-abort signature
+            // (ADR-050). Never suppressed: the watchdog kills with SIGKILL,
+            // so an abort is always the plugin's own.
+            if signal == 6 {
+                findings.push(HostFinding::aborted(plugin_id, signal));
+            }
             // SIGKILL (9) and SIGSEGV (11) are the observed signatures
-            // of an RLIMIT_AS kill in Sprint-1 testing.
-            if signal == 9 || signal == 11 {
+            // of an RLIMIT_AS kill in Sprint-1 testing — but when the
+            // lifecycle watchdog already killed this child, the SIGKILL is
+            // the host's own (the timeout finding is the root cause).
+            if (signal == 9 || signal == 11) && !suppress_kill_classification {
                 findings.push(HostFinding::oom_killed(plugin_id, signal));
             }
         } else if let Some(code) = status.code() {
@@ -4585,19 +5570,23 @@ fn filter_external_import_edges(
         .filter(|(_, record)| kind_roles.is_file_scope(&record.kind))
         .map(|(id, _)| id.as_str())
         .collect();
-    filter_external_import_edges_by_module_refs(&module_entity_ids, edges)
+    let all_entity_ids: BTreeSet<&str> = entities.iter().map(|(id, _)| id.as_str()).collect();
+    filter_external_import_edges_by_module_refs(&module_entity_ids, &all_entity_ids, edges)
 }
 
 fn filter_external_import_edges_by_module_ids(
     module_entity_ids: &BTreeSet<String>,
+    all_entity_ids: &BTreeSet<String>,
     edges: &mut Vec<(String, EdgeRecord)>,
 ) -> u64 {
     let module_entity_ids: BTreeSet<&str> = module_entity_ids.iter().map(String::as_str).collect();
-    filter_external_import_edges_by_module_refs(&module_entity_ids, edges)
+    let all_entity_ids: BTreeSet<&str> = all_entity_ids.iter().map(String::as_str).collect();
+    filter_external_import_edges_by_module_refs(&module_entity_ids, &all_entity_ids, edges)
 }
 
 fn filter_external_import_edges_by_module_refs(
     module_entity_ids: &BTreeSet<&str>,
+    all_entity_ids: &BTreeSet<&str>,
     edges: &mut Vec<(String, EdgeRecord)>,
 ) -> u64 {
     let before = edges.len();
@@ -4605,13 +5594,24 @@ fn filter_external_import_edges_by_module_refs(
         if edge.kind != "imports" {
             return true;
         }
+        // The `from X import sub` → `X.sub` collapse stays MODULE-keyed: we only
+        // rewrite the target onto an absolute submodule when that submodule is
+        // itself a file-scope module. A Python `from pkg import func` therefore
+        // keeps pointing at the module `pkg`, never re-targeting onto the function
+        // `pkg.func` — preserving the established Python import shape
+        // (clarion-d1e3dc67dc).
         if let Some(local_submodule) =
             absolute_from_import_submodule_target(edge, module_entity_ids)
         {
             edge.to_id = local_submodule;
             return true;
         }
-        module_entity_ids.contains(edge.to_id.as_str())
+        // Retain any edge whose target is a stored in-project entity of ANY kind
+        // (module, function, struct, const, trait, …). The Rust resolver targets
+        // `use` paths at non-module items; the Python plugin only ever mints module
+        // targets, so this is a strict superset for Python (clarion-d1e3dc67dc).
+        // A target absent from the store is still genuinely external and dropped.
+        all_entity_ids.contains(edge.to_id.as_str())
     });
     u64::try_from(before - edges.len()).unwrap_or(u64::MAX)
 }
@@ -5101,10 +6101,10 @@ fn unresolved_call_site_key(
 
 /// Skip-list for directory names during the source walk.
 ///
-/// Sprint 1 conservative set: VCS directories, loomweave's own state, and
+/// Sprint 1 conservative set: VCS directories, the shared .weft/ runtime state, and
 /// common virtual-environment directories.
 const SKIP_DIRS: &[&str] = &[
-    ".loomweave",
+    ".weft",
     ".git",
     ".hg",
     ".svn",
@@ -5189,6 +6189,18 @@ fn collect_source_files(root: &Path, wanted_extensions: &BTreeSet<String>) -> So
             suffix = if skipped == 1 { "y" } else { "ies" },
         );
     }
+    // Sort for a deterministic, filesystem-independent processing order. The
+    // `ignore` walker yields entries in readdir order, which varies by platform
+    // and filesystem (Linux is unsorted, macOS/APFS tends to be sorted), so two
+    // analyses of the same tree could otherwise process files in different
+    // orders. Beyond reproducibility, the incremental move path is currently
+    // order-sensitive: when a moved entity's NEW file is processed before its
+    // OLD file, phase3 trips LMWV-INFRA-PARENT-CONTAINS-MISMATCH (the entity's
+    // parent_id names the new file but the contains edge still anchors the old
+    // one) — see clarion-abda98c869 for the underlying writer-contract fix. A
+    // stable sorted order both fixes that observable failure and is correct in
+    // its own right.
+    out.sort();
     SourceWalkResult {
         files: out,
         skipped_errors,
@@ -5225,6 +6237,52 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::fs;
+
+    #[test]
+    fn relativize_for_emit_strips_project_root_else_passes_through() {
+        let root = Path::new("/home/u/proj");
+        // Under-root absolute path → project-relative (Filigree's requirement).
+        assert_eq!(
+            relativize_for_emit(root, "/home/u/proj/specimen/a.py"),
+            "specimen/a.py"
+        );
+        // An out-of-root path is left untouched (Filigree rejects it loudly
+        // rather than us silently rewriting it into something wrong).
+        assert_eq!(relativize_for_emit(root, "/etc/passwd"), "/etc/passwd");
+        // The project root itself relativizes to "" — the emit map filters this
+        // to None (a file-less, project-anchored finding) rather than emitting an
+        // empty path Filigree rejects ("path is empty after normalization").
+        assert_eq!(relativize_for_emit(root, "/home/u/proj"), "");
+    }
+
+    #[test]
+    fn clamp_lines_to_file_clears_positions_past_eof() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A 3-line file (no trailing newline) — `str::lines()` counts 3, matching
+        // Filigree's Python file-iteration line count.
+        fs::write(dir.path().join("three.py"), "a\nb\nc").expect("write");
+        // line_end past EOF is dropped; in-range line_start kept (the A4 case:
+        // a syntax-error finding reporting line_end 4 on a 3-line file).
+        assert_eq!(
+            clamp_lines_to_file(dir.path(), "three.py", Some(1), Some(4)),
+            (Some(1), None)
+        );
+        // line_start past EOF clears both (no usable anchor).
+        assert_eq!(
+            clamp_lines_to_file(dir.path(), "three.py", Some(9), Some(9)),
+            (None, None)
+        );
+        // In-range positions are preserved verbatim.
+        assert_eq!(
+            clamp_lines_to_file(dir.path(), "three.py", Some(2), Some(3)),
+            (Some(2), Some(3))
+        );
+        // An unreadable file leaves the positions untouched (no false clamp).
+        assert_eq!(
+            clamp_lines_to_file(dir.path(), "absent.py", Some(1), Some(99)),
+            (Some(1), Some(99))
+        );
+    }
 
     #[test]
     fn dedup_descriptors_keeps_one_per_locator_last_wins() {
@@ -5265,6 +6323,489 @@ mod tests {
             .unwrap();
         assert_eq!(f.body_hash.as_deref(), Some("last"));
         assert_eq!(f.signature.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn analyze_complete_full_run_reports_whole_graph_totals() {
+        // A full run (no unchanged files skipped) reports the graph totals with
+        // the subsystem breakdown, matching `project_status` phrasing.
+        let line = format_analyze_complete("run-1", 263, 5, 496, 0, None);
+        assert_eq!(
+            line,
+            "analyze complete: run run-1 completed \
+             (graph: 263 entities incl. 5 subsystems, 496 edges)"
+        );
+    }
+
+    #[test]
+    fn analyze_complete_incremental_run_annotates_skipped_files() {
+        // An incremental run that skipped unchanged files reports the SAME graph
+        // totals (not the tiny insert delta) plus an explicit incremental marker.
+        let line = format_analyze_complete("run-2", 263, 5, 496, 29, None);
+        assert_eq!(
+            line,
+            "analyze complete: run run-2 completed \
+             (graph: 263 entities incl. 5 subsystems, 496 edges; \
+             incremental: 29 unchanged files skipped)"
+        );
+    }
+
+    #[test]
+    fn analyze_complete_incremental_singular_file_uses_singular_noun() {
+        let line = format_analyze_complete("run-3", 10, 0, 4, 1, None);
+        assert_eq!(
+            line,
+            "analyze complete: run run-3 completed \
+             (graph: 10 entities incl. 0 subsystems, 4 edges; \
+             incremental: 1 unchanged file skipped)"
+        );
+    }
+
+    #[test]
+    fn analyze_complete_degraded_emit_rides_the_completion_line() {
+        // PDR-0023 honesty invariant: a dead Filigree emit must be visible on the
+        // command's stdout completion line, not swallowed as a confident exit-0.
+        // The marker carries a machine-readable status + reason a caller can gate on.
+        let line = format_analyze_complete(
+            "run-4",
+            10,
+            0,
+            4,
+            0,
+            Some("emit:unreachable (connection refused)"),
+        );
+        assert_eq!(
+            line,
+            "analyze complete: run run-4 completed \
+             (graph: 10 entities incl. 0 subsystems, 4 edges); \
+             emit:unreachable (connection refused)"
+        );
+    }
+
+    // --- emit_status_marker: the honesty-invariant classifier (PDR-0023) ---
+    //
+    // The three CLEAN shapes must yield NO marker (byte-indistinguishable from a
+    // plain success on the completion line), and must stay distinguishable from
+    // each DEGRADED shape — which is the whole point of the invariant.
+
+    #[test]
+    fn emit_marker_none_when_integration_disabled() {
+        // A `Null` blob = integration off / emit_findings=false: a clean disabled
+        // state, not a degraded seam. No marker.
+        assert_eq!(emit_status_marker(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn emit_marker_none_for_clean_true_negative_emit() {
+        // A real POST that landed with zero intake warnings is success — whether it
+        // carried zero findings (a clean true-negative) or many. No marker.
+        let blob = serde_json::json!({
+            "status": "emitted",
+            "findings_total": 0,
+            "emitted": 0,
+            "findings_created": 0,
+            "warnings": [],
+        });
+        assert_eq!(emit_status_marker(&blob), None);
+        let blob_nonempty = serde_json::json!({
+            "status": "emitted",
+            "emitted": 7,
+            "findings_created": 7,
+            "warnings": [],
+        });
+        assert_eq!(emit_status_marker(&blob_nonempty), None);
+    }
+
+    #[test]
+    fn emit_marker_none_for_filtered_no_op_skip() {
+        // The Phase-8c "nothing emittable remained" skip is a clean true-negative,
+        // NOT a degraded seam. No marker.
+        let blob = serde_json::json!({
+            "status": "skipped",
+            "reason": "no_postrun_findings_with_path",
+            "findings_total": 0,
+        });
+        assert_eq!(emit_status_marker(&blob), None);
+    }
+
+    #[test]
+    fn emit_marker_surfaces_total_unreachable_failure() {
+        // THE STRIKE: a total emit failure (the POST never landed) is the
+        // best-effort swallow. It must surface a degraded marker with its reason,
+        // distinguishable from `emitted` and from `disabled`.
+        let blob = serde_json::json!({
+            "status": "unreachable",
+            "rule_id": "LMWV-INFRA-FILIGREE-UNREACHABLE",
+            "endpoint": "http://127.0.0.1:9/api/v1/scan-results",
+            "emitted_attempted": 12,
+            "error": "error sending request: connection refused",
+        });
+        assert_eq!(
+            emit_status_marker(&blob).as_deref(),
+            Some("emit:unreachable (error sending request: connection refused)")
+        );
+    }
+
+    #[test]
+    fn emit_marker_surfaces_partial_intake() {
+        // A POST that landed but whose findings were rejected/coerced (intake
+        // warnings) is a PARTIAL emit — the bare `status:"emitted"` would read as
+        // full success. Surface it as partial with the warning count.
+        let blob = serde_json::json!({
+            "status": "emitted",
+            "emitted": 5,
+            "findings_created": 3,
+            "warnings": ["coerced severity for f1", "unknown scan_run_id for f2"],
+        });
+        assert_eq!(
+            emit_status_marker(&blob).as_deref(),
+            Some("emit:partial (2 intake warnings)")
+        );
+    }
+
+    #[test]
+    fn emit_marker_surfaces_pre_wire_skip() {
+        // A skip that is NOT the clean filtered no-op (a flush/read/open failure
+        // swallowed before the wire — an emit that never even reached the network,
+        // the same family as the dead-for-weeks seam) must surface.
+        let blob = serde_json::json!({"status": "skipped", "reason": "flush_failed"});
+        assert_eq!(
+            emit_status_marker(&blob).as_deref(),
+            Some("emit:skipped (flush_failed)")
+        );
+    }
+
+    #[test]
+    fn emit_marker_surfaces_unrecognized_status_as_drift() {
+        // An unknown/absent status string is itself a contract drift — never read
+        // as clean.
+        let blob = serde_json::json!({"status": "bizarro"});
+        assert_eq!(
+            emit_status_marker(&blob).as_deref(),
+            Some("emit:degraded (unrecognized status bizarro)")
+        );
+    }
+
+    #[test]
+    fn combined_emit_marker_primary_wins_then_postrun() {
+        // Both degraded → the during-run (primary) marker is the one surfaced.
+        assert_eq!(
+            combined_emit_marker(
+                Some("emit:unreachable (a)".to_owned()),
+                Some("emit:unreachable (b)".to_owned())
+            )
+            .as_deref(),
+            Some("emit:unreachable (a)")
+        );
+        // Only the post-commit emit degraded → it surfaces.
+        assert_eq!(
+            combined_emit_marker(None, Some("emit:unreachable (b)".to_owned())).as_deref(),
+            Some("emit:unreachable (b)")
+        );
+        // Both clean → no marker.
+        assert_eq!(combined_emit_marker(None, None), None);
+    }
+
+    // --- emit_reason_carrier: the TYPED weft-reason carrier (G3 / PDR-0023) ---
+    //
+    // The structured-output sibling of `emit_status_marker`: the degraded shapes
+    // must land a TYPED `{reason_class, cause, fix}` a consumer switches on (not a
+    // stdout substring), and the clean/disabled shapes must omit cause/fix. The
+    // reason_class strings are constrained to the canonical 11-class vocab.
+
+    #[test]
+    fn emit_reason_disabled_when_integration_off() {
+        // A `Null` blob = integration off / emit_findings=false → `disabled`
+        // (clean-family: no cause/fix), NOT `clean` — the two stay distinguishable.
+        let r = emit_reason_carrier(&serde_json::Value::Null);
+        assert_eq!(r.reason_class, "disabled");
+        assert_eq!(r.cause, None);
+        assert_eq!(r.fix, None);
+    }
+
+    #[test]
+    fn emit_reason_clean_for_true_negative_emit() {
+        // A real POST with zero intake warnings is the earned true-negative →
+        // `clean`, cause/fix omitted (and so absent from the JSON).
+        let blob = serde_json::json!({
+            "status": "emitted",
+            "emitted": 0,
+            "warnings": [],
+        });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "clean");
+        assert_eq!(r.cause, None);
+        assert_eq!(r.fix, None);
+        // A clean carrier serializes WITHOUT cause/fix keys (skip_serializing_if).
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json, serde_json::json!({ "reason_class": "clean" }));
+    }
+
+    #[test]
+    fn emit_reason_clean_for_filtered_no_op_skip() {
+        // The Phase-8c "nothing emittable remained" skip is a clean true-negative.
+        let blob = serde_json::json!({
+            "status": "skipped",
+            "reason": "no_postrun_findings_with_path",
+        });
+        assert_eq!(emit_reason_carrier(&blob).reason_class, "clean");
+    }
+
+    #[test]
+    fn emit_reason_degraded_emits_typed_carrier_not_a_substring() {
+        // THE G3 STRIKE: an unrecognized (drift) emit status must surface a TYPED
+        // {reason_class, cause, fix} carrier a consumer can switch on — not a
+        // grepped stdout substring. `reason_class` is the canonical `error` class
+        // (the loud catch-all for contract drift); cause + a recruiting fix are
+        // both present and machine-readable.
+        let blob = serde_json::json!({ "status": "bizarro" });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "error");
+        assert_eq!(
+            r.cause.as_deref(),
+            Some("unrecognized Filigree emit status bizarro")
+        );
+        // FIX is mandatory on every non-clean class (contract): present + non-empty.
+        let fix = r
+            .fix
+            .as_deref()
+            .expect("non-clean carrier must carry a fix");
+        assert!(!fix.is_empty());
+        // And it serializes as a typed object, NOT a bare string a consumer would
+        // have to substring-match.
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.is_object());
+        assert_eq!(json["reason_class"], "error");
+        assert_eq!(json["cause"], "unrecognized Filigree emit status bizarro");
+        assert!(json["fix"].is_string());
+    }
+
+    #[test]
+    fn emit_reason_unreachable_carries_cause_and_fix() {
+        // POST never landed → canonical `unreachable`, with the transport error in
+        // the cause and a recruiting retry in the fix.
+        let blob = serde_json::json!({
+            "status": "unreachable",
+            "error": "error sending request: connection refused",
+        });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "unreachable");
+        assert!(
+            r.cause
+                .as_deref()
+                .is_some_and(|c| c.contains("connection refused"))
+        );
+        assert!(r.fix.is_some());
+    }
+
+    #[test]
+    fn emit_reason_partial_for_intake_warnings() {
+        // A landed POST whose findings were rejected/coerced → `partial` (qualified
+        // trust): the bare `emitted` would read as full success.
+        let blob = serde_json::json!({
+            "status": "emitted",
+            "emitted": 5,
+            "warnings": ["coerced severity for f1", "unknown scan_run_id for f2"],
+        });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "partial");
+        assert!(r.cause.as_deref().is_some_and(|c| c.contains("2 intake")));
+        assert!(r.fix.is_some());
+    }
+
+    #[test]
+    fn emit_reason_pre_wire_skip_is_error_not_unreachable() {
+        // A pre-POST flush/read/open skip is an INTERNAL pre-wire failure (our side
+        // of the socket, the wire was never reached) → canonical `error`, the loud
+        // catch-all — justified over `unreachable` (which means the POST itself
+        // failed on the network).
+        let blob = serde_json::json!({ "status": "skipped", "reason": "flush_failed" });
+        let r = emit_reason_carrier(&blob);
+        assert_eq!(r.reason_class, "error");
+        assert!(
+            r.cause
+                .as_deref()
+                .is_some_and(|c| c.contains("flush_failed"))
+        );
+        assert!(r.fix.is_some());
+    }
+
+    #[test]
+    fn emit_reason_carrier_stays_in_lockstep_with_substring_marker() {
+        // The typed carrier and the human substring marker read the SAME blob and
+        // must never disagree on clean-vs-degraded: a marker `None` ⇔ a clean/
+        // disabled class; a `Some(_)` marker ⇔ a non-clean class.
+        let cases = [
+            serde_json::Value::Null,
+            serde_json::json!({ "status": "emitted", "warnings": [] }),
+            serde_json::json!({ "status": "emitted", "warnings": ["w"] }),
+            serde_json::json!({ "status": "unreachable", "error": "x" }),
+            serde_json::json!({ "status": "skipped", "reason": "no_postrun_findings_with_path" }),
+            serde_json::json!({ "status": "skipped", "reason": "flush_failed" }),
+            serde_json::json!({ "status": "bizarro" }),
+        ];
+        for blob in cases {
+            let marker_clean = emit_status_marker(&blob).is_none();
+            let class = emit_reason_carrier(&blob).reason_class;
+            let carrier_clean = class == "clean" || class == "disabled";
+            assert_eq!(
+                marker_clean, carrier_clean,
+                "marker/carrier disagree on clean-ness for blob {blob}"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_emit_reason_primary_wins_then_postrun() {
+        let unreachable = EmitReason::degraded("unreachable", "a", "retry");
+        let error = EmitReason::degraded("error", "b", "report");
+        // Both degraded → the during-run (primary) carrier surfaces.
+        assert_eq!(
+            combined_emit_reason(unreachable.clone(), Some(error.clone())).reason_class,
+            "unreachable"
+        );
+        // Primary clean, post-run degraded → the post-run carrier surfaces (a
+        // degraded Phase-8c emit is never masked by a clean during-run one).
+        assert_eq!(
+            combined_emit_reason(EmitReason::clean("clean"), Some(error.clone())).reason_class,
+            "error"
+        );
+        // Both clean → clean.
+        assert_eq!(
+            combined_emit_reason(EmitReason::clean("clean"), None).reason_class,
+            "clean"
+        );
+        // Primary disabled, post-run clean → disabled is preserved (the during-run
+        // posture), not flattened to clean.
+        assert_eq!(
+            combined_emit_reason(
+                EmitReason::clean("disabled"),
+                Some(EmitReason::clean("clean"))
+            )
+            .reason_class,
+            "disabled"
+        );
+    }
+
+    // --- G1 conformance: the canonical weft-reason vocabulary lock ---
+    //
+    // Source of truth: contracts/weft-reason-vocab.json in the weft hub repo — the
+    // CLOSED set of 11 reason_classes, plus the carrier rule (every NON-clean result
+    // carries {reason_class, cause, fix} with fix MANDATORY; a clean result omits
+    // cause+fix). This test introspects this member's ACTUAL emitted reason
+    // vocabulary and asserts it is a SUBSET of those 11, and that the carrier rule
+    // holds on every shape. It FAILS if loomweave ever drifts: adds a reason_class
+    // outside the canonical set, or drops cause/fix from a non-clean carrier.
+
+    /// The canonical 11 `reason_classes` (closed set) from the G1 contract,
+    /// `contracts/weft-reason-vocab.json`. Kept inline (no shared runtime dep —
+    /// members stay independent repos and conform by this per-member test).
+    const CANONICAL_REASON_CLASSES: [&str; 11] = [
+        "clean",
+        "disabled",
+        "unresolved_input",
+        "rejected",
+        "dead_path",
+        "unreachable",
+        "misrouted",
+        "error",
+        "scheme_mismatch",
+        "stale",
+        "partial",
+    ];
+
+    /// Exercises every branch of `emit_reason_carrier` (the member's sole
+    /// reason-emitting surface) so the conformance test sees the FULL emitted
+    /// vocabulary, not a convenient subset. Add a row here whenever a new emit
+    /// shape is wired — the subset/carrier asserts below then cover it for free.
+    fn all_emitted_reason_carriers() -> Vec<EmitReason> {
+        let blobs = [
+            // disabled
+            serde_json::Value::Null,
+            // clean (true-negative emit)
+            serde_json::json!({ "status": "emitted", "warnings": [] }),
+            // clean (filtered no-op skip)
+            serde_json::json!({ "status": "skipped", "reason": "no_postrun_findings_with_path" }),
+            // partial (intake warnings)
+            serde_json::json!({ "status": "emitted", "warnings": ["w1", "w2"] }),
+            // unreachable (POST never landed)
+            serde_json::json!({ "status": "unreachable", "error": "connection refused" }),
+            // error (pre-wire skip)
+            serde_json::json!({ "status": "skipped", "reason": "flush_failed" }),
+            // error (unknown status / contract drift)
+            serde_json::json!({ "status": "bizarro" }),
+            // error (absent status)
+            serde_json::json!({ "emitted": 0 }),
+        ];
+        blobs.iter().map(emit_reason_carrier).collect()
+    }
+
+    #[test]
+    fn reason_vocab_is_subset_of_canonical_eleven() {
+        // INTROSPECT the actual emitted vocabulary and assert ⊆ the canonical 11.
+        // FAILS the instant a non-canonical reason_class string is emitted.
+        for carrier in all_emitted_reason_carriers() {
+            assert!(
+                CANONICAL_REASON_CLASSES.contains(&carrier.reason_class),
+                "reason_class {:?} is NOT one of the canonical 11 (G1 drift): {:?}",
+                carrier.reason_class,
+                CANONICAL_REASON_CLASSES,
+            );
+        }
+    }
+
+    #[test]
+    fn reason_carrier_rule_holds_on_every_shape() {
+        // CARRIER RULE (G1): every NON-clean result carries cause + fix (fix
+        // MANDATORY, non-empty); a clean result (clean-family: clean/disabled, the
+        // two trust:true|"capability off" classes that omit cause+fix) carries
+        // NEITHER. Verified on both the struct fields and the serialized JSON, so a
+        // consumer reading the wire sees the same contract.
+        let clean_family = ["clean", "disabled"];
+        for carrier in all_emitted_reason_carriers() {
+            let json = serde_json::to_value(&carrier).expect("carrier serializes");
+            if clean_family.contains(&carrier.reason_class) {
+                // clean-family: cause+fix OMITTED, both on the struct and the wire.
+                assert_eq!(
+                    carrier.cause, None,
+                    "{} is clean-family but carries a cause",
+                    carrier.reason_class
+                );
+                assert_eq!(
+                    carrier.fix, None,
+                    "{} is clean-family but carries a fix",
+                    carrier.reason_class
+                );
+                assert!(
+                    json.get("cause").is_none() && json.get("fix").is_none(),
+                    "{} serialized with a cause/fix key (must be omitted)",
+                    carrier.reason_class
+                );
+            } else {
+                // non-clean: cause + a MANDATORY, non-empty fix, on struct + wire.
+                let cause = carrier.cause.as_deref().unwrap_or_else(|| {
+                    panic!("non-clean {} must carry a cause", carrier.reason_class)
+                });
+                let fix = carrier.fix.as_deref().unwrap_or_else(|| {
+                    panic!("non-clean {} must carry a fix", carrier.reason_class)
+                });
+                assert!(
+                    !cause.is_empty(),
+                    "non-clean {} carries an empty cause",
+                    carrier.reason_class
+                );
+                assert!(
+                    !fix.is_empty(),
+                    "non-clean {} carries an empty fix (fix is MANDATORY)",
+                    carrier.reason_class
+                );
+                assert!(
+                    json["cause"].is_string() && json["fix"].is_string(),
+                    "non-clean {} must serialize cause+fix as strings on the wire",
+                    carrier.reason_class
+                );
+            }
+        }
     }
 
     #[test]
@@ -5482,6 +7023,194 @@ mod tests {
         assert!(edges.is_empty());
     }
 
+    /// A minimal anchored resolving edge (`implements`) for the seen-set gate
+    /// tests: both endpoints supplied so membership is what decides readiness.
+    fn implements_edge_record(from_id: &str, to_id: &str) -> (String, EdgeRecord) {
+        (
+            format!("implements {from_id} -> {to_id}"),
+            EdgeRecord {
+                kind: "implements".to_owned(),
+                from_id: from_id.to_owned(),
+                to_id: to_id.to_owned(),
+                confidence: loomweave_core::EdgeConfidence::Resolved,
+                properties_json: None,
+                source_file_id: Some(from_id.to_owned()),
+                source_byte_start: Some(0),
+                source_byte_end: Some(4),
+            },
+        )
+    }
+
+    /// The seen-set gate's happy path: an edge whose BOTH endpoints are already
+    /// stored drains ready; one whose `to_id` is not yet seen stays pending (it
+    /// may become ready when a later batch stores the target — D3 reconciliation).
+    #[test]
+    fn drain_ready_plugin_edges_releases_only_fully_seen_endpoints() {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        seen.insert("rust:impl:c.Foo.impl[Tr]".to_owned());
+        seen.insert("rust:trait:c.Tr".to_owned());
+
+        let mut pending = vec![
+            // ready: both endpoints stored.
+            implements_edge_record("rust:impl:c.Foo.impl[Tr]", "rust:trait:c.Tr"),
+            // not ready: target not yet seen.
+            implements_edge_record("rust:impl:c.Foo.impl[Other]", "rust:trait:c.Other"),
+        ];
+
+        let ready = drain_ready_plugin_edges(&mut pending, &seen);
+
+        assert_eq!(ready.len(), 1, "only the fully-seen edge drains ready");
+        assert_eq!(ready[0].1.to_id, "rust:trait:c.Tr");
+        assert_eq!(pending.len(), 1, "the unseen-target edge stays pending");
+        assert_eq!(pending[0].1.to_id, "rust:trait:c.Other");
+    }
+
+    /// The seen-set gate's drop-and-count: anything STILL pending at end-of-plugin
+    /// has an endpoint the host never stored (D1 external / D2 gitignored-superset
+    /// / D3 stale). Flushing it would FK-HardFail the run, so the gate drops the
+    /// whole buffer and returns the count — never silently lost, never flushed.
+    #[test]
+    fn drop_unready_plugin_edges_drops_and_counts_never_flushes() {
+        let mut pending = vec![
+            implements_edge_record("rust:impl:c.Foo.impl[Ext]", "rust:trait:ext.Trait"),
+            implements_edge_record("rust:impl:c.Bar.impl[Gone]", "rust:trait:c.Gone"),
+        ];
+
+        let dropped = drop_unready_plugin_edges(&mut pending);
+
+        assert_eq!(dropped, 2, "both never-seen edges are counted as dropped");
+        assert!(
+            pending.is_empty(),
+            "the pending buffer is fully drained (dropped, not retained)"
+        );
+    }
+
+    /// Like [`implements_edge_record`] but kind-parameterized, for the gate
+    /// generality pins below.
+    fn anchored_edge_record(kind: &str, from_id: &str, to_id: &str) -> (String, EdgeRecord) {
+        (
+            format!("{kind} {from_id} -> {to_id}"),
+            EdgeRecord {
+                kind: kind.to_owned(),
+                from_id: from_id.to_owned(),
+                to_id: to_id.to_owned(),
+                confidence: loomweave_core::EdgeConfidence::Resolved,
+                properties_json: None,
+                source_file_id: Some(from_id.to_owned()),
+                source_byte_start: Some(0),
+                source_byte_end: Some(4),
+            },
+        )
+    }
+
+    /// PIN test (D8, Phase 2): the seen-set gate is kind-GENERIC — it switches
+    /// on endpoint membership only, never on `kind` — so the new `derives` and
+    /// `references` edge kinds ride it unchanged. This cannot go red-first (no
+    /// code change accompanies it); it pins the generality so a future
+    /// kind-aware refactor of the gate cannot silently strand the new kinds.
+    #[test]
+    fn drain_ready_plugin_edges_is_kind_generic_for_derives_and_references() {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        seen.insert("rust:struct:c.Foo".to_owned());
+        seen.insert("rust:trait:c.Tr".to_owned());
+        seen.insert("rust:function:c.make".to_owned());
+        seen.insert("rust:const:c.MAX".to_owned());
+
+        let mut pending = vec![
+            // ready: both endpoints stored.
+            anchored_edge_record("derives", "rust:struct:c.Foo", "rust:trait:c.Tr"),
+            anchored_edge_record("references", "rust:function:c.make", "rust:const:c.MAX"),
+            // not ready: target never stored (gitignored-superset / stale — D2/D3).
+            anchored_edge_record("derives", "rust:struct:c.Foo", "rust:trait:c.Hidden"),
+            anchored_edge_record("references", "rust:function:c.make", "rust:struct:c.Gone"),
+        ];
+
+        let ready = drain_ready_plugin_edges(&mut pending, &seen);
+
+        assert_eq!(
+            ready.len(),
+            2,
+            "both fully-seen edges drain ready regardless of kind"
+        );
+        assert_eq!(ready[0].1.kind, "derives");
+        assert_eq!(ready[0].1.to_id, "rust:trait:c.Tr");
+        assert_eq!(ready[1].1.kind, "references");
+        assert_eq!(ready[1].1.to_id, "rust:const:c.MAX");
+        assert_eq!(
+            pending.len(),
+            2,
+            "both unseen-target edges stay pending regardless of kind"
+        );
+        assert_eq!(pending[0].1.to_id, "rust:trait:c.Hidden");
+        assert_eq!(pending[1].1.to_id, "rust:struct:c.Gone");
+    }
+
+    /// PIN test (D8, Phase 2): end-of-plugin reconciliation drop-counts pending
+    /// `derives`/`references` edges exactly like `implements` — kind never
+    /// enters the decision. See the drain pin above for why no red state exists.
+    #[test]
+    fn drop_unready_plugin_edges_counts_derives_and_references() {
+        let mut pending = vec![
+            anchored_edge_record("derives", "rust:struct:c.Foo", "rust:trait:c.Hidden"),
+            anchored_edge_record("references", "rust:function:c.make", "rust:struct:c.Gone"),
+        ];
+
+        let dropped = drop_unready_plugin_edges(&mut pending);
+
+        assert_eq!(
+            dropped, 2,
+            "both never-seen Phase-2 edges are counted as dropped"
+        );
+        assert!(
+            pending.is_empty(),
+            "the pending buffer is fully drained (dropped, not retained)"
+        );
+    }
+
+    #[test]
+    fn filter_import_edges_retains_non_module_in_project_target() {
+        // clarion-d1e3dc67dc: the Rust resolver targets `use` paths at functions /
+        // structs / consts / traits, not just file-scope modules. Such an in-project,
+        // non-module target was dropped as "external" by the module-only gate even
+        // though its entity was stored. It must now survive.
+        let entities = vec![
+            module_record("rust:module:demo.sub"),
+            record_of_kind("rust:function:demo.sub.helper", "function"),
+        ];
+        let mut edges = vec![resolved_import_edge(
+            "rust:module:demo",
+            "rust:function:demo.sub.helper",
+        )];
+
+        // python_kind_roles has file_scope = {module}, so `function` is correctly
+        // NOT file-scope — exercising exactly the non-module-target path.
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
+
+        assert_eq!(skipped, 0, "an in-project function target is not external");
+        assert_eq!(
+            edges.len(),
+            1,
+            "the import edge to a function must be retained"
+        );
+        assert_eq!(edges[0].1.to_id, "rust:function:demo.sub.helper");
+    }
+
+    #[test]
+    fn filter_import_edges_still_drops_unstored_target() {
+        // The broadened fallback must not become a blanket keep: a target that is
+        // NOT a stored in-project entity (any kind) is still external and dropped.
+        let entities = vec![module_record("rust:module:demo")];
+        let mut edges = vec![resolved_import_edge(
+            "rust:module:demo",
+            "rust:function:other_crate.thing",
+        )];
+
+        let skipped = filter_external_import_edges(&entities, &python_kind_roles(), &mut edges);
+
+        assert_eq!(skipped, 1, "an unstored target is still external");
+        assert!(edges.is_empty());
+    }
+
     #[test]
     fn subsystem_display_name_uses_common_module_prefix() {
         let (name, short_name) = subsystem_display_name(
@@ -5563,6 +7292,12 @@ mod tests {
         )
     }
 
+    fn record_of_kind(id: &str, kind: &str) -> (String, EntityRecord) {
+        let (_, mut record) = module_record(id);
+        record.kind = kind.to_owned();
+        (id.to_owned(), record)
+    }
+
     fn entity_with_properties(id: &str, properties_json: &str) -> EntityRecord {
         EntityRecord {
             id: id.to_owned(),
@@ -5615,10 +7350,10 @@ mod tests {
         assert_eq!(finding.kind, "defect");
         assert_eq!(finding.severity, "WARN");
         assert_eq!(finding.tool, "loomweave");
-        // Deterministic, run-scoped id keeps InsertFinding idempotent on resume.
+        // Deterministic, content-keyed id keeps InsertFinding idempotent across runs.
         assert_eq!(
             finding.id,
-            "core:finding:run-1:syntax-error:python:module:pkg.broken"
+            "core:finding:syntax-error:python:module:pkg.broken"
         );
     }
 
@@ -5654,10 +7389,10 @@ mod tests {
         assert_eq!(finding.severity, "INFO");
         // Anchors to the deleted entity's own (never-pruned) row.
         assert_eq!(finding.entity_id, "python:function:pkg.gone");
-        // Deterministic, run-scoped id keeps InsertFinding idempotent on resume.
+        // Deterministic, content-keyed id keeps InsertFinding idempotent across runs.
         assert_eq!(
             finding.id,
-            "core:finding:run-1:entity-deleted:python:function:pkg.gone"
+            "core:finding:entity-deleted:python:function:pkg.gone"
         );
     }
 
@@ -5690,10 +7425,7 @@ mod tests {
         assert_eq!(finding.kind, "fact");
         assert_eq!(finding.severity, "WARN");
         assert_eq!(finding.entity_id, "core:subsystem:abc");
-        assert_eq!(
-            finding.id,
-            "core:finding:run-1:tier-mixing:core:subsystem:abc"
-        );
+        assert_eq!(finding.id, "core:finding:tier-mixing:core:subsystem:abc");
         let evidence: serde_json::Value = serde_json::from_str(&finding.evidence_json).unwrap();
         assert_eq!(evidence["tier_distribution"]["public"], 1);
         assert_eq!(evidence["tier_distribution"]["internal"], 1);
@@ -5733,7 +7465,7 @@ mod tests {
         assert_eq!(related, serde_json::json!(["python:function:pkg.gone"]));
         assert_eq!(
             finding.id,
-            "core:finding:run-1:guidance-orphan:core:guidance:g1:python:function:pkg.gone"
+            "core:finding:guidance-orphan:core:guidance:g1:python:function:pkg.gone"
         );
     }
 
@@ -5813,16 +7545,55 @@ mod tests {
     #[test]
     fn plugin_watchdog_arm_disarm_and_severity() {
         let wd = PluginWatchdog::new();
-        assert!(!wd.did_time_out(), "fresh watchdog has not fired");
-        wd.arm(std::time::Duration::from_secs(60));
+        assert!(
+            wd.timed_out_phase().is_none(),
+            "fresh watchdog has not fired"
+        );
+        wd.arm(std::time::Duration::from_secs(60), WatchdogPhase::File);
         assert!(wd.deadline.lock().unwrap().is_some(), "arm sets a deadline");
+        assert!(
+            wd.expire_if_due().is_none(),
+            "an unexpired deadline does not fire"
+        );
         wd.disarm();
         assert!(
             wd.deadline.lock().unwrap().is_none(),
             "disarm clears the deadline"
         );
-        // A timeout is an ERROR-severity loss of work.
+        // A timeout is an ERROR-severity loss of work; a shutdown timeout is
+        // exit etiquette only (ADR-050 D7) — WARN, never ERROR.
         assert_eq!(infra_severity(PLUGIN_TIMEOUT_RULE_ID), "ERROR");
+        assert_eq!(infra_severity(PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID), "WARN");
+    }
+
+    #[test]
+    fn plugin_watchdog_expiry_records_armed_phase() {
+        let wd = PluginWatchdog::new();
+        wd.arm(std::time::Duration::ZERO, WatchdogPhase::Handshake);
+        assert_eq!(
+            wd.expire_if_due(),
+            Some(WatchdogPhase::Handshake),
+            "an expired deadline fires with the armed phase"
+        );
+        assert_eq!(
+            wd.timed_out_phase(),
+            Some(WatchdogPhase::Handshake),
+            "the fired phase is recorded"
+        );
+        // Kill-at-most-once per arm: expiry disarms.
+        assert!(
+            wd.expire_if_due().is_none(),
+            "a fired deadline does not fire twice"
+        );
+        // A later expiry still triggers a kill, but the FIRST recorded phase
+        // wins — it names the phase that broke the run.
+        wd.arm(std::time::Duration::ZERO, WatchdogPhase::Shutdown);
+        assert_eq!(wd.expire_if_due(), Some(WatchdogPhase::Shutdown));
+        assert_eq!(
+            wd.timed_out_phase(),
+            Some(WatchdogPhase::Handshake),
+            "first recorded phase wins"
+        );
     }
 
     #[test]
@@ -5832,6 +7603,24 @@ mod tests {
         assert_eq!(rec.severity, "ERROR");
         assert_eq!(rec.entity_id, "core:project:demo");
         assert!(rec.message.contains("boom"));
+    }
+
+    fn resolved_import_edge(from_id: &str, to_id: &str) -> (String, EdgeRecord) {
+        (
+            format!("imports {from_id} -> {to_id}"),
+            EdgeRecord {
+                kind: "imports".to_owned(),
+                from_id: from_id.to_owned(),
+                to_id: to_id.to_owned(),
+                confidence: loomweave_core::EdgeConfidence::Resolved,
+                properties_json: Some(
+                    serde_json::json!({ "import_style": "import", "level": 0 }).to_string(),
+                ),
+                source_file_id: Some(from_id.to_owned()),
+                source_byte_start: Some(0),
+                source_byte_end: Some(10),
+            },
+        )
     }
 
     fn from_import_edge(from_id: &str, to_id: &str, imported_name: &str) -> (String, EdgeRecord) {
@@ -5933,6 +7722,7 @@ mod tests {
             "stubborn",
             &mut findings,
             std::time::Duration::from_millis(50),
+            false,
         );
 
         assert!(
@@ -5947,6 +7737,68 @@ mod tests {
             findings.is_empty(),
             "timeout kill should not be misclassified as an OOM finding: {findings:?}"
         );
+    }
+
+    /// ADR-050: SIGABRT (signal 6) — the stack-overflow / explicit-abort
+    /// signature — is classified distinctly as `LMWV-INFRA-PLUGIN-ABORTED`,
+    /// never as an OOM kill, and is ERROR severity.
+    #[test]
+    #[cfg(unix)]
+    fn reap_classifies_sigabrt_as_aborted_finding() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "kill -ABRT $$"])
+            .spawn()
+            .expect("spawn self-aborting child");
+        let mut findings = Vec::new();
+
+        reap_and_classify_exit_with_timeout(
+            &mut child,
+            "abrt",
+            &mut findings,
+            std::time::Duration::from_secs(5),
+            false,
+        );
+
+        assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+        assert_eq!(findings[0].subcode, FINDING_PLUGIN_ABORTED);
+        assert_eq!(
+            findings[0].metadata.get("signal").map(String::as_str),
+            Some("6")
+        );
+        assert_eq!(infra_severity(FINDING_PLUGIN_ABORTED), "ERROR");
+    }
+
+    /// ADR-050 `timed_out` gate: when the lifecycle watchdog killed the child,
+    /// the resulting SIGKILL must not be double-reported as an OOM event —
+    /// but without suppression the SIGKILL classification is unchanged.
+    #[test]
+    #[cfg(unix)]
+    fn reap_suppresses_oom_classification_for_watchdog_kill() {
+        for (suppress, expected_oom) in [(true, 0_usize), (false, 1_usize)] {
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleeping child");
+            child.kill().expect("kill child (watchdog stand-in)");
+            let mut findings = Vec::new();
+
+            reap_and_classify_exit_with_timeout(
+                &mut child,
+                "killed",
+                &mut findings,
+                std::time::Duration::from_secs(5),
+                suppress,
+            );
+
+            let oom_count = findings
+                .iter()
+                .filter(|f| f.subcode == "LMWV-INFRA-PLUGIN-OOM-KILLED")
+                .count();
+            assert_eq!(
+                oom_count, expected_oom,
+                "suppress={suppress} must yield {expected_oom} OOM findings: {findings:?}"
+            );
+        }
     }
 
     #[test]
@@ -6134,8 +7986,8 @@ mod tests {
         use loomweave_storage::{EmbeddingKey, EmbeddingStore, pragma, schema};
 
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".loomweave")).unwrap();
-        let db_path = project.path().join(".loomweave/loomweave.db");
+        std::fs::create_dir_all(loomweave_core::store::store_dir(project.path())).unwrap();
+        let db_path = loomweave_core::store::db_path(project.path());
         let mut conn = rusqlite::Connection::open(&db_path).unwrap();
         pragma::apply_write_pragmas(&conn).unwrap();
         schema::apply_migrations(&mut conn).unwrap();
@@ -6150,7 +8002,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let store = EmbeddingStore::open_in_loomweave_dir(project.path()).unwrap();
+        let store = EmbeddingStore::open_in_store_dir(project.path()).unwrap();
         store
             .upsert(
                 &EmbeddingKey {
@@ -6203,8 +8055,8 @@ mod tests {
         use loomweave_storage::{pragma, schema};
 
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".loomweave")).unwrap();
-        let db_path = project.path().join(".loomweave/loomweave.db");
+        std::fs::create_dir_all(loomweave_core::store::store_dir(project.path())).unwrap();
+        let db_path = loomweave_core::store::db_path(project.path());
         let mut conn = rusqlite::Connection::open(&db_path).unwrap();
         pragma::apply_write_pragmas(&conn).unwrap();
         schema::apply_migrations(&mut conn).unwrap();

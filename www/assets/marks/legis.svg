@@ -1,0 +1,10 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Legis">
+  
+  <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M16 6 V25"></path>
+    <path d="M9 25 H23"></path>
+    <path d="M7 9 H25"></path>
+    <path d="M7 9 L4 16 H10 L7 9Z"></path>
+    <path d="M25 9 L22 16 H28 L25 9Z"></path>
+  </g>
+</svg>

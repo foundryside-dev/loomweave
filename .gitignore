@@ -1,9 +1,13 @@
 .filigree/
+.filigree.conf
+.weft/filigree/
 /target
 **/*.rs.bk
 Cargo.lock.bak
 
-# SQLite working files (project-level .loomweave/ is tracked per ADR-005)
+# SQLite working files (project-level .weft/loomweave/ is a regenerable cache,
+# ignored — ADR-005 as reversed by C1/weft-d822a7de2d; see the .weft/loomweave/
+# entries below and the blanket .weft/ rule)
 *.db-journal
 *.db-wal
 
@@ -24,6 +28,10 @@ htmlcov/
 
 .env
 
+# Codex/Claude harness debug logs at the repo root (one was committed by the
+# authoring agent in c475e90; weft-ac59e8e730).
+/error.log
+
 # Smoke-test result artifacts (per-run; archived separately at tag-cut)
 tests/e2e/external-operator-smoke-results-*.md
 
@@ -32,13 +40,17 @@ tests/e2e/external-operator-smoke-results-*.md
 
 # Loomweave runtime artifacts — the index DB, per-project instance fingerprint,
 # and analyze lock change on every run, so they are not tracked
-# (see .loomweave/.gitignore).
-.loomweave/loomweave.db
-.loomweave/instance_id
-.loomweave/loomweave.lock
+# (see .weft/loomweave/.gitignore).
+.weft/loomweave/loomweave.db
+.weft/loomweave/instance_id
+.weft/loomweave/loomweave.lock
+.weft/loomweave/ephemeral.port
 
 # Documentation site build output (mkdocs `site_dir`, web/mkdocs.yml).
 /site-build/
+
+# Wardline scan output written by `wardline scan` (raw, regenerated per run).
+/findings.jsonl
 
 # Filigree-managed docs — a running filigree process rewrites its managed
 # instruction blocks in these every session; untracked to avoid diff churn
@@ -46,3 +58,13 @@ tests/e2e/external-operator-smoke-results-*.md
 AGENTS.md
 CLAUDE.md
 .agents/skills/filigree-workflow/SKILL.md
+
+# Filigree issue tracker
+.weft/
+
+# Developer config / local tooling — not part of the solution
+.agents/
+
+# Local tool/federation config — not part of the solution
+.mcp.json
+loomweave.yaml

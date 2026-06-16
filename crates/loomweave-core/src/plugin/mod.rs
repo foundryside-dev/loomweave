@@ -15,6 +15,7 @@ pub mod breaker;
 pub mod discovery;
 pub mod host;
 mod host_findings;
+mod host_validate;
 pub mod jail;
 pub mod limits;
 pub mod manifest;

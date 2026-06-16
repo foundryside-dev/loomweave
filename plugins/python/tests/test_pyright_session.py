@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ast
+import errno
+import os
 import shutil
 import stat
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -17,22 +20,30 @@ from loomweave_plugin_python.pyright_session import (
     FINDING_PYRIGHT_POISON_FRAME,
     FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
     FINDING_PYRIGHT_REFERENCE_SITE_CAP,
+    FINDING_PYRIGHT_RESOURCE_EXHAUSTED,
     FINDING_PYRIGHT_RESTART,
+    FINDING_PYRIGHT_SPAWN_DEFERRED,
     FINDING_PYRIGHT_UNAVAILABLE,
+    MAX_CONSECUTIVE_SPAWN_DEFERRALS,
     LspTimeoutError,
+    PyrightRunState,
     PyrightSession,
     _build_function_index,
     _CallSite,
     _containing_function_id,
+    _filter_relation_candidates,
     _FunctionIndex,
     _FunctionInfo,
+    _merge_reference_site,
+    _reference_accumulator_to_edge,
     _unresolved_call_site_total_for_function,
     _unresolved_call_sites_for_function,
 )
 from loomweave_plugin_python.reference_resolver import ReferenceSite, ReferenceSiteKind
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
+    from typing import NoReturn
 
     from loomweave_plugin_python.call_resolver import Finding
 
@@ -470,6 +481,400 @@ def test_pyright_session_references_dedup_to_earliest_range(
     assert result.edges[0]["source_byte_end"] == later.source_byte_end
 
 
+def _accumulated_edges(
+    site: ReferenceSite,
+    candidate_ids: list[str],
+) -> list[dict[str, object]]:
+    accumulators: dict[tuple[str, str, str], object] = {}
+    _merge_reference_site(accumulators, site, candidate_ids)  # type: ignore[arg-type]
+    return [
+        cast("dict[str, object]", _reference_accumulator_to_edge(acc))  # type: ignore[arg-type]
+        for acc in accumulators.values()
+    ]
+
+
+def test_merge_base_site_accumulates_inherits_from_edge() -> None:
+    source = "class Base:\n    pass\n\nclass Child(Base):\n    pass\n"
+    site = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Base",
+        kind="base",
+        occurrence=1,
+    )
+
+    assert _accumulated_edges(site, ["python:class:demo.Base"]) == [
+        {
+            "kind": "inherits_from",
+            "from_id": "python:class:demo.Child",
+            "to_id": "python:class:demo.Base",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+            "confidence": "resolved",
+        },
+    ]
+
+
+def test_merge_decorator_site_inverts_direction_for_decorates_edge() -> None:
+    source = "def deco(fn):\n    return fn\n\n@deco\ndef target():\n    pass\n"
+    site = _reference_site(
+        source,
+        from_id="python:function:demo.target",
+        needle="deco",
+        kind="decorator",
+        occurrence=1,
+    )
+
+    assert _accumulated_edges(site, ["python:function:demo.deco"]) == [
+        {
+            "kind": "decorates",
+            "from_id": "python:function:demo.deco",
+            "to_id": "python:function:demo.target",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+            "confidence": "resolved",
+        },
+    ]
+
+
+def test_merge_keeps_same_pair_distinct_across_edge_kinds() -> None:
+    source = "class Base:\n    pass\n\nclass Child(Base):\n    x: Base\n"
+    base_site = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Base",
+        kind="base",
+        occurrence=1,
+    )
+    annotation_site = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Base",
+        kind="annotation",
+        occurrence=2,
+    )
+
+    accumulators: dict[tuple[str, str, str], object] = {}
+    _merge_reference_site(accumulators, base_site, ["python:class:demo.Base"])  # type: ignore[arg-type]
+    _merge_reference_site(accumulators, annotation_site, ["python:class:demo.Base"])  # type: ignore[arg-type]
+
+    kinds = sorted(
+        cast("dict[str, str]", _reference_accumulator_to_edge(acc))["kind"]  # type: ignore[arg-type]
+        for acc in accumulators.values()
+    )
+    assert kinds == ["inherits_from", "references"]
+
+
+def test_filter_relation_candidates_enforces_kind_and_self_edge_discipline() -> None:
+    source = "class Base:\n    pass\n\nclass Child(Base):\n    pass\n"
+    base_site = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Base",
+        kind="base",
+        occurrence=1,
+    )
+    deco_source = "def deco(fn):\n    return fn\n\n@deco\ndef target():\n    pass\n"
+    decorator_site = _reference_site(
+        deco_source,
+        from_id="python:function:demo.target",
+        needle="deco",
+        kind="decorator",
+        occurrence=1,
+    )
+    name_site = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Base",
+        kind="name",
+        occurrence=1,
+    )
+
+    # Base targets: class entities only, and never the subclass itself.
+    assert _filter_relation_candidates(
+        base_site,
+        [
+            "python:function:demo.make",
+            "python:class:demo.Base",
+            "python:class:demo.Child",
+            "python:module:demo",
+        ],
+    ) == ["python:class:demo.Base"]
+    # Decorator candidates: functions and classes both decorate; self dropped.
+    assert _filter_relation_candidates(
+        decorator_site,
+        [
+            "python:function:demo.target",
+            "python:function:demo.deco",
+            "python:class:demo.Deco",
+        ],
+    ) == ["python:function:demo.deco", "python:class:demo.Deco"]
+    # Plain reference sites are untouched.
+    candidates = ["python:module:demo", "python:class:demo.Child"]
+    assert _filter_relation_candidates(name_site, candidates) == candidates
+
+
+def test_target_id_from_location_relation_sites_skip_module_fallback(tmp_path: Path) -> None:
+    """Relation sites resolve to precise entities only — no module-id coarse
+    fallback (Rust parity: an alias/assignment target is dropped like an
+    External derive, not coarsened to the defining module)."""
+    source = "class Base:\n    pass\n\nAlias = Base\n"
+    path = _write_module(tmp_path, source)
+    session = PyrightSession(tmp_path)
+    # Location of the `Alias` assignment target: a declaration position that
+    # is not an entity name-token position.
+    location = {
+        "uri": path.as_uri(),
+        "range": {
+            "start": {"line": 3, "character": 0},
+            "end": {"line": 3, "character": 5},
+        },
+    }
+
+    assert session._target_id_from_location(location) == (  # noqa: SLF001
+        "python:module:demo",
+        False,
+    )
+    assert session._target_id_from_location(  # noqa: SLF001
+        location,
+        precise_only=True,
+    ) == (None, False)
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolves_base_site_to_inherits_from_edge(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        class Base:
+            pass
+
+        class Child(Base):
+            pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Base",
+        kind="base",
+        occurrence=1,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == [
+        {
+            "kind": "inherits_from",
+            "from_id": "python:class:demo.Child",
+            "to_id": "python:class:demo.Base",
+            "confidence": "resolved",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+        },
+    ]
+    assert result.references_resolved_total == 1
+    assert result.unresolved_reference_sites_total == 0
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolves_decorator_site_to_decorates_edge(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        def deco(fn):
+            return fn
+
+        @deco
+        def target():
+            pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:function:demo.target",
+        needle="deco",
+        kind="decorator",
+        occurrence=1,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == [
+        {
+            "kind": "decorates",
+            "from_id": "python:function:demo.deco",
+            "to_id": "python:function:demo.target",
+            "confidence": "resolved",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+        },
+    ]
+
+
+@pytest.mark.pyright
+def test_pyright_session_skips_external_base_target(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = "class Boom(Exception):\n    pass\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:class:demo.Boom",
+        needle="Exception",
+        kind="base",
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == []
+    assert result.references_skipped_external_total == 1
+    assert result.unresolved_reference_sites_total == 1
+
+
+@pytest.mark.pyright
+def test_pyright_session_base_resolving_to_function_is_dropped(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    """`inherits_from` targets are class entities only: a base name that
+    resolves to a function (factory aliases, `def base(): ...` shadowing)
+    yields no edge rather than a class-inherits-function fact."""
+    source = textwrap.dedent(
+        """
+        def base():
+            return object
+
+        class Child(base):
+            pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="base",
+        kind="base",
+        occurrence=1,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == []
+    assert result.unresolved_reference_sites_total == 1
+
+
+@pytest.mark.pyright
+def test_pyright_session_self_decoration_via_redefinition_is_filtered(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    """The relation discipline (precise_only + self-edge drop) is load-bearing.
+
+    ``@helper`` above the redefining ``def helper`` resolves at this position
+    (a control query with ``kind="name"`` yields an ambiguous references edge
+    whose candidates include ``python:function:demo.helper`` plus the
+    module-fallback id), so the empty edge list here is produced by the
+    discipline, not by pyright failing to resolve: precise_only drops the
+    module-fallback candidate and the self-edge filter drops the function id
+    (first-wins dedup gives both ``helper`` definitions one entity id).
+    """
+    source = textwrap.dedent(
+        """
+        def helper(fn):
+            return fn
+
+        @helper
+        def helper():
+            pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:function:demo.helper",
+        needle="helper",
+        kind="decorator",
+        occurrence=2,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == []
+    # Counted as unresolved: the candidates existed but were disciplined away.
+    assert result.unresolved_reference_sites_total == 1
+
+
+def test_merge_ambiguous_base_site_emits_candidates_payload() -> None:
+    source = "class Base:\n    pass\n\nclass Child(Base):\n    pass\n"
+    site = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Base",
+        kind="base",
+        occurrence=1,
+    )
+
+    assert _accumulated_edges(
+        site,
+        ["python:class:other.Base", "python:class:demo.Base"],
+    ) == [
+        {
+            "kind": "inherits_from",
+            "from_id": "python:class:demo.Child",
+            "to_id": "python:class:demo.Base",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+            "confidence": "ambiguous",
+            "properties": {
+                "candidates": ["python:class:demo.Base", "python:class:other.Base"],
+            },
+        },
+    ]
+
+
+def test_merge_ambiguous_decorator_site_candidates_are_from_side() -> None:
+    """Ambiguous `decorates` candidates list alternative FROM-side decorator
+    entities (direction is inverted), with from_id = the sorted-first one."""
+    source = "def deco(fn):\n    return fn\n\n@deco\ndef target():\n    pass\n"
+    site = _reference_site(
+        source,
+        from_id="python:function:demo.target",
+        needle="deco",
+        kind="decorator",
+        occurrence=1,
+    )
+
+    assert _accumulated_edges(
+        site,
+        ["python:function:demo.deco", "python:class:demo.Deco"],
+    ) == [
+        {
+            "kind": "decorates",
+            "from_id": "python:class:demo.Deco",
+            "to_id": "python:function:demo.target",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+            "confidence": "ambiguous",
+            "properties": {
+                "candidates": ["python:class:demo.Deco", "python:function:demo.deco"],
+            },
+        },
+    ]
+
+
 def test_pyright_session_reference_unavailable_binary_missing(tmp_path: Path) -> None:
     source = "def world():\n    pass\n\nCONST_REF = world\n"
     module = _write_module(tmp_path, source)
@@ -874,6 +1279,128 @@ def test_pyright_session_install_failure(tmp_path: Path) -> None:
     assert result.edges == []
     assert result.unresolved_call_sites_total == 1
     assert FINDING_PYRIGHT_INSTALL_FAILURE in _finding_codes(result.findings)
+
+
+def _popen_raising(err: int) -> Callable[..., NoReturn]:
+    def _factory(*args: object, **kwargs: object) -> NoReturn:
+        _ = (args, kwargs)
+        raise OSError(err, os.strerror(err))
+
+    return _factory
+
+
+def test_transient_spawn_failure_defers_without_disabling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EAGAIN on spawn is transient: skip the file, retry next, never poison."""
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n")
+    monkeypatch.setattr(subprocess, "Popen", _popen_raising(errno.EAGAIN))
+    run_state = PyrightRunState()
+
+    with PyrightSession(tmp_path, executable=sys.executable, run_state=run_state) as session:
+        first = session.resolve_calls(module, ["python:function:demo.caller"])
+        second = session.resolve_calls(module, ["python:function:demo.caller"])
+
+    # A transient resource squeeze must NOT permanently disable pyright...
+    assert run_state.disabled is False
+    # ...and every file re-attempts the spawn (skip-and-continue).
+    assert run_state.consecutive_spawn_deferrals == 2
+    # One finding per pressure episode (the 0 -> 1 transition), not per file,
+    # and never the permanent install-failure poison.
+    assert FINDING_PYRIGHT_SPAWN_DEFERRED in _finding_codes(first.findings)
+    assert FINDING_PYRIGHT_SPAWN_DEFERRED not in _finding_codes(second.findings)
+    assert FINDING_PYRIGHT_INSTALL_FAILURE not in _finding_codes(first.findings)
+    assert first.edges == []
+    assert first.unresolved_call_sites_total == 1
+    assert second.unresolved_call_sites_total == 1
+
+
+def test_permanent_spawn_failure_disables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-transient errno (ENOENT) is a genuine install defect: disable."""
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n")
+    monkeypatch.setattr(subprocess, "Popen", _popen_raising(errno.ENOENT))
+    run_state = PyrightRunState()
+
+    with PyrightSession(tmp_path, executable=sys.executable, run_state=run_state) as session:
+        result = session.resolve_calls(module, ["python:function:demo.caller"])
+
+    assert run_state.disabled is True
+    assert FINDING_PYRIGHT_INSTALL_FAILURE in _finding_codes(result.findings)
+    assert FINDING_PYRIGHT_SPAWN_DEFERRED not in _finding_codes(result.findings)
+    assert result.unresolved_call_sites_total == 1
+
+
+def test_sustained_spawn_pressure_trips_resource_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unrelenting EAGAIN eventually gives up — with its own finding, not poison."""
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n")
+    monkeypatch.setattr(subprocess, "Popen", _popen_raising(errno.EAGAIN))
+    run_state = PyrightRunState()
+    codes: set[str] = set()
+
+    with PyrightSession(tmp_path, executable=sys.executable, run_state=run_state) as session:
+        for _ in range(MAX_CONSECUTIVE_SPAWN_DEFERRALS + 1):
+            result = session.resolve_calls(module, ["python:function:demo.caller"])
+            codes |= _finding_codes(result.findings)
+
+    assert run_state.disabled is True
+    assert FINDING_PYRIGHT_RESOURCE_EXHAUSTED in codes
+    # The soft-stop is distinct from the install-failure poison.
+    assert FINDING_PYRIGHT_INSTALL_FAILURE not in codes
+
+
+@pytest.mark.pyright
+def test_successful_spawn_resets_deferral_counter(
+    tmp_path: Path,
+    pyright_langserver: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a deferred file, a clean spawn clears the pressure counter."""
+    module = _write_module(
+        tmp_path,
+        """
+        def callee():
+            pass
+
+        def caller():
+            callee()
+        """,
+    )
+    real_popen = cast("Callable[..., subprocess.Popen[bytes]]", subprocess.Popen)
+    calls = {"n": 0}
+
+    def flaky_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        # Fail only the *first pyright* spawn. _start_process incidentally shells
+        # out via ctypes.util.find_library (ldconfig/gcc/objdump); those must pass
+        # through to the real Popen, or the injected EAGAIN lands on the wrong call.
+        argv = args[0] if args else kwargs.get("args")
+        executable = argv[0] if isinstance(argv, (list, tuple)) and argv else None
+        if isinstance(executable, str) and executable.endswith("pyright-langserver"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", flaky_popen)
+    run_state = PyrightRunState()
+    function_ids = ["python:function:demo.caller", "python:function:demo.callee"]
+
+    with PyrightSession(tmp_path, executable=pyright_langserver, run_state=run_state) as session:
+        deferred = session.resolve_calls(module, function_ids)
+        resolved = session.resolve_calls(module, function_ids)
+
+    assert FINDING_PYRIGHT_SPAWN_DEFERRED in _finding_codes(deferred.findings)
+    assert deferred.edges == []
+    # The second file spawned cleanly: not disabled and the counter is reset.
+    assert run_state.disabled is False
+    assert run_state.consecutive_spawn_deferrals == 0
+    assert resolved.edges
 
 
 class TimeoutSession(PyrightSession):

@@ -1,0 +1,76 @@
+# Build the Loomweave member Astro site (site/) and deploy to GitHub Pages.
+#
+# The site deploys to loomweave.foundryside.dev (CNAME in site/public/CNAME,
+# copied verbatim into the build output). It consumes the shared @weft/site-kit,
+# which lives in a SUBDIRECTORY of a DIFFERENT repo (foundryside-dev/weft) — so
+# the build first sparse-fetches the kit into site/vendor/site-kit (via the
+# preinstall hook in package.json) and resolves it as a file: dependency.
+#
+# NOTE: this supersedes the legacy `docs.yml`, which publishes the hand-rolled
+# www/ site to the gh-pages branch. Retire docs.yml and switch the Pages source
+# to "GitHub Actions" once this Astro site is the live loomweave.foundryside.dev.
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/deploy-site.yml'
+  workflow_dispatch:
+
+# GitHub Pages deploy permissions.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One in-flight Pages deploy at a time; don't cancel a running deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch @weft/site-kit
+        # Sparse-fetch packages/site-kit from foundryside-dev/weft into
+        # site/vendor/site-kit so the file: dependency resolves. (npm install
+        # also triggers this via the preinstall hook; running it explicitly
+        # keeps the failure mode legible in CI logs.)
+        run: npm run fetch-site-kit
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        # prebuild hook copies @weft/site-kit/assets into public/_site-kit.
+        run: npm run build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

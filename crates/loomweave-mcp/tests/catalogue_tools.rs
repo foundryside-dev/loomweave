@@ -3,10 +3,14 @@
 //! honest-empty behaviour, and the bounded/pagination contract over the public
 //! JSON-RPC surface.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use loomweave_core::{EmbeddingRecording, RecordingEmbeddingProvider};
 use loomweave_mcp::config::SemanticSearchConfig;
+use loomweave_mcp::filigree::{
+    EntityAssociationsResponse, FiligreeClientError, FiligreeLookup, WardlineFinding,
+};
 use loomweave_mcp::{ServerState, list_tools};
 use loomweave_storage::{EmbeddingKey, EmbeddingStore, ReaderPool, pragma, schema};
 use rusqlite::{Connection, params};
@@ -14,8 +18,8 @@ use serde_json::{Value, json};
 
 fn open_project() -> (tempfile::TempDir, std::path::PathBuf, Connection) {
     let project = tempfile::tempdir().expect("temp project");
-    let loomweave_dir = project.path().join(".loomweave");
-    std::fs::create_dir(&loomweave_dir).expect("create .loomweave");
+    let loomweave_dir = project.path().join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).expect("create .loomweave");
     let db_path = loomweave_dir.join("loomweave.db");
     let mut conn = Connection::open(&db_path).expect("open sqlite");
     pragma::apply_write_pragmas(&conn).expect("write pragmas");
@@ -27,6 +31,98 @@ fn state_for(project_root: &std::path::Path, db_path: &std::path::Path) -> Serve
     let pool = ReaderPool::open(db_path, 2).expect("reader pool");
     ServerState::new(project_root.to_path_buf(), pool)
         .with_clock(|| "2026-06-02T00:00:00.000Z".to_owned())
+}
+
+fn state_for_filigree(
+    project_root: &std::path::Path,
+    db_path: &std::path::Path,
+    client: Arc<dyn FiligreeLookup>,
+) -> ServerState {
+    let pool = ReaderPool::open(db_path, 2).expect("reader pool");
+    ServerState::new(project_root.to_path_buf(), pool)
+        .with_clock(|| "2026-06-02T00:00:00.000Z".to_owned())
+        .with_filigree_client(client)
+}
+
+#[derive(Debug, Default)]
+struct WardlineFindingClient {
+    findings_by_path: Mutex<HashMap<String, Vec<WardlineFinding>>>,
+    path_calls: Mutex<Vec<String>>,
+    // When set, `wardline_findings_for_path` returns a transport error (503),
+    // modelling a Filigree outage / paginated-hop truncation (L4).
+    fail: bool,
+}
+
+impl WardlineFindingClient {
+    fn with_findings_for_path(self, path: &str, findings: Vec<WardlineFinding>) -> Self {
+        self.findings_by_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_owned(), findings);
+        self
+    }
+
+    fn failing() -> Self {
+        Self {
+            fail: true,
+            ..Self::default()
+        }
+    }
+
+    fn path_calls(&self) -> Vec<String> {
+        self.path_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl FiligreeLookup for WardlineFindingClient {
+    fn associations_for(
+        &self,
+        _entity_id: &str,
+    ) -> Result<EntityAssociationsResponse, FiligreeClientError> {
+        Ok(EntityAssociationsResponse {
+            associations: Vec::new(),
+        })
+    }
+
+    fn wardline_findings_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Vec<WardlineFinding>, FiligreeClientError> {
+        self.path_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_owned());
+        if self.fail {
+            return Err(FiligreeClientError::HttpStatus {
+                status: 503,
+                body: "down".to_owned(),
+            });
+        }
+        Ok(self
+            .findings_by_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+fn wardline_finding(qualname: &str, rule_id: &str) -> WardlineFinding {
+    WardlineFinding {
+        rule_id: rule_id.to_owned(),
+        message: "tainted sink".to_owned(),
+        severity: Some("high".to_owned()),
+        status: Some("open".to_owned()),
+        line_start: Some(10),
+        line_end: Some(10),
+        fingerprint: Some(format!("fp-{rule_id}")),
+        file_id: Some("file-demo".to_owned()),
+        metadata: json!({"wardline": {"qualname": qualname}}),
+    }
 }
 
 fn insert_entity(
@@ -231,6 +327,36 @@ async fn entity_sei_is_null_without_binding_and_populated_with_one() {
     );
 }
 
+#[tokio::test]
+async fn wardline_for_accepts_sei_and_resolves_to_same_entity_as_locator() {
+    // Item 1 (clarion-d76e7f7267): wardline_for accepts a SEI and resolves it to
+    // the same entity as the locator.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_taint_fact(
+        &conn,
+        "python:function:m.f",
+        r#"{"taint":"tainted","sources":["request.body"]}"#,
+    );
+    insert_alive_sei(&conn, "loomweave:eid:mf", "python:function:m.f");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let by_locator = call_tool(&state, "wardline_for", json!({"id": "python:function:m.f"})).await;
+    let by_sei = call_tool(&state, "wardline_for", json!({"id": "loomweave:eid:mf"})).await;
+
+    assert_eq!(by_locator["ok"], true, "{by_locator}");
+    assert_eq!(by_sei["ok"], true, "SEI must resolve: {by_sei}");
+    assert_eq!(by_sei["result"]["result_kind"], "present");
+    assert_eq!(by_sei["result"], by_locator["result"]);
+}
+
 // ---- findings_for -------------------------------------------------------
 
 #[tokio::test]
@@ -371,6 +497,266 @@ async fn findings_for_empty_entity_is_not_an_error() {
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["page"]["total"], 0);
     assert!(env["result"]["findings"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn findings_for_rejects_unknown_filter_values_with_vocabulary() {
+    // clarion-c137d73ebf: kind/severity/status are closed sets (ADR-031 CHECK
+    // constraints), so a typo'd value can never match a row — silently
+    // returning an empty page is indistinguishable from a clean entity. An
+    // unknown value is a caller bug: JSON-RPC param error (-32602) naming the
+    // valid vocabulary, mirroring the unknown-argument-KEY precedent.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    for (field, bad, vocab_member) in [
+        ("severity", "eror", "CRITICAL"),
+        ("kind", "defct", "classification"),
+        ("status", "opne", "promoted_to_issue"),
+    ] {
+        let response = state
+            .handle_json_rpc(&json!({
+                "jsonrpc": "2.0",
+                "id": "bad-filter",
+                "method": "tools/call",
+                "params": {"name": "entity_finding_list", "arguments": {
+                    "id": "python:function:m.f",
+                    "filter": {field: bad}
+                }}
+            }))
+            .await
+            .expect("response");
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "filter.{field}={bad} must be a param error: {response}"
+        );
+        let message = response["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains(vocab_member),
+            "filter.{field} error must list the valid vocabulary: {message}"
+        );
+        assert!(
+            message.contains(bad),
+            "filter.{field} error must echo the rejected value: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn findings_for_filter_values_canonicalize_case() {
+    // The canonical vocabulary mixes cases (severity uppercase, kind/status
+    // lowercase) and agents reliably type the other one — `severity: "error"`
+    // appeared in our own skill example. Case-insensitive input canonicalises
+    // instead of rejecting, and the echoed filter shows the canonical value.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    insert_finding(
+        &conn,
+        "f-err",
+        "python:function:m.f",
+        "defect",
+        "ERROR",
+        "open",
+    );
+    insert_finding(
+        &conn,
+        "f-info",
+        "python:function:m.f",
+        "fact",
+        "INFO",
+        "open",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_finding_list",
+        json!({"id": "python:function:m.f", "filter": {"severity": "error", "kind": "DEFECT", "status": "Open"}}),
+    )
+    .await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["findings"][0]["id"], "f-err", "{env}");
+    assert_eq!(env["result"]["filter"]["severity"], "ERROR", "{env}");
+    assert_eq!(env["result"]["filter"]["kind"], "defect", "{env}");
+    assert_eq!(env["result"]["filter"]["status"], "open", "{env}");
+}
+
+// ---- project_finding_list (L1: whole-project finding browser) -----------
+
+#[tokio::test]
+async fn project_finding_list_total_reconciles_with_project_status_finding_count() {
+    // The L1 acceptance: an agent must be able to go from project_status's
+    // `findings: N` straight to the N findings — so the project-wide list's
+    // page.total must reconcile with project_status_get's finding count.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((3, 4)));
+    insert_finding(&conn, "f-1", "python:function:a", "defect", "WARN", "open");
+    insert_finding(&conn, "f-2", "python:function:a", "defect", "ERROR", "open");
+    insert_finding(&conn, "f-3", "python:function:b", "fact", "INFO", "open");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let status = call_tool(&state, "project_status", json!({})).await;
+    let count = status["result"]["counts"]["findings"].as_i64().unwrap();
+    assert_eq!(count, 3, "{status}");
+
+    let env = call_tool(&state, "project_finding_list", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(
+        env["result"]["page"]["total"].as_i64().unwrap(),
+        count,
+        "project_finding_list total must reconcile with project_status finding count: {env}"
+    );
+    assert_eq!(
+        env["result"]["findings"].as_array().unwrap().len(),
+        3,
+        "{env}"
+    );
+}
+
+#[tokio::test]
+async fn project_finding_list_honest_empty_when_no_findings() {
+    // Honest-empty: a project with 0 findings returns an empty list, not an error.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "project_finding_list", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+    assert!(
+        env["result"]["findings"].as_array().unwrap().is_empty(),
+        "{env}"
+    );
+}
+
+#[tokio::test]
+async fn project_finding_list_rows_carry_entity_sei_file_line_severity_rule() {
+    // Each finding carries its anchoring entity SEI + file:line + severity/rule —
+    // with no entity id supplied by the caller.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((4, 9)),
+    );
+    insert_alive_sei(&conn, "loomweave:eid:abc123", "python:function:m.f");
+    insert_finding(
+        &conn,
+        "f-1",
+        "python:function:m.f",
+        "defect",
+        "WARN",
+        "open",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "project_finding_list", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let row = &env["result"]["findings"][0];
+    assert_eq!(row["rule_id"], "R1", "{env}");
+    assert_eq!(row["severity"], "WARN", "{env}");
+    assert_eq!(row["entity"]["id"], "python:function:m.f", "{env}");
+    assert_eq!(row["entity"]["sei"], "loomweave:eid:abc123", "{env}");
+    assert_eq!(row["entity"]["file"], "m.py", "{env}");
+    assert_eq!(row["entity"]["line"], 4, "{env}");
+}
+
+#[tokio::test]
+async fn project_finding_list_rejects_unknown_filter_value() {
+    // Same closed-set discipline as entity_finding_list — both routes share
+    // FindingFilter::parse, but the contract is asserted per registered tool.
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    let response = state
+        .handle_json_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": "bad-filter",
+            "method": "tools/call",
+            "params": {"name": "project_finding_list", "arguments": {
+                "filter": {"severity": "eror"}
+            }}
+        }))
+        .await
+        .expect("response");
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "typo'd severity must be a param error: {response}"
+    );
+    let message = response["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("CRITICAL") && message.contains("eror"),
+        "error must list the vocabulary and echo the rejected value: {message}"
+    );
+}
+
+#[tokio::test]
+async fn project_finding_list_filters_and_paginates() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    for i in 0..5 {
+        insert_finding(
+            &conn,
+            &format!("f-{i}"),
+            "python:function:a",
+            "defect",
+            "WARN",
+            "open",
+        );
+    }
+    insert_finding(
+        &conn,
+        "z-crit",
+        "python:function:a",
+        "defect",
+        "CRITICAL",
+        "open",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Filter: only the CRITICAL one.
+    let env = call_tool(
+        &state,
+        "project_finding_list",
+        json!({"filter": {"severity": "CRITICAL"}}),
+    )
+    .await;
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["findings"][0]["id"], "z-crit", "{env}");
+
+    // Paginate over the full set (6 findings).
+    let env = call_tool(
+        &state,
+        "project_finding_list",
+        json!({"limit": 2, "offset": 0}),
+    )
+    .await;
+    assert_eq!(env["result"]["page"]["total"], 6, "{env}");
+    assert_eq!(env["result"]["page"]["returned"], 2, "{env}");
+    assert_eq!(env["result"]["page"]["truncated"], true, "{env}");
 }
 
 // ---- guidance_for -------------------------------------------------------
@@ -565,17 +951,32 @@ async fn find_by_kind_returns_matching_entities_with_sei_field() {
         ents[0].get("sei").is_some(),
         "entity rows must carry sei: {env}"
     );
+    assert!(
+        env["result"].get("known_kinds").is_none(),
+        "known_kinds is an unknown-kind hint, not a constant payload: {env}"
+    );
 }
 
 #[tokio::test]
-async fn find_by_kind_unknown_kind_is_empty_not_error() {
+async fn find_by_kind_unknown_kind_is_empty_with_known_kinds_hint() {
+    // clarion-c137d73ebf: kinds are plugin-owned (an OPEN set, unlike finding
+    // filters) so an unknown kind cannot be rejected up front — but the empty
+    // result must be distinguishable from "kind exists, no matches in scope".
+    // When the kind matches zero entities project-wide the result carries the
+    // kinds the index actually holds.
     let (project, db, conn) = open_project();
     insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:class:C", "class", "c.py", Some((1, 2)));
     drop(conn);
     let state = state_for(project.path(), &db);
     let env = call_tool(&state, "find_by_kind", json!({"kind": "nonesuch"})).await;
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(
+        env["result"]["known_kinds"],
+        json!(["class", "function"]),
+        "empty-by-unknown-kind must list the kinds the index holds: {env}"
+    );
 }
 
 #[tokio::test]
@@ -613,6 +1014,60 @@ async fn find_by_tag_is_honest_empty_when_no_tag_emitted() {
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["page"]["total"], 0);
     assert_eq!(env["result"]["signal"]["available"], false);
+}
+
+#[tokio::test]
+async fn find_by_tag_empty_reason_is_derived_from_reality_not_hand_maintained() {
+    // weft-7256739b31 (dogfood-4 B10b): the honest-empty reason claimed "the
+    // Python plugin emits none today" while test/data-model/entry-point tags
+    // were demonstrably populated in the same index. The reason must be derived
+    // from the store: name the tags that ARE present, and never assert that
+    // plugins emit no tags when they visibly do.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((1, 2)));
+    insert_tag(&conn, "python:function:a", "test");
+    insert_tag(&conn, "python:function:b", "entry-point");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "no-such-tag"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(env["result"]["signal"]["available"], false);
+    let reason = env["result"]["signal"]["reason"]
+        .as_str()
+        .expect("missing-signal reason is a string");
+    assert!(
+        !reason.contains("emits none"),
+        "the reason must not claim plugins emit no tags when tags are populated: {reason}"
+    );
+    // The truthful, reality-derived hint: the tags this index actually holds.
+    let known = env["result"]["known_tags"]
+        .as_array()
+        .unwrap_or_else(|| panic!("known_tags must list the populated tags: {env}"));
+    let known: Vec<&str> = known.iter().filter_map(Value::as_str).collect();
+    assert_eq!(known, ["entry-point", "test"], "{env}");
+}
+
+#[tokio::test]
+async fn find_by_tag_empty_reason_on_tagless_index_says_so() {
+    // The other truthful branch: an index with NO tags at all says exactly
+    // that, with an empty known_tags list.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "test"})).await;
+    assert_eq!(env["result"]["page"]["total"], 0);
+    assert_eq!(env["result"]["signal"]["available"], false);
+    assert_eq!(env["result"]["known_tags"], json!([]), "{env}");
+    let reason = env["result"]["signal"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("no categorisation tags"),
+        "a tagless index must say no tags are populated at all: {reason}"
+    );
 }
 
 #[tokio::test]
@@ -730,6 +1185,168 @@ async fn find_by_wardline_honest_empty_when_no_facts() {
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["page"]["total"], 0);
     assert_eq!(env["result"]["signal"]["available"], false);
+}
+
+#[tokio::test]
+async fn find_by_wardline_has_findings_filter_restricts_to_fact_carrying_entities() {
+    // L1 complement: page only the wardline entities that actually carry
+    // findings, instead of every taint-fact-bearing entity.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_entity(&conn, "python:function:b", "function", "b.py", Some((1, 2)));
+    insert_taint_fact(&conn, "python:function:a", r#"{"tier":"exact"}"#);
+    insert_taint_fact(&conn, "python:function:b", r#"{"tier":"exact"}"#);
+    // Only `a` carries a finding.
+    insert_finding(&conn, "f-1", "python:function:a", "defect", "WARN", "open");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Unfiltered: both taint-fact entities.
+    let env = call_tool(&state, "find_by_wardline", json!({})).await;
+    assert_eq!(env["result"]["page"]["total"], 2, "{env}");
+
+    // has_findings: true → only `a`.
+    let env = call_tool(&state, "find_by_wardline", json!({"has_findings": true})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(
+        env["result"]["entities"][0]["id"], "python:function:a",
+        "{env}"
+    );
+    assert_eq!(env["result"]["facet"]["has_findings"], true, "{env}");
+}
+
+#[tokio::test]
+async fn find_by_wardline_has_findings_uses_filigree_wardline_enrichment() {
+    // Lacuna dogfood regression: targeted enrichment (`entity_issue_list`) can
+    // hydrate Wardline findings from Filigree even when the local Loomweave
+    // findings table is empty. The browse/facet path must agree.
+    let (project, db, conn) = open_project();
+    std::fs::create_dir_all(project.path().join("src")).expect("create src dir");
+    std::fs::write(
+        project.path().join("src/demo.py"),
+        "def hello():\n    pass\n",
+    )
+    .expect("write source");
+    insert_entity(
+        &conn,
+        "python:function:demo.hello",
+        "function",
+        "src/demo.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:demo.other",
+        "function",
+        "src/demo.py",
+        Some((4, 5)),
+    );
+    insert_taint_fact(&conn, "python:function:demo.hello", r#"{"tier":"exact"}"#);
+    insert_taint_fact(&conn, "python:function:demo.other", r#"{"tier":"exact"}"#);
+    drop(conn);
+
+    let client = Arc::new(WardlineFindingClient::default().with_findings_for_path(
+        "src/demo.py",
+        vec![wardline_finding("demo.hello", "WLN-TAINT-001")],
+    ));
+    let state = state_for_filigree(project.path(), &db, client.clone());
+
+    let targeted = call_tool(
+        &state,
+        "entity_issue_list",
+        json!({"id": "python:function:demo.hello", "include_contained": false}),
+    )
+    .await;
+    assert_eq!(targeted["ok"], true, "{targeted}");
+    assert_eq!(
+        targeted["result"]["wardline_findings"]["result_kind"], "matched",
+        "{targeted}"
+    );
+
+    let listed = call_tool(
+        &state,
+        "entity_wardline_list",
+        json!({"has_findings": true}),
+    )
+    .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(listed["result"]["page"]["total"], 1, "{listed}");
+    assert_eq!(
+        listed["result"]["entities"][0]["id"], "python:function:demo.hello",
+        "{listed}"
+    );
+    assert_eq!(
+        client.path_calls(),
+        vec!["src/demo.py".to_owned(), "src/demo.py".to_owned()],
+        "targeted lookup plus cached browse lookup should each resolve the project-relative path"
+    );
+}
+
+#[tokio::test]
+async fn find_by_wardline_has_findings_emits_degrade_marker_on_filigree_outage() {
+    // L4: during a Filigree outage the has_findings filter cannot evaluate the
+    // Filigree-only-finding entities (no local anchor row), so they are dropped.
+    // The response must carry an in-band `wardline` degrade marker rather than
+    // an affirmative "no entity matches" missing-signal — "couldn't check" must
+    // never be conflated with "confirmed none".
+    let (project, db, conn) = open_project();
+    std::fs::create_dir_all(project.path().join("src")).expect("create src dir");
+    std::fs::write(
+        project.path().join("src/demo.py"),
+        "def hello():\n    pass\n",
+    )
+    .expect("write source");
+    insert_entity(
+        &conn,
+        "python:function:demo.hello",
+        "function",
+        "src/demo.py",
+        Some((1, 2)),
+    );
+    insert_taint_fact(&conn, "python:function:demo.hello", r#"{"tier":"exact"}"#);
+    // No local findings row: the only path to a positive has_findings answer is
+    // the Filigree Wardline lookup — which is down.
+    drop(conn);
+
+    let client = Arc::new(WardlineFindingClient::failing());
+    let state = state_for_filigree(project.path(), &db, client.clone());
+
+    let listed = call_tool(
+        &state,
+        "entity_wardline_list",
+        json!({"has_findings": true}),
+    )
+    .await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    // The entity was dropped (enrich-only: the outage never breaks the facet)...
+    assert_eq!(listed["result"]["page"]["total"], 0, "{listed}");
+    // ...but the result is explicitly marked degraded, NOT a confirmed empty.
+    assert_eq!(
+        listed["result"]["wardline"]["result_kind"], "unavailable",
+        "a Filigree outage must surface an in-band wardline degrade marker: {listed}"
+    );
+    assert!(
+        listed["result"]["signal"].is_null(),
+        "the affirmative 'no entity matches' missing-signal must NOT appear on a degraded read: {listed}"
+    );
+}
+
+#[test]
+fn entity_wardline_list_schema_declares_has_findings() {
+    // additionalProperties:false on the advertised schema would reject an
+    // undeclared param, so has_findings must be declared for clients to send it.
+    let tools = list_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == "entity_wardline_list")
+        .expect("entity_wardline_list tool definition");
+    assert_eq!(
+        tool.input_schema["properties"]["has_findings"],
+        json!({"type": "boolean"}),
+        "{:#}",
+        tool.input_schema
+    );
 }
 
 // ---- graph shortcuts ----------------------------------------------------
@@ -1212,6 +1829,115 @@ fn insert_ambiguous_calls_edge(conn: &Connection, from: &str, to: &str, candidat
     .expect("insert ambiguous calls edge");
 }
 
+/// Like [`insert_entity`] but with an explicit `short_name` (the terminal
+/// identifier). The dead-code unresolved-call-site shield matches a candidate's
+/// `short_name` against unresolved callee leaves, so realistic leaf names
+/// (`do_work`, not the full id) are required to exercise it.
+fn insert_entity_named(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    source_path: &str,
+    range: Option<(i64, i64)>,
+    short_name: &str,
+) {
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at) \
+         VALUES (?1,'rust',?2,?1,?6,?3,?4,?5,'{}','hash','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+        params![id, kind, source_path, range.map(|(s, _)| s), range.map(|(_, e)| e), short_name],
+    )
+    .expect("insert named entity");
+}
+
+/// Record an unresolved call site whose caller is content-current (hash `hash`,
+/// matching [`insert_entity`] / [`insert_entity_named`]), so the dead-code
+/// staleness join keeps it. `callee_expr` is the recorded form (`.foo` for a
+/// method call, `Type::assoc` for an associated call).
+fn insert_unresolved_site(conn: &Connection, caller_id: &str, site_key: &str, callee_expr: &str) {
+    conn.execute(
+        "INSERT INTO entity_unresolved_call_sites ( \
+            caller_entity_id, caller_content_hash, site_key, site_ordinal, \
+            source_byte_start, source_byte_end, callee_expr, created_at \
+         ) VALUES (?1, 'hash', ?2, 0, 10, 20, ?3, '2026-01-01T00:00:00.000Z')",
+        params![caller_id, site_key, callee_expr],
+    )
+    .expect("insert unresolved site");
+}
+
+// clarion-… consumer honesty: a function reached ONLY via an unresolved call
+// site (a method `x.do_work()` or associated `Svc::make()` call the Rust
+// resolver could not bind — no `calls` edge) has no incoming edge, so pure
+// static reachability would false-flag it dead. The dead-code tool must spare
+// it (fail toward live) and disclose the suppression count.
+#[tokio::test]
+async fn find_dead_code_spares_fn_reached_only_via_unresolved_call_site() {
+    let (project, db, conn) = open_project();
+    // Root so the reachability root set is non-empty (else signal-unavailable).
+    // Inserted as a RUST-plugin entity (matching the candidates below) so the
+    // rust plugin has root coverage and its entities are surveyed — the
+    // per-plugin honest-exclusion path (weft-3fb0f5dfc7) is exercised by its
+    // own test.
+    insert_entity_named(
+        &conn,
+        "rust:function:app.main",
+        "function",
+        "app.rs",
+        Some((1, 5)),
+        "main",
+    );
+    insert_tag(&conn, "rust:function:app.main", "entry-point");
+    // Reached ONLY via an unresolved method call `.do_work` — no edge.
+    insert_entity_named(
+        &conn,
+        "rust:function:app.Svc.impl.do_work",
+        "function",
+        "app.rs",
+        Some((6, 9)),
+        "do_work",
+    );
+    insert_unresolved_site(&conn, "rust:function:app.main", "s0", ".do_work");
+    // Reached ONLY via an unresolved associated call `Svc::make` — no edge.
+    insert_entity_named(
+        &conn,
+        "rust:function:app.Svc.impl.make",
+        "function",
+        "app.rs",
+        Some((10, 12)),
+        "make",
+    );
+    insert_unresolved_site(&conn, "rust:function:app.main", "s1", "Svc::make");
+    // Genuinely dead — no edge and no unresolved site names it.
+    insert_entity_named(
+        &conn,
+        "rust:function:app.orphan",
+        "function",
+        "app.rs",
+        Some((13, 15)),
+        "orphan",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["rust:function:app.orphan".to_owned()],
+        "method/assoc-only-called fns must be spared; only the true orphan is dead: {env}"
+    );
+    assert_eq!(
+        env["result"]["unresolved_call_site_suppressed"], 2,
+        "the two unresolved-call-site shields must be disclosed: {env}"
+    );
+}
+
 #[test]
 fn tools_list_includes_find_dead_code() {
     let names: Vec<&str> = list_tools().iter().map(|t| t.name).collect();
@@ -1328,20 +2054,78 @@ async fn find_dead_code_flags_unreachable_and_spares_live() {
     assert_eq!(dead, vec!["python:function:unused".to_owned()], "{env}");
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
 
-    let candidate = &env["result"]["dead_code"][0];
-    assert_eq!(
-        candidate["rule_id"], "LMWV-FACT-DEAD-CODE-CANDIDATE",
-        "{env}"
-    );
-    assert_eq!(candidate["kind"], "fact", "{env}");
-    assert_eq!(candidate["confidence_basis"], "heuristic", "{env}");
+    // The candidate facets are hoisted to the top-level `finding` block
+    // (weft-3fb0f5dfc7 — they used to repeat verbatim on every row).
+    let finding = &env["result"]["finding"];
+    assert_eq!(finding["rule_id"], "LMWV-FACT-DEAD-CODE-CANDIDATE", "{env}");
+    assert_eq!(finding["kind"], "fact", "{env}");
+    assert_eq!(finding["confidence_basis"], "heuristic", "{env}");
     assert!(
-        candidate["confidence"].as_f64().unwrap() < 1.0,
+        finding["confidence"].as_f64().unwrap() < 1.0,
         "heuristic confidence must be < 1: {env}"
     );
+    let candidate = &env["result"]["dead_code"][0];
     assert!(
         candidate["entity"]["sei"].is_null() || candidate["entity"]["sei"].is_string(),
         "candidate carries an sei field: {env}"
+    );
+}
+
+// clarion-bf496d55d1 §4.2: a Wardline-derived trust-boundary tag
+// (`wardline:external_boundary` / `wardline:trusted`, emitted by the Python
+// plugin from the on-disk Wardline vocabulary descriptor) acts as a reachability
+// root, so a statically-unreached but human-annotated trust boundary is NOT
+// flagged dead, while an untagged unreached entity still is.
+#[tokio::test]
+async fn find_dead_code_treats_wardline_trust_boundaries_as_roots() {
+    let (project, db, conn) = open_project();
+    // An externally-invoked boundary: unreached over static edges, but annotated
+    // @external_boundary -> wardline:external_boundary. Must be a root, not dead.
+    insert_entity(
+        &conn,
+        "python:function:webhook",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(
+        &conn,
+        "python:function:webhook",
+        "wardline:external_boundary",
+    );
+    // A trusted producer: @trusted -> wardline:trusted. Also a root.
+    insert_entity(
+        &conn,
+        "python:function:mint_token",
+        "function",
+        "app.py",
+        Some((6, 10)),
+    );
+    insert_tag(&conn, "python:function:mint_token", "wardline:trusted");
+    // Genuinely dead leaf — unreached and untagged.
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((11, 15)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "only the untagged unreached entity is dead; the Wardline trust \
+         boundaries are roots: {env}"
     );
 }
 
@@ -1434,7 +2218,7 @@ async fn search_semantic_ranks_by_cosine_similarity() {
     drop(conn);
 
     let now = "2026-01-01T00:00:00.000Z";
-    let store = EmbeddingStore::open_in_loomweave_dir(project.path()).expect("open sidecar");
+    let store = EmbeddingStore::open_in_store_dir(project.path()).expect("open sidecar");
     let mk = |id: &str, hash: &str| EmbeddingKey {
         entity_id: id.to_owned(),
         content_hash: hash.to_owned(),
@@ -1496,4 +2280,1328 @@ async fn search_semantic_ranks_by_cosine_similarity() {
         results[0]["score"].as_f64().unwrap() > results[1]["score"].as_f64().unwrap(),
         "login should outrank add: {env}"
     );
+}
+
+// ---- briefing_blocked identity gate (clarion-307668e2be) ----------------
+
+/// Like [`insert_entity`] but marks the row briefing-blocked. `content_hash` is
+/// kept identical to [`insert_entity`] ("hash") so embedding keys still match.
+fn insert_blocked_entity(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    source_path: &str,
+    range: Option<(i64, i64)>,
+    reason: &str,
+) {
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            source_line_start, source_line_end, properties, content_hash, created_at, updated_at) \
+         VALUES (?1,'python',?2,?1,?1,?3,?4,?5,?6,'hash','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+        params![
+            id,
+            kind,
+            source_path,
+            range.map(|(s, _)| s),
+            range.map(|(_, e)| e),
+            json!({"briefing_blocked": reason}).to_string(),
+        ],
+    )
+    .expect("insert blocked entity");
+}
+
+/// Assert an entity projection is a redacted stub: every identity field null,
+/// only the block reason present.
+fn assert_redacted_identity(entity: &Value, reason: &str) {
+    assert_eq!(entity["briefing_blocked"], reason, "stub reason: {entity}");
+    for field in [
+        "id",
+        "sei",
+        "kind",
+        "name",
+        "short_name",
+        "source_file_path",
+        "source_line_start",
+        "source_line_end",
+        "content_hash",
+    ] {
+        assert!(
+            entity.get(field).is_none_or(Value::is_null),
+            "identity field `{field}` must be withheld for a blocked entity: {entity}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn find_by_kind_redacts_briefing_blocked_identity() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:visible",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_blocked_entity(
+        &conn,
+        "python:function:leaky",
+        "function",
+        "b.py",
+        Some((3, 4)),
+        "secret_present",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_kind", json!({"kind": "function"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    // Both functions counted; the blocked one is a stub, not omitted.
+    assert_eq!(env["result"]["page"]["total"], 2, "{env}");
+    let blocked = env["result"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["briefing_blocked"] == "secret_present")
+        .expect("blocked entity stub present");
+    assert_redacted_identity(blocked, "secret_present");
+    assert!(
+        !env.to_string().contains("python:function:leaky"),
+        "blocked id leaked in find_by_kind response: {env}"
+    );
+}
+
+#[tokio::test]
+async fn search_semantic_redacts_briefing_blocked_identity() {
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "python:function:login",
+        "function",
+        "auth.py",
+        Some((1, 2)),
+        "secret_present",
+    );
+    drop(conn);
+
+    let now = "2026-01-01T00:00:00.000Z";
+    let store = EmbeddingStore::open_in_store_dir(project.path()).expect("open sidecar");
+    let key = EmbeddingKey {
+        entity_id: "python:function:login".to_owned(),
+        content_hash: "hash".to_owned(),
+        model_id: "rec-model".to_owned(),
+    };
+    store
+        .upsert(&key, &[1.0, 0.0], 0.0, 1, now)
+        .expect("upsert login embedding");
+    drop(store);
+
+    let provider = Arc::new(RecordingEmbeddingProvider::from_recordings(
+        "rec-model",
+        2,
+        vec![EmbeddingRecording {
+            text: "authenticate user".to_owned(),
+            vector: vec![0.9, 0.1],
+        }],
+    ));
+    let config = SemanticSearchConfig {
+        enabled: true,
+        model_id: "rec-model".to_owned(),
+        dimensions: 2,
+        ..SemanticSearchConfig::default()
+    };
+    let state = state_for(project.path(), &db).with_semantic_search(config, provider);
+
+    let env = call_tool(
+        &state,
+        "search_semantic",
+        json!({"query": "authenticate user"}),
+    )
+    .await;
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "{env}");
+    assert_redacted_identity(&results[0]["entity"], "secret_present");
+    assert!(
+        !env.to_string().contains("python:function:login"),
+        "blocked id leaked in search_semantic response: {env}"
+    );
+}
+
+#[tokio::test]
+async fn find_by_wardline_redacts_blocked_entity_and_withholds_blob() {
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "python:function:tainted",
+        "function",
+        "t.py",
+        Some((1, 2)),
+        "secret_present",
+    );
+    // The Wardline taint blob embeds a qualname — which would survive the
+    // identity stub if attached.
+    insert_taint_fact(
+        &conn,
+        "python:function:tainted",
+        &json!({"qualname": "app.secrets.tainted", "tier": "high"}).to_string(),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_wardline", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let blocked = env["result"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["briefing_blocked"] == "secret_present")
+        .expect("blocked entity stub present");
+    assert_redacted_identity(blocked, "secret_present");
+    assert!(
+        blocked["wardline"].is_null(),
+        "wardline blob leaks identity for a blocked entity: {blocked}"
+    );
+    assert!(
+        !env.to_string().contains("app.secrets.tainted"),
+        "qualname leaked via the wardline blob: {env}"
+    );
+    assert!(
+        !env.to_string().contains("python:function:tainted"),
+        "blocked id leaked in find_by_wardline response: {env}"
+    );
+}
+
+// ---- entity_resolve (Item 2, clarion-d76e7f7267) ------------------------
+
+#[tokio::test]
+async fn entity_resolve_resolves_qualname_to_id_and_sei() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["qualname"], "demo.entry");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["id"], "python:function:demo.entry");
+    assert_eq!(candidates[0]["sei"], "loomweave:eid:demo-entry");
+    assert_eq!(candidates[0]["kind"], "function");
+}
+
+#[tokio::test]
+async fn entity_resolve_full_locator_input_resolves_to_sei_gv_lw_5() {
+    // GV-LW-5 (warpline interface-lock 2026-06-13, HX1): warpline resolves SEIs by
+    // passing a fully-formed Loomweave locator (`python:function:m.f`), not the
+    // bare qualname. It must resolve to the real `loomweave:eid:` SEI so warpline
+    // stores `sei` + `enrichment.sei: present` instead of `sei: null`.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["python:function:demo.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["qualname"], "python:function:demo.entry");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["id"], "python:function:demo.entry");
+    assert_eq!(candidates[0]["sei"], "loomweave:eid:demo-entry");
+}
+
+#[tokio::test]
+async fn entity_resolve_unknown_qualname_is_unresolved_not_error() {
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["no.such.thing"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "honest-empty, not an error: {env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["result_kind"], "unresolved");
+    assert_eq!(
+        results[0]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_preserves_input_order_across_batch() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:a.one",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:b.two",
+        "function",
+        "b.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Order: known, unknown, known — must echo back in exactly this order.
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["b.two", "missing.x", "a.one"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["qualname"], "b.two");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    assert_eq!(results[1]["qualname"], "missing.x");
+    assert_eq!(results[1]["result_kind"], "unresolved");
+    assert_eq!(results[2]["qualname"], "a.one");
+    assert_eq!(results[2]["candidates"][0]["id"], "python:function:a.one");
+}
+
+#[tokio::test]
+async fn entity_resolve_over_cap_is_param_error() {
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    // A ParamError surfaces as a JSON-RPC error (-32602), not a tool envelope,
+    // so drive handle_json_rpc directly.
+    let qualnames: Vec<String> = (0..2001).map(|i| format!("q.{i}")).collect();
+    let response = state
+        .handle_json_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": "over-cap",
+            "method": "tools/call",
+            "params": {"name": "entity_resolve", "arguments": {"qualnames": qualnames}}
+        }))
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "over-cap must be a JSON-RPC param error: {response}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_collapses_briefing_blocked_candidate_to_stub() {
+    // Landmine #9: a blocked entity's candidate must collapse to the stub —
+    // routing through entity_json — so the reverse-map never discloses a
+    // secret-scan-blocked locator.
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "python:function:secret.handler",
+        "function",
+        "secret.py",
+        Some((1, 2)),
+        "secret_in_source",
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:secret",
+        "python:function:secret.handler",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["secret.handler"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidate = &results[0]["candidates"][0];
+    assert_redacted_identity(candidate, "secret_in_source");
+    assert!(
+        !env.to_string().contains("python:function:secret.handler"),
+        "blocked locator leaked via entity_resolve: {env}"
+    );
+    assert!(
+        !env.to_string().contains("loomweave:eid:secret"),
+        "blocked SEI leaked via entity_resolve: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_resolves_rust_qualname_to_id_and_sei() {
+    // clarion-69db8b2739: per-plugin candidate minting resolves a Rust
+    // qualname to its `rust:function:` id (no longer python-only).
+    let (project, db, conn) = open_project();
+    insert_entity_named(
+        &conn,
+        "rust:function:mcp_fixture.ops.entry",
+        "function",
+        "ops.rs",
+        Some((1, 2)),
+        "entry",
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:rust-entry",
+        "rust:function:mcp_fixture.ops.entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["mcp_fixture.ops.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["id"], "rust:function:mcp_fixture.ops.entry");
+    assert_eq!(candidates[0]["sei"], "loomweave:eid:rust-entry");
+    assert_eq!(candidates[0]["kind"], "function");
+}
+
+#[tokio::test]
+async fn entity_resolve_same_qualname_under_two_plugins_is_ambiguous() {
+    // The same dotted qualname under both plugins surfaces as result_kind
+    // "ambiguous" with BOTH candidates (sorted: python < rust).
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:dual.target",
+        "function",
+        "dual.py",
+        Some((1, 2)),
+    );
+    insert_entity_named(
+        &conn,
+        "rust:function:dual.target",
+        "function",
+        "dual.rs",
+        Some((1, 2)),
+        "target",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.target"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["result_kind"], "ambiguous");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 2);
+    let ids: Vec<&str> = candidates
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["python:function:dual.target", "rust:function:dual.target"],
+        "both candidates, sorted: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_collapses_briefing_blocked_rust_candidate_to_stub() {
+    // The stub-collapse non-disclosure property applies to RUST candidates too:
+    // a briefing-blocked rust:function entity must come back as the redacted
+    // stub, never leaking its locator or SEI.
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "rust:function:secret.rust_handler",
+        "function",
+        "secret.rs",
+        Some((1, 2)),
+        "secret_in_source",
+    );
+    // Mark plugin_id=rust so per-plugin candidate minting enumerates it.
+    conn.execute(
+        "UPDATE entities SET plugin_id = 'rust' WHERE id = ?1",
+        params!["rust:function:secret.rust_handler"],
+    )
+    .expect("set plugin_id");
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:rust-secret",
+        "rust:function:secret.rust_handler",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["secret.rust_handler"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidate = &results[0]["candidates"][0];
+    assert_redacted_identity(candidate, "secret_in_source");
+    assert!(
+        !env.to_string()
+            .contains("rust:function:secret.rust_handler"),
+        "blocked rust locator leaked via entity_resolve: {env}"
+    );
+    assert!(
+        !env.to_string().contains("loomweave:eid:rust-secret"),
+        "blocked SEI leaked via entity_resolve: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_rejects_blank_kind_and_blank_plugin() {
+    // clarion-c2bb394f46: `kind` and `plugin` are free-form constraints, but a
+    // BLANK value is a caller bug — JSON-RPC param error (-32602), mirroring
+    // the HTTP layer's blank-rejection adjudication (ADR-036 plugin hint).
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    for (param, value) in [("kind", "  "), ("plugin", "")] {
+        let response = state
+            .handle_json_rpc(&json!({
+                "jsonrpc": "2.0",
+                "id": "blank-param",
+                "method": "tools/call",
+                "params": {
+                    "name": "entity_resolve",
+                    "arguments": {"qualnames": ["demo.entry"], param: value}
+                }
+            }))
+            .await
+            .expect("response");
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "blank {param} must be a JSON-RPC param error: {response}"
+        );
+    }
+}
+
+// ---- entity_resolve all-kinds + SEI + plugin hint (clarion-c2bb394f46) ----
+
+#[tokio::test]
+async fn entity_resolve_resolves_class_qualname_to_id_and_sei() {
+    // The reverse-map is no longer function-only: a class qualname resolves to
+    // its identity row.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:class:demo.Widget",
+        "class",
+        "demo.py",
+        Some((1, 9)),
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:demo-widget",
+        "python:class:demo.Widget",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.Widget"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    let candidate = &results[0]["candidates"][0];
+    assert_eq!(candidate["id"], "python:class:demo.Widget");
+    assert_eq!(candidate["sei"], "loomweave:eid:demo-widget");
+    assert_eq!(candidate["kind"], "class");
+}
+
+#[tokio::test]
+async fn entity_resolve_resolves_rust_struct_qualname() {
+    let (project, db, conn) = open_project();
+    insert_entity_named(
+        &conn,
+        "rust:struct:mcp_fixture.ops.Widget",
+        "struct",
+        "ops.rs",
+        Some((1, 9)),
+        "Widget",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["mcp_fixture.ops.Widget"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    assert_eq!(
+        results[0]["candidates"][0]["id"],
+        "rust:struct:mcp_fixture.ops.Widget"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_cross_kind_collision_is_ambiguous_and_kind_constrains() {
+    // The same qualname as a python function AND class: honest ambiguous by
+    // default (sorted class < function); kind="class" collapses it; an unknown
+    // kind is a constraint nothing satisfies (unresolved, not an error).
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.thing",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:class:demo.thing",
+        "class",
+        "demo.py",
+        Some((4, 9)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.thing"]}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "ambiguous", "{env}");
+    let ids: Vec<&str> = results[0]["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["python:class:demo.thing", "python:function:demo.thing"],
+        "both kinds, sorted: {env}"
+    );
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.thing"], "kind": "class"}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved", "{env}");
+    assert_eq!(results[0]["candidates"][0]["id"], "python:class:demo.thing");
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.thing"], "kind": "nosuch"}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(
+        results[0]["result_kind"], "unresolved",
+        "unknown kind is honest-empty, not an error: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_plugin_hint_constrains_cross_plugin_collision() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:dual.target",
+        "function",
+        "dual.py",
+        Some((1, 2)),
+    );
+    insert_entity_named(
+        &conn,
+        "rust:function:dual.target",
+        "function",
+        "dual.rs",
+        Some((1, 2)),
+        "target",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.target"], "plugin": "python"}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved", "{env}");
+    assert_eq!(
+        results[0]["candidates"][0]["id"],
+        "python:function:dual.target"
+    );
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.target"], "plugin": "cobol"}),
+    )
+    .await;
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(
+        results[0]["result_kind"], "unresolved",
+        "unknown plugin is a constraint nothing satisfies: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_accepts_sei_entry_ignoring_constraints() {
+    // An SEI token in the batch is an exact identity lookup: it resolves to
+    // its alive entity row, and kind/plugin constraints do NOT apply (an SEI
+    // is already exact — constraining it can only manufacture a false miss).
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:demo-entry",
+        "python:function:demo.entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["loomweave:eid:demo-entry"], "kind": "class"}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(
+        results[0]["qualname"], "loomweave:eid:demo-entry",
+        "echoes the input as given: {env}"
+    );
+    assert_eq!(results[0]["result_kind"], "resolved", "{env}");
+    let candidate = &results[0]["candidates"][0];
+    assert_eq!(candidate["id"], "python:function:demo.entry");
+    assert_eq!(candidate["sei"], "loomweave:eid:demo-entry");
+}
+
+#[tokio::test]
+async fn entity_resolve_mixed_sei_and_qualname_batch_preserves_order() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:a.one",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:b.two",
+        "function",
+        "b.py",
+        Some((1, 2)),
+    );
+    insert_alive_sei(&conn, "loomweave:eid:a-one", "python:function:a.one");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["b.two", "loomweave:eid:a-one", "missing.x"]}),
+    )
+    .await;
+
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["qualname"], "b.two");
+    assert_eq!(results[0]["candidates"][0]["id"], "python:function:b.two");
+    assert_eq!(results[1]["qualname"], "loomweave:eid:a-one");
+    assert_eq!(results[1]["candidates"][0]["id"], "python:function:a.one");
+    assert_eq!(results[2]["qualname"], "missing.x");
+    assert_eq!(results[2]["result_kind"], "unresolved");
+}
+
+#[tokio::test]
+async fn entity_resolve_unknown_sei_is_unresolved_not_error() {
+    let (project, db, _conn) = open_project();
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["loomweave:eid:never-minted"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "honest-empty, not an error: {env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "unresolved");
+    assert_eq!(
+        results[0]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_blocked_sei_entry_collapses_to_stub() {
+    // The non-disclosure property holds on the SEI path too: an SEI whose
+    // entity is secret-scan-blocked resolves to the redacted stub, never
+    // leaking the locator.
+    let (project, db, conn) = open_project();
+    insert_blocked_entity(
+        &conn,
+        "python:function:secret.handler",
+        "function",
+        "secret.py",
+        Some((1, 2)),
+        "secret_in_source",
+    );
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:secret",
+        "python:function:secret.handler",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["loomweave:eid:secret"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results[0]["result_kind"], "resolved");
+    assert_redacted_identity(&results[0]["candidates"][0], "secret_in_source");
+    assert!(
+        !env.to_string().contains("python:function:secret.handler"),
+        "blocked locator leaked via SEI entry: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_normalizes_rust_path_separator() {
+    // MCP-audit F6 acceptance criterion: a pasted Rust `::` path (stack trace,
+    // compiler error, rustdoc) resolves — `::` normalizes to `.` for
+    // resolution while the result echoes the input as given. Storage stays
+    // byte-exact; normalization is this tool's input courtesy only.
+    let (project, db, conn) = open_project();
+    insert_entity_named(
+        &conn,
+        "rust:function:mcp_fixture.ops.entry",
+        "function",
+        "ops.rs",
+        Some((1, 2)),
+        "entry",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["mcp_fixture::ops::entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(
+        results[0]["qualname"], "mcp_fixture::ops::entry",
+        "echoes the :: form as pasted: {env}"
+    );
+    assert_eq!(results[0]["result_kind"], "resolved", "{env}");
+    assert_eq!(
+        results[0]["candidates"][0]["id"],
+        "rust:function:mcp_fixture.ops.entry"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_ambiguous_with_blocked_candidate_redacts_only_that_candidate() {
+    // Composition: a dual-plugin qualname where ONE candidate is
+    // briefing-blocked. result_kind stays "ambiguous" (both rows survive), the
+    // normal candidate keeps its identity, and the blocked one collapses to
+    // the redacted stub — its locator and SEI never appear anywhere in the
+    // envelope.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:dual.secret",
+        "function",
+        "dual.py",
+        Some((1, 2)),
+    );
+    insert_blocked_entity(
+        &conn,
+        "rust:function:dual.secret",
+        "function",
+        "secret.rs",
+        Some((1, 2)),
+        "secret_in_source",
+    );
+    // Mark plugin_id=rust so per-plugin candidate minting enumerates it.
+    conn.execute(
+        "UPDATE entities SET plugin_id = 'rust' WHERE id = ?1",
+        params!["rust:function:dual.secret"],
+    )
+    .expect("set plugin_id");
+    insert_alive_sei(
+        &conn,
+        "loomweave:eid:dual-secret",
+        "rust:function:dual.secret",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.secret"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["result_kind"], "ambiguous", "{env}");
+    let candidates = results[0]["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 2, "both candidates kept: {env}");
+    // Sorted python < rust: the python candidate comes first, identity intact…
+    assert_eq!(candidates[0]["id"], "python:function:dual.secret");
+    // …and the rust one is the redacted stub.
+    assert_redacted_identity(&candidates[1], "secret_in_source");
+    assert!(
+        !env.to_string().contains("rust:function:dual.secret"),
+        "blocked rust locator leaked via ambiguous entity_resolve: {env}"
+    );
+    assert!(
+        !env.to_string().contains("loomweave:eid:dual-secret"),
+        "blocked SEI leaked via ambiguous entity_resolve: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_mixed_batch_ambiguous_unresolved_resolved_in_order() {
+    // One batch carrying all three result kinds: results echo back in input
+    // order and the dual qualname's rust row must not cross-contaminate the
+    // python-only resolved entry.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:a.one",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:dual.target",
+        "function",
+        "dual.py",
+        Some((1, 2)),
+    );
+    insert_entity_named(
+        &conn,
+        "rust:function:dual.target",
+        "function",
+        "dual.rs",
+        Some((1, 2)),
+        "target",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["dual.target", "missing.x", "a.one"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let results = env["result"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["qualname"], "dual.target");
+    assert_eq!(results[0]["result_kind"], "ambiguous");
+    assert_eq!(
+        results[0]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        2,
+        "{env}"
+    );
+    assert_eq!(results[1]["qualname"], "missing.x");
+    assert_eq!(results[1]["result_kind"], "unresolved");
+    assert_eq!(
+        results[1]["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        0,
+        "{env}"
+    );
+    assert_eq!(results[2]["qualname"], "a.one");
+    assert_eq!(results[2]["result_kind"], "resolved");
+    let resolved = results[2]["candidates"].as_array().expect("candidates");
+    assert_eq!(resolved.len(), 1, "no cross-contamination: {env}");
+    assert_eq!(resolved[0]["id"], "python:function:a.one");
+}
+
+// ── B2 (weft-3fb0f5dfc7): entity_dead_list usable as a survey ─────────────────
+
+/// Insert an entity with an explicit plugin id (the shared helper hardcodes
+/// `python`); used by the dead-list survey tests below.
+fn insert_entity_with_plugin(
+    conn: &Connection,
+    id: &str,
+    plugin_id: &str,
+    kind: &str,
+    source_path: &str,
+    properties: &str,
+) {
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_path, \
+            properties, content_hash, created_at, updated_at) \
+         VALUES (?1,?2,?3,?1,?1,?4,?5,'hash','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+        params![id, plugin_id, kind, source_path, properties],
+    )
+    .expect("insert entity");
+}
+
+/// B2(1) failing-first: non-code entities — core `file` anchors (the dogfooded
+/// `.env.example`), the project anchor, subsystems, guidance — must never be
+/// "dead CODE" candidates.
+#[tokio::test]
+async fn find_dead_code_excludes_non_code_entities() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    // A genuinely dead python function — the only legitimate candidate.
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    // Non-code rows, all unreachable by construction.
+    insert_entity_with_plugin(
+        &conn,
+        "core:file:.env.example",
+        "core",
+        "file",
+        ".env.example",
+        "{}",
+    );
+    insert_entity_with_plugin(&conn, "core:project:proj", "core", "project", "/proj", "{}");
+    insert_entity_with_plugin(&conn, "core:subsystem:abc", "core", "subsystem", "x", "{}");
+    insert_guidance(&conn, "core:guidance:g1", "{}");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "config files / anchors / subsystems / guidance are not dead CODE: {env}"
+    );
+}
+
+/// B2(2) failing-first: entities owned by a plugin that emitted NO reachability
+/// root tags (the Rust plugin today — binary/lib roots unsupported, PDR-0012
+/// keeps the Rust line out of the launch envelope) must be EXCLUDED with an
+/// in-band marker, never false-flagged dead. A wrong answer is worse than an
+/// honest scope statement.
+#[tokio::test]
+async fn find_dead_code_excludes_plugins_without_root_coverage_with_marker() {
+    let (project, db, conn) = open_project();
+    // Python emits roots; rust emits none (true to the live plugins).
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    // The dogfooded false positive: specimen-rs/src/main.rs, unreachable only
+    // because no rust root tags exist.
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:specimen_rs.main",
+        "rust",
+        "function",
+        "specimen-rs/src/main.rs",
+        "{}",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "a rootless plugin's entities must not be false-flagged dead: {env}"
+    );
+    // The honest in-band scope statement.
+    let excluded = env["result"]["excluded"]["plugins_without_roots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing plugins_without_roots marker: {env}"));
+    assert_eq!(excluded.len(), 1, "{env}");
+    assert_eq!(excluded[0]["plugin"], "rust", "{env}");
+    assert_eq!(excluded[0]["entities_excluded"], 1, "{env}");
+    assert!(
+        excluded[0]["reason"].as_str().unwrap().contains("root"),
+        "the marker must explain the missing root coverage: {env}"
+    );
+}
+
+/// B2(3) failing-first (revised per PM ruling on weft-3fb0f5dfc7): a
+/// briefing-blocked entity appears in the survey NEITHER as an all-null row
+/// (unactionable noise — the dogfooded failure) NOR as an identity-bearing row
+/// (the stub-collapse non-disclosure invariant stays absolute). It is EXCLUDED
+/// from the row set, and the exclusion is reported once, in-band, at the top
+/// level: count + reason + the standard recovery path.
+#[tokio::test]
+async fn find_dead_code_withholds_blocked_entities_with_aggregate_marker() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "python:function:leaky.helper",
+        "python",
+        "function",
+        "leaky.py",
+        r#"{"briefing_blocked": "secret_present"}"#,
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "python:function:leaky.other",
+        "python",
+        "function",
+        "leaky.py",
+        r#"{"briefing_blocked": "secret_present"}"#,
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    // No blocked row in the page — neither nulls nor identity.
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap_or("<null>").to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "blocked entities must be excluded from the row set: {env}"
+    );
+    assert!(
+        !env.to_string().contains("python:function:leaky"),
+        "blocked identity must not be disclosed anywhere in the envelope: {env}"
+    );
+    // The single aggregate in-band marker.
+    let withheld = &env["result"]["withheld"];
+    assert_eq!(withheld["count"], 2, "{env}");
+    assert_eq!(withheld["reasons"][0], "secret_present", "{env}");
+    assert!(
+        withheld["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("secrets-baseline"),
+        "the marker must carry the standard briefing-block recovery path: {env}"
+    );
+}
+
+/// B2(4) failing-first: the constant five-line `reason` (and rule/confidence
+/// facets) must be hoisted to ONE top-level block, not repeated verbatim on
+/// every row of every page (the C12-class repeated-degrade-block problem).
+#[tokio::test]
+async fn find_dead_code_hoists_constant_facets_to_top_level() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan_a",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:orphan_b",
+        "function",
+        "app.py",
+        Some((10, 13)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let finding = &env["result"]["finding"];
+    assert_eq!(finding["rule_id"], "LMWV-FACT-DEAD-CODE-CANDIDATE", "{env}");
+    assert_eq!(finding["kind"], "fact", "{env}");
+    assert!(finding["confidence"].is_number(), "{env}");
+    assert!(
+        finding["reason"].as_str().unwrap().contains("unreachable"),
+        "{env}"
+    );
+    for row in env["result"]["dead_code"].as_array().unwrap() {
+        for hoisted in [
+            "reason",
+            "rule_id",
+            "kind",
+            "confidence",
+            "confidence_basis",
+        ] {
+            assert!(
+                row.get(hoisted).is_none(),
+                "constant facet '{hoisted}' must be hoisted, not repeated per row: {env}"
+            );
+        }
+    }
 }

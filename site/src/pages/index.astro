@@ -1,0 +1,547 @@
+---
+// ============================================================
+// loomweave.foundryside.dev — the Loomweave member site.
+//
+// The member-page template (IA §5.1), filled for Loomweave:
+//   Nav+breadcrumb → Hero → What it is → Key capabilities →
+//   Usage snapshot → How it composes → Status & honest limits →
+//   Links → CTA → Footer.
+//
+// Everything that could disagree across the seven subdomains — the
+// roster, the matrix slice, the SEI vocabulary, the cross-links — is
+// sourced from the shared @weft/site-kit data (ROSTER / MATRIX /
+// SEI_SPINE), never hardcoded here, so this site cannot drift from
+// the hub or its peers (IA §1.3, §3). The pairing cards render only
+// Loomweave's slice of the matrix and link cross-subdomain via the
+// kit's memberUrl().
+//
+// Loomweave's site OWNS the authoritative SEI explanation — it is the
+// one member that MINTS the SEI every other member keys on (IA §3.3,
+// §4.2.1). Honest limits are mandatory and non-empty: Rust analysis is
+// parse-only, and v1.1.0 is a release candidate (v1.0.0 is the latest
+// tagged release — we do NOT reference a v1.1.0 release tag).
+// ============================================================
+import Layout from '@weft/site-kit/layouts/Layout.astro';
+import { Button, Badge, Tag, Banner, MemberMark, SeiTag, EnrichmentChip, FreshnessMeter } from '@weft/site-kit/components';
+import {
+  SEI_SPINE,
+  pairingsFor,
+  partnerOf,
+  memberUrl,
+  getMember,
+} from '@weft/site-kit/data';
+
+const SELF = 'loomweave';
+const me = getMember(SELF);
+
+// Loomweave's slice of the combination matrix (IA §2.2). Each pairing links
+// cross-subdomain to the partner via memberUrl() — the sanctioned cross-link.
+const PAIRINGS = pairingsFor(SELF);
+
+// Cross-subdomain CTAs come from kit data — never hand-written URLs.
+const LACUNA_URL = memberUrl('lacuna');
+const HUB = 'https://weft.foundryside.dev';
+const REPO = me.repo;
+
+// Repo pointers for surface facts that move (versions / tool counts) — IA §5.1
+// template invariant 1: every moving number is a snapshot WITH a repo pointer.
+const README_URL = `${REPO}/blob/main/README.md`;
+const CARGO_URL = `${REPO}/blob/main/Cargo.toml`;
+const RELEASES_URL = `${REPO}/releases`;
+const RUST_LIMITS_URL = `${REPO}/blob/main/docs/operator/rust-known-limitations.md`;
+const GETTING_STARTED_URL = `${REPO}/blob/main/docs/operator/getting-started.md`;
+const SEI_STANDARD_URL = `${HUB}/#spine`;
+
+// Map a matrix pairing status to a Badge tone — honest, never rounded up
+// ('partial'/'planned' are NEVER styled as 'live'; IA §2.2, §3.2).
+const statusTone = (s) => (s === 'live' ? 'ok' : s === 'partial' ? 'warn' : 'neutral');
+
+// Curated quick-start (IA §5.1 block 4). v1.0.0 is the latest tagged release —
+// the v1.1 line is a release candidate built from source, so the install path
+// points at v1.0.0 (we do NOT reference a non-existent v1.1.0 release tag).
+// Built as a string so the shell ${TAG} stays literal while the repo URL is
+// sourced from kit data, not hardcoded.
+const quickStart =
+  '# install the binary + Python plugin from the current GitHub Release\n' +
+  '# v1.0.0 is the latest tagged release; the v1.1 line is a release candidate (build from source — see README)\n' +
+  'TAG=v1.0.0\n' +
+  'curl -L -o loomweave.tar.gz \\\n' +
+  '  "' + REPO + '/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"\n' +
+  'tar xzf loomweave.tar.gz\n' +
+  'install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/\n' +
+  '\n' +
+  '# wire the agent, walk the corpus, serve the graph over MCP\n' +
+  'loomweave install --path .   # init .weft/loomweave/, wire the MCP client + skill + hook\n' +
+  'loomweave analyze            # extract entities + edges (no LLM credentials needed)\n' +
+  'loomweave serve              # expose the consult-mode MCP surface';
+---
+
+<Layout
+  title="Loomweave — code structure + the federation's identity authority"
+  description="Loomweave turns a codebase into a queryable, identity-stable structural graph an agent reads instead of re-deriving by grep — and mints the SEI every other Weft member keys on. Rust core, deterministic extraction, local-first. Rust analysis is parse-only; v1.1.0 is a release candidate."
+  member={SELF}
+  breadcrumb
+  repo={REPO}
+>
+  {/* ---------------------------------------------------------------- */}
+  {/* 1 · Hero — tagline + member dossier terminal + version snapshot  */}
+  {/* ---------------------------------------------------------------- */}
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Loomweave · code structure + identity authority · Rust</p>
+      <h1 class="hero__title">The federation's map — and its coordinate system.</h1>
+      <p class="hero__sub">
+        Turns a codebase into a queryable, identity-stable structural graph an agent
+        reads <strong>instead of re-deriving by grep</strong> — and mints the
+        <code>SEI</code> every other member keys on. Deterministic structural
+        extraction; <strong>no LLM needed</strong> to build the graph.
+      </p>
+
+      <div class="hero__meta">
+        <Tag client:idle>Rust</Tag>
+        <span class="hero__ver">
+          <span class="hero__verlabel">version</span>
+          <a href={RELEASES_URL} rel="noopener">v1.1.0 · latest release</a>
+        </span>
+      </div>
+
+      <div class="hero__cta">
+        <Button client:idle as="a" href="#usage">Quick start →</Button>
+        <Button client:idle as="a" variant="secondary" href={REPO} rel="noopener">View on GitHub →</Button>
+      </div>
+
+      {/* Member dossier terminal — Loomweave mints the SEI; the chips mix
+          present / absent / unavailable on purpose. The brand refuses to show
+          an all-green dossier (IA §3.4, §5.1: at least one non-present state). */}
+      <div class="terminal">
+        <div class="terminal__lines">
+          <div><span class="terminal__prompt">$</span> loomweave <span class="terminal__arg">entity_orientation_pack_get</span></div>
+          <div class="terminal__dim">resolving entity → one SEI, typed facts from every present peer…</div>
+        </div>
+        <div class="terminal__chips">
+          <SeiTag client:visible value={SEI_SPINE.sampleSei} copyable />
+          <EnrichmentChip client:visible state="present" peer="loomweave" />
+          <EnrichmentChip client:visible state="present" peer="wardline" />
+          <EnrichmentChip client:visible state="absent" peer="legis" />
+          <EnrichmentChip client:visible state="unavailable" peer="charter" />
+        </div>
+      </div>
+    </div>
+  </section>
+
+  {/* ---------------------------------------------------------------- */}
+  {/* 2 · What it is                                                   */}
+  {/* ---------------------------------------------------------------- */}
+  <section class="band">
+    <div class="wrap">
+      <p class="eyebrow">What it is · the now</p>
+      <h2 class="h2">A structural graph an agent queries instead of re-grepping.</h2>
+      <p class="lede">
+        Loomweave walks a codebase, extracts entities — <code>functions</code>,
+        <code>classes</code>, <code>modules</code> (the Rust plugin extends this
+        with <code>struct</code>, <code>enum</code>, <code>trait</code>,
+        <code>type_alias</code>, <code>const</code>, <code>static</code>,
+        <code>macro</code>, <code>impl</code>) — and the edges between them
+        (<code>contains</code>, <code>calls</code>, <code>references</code>,
+        <code>imports</code>, plus <code>implements</code>/<code>derives</code> in
+        Rust and <code>inherits_from</code>/<code>decorates</code> in Python). The
+        structural graph persists to a local SQLite store and is served over CLI,
+        MCP (stdio), and a loopback HTTP read API. Loomweave owns <em>the now</em>:
+        the current structure of the code.
+      </p>
+      <Banner client:visible tone="info" title="Deterministic structural extraction — no LLM required to build the graph.">
+        <code>loomweave analyze</code> extracts entities and edges with no model
+        and no credentials — it is the fastest way to verify an install. The LLM is
+        dispatched lazily, one entity at a time, only on an explicit
+        <code>entity_summary_get</code> call after live-provider opt-in. Every
+        traversal result also carries a <code>scope_excludes</code> block naming
+        exactly what was not searched, so an empty answer reads as "none found among
+        the edges I can see," never a guaranteed true negative.
+      </Banner>
+    </div>
+  </section>
+
+  {/* ---------------------------------------------------------------- */}
+  {/* 3 · Key capabilities                                            */}
+  {/* ---------------------------------------------------------------- */}
+  <section class="section">
+    <div class="wrap">
+      <p class="eyebrow">Key capabilities</p>
+      <h2 class="h2">Structure, identity, and one-call orientation.</h2>
+      <div class="grid grid--2">
+        <article class="card cap">
+          <h3 class="cap__name">Structural extraction</h3>
+          <p class="cap__body">
+            Entities and typed edges across first-party Python and Rust plugins,
+            persisted to a local graph. Subsystem clustering groups modules into
+            navigable first-class entities; a BLAKE3 <code>content_hash</code> per
+            entity body is the drift signal every cross-tool binding checks.
+          </p>
+        </article>
+        <article class="card cap">
+          <h3 class="cap__name">SEI — minting, persistence, resolution, lineage</h3>
+          <p class="cap__body">
+            The keystone. Loomweave mints a durable <code>SEI</code> for every
+            entity, persists it across re-analysis, re-binds it through renames and
+            moves, and serves <code>resolve</code> / <code>lineage</code> for the
+            suite. The <code>{`{plugin}:{kind}:{qualname}`}</code> locator is the
+            <em>address</em>; <code>SEI</code> is the <em>identity</em> (ADR-038).
+          </p>
+        </article>
+        <article class="card cap">
+          <h3 class="cap__name">One-shot orientation</h3>
+          <p class="cap__body">
+            <code>entity_orientation_pack_get</code> returns find + at + source +
+            neighborhood + issues + freshness in a single call — the read a
+            consult-mode agent makes first. SARIF import folds external findings
+            into the graph.
+          </p>
+        </article>
+        <article class="card cap cap--meter">
+          <h3 class="cap__name">Freshness, stated honestly</h3>
+          <p class="cap__body">
+            Graph answers carry completeness and staleness, never an implied
+            "complete" — the same honesty the whole suite keys on.
+          </p>
+          <FreshnessMeter client:visible completeness={0.86} staleness="2 commits behind" label="graph completeness" />
+        </article>
+      </div>
+      <p class="footnote">
+        The full MCP surface (≈46 tools — <a href={README_URL} rel="noopener">snapshot, see the repo</a>)
+        is grouped by family: navigation and graph traversal, briefing and source
+        inspection, guidance / findings / federation context, analyze lifecycle, and
+        faceted shortcut queries. The exact count moves with the release — the repo
+        is authoritative.
+      </p>
+    </div>
+  </section>
+
+  {/* ---------------------------------------------------------------- */}
+  {/* 4 · Usage snapshot — curated quick-start, not the reference      */}
+  {/* ---------------------------------------------------------------- */}
+  <section id="usage" class="band">
+    <div class="wrap">
+      <p class="eyebrow">Usage snapshot · install → analyze → serve</p>
+      <h2 class="h2">Install, walk the corpus, serve the graph.</h2>
+      <p class="lede">
+        <code>analyze</code> needs no LLM credentials — it is the fastest way to
+        verify the install end-to-end. The deep CLI and MCP reference lives in the
+        repo.
+      </p>
+
+      <div class="terminal terminal--block">
+        <pre class="terminal__pre">{quickStart}</pre>
+      </div>
+
+      <p class="footnote">
+        A full walkthrough — fresh machine, a small public project, an MCP client,
+        three questions — is in
+        <a href={GETTING_STARTED_URL} rel="noopener">docs/operator/getting-started.md</a>.
+        The v1.1 release candidate can be built from a local checkout
+        (<code>cargo install --path crates/loomweave-cli</code>); see
+        <a href={README_URL} rel="noopener">the README</a>.
+      </p>
+    </div>
+  </section>
+
+  {/* ---------------------------------------------------------------- */}
+  {/* 5 · How it composes — Loomweave's slice of the matrix           */}
+  {/* ---------------------------------------------------------------- */}
+  <section class="section">
+    <div class="wrap">
+      <p class="eyebrow">How it composes · value is the weave</p>
+      <h2 class="h2">Each pairing lights up a capability neither tool has alone.</h2>
+      <p class="lede">
+        These are Loomweave's rows of the combination matrix. Every pairing's status
+        is honest on its face — a <code>partial</code> or <code>planned</code> pair
+        is never rendered as <code>live</code>. Each partner links to its own site;
+        the matrix is the sanctioned cross-link channel (IA §2.2).
+      </p>
+
+      <div class="grid grid--2">
+        {PAIRINGS.map((p) => {
+          const partner = partnerOf(p, SELF);
+          const partnerUrl = memberUrl(partner);
+          return (
+            <article class="card card--pair">
+              <div class="pair__head">
+                <span class="pair__mark"><MemberMark client:visible member={SELF} /></span>
+                <span class="pair__plus" aria-hidden="true">+</span>
+                <a class="pair__mark" href={partnerUrl}><MemberMark client:visible member={partner} /></a>
+                <span class="pair__status">
+                  <Badge client:visible tone={statusTone(p.status)} dot>{p.status}</Badge>
+                </span>
+              </div>
+              <p class="pair__cap">{p.capability}</p>
+              {p.note && <p class="pair__note">{p.note}</p>}
+            </article>
+          );
+        })}
+      </div>
+    </div>
+  </section>
+
+  {/* ---------------------------------------------------------------- */}
+  {/* 6 · Status & honest limits — this page OWNS the SEI explanation  */}
+  {/* ---------------------------------------------------------------- */}
+  <section class="band">
+    <div class="wrap">
+      <p class="eyebrow">{SEI_SPINE.eyebrow}</p>
+      <h2 class="h2">{SEI_SPINE.heading}</h2>
+      <p class="lede">{SEI_SPINE.body}</p>
+
+      <div class="spine">
+        <div class="spine__entity">
+          <div class="spine__cap">entity · minted here</div>
+          <SeiTag client:visible value={SEI_SPINE.sampleSei} copyable />
+        </div>
+        <div class="spine__arrow" aria-hidden="true">→</div>
+        <div class="spine__facts">
+          <div class="spine__cap">typed facts · one call</div>
+          <div class="spine__rows">
+            {SEI_SPINE.typedFacts.map((f) => (
+              <div class="spine__row">
+                <MemberMark client:visible member={f.peer} />
+                <span class="spine__fact">{f.fact}</span>
+                <EnrichmentChip client:visible state={f.state} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div class="vocab">
+        {SEI_SPINE.enrichmentVocab.map((v) => (
+          <div class="vocab__item">
+            <EnrichmentChip client:visible state={v.state} />
+            <span class="vocab__meaning">{v.meaning}</span>
+          </div>
+        ))}
+      </div>
+
+      <Banner client:visible tone="warn" title="Status & honest limits — stated in the open.">
+        <ul class="limits">
+          <li>
+            <strong>v1.1.0 is a release candidate (rc5).</strong> <code>v1.0.0</code>
+            is the latest tagged GitHub Release; the v1.1 line builds from source.
+            See <a href={CARGO_URL} rel="noopener">Cargo.toml</a> and
+            <a href={RELEASES_URL} rel="noopener">Releases</a>.
+          </li>
+          <li>
+            <strong>Rust analysis is parse-only.</strong> Macro expansions and
+            external-crate edge targets are not resolved; closures and nested
+            functions fold into the nearest named item.
+            See <a href={RUST_LIMITS_URL} rel="noopener">rust-known-limitations.md</a>.
+          </li>
+          <li>
+            <strong>Rust <code>references</code> has a narrow deferred envelope.</strong>
+            Match/let pattern paths and enum-variant discriminant expressions are not
+            emitted yet.
+          </li>
+          <li>
+            <strong>Public registries are not the release source yet.</strong> Tagged
+            GitHub Release assets remain canonical until a later ADR introduces
+            PyPI / crates.io publication.
+          </li>
+          <li>
+            <strong>Loomweave↔Filigree is <code>partial</code>.</strong> The
+            drift-aware entity⇄issue binding is still maturing — it is not rounded up
+            to <code>live</code>.
+          </li>
+        </ul>
+      </Banner>
+
+      <ul class="spine__notes">
+        {SEI_SPINE.facts.map((fact) => <li>{fact}</li>)}
+      </ul>
+    </div>
+  </section>
+
+  {/* ---------------------------------------------------------------- */}
+  {/* 7 · Links / pointers                                            */}
+  {/* ---------------------------------------------------------------- */}
+  <section class="section">
+    <div class="wrap">
+      <p class="eyebrow">Links · pointers to the authorities</p>
+      <h2 class="h2">The repo owns the moving facts.</h2>
+      <div class="links">
+        <a class="links__item" href={REPO} rel="noopener">
+          <span class="links__name">Repository</span>
+          <span class="links__sub">github.com/foundryside-dev/loomweave</span>
+        </a>
+        <a class="links__item" href={README_URL} rel="noopener">
+          <span class="links__name">README</span>
+          <span class="links__sub">status, tool families, quick start</span>
+        </a>
+        <a class="links__item" href={SEI_STANDARD_URL} rel="noopener">
+          <span class="links__name">SEI spine</span>
+          <span class="links__sub">the federation identity model (hub)</span>
+        </a>
+        <a class="links__item" href={`${HUB}/#doctrine`} rel="noopener">
+          <span class="links__name">Doctrine</span>
+          <span class="links__sub">the federation axiom (hub)</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  {/* ---------------------------------------------------------------- */}
+  {/* 8 · CTA — see it on the specimen                                */}
+  {/* ---------------------------------------------------------------- */}
+  <section class="lacuna">
+    <div class="wrap lacuna__inner">
+      <span class="lacuna__dot" style={`background:${getMember('lacuna').thread}`}></span>
+      <div class="lacuna__copy">
+        <p class="lacuna__lead">Want to see it actually run?</p>
+        <p class="lacuna__sub">
+          <code>make tour</code> the whole federation against <strong>Lacuna</strong>,
+          the demonstration specimen — Loomweave catalogs its structural findings
+          (dead entity, circular import, duplicate locator) alongside every other
+          member at once.
+        </p>
+      </div>
+      <span class="lacuna__cta">
+        <Button client:idle as="a" variant="secondary" href={LACUNA_URL}>See it on the specimen →</Button>
+      </span>
+    </div>
+  </section>
+</Layout>
+
+<style>
+  /* Page-local layout. Brand atoms (colors, type, motifs) come ONLY from the
+     site-kit token layer — no new colors, no dark mode (light theme only). */
+  .wrap { max-width: var(--width-content); margin: 0 auto; padding: 0 36px; }
+  .eyebrow {
+    font: var(--type-mono-sm); text-transform: uppercase;
+    letter-spacing: var(--tracking-caps); color: var(--text-muted);
+    font-size: var(--text-xs); margin: 0 0 14px;
+  }
+  .h2 { font: var(--type-h1); color: var(--text-strong); margin: 0 0 16px; max-width: 26ch; }
+  .lede { font: var(--type-body); color: var(--text-body); max-width: 66ch; margin: 0 0 26px; }
+  .lede code, .cap__body code, .pair__cap code, .footnote code, .limits code {
+    font-family: var(--font-mono); font-size: 0.92em; color: var(--text-strong);
+  }
+  .footnote { font: var(--type-body-sm); color: var(--text-muted); max-width: 66ch; margin: 20px 0 0; }
+  .footnote a, .lede a, .limits a { color: var(--indigo-700); }
+
+  .section { padding: 64px 0; }
+  .band {
+    padding: 64px 0; background: var(--bg-sunken);
+    border-top: 1px solid var(--border-hairline);
+    border-bottom: 1px solid var(--border-hairline);
+  }
+
+  /* hero */
+  .hero { padding: 64px 0; border-bottom: 1px solid var(--border-hairline); }
+  .hero__title {
+    font: var(--type-display); color: var(--loom-900);
+    letter-spacing: -0.025em; line-height: 1.05;
+    max-width: 18ch; margin: 0 0 22px;
+  }
+  .hero__sub { font: var(--type-body); font-size: var(--text-lg); color: var(--text-body); max-width: 60ch; margin: 0 0 22px; }
+  .hero__sub strong { color: var(--text-strong); }
+  .hero__sub code { font-family: var(--font-mono); font-size: 0.9em; color: var(--text-strong); }
+  .hero__meta { display: flex; align-items: center; gap: 14px; margin-bottom: 26px; flex-wrap: wrap; }
+  .hero__ver { font: var(--type-mono-sm); color: var(--text-muted); display: inline-flex; align-items: center; gap: 8px; }
+  .hero__verlabel { color: var(--text-faint); text-transform: uppercase; letter-spacing: var(--tracking-caps); font-size: var(--text-2xs); }
+  .hero__ver a { color: var(--indigo-700); text-decoration: none; }
+  .hero__ver a:hover { text-decoration: underline; text-underline-offset: 3px; }
+  .hero__cta { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 40px; }
+
+  .terminal {
+    background: var(--surface-inverse); border-radius: var(--radius-lg);
+    padding: 18px 20px; max-width: 760px; box-shadow: var(--shadow-lg);
+  }
+  .terminal__lines { font: var(--type-mono); color: var(--text-on-inverse); font-size: var(--text-xs); line-height: 1.7; }
+  .terminal__prompt { color: var(--ash-500); }
+  .terminal__arg { color: var(--indigo-300); }
+  .terminal__dim { color: var(--ash-500); }
+  .terminal__chips { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .terminal--block { margin-top: 8px; }
+  .terminal__pre {
+    margin: 0; font-family: var(--font-mono); font-size: var(--text-xs);
+    line-height: 1.7; color: var(--text-on-inverse); white-space: pre-wrap; word-break: break-word;
+  }
+  .terminal__cm { color: var(--ash-500); }
+
+  /* cards */
+  .grid { display: grid; gap: 16px; }
+  .grid--2 { grid-template-columns: repeat(2, 1fr); }
+  .card {
+    background: var(--surface-card); border: 1px solid var(--border-hairline);
+    border-radius: var(--radius-lg); overflow: hidden; box-shadow: var(--shadow-xs);
+  }
+
+  /* capability card */
+  .cap { padding: 20px; }
+  .cap__name { font: var(--type-h3); color: var(--text-strong); margin: 0 0 10px; }
+  .cap__body { font: var(--type-body-sm); color: var(--text-body); margin: 0; }
+  .cap--meter { display: flex; flex-direction: column; gap: 14px; }
+
+  /* matrix pair card */
+  .card--pair { padding: 16px; }
+  .pair__head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .pair__mark { text-decoration: none; }
+  a.pair__mark:hover { text-decoration: underline; text-underline-offset: 3px; }
+  .pair__plus { color: var(--text-faint); font-family: var(--font-mono); }
+  .pair__status { margin-left: auto; }
+  .pair__cap { font: var(--type-body-sm); color: var(--text-body); margin: 0; }
+  .pair__note { font: var(--type-mono-sm); color: var(--text-faint); margin: 8px 0 0; line-height: 1.5; }
+
+  /* spine */
+  .spine { display: flex; align-items: stretch; gap: 14px; flex-wrap: wrap; margin-bottom: 24px; }
+  .spine__entity, .spine__facts {
+    background: var(--surface-card); border: 1px solid var(--border-hairline);
+    border-radius: var(--radius-md); padding: 16px;
+  }
+  .spine__entity { flex: 1 1 220px; }
+  .spine__facts { flex: 2 1 360px; }
+  .spine__arrow { display: flex; align-items: center; color: var(--text-faint); font-size: 22px; }
+  .spine__cap { font: var(--type-mono-sm); color: var(--text-faint); margin-bottom: 10px; }
+  .spine__rows { display: flex; flex-direction: column; gap: 8px; }
+  .spine__row { display: flex; align-items: center; gap: 10px; }
+  .spine__fact { margin-left: auto; font: var(--type-mono-sm); color: var(--text-muted); }
+  .spine__notes { margin: 22px 0 0; padding-left: 18px; color: var(--text-muted); font: var(--type-body-sm); }
+  .spine__notes li { margin: 6px 0; }
+
+  .vocab {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 18px;
+    margin: 0 0 24px; padding: 16px;
+    background: var(--surface-card); border: 1px solid var(--border-hairline); border-radius: var(--radius-md);
+  }
+  .vocab__item { display: flex; align-items: center; gap: 10px; }
+  .vocab__meaning { font: var(--type-body-sm); color: var(--text-muted); }
+
+  .limits { margin: 0; padding-left: 18px; }
+  .limits li { margin: 8px 0; font: var(--type-body-sm); color: var(--text-body); }
+
+  /* links */
+  .links { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; max-width: 720px; }
+  .links__item {
+    display: flex; flex-direction: column; gap: 4px; padding: 16px;
+    background: var(--surface-card); border: 1px solid var(--border-hairline);
+    border-radius: var(--radius-md); text-decoration: none;
+    transition: box-shadow var(--dur-fast) var(--ease-out);
+  }
+  .links__item:hover { box-shadow: var(--shadow-lg); }
+  .links__name { font: var(--type-body); font-weight: var(--fw-semibold); color: var(--indigo-700); }
+  .links__sub { font: var(--type-mono-sm); color: var(--text-muted); }
+
+  /* lacuna strip */
+  .lacuna { padding: 40px 0; background: var(--bg-sunken); border-top: 1px solid var(--border-hairline); }
+  .lacuna__inner { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .lacuna__dot { width: 12px; height: 12px; border-radius: 3px; flex: none; box-shadow: inset 0 0 0 1px rgba(0,0,0,.08); }
+  .lacuna__copy { flex: 1 1 360px; }
+  .lacuna__lead { font: var(--type-body); font-weight: var(--fw-semibold); color: var(--text-strong); margin: 0 0 2px; }
+  .lacuna__sub { font: var(--type-body-sm); color: var(--text-muted); margin: 0; }
+  .lacuna__sub code { font-family: var(--font-mono); color: var(--text-strong); }
+  .lacuna__cta { flex: none; }
+
+  @media (max-width: 880px) {
+    .grid--2, .vocab, .links { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 720px) {
+    .wrap { padding: 0 18px; }
+    .hero { padding: 48px 0; }
+  }
+</style>

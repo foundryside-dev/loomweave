@@ -161,6 +161,41 @@ pub fn hardened_git_command(repo_root: &Path) -> Command {
     command
 }
 
+/// List untracked, non-ignored files in `repo_root`, hardened for an untrusted
+/// corpus (clarion-d9cf8bcfa9; ADR-045).
+///
+/// Uses `git ls-files --others --exclude-standard -z`: it enumerates worktree
+/// paths Git is not tracking and that `.gitignore`/exclude rules do not cover,
+/// **without hashing working-tree content**. That distinction is load-bearing —
+/// `git status` must hash to report modifications, which runs a repo-controlled
+/// `filter.<drv>.clean` (the one residual the module docs describe, via
+/// `$GIT_DIR/info/attributes`); listing untracked paths never hashes, so that
+/// filter is never invoked. Verified by the
+/// `ls_files_others_does_not_run_clean_filter` test in this module.
+///
+/// `-z` is NUL-delimited, so paths containing newlines or other special bytes
+/// are unambiguous (no C-quoting to decode). Fail-soft like the crate's other
+/// corpus git probes: returns `None` when git is unavailable, `repo_root` is not
+/// a work tree, or the command fails — never an error. An empty `Vec` means "a
+/// git repo with no untracked files".
+#[must_use]
+pub fn list_untracked_files(repo_root: &Path) -> Option<Vec<String>> {
+    let out = hardened_git_command(repo_root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| String::from_utf8_lossy(segment).into_owned())
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +263,68 @@ mod tests {
             Some((2, 40))
         );
         assert_eq!(parse_git_version("garbage"), None);
+    }
+
+    #[test]
+    fn ls_files_others_does_not_run_clean_filter() {
+        // The one corpus-controlled code-exec vector hardened_git CANNOT disable by
+        // config is `$GIT_DIR/info/attributes` naming a `filter`, whose `.clean`
+        // runs only when git HASHES working-tree content. `list_untracked_files`
+        // uses `ls-files --others`, which lists paths and never hashes — so the
+        // filter must never fire. Prove it empirically (ADR-045, clarion-d9cf8bcfa9):
+        // a booby-trapped repo whose clean filter would create a marker must leave
+        // NO marker after the call, while still returning the untracked file.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        // Skip cleanly if git is unavailable on the test host.
+        let Ok(init) = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+        else {
+            return;
+        };
+        if !init.success() {
+            return;
+        }
+        // git refuses commands without an identity in some environments; not needed
+        // here (no commit), but set repo-local config defensively.
+        let _ = Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(repo)
+            .status();
+
+        // Booby-trap: an in-`.git` attribute selects a clean filter (the residual
+        // source --attr-source cannot neutralize), and a repo-local config defines
+        // that filter to create PWNED if ever invoked. Repo-local config + in-git
+        // attributes are exactly what an untrusted corpus controls.
+        std::fs::create_dir_all(repo.join(".git/info")).unwrap();
+        std::fs::write(repo.join(".git/info/attributes"), "* filter=pwn\n").unwrap();
+        let marker = repo.join("PWNED");
+        Command::new("git")
+            .args([
+                "config",
+                "filter.pwn.clean",
+                &format!("sh -c 'touch \"{}\"'", marker.display()),
+            ])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+
+        // An untracked file matching the `*` filter attribute. If anything hashed
+        // it, the clean filter would run and create the marker.
+        std::fs::write(repo.join("evil.py"), "x = 1\n").unwrap();
+
+        let untracked = list_untracked_files(repo).expect("ls-files must succeed in a git repo");
+        assert!(
+            untracked.iter().any(|p| p == "evil.py"),
+            "the untracked file must be listed: {untracked:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "ls-files --others must NOT hash working-tree content, so the corpus \
+             clean filter must never run (no PWNED marker)"
+        );
     }
 }

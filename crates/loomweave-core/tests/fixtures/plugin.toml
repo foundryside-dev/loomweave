@@ -14,7 +14,7 @@ wardline_aware = false
 reads_outside_project_root = false
 
 [ontology]
-entity_kinds = ["widget"]
+entity_kinds = ["widget", "gadget"]
 edge_kinds = ["uses"]
 rule_id_prefix = "LMWV-FIXTURE-"
 ontology_version = "0.1.0"

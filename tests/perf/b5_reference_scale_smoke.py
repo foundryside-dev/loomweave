@@ -24,7 +24,7 @@ from loomweave_plugin_python.pyright_session import PyrightSession  # noqa: E402
 
 EXCLUDED_PARTS = frozenset(
     {
-        ".loomweave",
+        ".weft",
         ".git",
         ".mypy_cache",
         ".pytest_cache",

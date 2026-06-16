@@ -631,6 +631,53 @@ fn fts_trigger_populates_entity_fts_on_insert() {
 }
 
 #[test]
+fn migration_0009_drops_dead_fts_content_text_column() {
+    // V11-STO-06 / clarion-716449c371: the never-populated, never-read
+    // content_text column is gone after 0009, and search via the recreated
+    // virtual table + triggers still works.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='entity_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !sql.contains("content_text"),
+        "entity_fts must not declare content_text after 0009; sql was: {sql}"
+    );
+
+    let summary_json = r#"{"briefing": {"purpose": "rotate signing keys"}}"#;
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, summary, \
+         created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, \
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![
+            "python:function:auth.rotate",
+            "python",
+            "function",
+            "auth.rotate",
+            "rotate",
+            summary_json,
+        ],
+    )
+    .unwrap();
+
+    let matched_id: String = conn
+        .query_row(
+            "SELECT entity_id FROM entity_fts WHERE entity_fts MATCH 'rotate'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("FTS search still works after content_text drop");
+    assert_eq!(matched_id, "python:function:auth.rotate");
+}
+
+#[test]
 fn edges_table_has_no_id_column() {
     // ADR-026 decision 4: drop synthetic `id` PK from edges. Natural key
     // `(kind, from_id, to_id)` is the only identity.
@@ -795,7 +842,7 @@ fn migrations_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut conn = open_fresh(&tempdir);
     schema::apply_migrations(&mut conn).expect("second apply should be a no-op");
-    assert_eq!(schema::applied_count(&conn).unwrap(), 8);
+    assert_eq!(schema::applied_count(&conn).unwrap(), 10);
     let tables_after = table_names(&conn);
     assert!(tables_after.contains(&"entities".to_owned()));
 }
@@ -809,7 +856,7 @@ fn schema_migrations_records_each_applied_migration() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 8);
+    assert_eq!(count, 10);
     let names: Vec<String> = {
         let mut stmt = conn
             .prepare("SELECT name FROM schema_migrations ORDER BY version")
@@ -828,6 +875,8 @@ fn schema_migrations_records_each_applied_migration() {
             "0006_wardline_taint_sei",
             "0007_run_analyzed_commit",
             "0008_run_owner_heartbeat",
+            "0009_drop_fts_content_text",
+            "0010_dedupe_findings_drop_run_scoped_ids",
         ]
     );
 }
@@ -1068,6 +1117,53 @@ fn findings_status_check_accepts_all_documented_values() {
             .unwrap_or_else(|err| panic!("status={status} rejected unexpectedly: {err}"));
         conn.execute("DELETE FROM findings", []).unwrap();
     }
+}
+
+#[test]
+fn migration_0010_preserves_operator_lifecycle_findings() {
+    // The dedupe migration drops regenerable open+unlinked findings, but must
+    // keep operator-owned lifecycle rows — Filigree-linked or triaged out of
+    // `open` (Codex P1: a blanket DELETE reopened already-triaged issues). This
+    // re-runs the 0010 body over seeded rows and asserts the surviving set.
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    insert_run(&conn, "r1");
+    insert_anchor_entity(&conn, "python:function:demo.a");
+
+    let put = |id: &str, status: &str, issue: Option<&str>| {
+        conn.execute(
+            "INSERT INTO findings (id, tool, tool_version, run_id, rule_id, kind, severity, \
+             entity_id, related_entities, message, evidence, properties, supports, \
+             supported_by, status, filigree_issue_id, created_at, updated_at) \
+             VALUES (?1, 'loomweave', '0.1', 'r1', 'LMWV-FACT-TODO', 'fact', 'INFO', \
+             'python:function:demo.a', '[]', 'm', '{}', '{}', '[]', '[]', ?2, ?3, \
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![id, status, issue],
+        )
+        .unwrap();
+    };
+    put("core:finding:r1:open-unlinked", "open", None);
+    put("core:finding:r1:linked", "open", Some("clarion-123"));
+    put("core:finding:r1:acked", "acknowledged", None);
+
+    conn.execute_batch(include_str!(
+        "../migrations/0010_dedupe_findings_drop_run_scoped_ids.sql"
+    ))
+    .unwrap();
+
+    let surviving: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM findings ORDER BY id").unwrap();
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        rows.map(std::result::Result::unwrap).collect()
+    };
+    assert_eq!(
+        surviving,
+        vec![
+            "core:finding:r1:acked".to_string(),
+            "core:finding:r1:linked".to_string(),
+        ],
+        "0010 must drop only open+unlinked findings, preserving linked/triaged rows"
+    );
 }
 
 #[test]

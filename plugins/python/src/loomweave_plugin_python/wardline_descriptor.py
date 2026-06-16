@@ -4,7 +4,7 @@ This module deliberately reads descriptor files without importing Wardline.
 Wardline remains authoritative for the vocabulary; Loomweave records only the
 source-observed decorator facts it can derive from that descriptor.
 
-Two contract details below (``PROJECT_DESCRIPTOR_PATH`` and the descriptor
+Two contract details below (``PROJECT_DESCRIPTOR_PATHS`` and the descriptor
 ``version`` semantics) are Loomweave-side assumptions pending Wardline's
 "Pre-Rust core hardening" Task B, which has not yet published the canonical
 project-local descriptor location or the ``schema: wardline.vocabulary/v1``
@@ -28,7 +28,18 @@ import yaml
 # location and descriptor-version semantics are not yet pinned by Wardline.
 # Tracked: filigree clarion-6ab5668d82.
 EXPECTED_DESCRIPTOR_VERSION = "wardline-generic-2"
-PROJECT_DESCRIPTOR_PATH = Path(".wardline/vocabulary.yaml")
+
+# Weft store consolidation (ADR-046): sibling runtime state lives under the
+# shared ``.weft/<member>/`` dotdir, so the Wardline descriptor is read only from
+# the consolidated ``.weft/wardline/`` location. There is no fallback to the
+# pre-consolidation ``.wardline/`` path: after the coordinated cutover every
+# sibling is at ``.weft/`` by construction, so a descriptor found only on the
+# legacy path means a mis-sequenced cutover; resolving it would silently bind a
+# stale dir. Instead the project descriptor reads as absent and the loader falls
+# through to the package descriptor (a loud, visible signal). Loomweave never
+# writes a sibling's subtree — this is read-only.
+WEFT_DESCRIPTOR_PATH = Path(".weft/wardline/vocabulary.yaml")
+PROJECT_DESCRIPTOR_PATHS = (WEFT_DESCRIPTOR_PATH,)
 
 DescriptorSource = Literal["project", "package"]
 DescriptorStatus = Literal["enabled", "version_skew", "absent"]
@@ -97,13 +108,17 @@ def load_wardline_descriptor(project_root: Path | None) -> WardlineDescriptorSta
 def _read_project_descriptor(project_root: Path | None) -> str | None:
     if project_root is None:
         return None
-    path = project_root / PROJECT_DESCRIPTOR_PATH
-    if not path.is_file():
-        return None
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return None
+    # Read only the consolidated .weft/wardline/ location (ADR-046); the
+    # pre-consolidation .wardline/ path is not consulted.
+    for relative in PROJECT_DESCRIPTOR_PATHS:
+        path = project_root / relative
+        if not path.is_file():
+            continue
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+    return None
 
 
 def _read_package_descriptor() -> str | None:

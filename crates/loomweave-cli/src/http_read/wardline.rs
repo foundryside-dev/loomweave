@@ -25,6 +25,18 @@ pub(crate) struct ResolveRequest {
     #[serde(default)]
     project: String,
     qualnames: Vec<String>,
+    /// Optional batch-scoped plugin hint (clarion-b1a158f7f5; ADR-036
+    /// plugin-hint amendment; agreed shape in Wardline's
+    /// `2026-06-11-wardline-resolve-plugin-hint-proposal.md`). An ADR-049
+    /// plugin id (`python`, `rust`) restricting resolution to that plugin's
+    /// namespace — a CONSTRAINT, never a preference order. Omission is legal
+    /// forever and is byte-for-byte the pre-hint cross-plugin behavior.
+    /// Adjudicated edge cases: blank/whitespace-only → 400 naming this field
+    /// (cross-version diagnosability); any other non-blank string is honored
+    /// as a constraint (an unknown plugin id simply resolves nothing — plugin
+    /// ids are NOT validated against the store).
+    #[serde(default)]
+    plugin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,9 +136,10 @@ pub(crate) struct TaintFactBySeiView {
 /// Exact-tier Wardline qualname resolve (ADR-036, W.4). Takes a batch of
 /// PRE-COMPOSED dotted qualnames that Wardline has already shaped to
 /// byte-match Loomweave's `canonical_qualified_name`; resolution is the direct
-/// existence lookup in `loomweave_storage::resolve_wardline_qualnames`. No
-/// `&file=` disambiguator, no normalization — the generic resolve oracle
-/// remains deferred.
+/// existence lookup in `loomweave_storage::resolve_wardline_qualnames_for_plugin`,
+/// optionally constrained by the batch-scoped `plugin` hint (see
+/// [`ResolveRequest::plugin`]). No `&file=` disambiguator, no normalization —
+/// the generic resolve oracle remains deferred.
 pub(crate) async fn post_wardline_resolve(
     State(state): State<AppState>,
     body: Result<Json<ResolveRequest>, axum::extract::rejection::JsonRejection>,
@@ -151,12 +164,34 @@ pub(crate) async fn post_wardline_resolve(
             "too many qualnames in one request",
         );
     }
-    // Move only `qualnames` into the reader closure; `project` was consumed by
-    // the guard above. `with_reader` runs the lookup on a pooled connection.
+    // A PRESENT-but-blank hint is a malformed request, rejected with a message
+    // that NAMES the field (the proposal's cross-version diagnosability note;
+    // adjudicated under clarion-b1a158f7f5). Omitting the field is the legal
+    // "no hint" spelling. Any non-blank value is honored as a constraint —
+    // an unknown plugin id resolves nothing rather than erroring.
+    if let Some(plugin) = &req.plugin
+        && plugin.trim().is_empty()
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidPath,
+            "plugin must not be blank when present (omit the plugin field for cross-plugin resolution)",
+        );
+    }
+    // Move only `qualnames` + the hint into the reader closure; `project` was
+    // consumed by the guard above. `with_reader` runs the lookup on a pooled
+    // connection.
     let qualnames = req.qualnames;
+    let plugin = req.plugin;
     let result = state
         .readers
-        .with_reader(move |conn| loomweave_storage::resolve_wardline_qualnames(conn, &qualnames))
+        .with_reader(move |conn| {
+            loomweave_storage::resolve_wardline_qualnames_for_plugin(
+                conn,
+                &qualnames,
+                plugin.as_deref(),
+            )
+        })
         .await;
     match result {
         Ok(pairs) => {
@@ -718,6 +753,470 @@ mod tests {
             .expect("read body");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(parsed["code"], "PROJECT_MISMATCH");
+    }
+
+    /// Insert one `function` entity under an explicit `plugin_id` into an
+    /// existing migrated DB. The ambiguity tests need a `rust:function:` row
+    /// alongside a `python:function:` one so per-plugin candidate minting
+    /// (clarion-69db8b2739) sees the same qualname under both plugins.
+    fn insert_function_entity(db_path: &std::path::Path, plugin: &str, id: &str) {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        conn.execute(
+            "INSERT INTO entities ( \
+                id, plugin_id, kind, name, short_name, properties, \
+                content_hash, created_at, updated_at \
+             ) VALUES (?1, ?2, 'function', ?1, ?1, '{}', 'deadbeef', \
+                       '2026-05-31T00:00:00.000Z', '2026-05-31T00:00:00.000Z')",
+            rusqlite::params![id, plugin],
+        )
+        .expect("seed function entity");
+    }
+
+    /// Insert a `wardline_taint_facts` row verbatim into an existing migrated
+    /// DB (for read tests over a non-python locator, where the python-seeding
+    /// state builders cannot place the fact).
+    fn insert_taint_fact(db_path: &std::path::Path, entity_id: &str, blob: &str) {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        conn.execute(
+            "INSERT INTO wardline_taint_facts \
+                (entity_id, wardline_json, scan_id, content_hash_at_compute, updated_at) \
+             VALUES (?1, ?2, NULL, NULL, '2026-05-31T00:00:00.000Z')",
+            rusqlite::params![entity_id, blob],
+        )
+        .expect("seed taint fact");
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_returns_rust_only_qualname_as_resolved() {
+        // Positive rust coverage on the federation resolve route
+        // (clarion-69db8b2739): a qualname that exists ONLY under the `rust`
+        // plugin resolves Exact and appears in the resolved map with its
+        // `rust:function:` id — the route is no longer python-only.
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) = wardline_resolve_test_state(secret, &[]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:mcp_fixture.ops.entry");
+
+        let body = br#"{"qualnames":["mcp_fixture.ops.entry"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(
+            parsed["resolved"]["mcp_fixture.ops.entry"], "rust:function:mcp_fixture.ops.entry",
+            "rust-only qualname resolves to its rust:function: id: {parsed}"
+        );
+        assert_eq!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .len(),
+            1
+        );
+        assert_eq!(
+            parsed["unresolved"],
+            serde_json::json!([]),
+            "nothing unresolved: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_persists_fact_under_rust_locator() {
+        // Positive rust coverage on the WRITE route: a rust-only qualname
+        // resolves Exact, so its fact is persisted under the `rust:function:`
+        // locator (written count + DB row both confirm it).
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) = wardline_write_test_state(secret, &[]);
+        insert_function_entity(&db_path, "rust", "rust:function:mcp_fixture.ops.entry");
+
+        let blob = r#"{"taint":{"ret":"RAW"},"v":1}"#;
+        let body = format!(
+            r#"{{"facts":[{{"qualname":"mcp_fixture.ops.entry","wardline_json":{blob}}}]}}"#
+        );
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body.as_bytes());
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["written"], 1, "rust-locator fact written: {parsed}");
+        assert_eq!(parsed["unresolved_qualnames"], serde_json::json!([]));
+
+        let stored = read_taint_blob(&db_path, "rust:function:mcp_fixture.ops.entry")
+            .expect("fact stored under the rust locator");
+        assert_eq!(stored, blob, "blob stored byte-verbatim");
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_read_returns_fact_stored_under_rust_locator() {
+        // Positive rust coverage on the READ route: a fact stored under a
+        // `rust:function:` locator is retrievable by its bare qualname.
+        use tower::ServiceExt;
+
+        let secret = "wardline-read-secret";
+        let (state, tempdir) = wardline_read_test_state(secret, &[]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:mcp_fixture.ops.entry");
+        let blob = r#"{"rust":true,"v":1}"#;
+        insert_taint_fact(&db_path, "rust:function:mcp_fixture.ops.entry", blob);
+
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=mcp_fixture.ops.entry",
+            b"",
+        );
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+
+        assert_eq!(parsed["qualname"], "mcp_fixture.ops.entry");
+        assert_eq!(parsed["exists"], true, "rust-locator fact found: {parsed}");
+        assert!(
+            text.contains(r#""wardline_json":{"rust":true,"v":1}"#),
+            "wardline_json byte-faithful: {text}"
+        );
+        // The seeded rust entity row carries no source_file_path, so the live
+        // freshness hash degrades to null (a stale signal, not an error).
+        assert_eq!(parsed["current_content_hash"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_read_fact_eclipsed_when_qualname_turns_ambiguous() {
+        // Fact eclipse (read-route ambiguous degradation): a fact persisted
+        // while `dual.target` was Exact under `python` becomes unreachable BY
+        // QUALNAME once a same-qualname `rust` entity appears — resolution
+        // flips Exact→Ambiguous, the accessors degrade it to unresolved, and
+        // the read routes report `exists: false`. The stored row is NOT
+        // deleted: it remains reachable by SEI/locator, only the qualname
+        // lookup is eclipsed (ADR-036 Amendment 2026-06-11).
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:dual.target"]);
+
+        // 1. Write the fact while the qualname is unambiguous (Exact → written).
+        let body = br#"{"facts":[{"qualname":"dual.target","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        let response = router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(parsed["written"], 1, "fact written while Exact: {parsed}");
+        assert!(
+            read_taint_blob(&db_path, "python:function:dual.target").is_some(),
+            "fact persisted under the python locator"
+        );
+
+        // 2. A same-qualname rust entity appears (e.g. a later analyze run).
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        // 3. Single GET: the qualname now resolves Ambiguous → exists: false.
+        let request = hmac_request(
+            secret,
+            "GET",
+            "/api/wardline/taint-facts?qualname=dual.target",
+            b"",
+        );
+        let response = router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            parsed["exists"], false,
+            "qualname-eclipsed fact must read as exists: false: {parsed}"
+        );
+        assert!(
+            parsed.get("wardline_json").is_none(),
+            "eclipsed fact must not leak its blob: {parsed}"
+        );
+
+        // 4. Batch-get degrades identically.
+        let body = br#"{"qualnames":["dual.target"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts:batch-get", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["qualname"], "dual.target");
+        assert_eq!(arr[0]["exists"], false, "batch-get eclipsed too: {parsed}");
+
+        // 5. Eclipsed, not erased: the stored row survives untouched.
+        assert_eq!(
+            read_taint_blob(&db_path, "python:function:dual.target").as_deref(),
+            Some(r#"{"v":1}"#),
+            "the fact row still exists in the DB (qualname-eclipsed, not deleted)"
+        );
+        drop(writer);
+    }
+
+    // ── ResolveRequest plugin hint (clarion-b1a158f7f5, ADR-036 amendment) ──
+    // Wire-level pins for the agreed Wardline proposal shape
+    // (wardline/docs/integration/2026-06-11-wardline-resolve-plugin-hint-proposal.md),
+    // including the proposal's three conformance cases: hinted-hit,
+    // hinted-miss, and unhinted-ambiguous (see
+    // wardline_resolve_plugin_hint_disambiguates_dual_qualname).
+
+    /// Helper: POST /api/wardline/resolve with the given body, expect 200 and
+    /// return the parsed JSON response.
+    async fn resolve_ok(state: AppState, secret: &str, body: &[u8]) -> serde_json::Value {
+        use tower::ServiceExt;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_plugin_hint_hit_resolves_rust_only_qualname() {
+        // hinted-hit: rust hint + rust-only qualname → resolved with the
+        // rust:function: id.
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) = wardline_resolve_test_state(secret, &[]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:mcp_fixture.ops.entry");
+
+        let body = br#"{"qualnames":["mcp_fixture.ops.entry"],"plugin":"rust"}"#;
+        let parsed = resolve_ok(state, secret, body).await;
+        assert_eq!(
+            parsed["resolved"]["mcp_fixture.ops.entry"], "rust:function:mcp_fixture.ops.entry",
+            "hinted-hit resolves to the rust id: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_plugin_hint_miss_other_plugin_owned_is_unresolved() {
+        // hinted-miss: the qualname is owned ONLY by python; a rust hint must
+        // return it unresolved. The hint is a CONSTRAINT, never a preference
+        // order that falls back to whoever owns the qualname.
+        let secret = "wardline-resolve-secret";
+        let (state, _tempdir) =
+            wardline_resolve_test_state(secret, &["python:function:py.only.fn"]);
+
+        let body = br#"{"qualnames":["py.only.fn"],"plugin":"rust"}"#;
+        let parsed = resolve_ok(state, secret, body).await;
+        assert!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .is_empty(),
+            "a hinted miss must NOT fall back to the other plugin: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!(["py.only.fn"]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_plugin_hint_disambiguates_dual_qualname() {
+        // The headline case: a qualname under BOTH plugins is unresolved
+        // unhinted (Ambiguous degrades on the wire), but a rust hint pins it
+        // to the rust id — on the SAME store state.
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) =
+            wardline_resolve_test_state(secret, &["python:function:dual.target"]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        // Unhinted on this state: still unresolved (the pre-hint behavior).
+        let parsed = resolve_ok(state.clone(), secret, br#"{"qualnames":["dual.target"]}"#).await;
+        assert_eq!(
+            parsed["unresolved"],
+            serde_json::json!(["dual.target"]),
+            "unhinted dual-plugin qualname stays unresolved: {parsed}"
+        );
+
+        // Hinted: the rust hint disambiguates to the rust id.
+        let parsed = resolve_ok(
+            state,
+            secret,
+            br#"{"qualnames":["dual.target"],"plugin":"rust"}"#,
+        )
+        .await;
+        assert_eq!(
+            parsed["resolved"]["dual.target"], "rust:function:dual.target",
+            "the rust hint disambiguates the dual qualname: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_plugin_hint_python_symmetric_hit() {
+        // Symmetric python hint on the dual-plugin state resolves the python id.
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) =
+            wardline_resolve_test_state(secret, &["python:function:dual.target"]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        let body = br#"{"qualnames":["dual.target"],"plugin":"python"}"#;
+        let parsed = resolve_ok(state, secret, body).await;
+        assert_eq!(
+            parsed["resolved"]["dual.target"], "python:function:dual.target",
+            "the python hint resolves the python id: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_blank_plugin_is_400_naming_the_field() {
+        // Adjudicated under clarion-b1a158f7f5: a blank/whitespace-only
+        // `plugin` is a 400 whose message NAMES the field (cross-version
+        // diagnosability per the proposal's rollout note) — not a silent
+        // whole-batch unresolved.
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        for body in [
+            br#"{"qualnames":["a.b.c"],"plugin":""}"#.as_slice(),
+            br#"{"qualnames":["a.b.c"],"plugin":"  "}"#.as_slice(),
+        ] {
+            let (state, _tempdir) = wardline_resolve_test_state(secret, &["python:function:a.b.c"]);
+            let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+            let response = router(state).oneshot(request).await.expect("oneshot");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(response.into_body(), 4096)
+                .await
+                .expect("read body");
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            let message = parsed["error"].as_str().expect("error message");
+            assert!(
+                message.contains("plugin"),
+                "the 400 must NAME the plugin field: {parsed}"
+            );
+            assert!(
+                message.contains("blank"),
+                "the 400 must say WHY (blank), not just reject: {parsed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_unknown_plugin_returns_all_unresolved() {
+        // A non-blank unknown plugin id is a constraint nothing satisfies:
+        // 200 with everything unresolved — NOT a 400 (plugin ids are not
+        // validated against the store; adjudicated under clarion-b1a158f7f5).
+        let secret = "wardline-resolve-secret";
+        let (state, _tempdir) = wardline_resolve_test_state(secret, &["python:function:a.b.c"]);
+
+        let body = br#"{"qualnames":["a.b.c"],"plugin":"java"}"#;
+        let parsed = resolve_ok(state, secret, body).await;
+        assert!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .is_empty(),
+            "an unknown plugin constraint resolves nothing: {parsed}"
+        );
+        assert_eq!(parsed["unresolved"], serde_json::json!(["a.b.c"]));
+    }
+
+    #[tokio::test]
+    async fn wardline_resolve_degrades_ambiguous_to_unresolved() {
+        // clarion-69db8b2739: the same qualname under BOTH plugins resolves
+        // Ambiguous; the federation accessor degrades it to "unresolved" (never
+        // pick a plugin arbitrarily — ADR-036 exact-only-write), so the qualname
+        // appears in `unresolved`, NOT in `resolved`, and the single-id
+        // ResolveResponse wire shape is preserved.
+        use tower::ServiceExt;
+
+        let secret = "wardline-resolve-secret";
+        let (state, tempdir) =
+            wardline_resolve_test_state(secret, &["python:function:dual.target"]);
+        let db_path = tempdir.path().join("loomweave.db");
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        let body = br#"{"qualnames":["dual.target"]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/resolve", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert!(
+            parsed["resolved"]
+                .as_object()
+                .expect("resolved object")
+                .is_empty(),
+            "an ambiguous qualname must NOT appear in resolved: {parsed}"
+        );
+        assert_eq!(
+            parsed["unresolved"],
+            serde_json::json!(["dual.target"]),
+            "an ambiguous qualname degrades to unresolved: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wardline_taint_write_reports_ambiguous_as_unresolved_and_writes_nothing() {
+        // Write-path counterpart: an ambiguous qualname is reported in
+        // `unresolved_qualnames` and nothing is persisted under either plugin's
+        // locator (exact-only-write preserved).
+        use tower::ServiceExt;
+
+        let secret = "wardline-write-secret";
+        let (state, db_path, writer, _tempdir) =
+            wardline_write_test_state(secret, &["python:function:dual.target"]);
+        insert_function_entity(&db_path, "rust", "rust:function:dual.target");
+
+        let body = br#"{"facts":[{"qualname":"dual.target","wardline_json":{"v":1}}]}"#;
+        let request = hmac_request(secret, "POST", "/api/wardline/taint-facts", body);
+        let response = router(state).oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), WARDLINE_BODY_LIMIT_BYTES)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            parsed["written"], 0,
+            "nothing written for ambiguous: {parsed}"
+        );
+        assert_eq!(
+            parsed["unresolved_qualnames"],
+            serde_json::json!(["dual.target"])
+        );
+        assert!(
+            read_taint_blob(&db_path, "python:function:dual.target").is_none(),
+            "no python-locator fact written"
+        );
+        assert!(
+            read_taint_blob(&db_path, "rust:function:dual.target").is_none(),
+            "no rust-locator fact written"
+        );
+        drop(writer);
     }
 
     /// Build a write-enabled `AppState` over a fresh temp migrated DB with the

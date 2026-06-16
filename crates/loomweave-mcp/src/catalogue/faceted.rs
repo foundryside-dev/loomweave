@@ -7,6 +7,8 @@
 //! yields an empty page (with `scan_truncated`/`scope_truncated` flags), never a
 //! fabricated row.
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{Value, json};
 
 use loomweave_core::McpErrorCode;
@@ -39,8 +41,7 @@ impl ServerState {
         Ok(self
             .tag_facet(
                 tag,
-                "no entity carries this categorisation tag; tags are populated by plugins \
-                 (the Python plugin emits none today)",
+                "no entity carries this categorisation tag in this index",
                 scope,
                 page,
             )
@@ -52,6 +53,12 @@ impl ServerState {
     /// the result is empty. Reused by `find_by_tag` and the categorisation
     /// shortcuts (`find_entry_points`, `find_tests`, …), each of which reads an
     /// existing tag and is honest-empty when no plugin emits it.
+    ///
+    /// The empty-result note is DERIVED from the store, never hand-maintained
+    /// (weft-7256739b31 / dogfood-4 B10b: a static "the Python plugin emits none
+    /// today" claim contradicted an index with populated test/entry-point tags).
+    /// `known_tags` lists the tags the index actually holds, and the reason
+    /// distinguishes "this tag is absent" from "no tags are populated at all".
     pub(crate) async fn tag_facet(
         &self,
         tag: String,
@@ -75,7 +82,22 @@ impl ServerState {
                 );
                 attach_facet(&mut response, json!({ "tag": tag }));
                 if response["page"]["total"] == json!(0) {
-                    attach_signal(&mut response, missing_signal("entity_tags", missing_reason));
+                    let known = loomweave_storage::known_entity_tags(conn)?;
+                    let reason = if known.is_empty() {
+                        format!(
+                            "{missing_reason}; no categorisation tags are populated in this \
+                             index at all (no active plugin emitted any)"
+                        )
+                    } else {
+                        format!(
+                            "{missing_reason}; this index does hold other categorisation \
+                             tags — see known_tags"
+                        )
+                    };
+                    if let Some(object) = response.as_object_mut() {
+                        object.insert("known_tags".to_owned(), json!(known));
+                    }
+                    attach_signal(&mut response, missing_signal("entity_tags", &reason));
                 }
                 Ok(success_envelope(response))
             })
@@ -109,6 +131,16 @@ impl ServerState {
                         }
                         Err(err) => return Err(err),
                     };
+                // An unknown kind "matches no rows" by design (kinds are
+                // plugin-owned, an open set), but a silent empty is
+                // indistinguishable from "kind exists, nothing in scope" — so
+                // when the kind matches zero entities project-wide, hint with
+                // the kinds the index actually holds (clarion-c137d73ebf).
+                let known_kinds = if candidates.is_empty() {
+                    Some(loomweave_storage::known_entity_kinds(conn)?)
+                } else {
+                    None
+                };
                 let mut response = finalize_entity_page(
                     conn,
                     &project_root,
@@ -118,6 +150,11 @@ impl ServerState {
                     scan_truncated,
                 );
                 attach_facet(&mut response, json!({ "kind": kind }));
+                if let Some(kinds) = known_kinds
+                    && let Some(object) = response.as_object_mut()
+                {
+                    object.insert("known_kinds".to_owned(), json!(kinds));
+                }
                 Ok(success_envelope(response))
             })
             .await;
@@ -136,15 +173,23 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         let tier = optional_facet(arguments, "tier")?;
         let group = optional_facet(arguments, "group")?;
+        let has_findings = optional_bool(arguments, "has_findings")?;
         let scope = RawScope::parse(arguments)?;
         let page = Page::parse(arguments, FACET_PAGE_DEFAULT, FACET_PAGE_MAX)?;
         let project_root = self.project_root.clone();
+        let filigree_client = self.filigree_client.clone();
         let result = self
             .readers
             .with_reader(move |conn| {
                 let filter = scope.resolve(conn)?;
                 let (candidates, scan_truncated) =
                     entities_with_wardline_facts(conn, FACET_SCAN_CAP)?;
+
+                let local_finding_anchor_ids = if has_findings {
+                    Some(local_finding_anchor_ids(conn)?)
+                } else {
+                    None
+                };
 
                 // Scope-filter first, then fetch the (opaque) blobs only for the
                 // survivors — a narrow scope avoids reading every candidate blob.
@@ -165,7 +210,7 @@ impl ServerState {
                     })
                     .collect();
 
-                let matched: Vec<(EntityRow, Value)> = in_scope
+                let mut matched: Vec<(EntityRow, Value)> = in_scope
                     .into_iter()
                     .filter_map(|e| {
                         let blob = blobs.get(&e.id).cloned().unwrap_or(Value::Null);
@@ -178,6 +223,23 @@ impl ServerState {
                         }
                     })
                     .collect();
+                // Set when a Wardline lookup needed by the `has_findings` filter
+                // failed (Filigree outage / paginated-hop truncation), so the
+                // result is "couldn't fully check", not "confirmed none" (L4).
+                let mut wardline_degraded = false;
+                if has_findings {
+                    let mut wardline_cache = HashMap::new();
+                    matched.retain(|(entity, _)| {
+                        entity_has_finding(
+                            entity,
+                            local_finding_anchor_ids.as_ref(),
+                            filigree_client.as_ref(),
+                            &project_root,
+                            &mut wardline_cache,
+                            &mut wardline_degraded,
+                        )
+                    });
+                }
 
                 let total = matched.len();
                 let returned: Vec<(EntityRow, Value)> = matched
@@ -191,8 +253,16 @@ impl ServerState {
                     .iter()
                     .map(|(entity, blob)| {
                         let mut row = entity_json(conn, entity);
+                        // The Wardline taint blob carries qualnames, which would
+                        // survive the identity stub of a blocked entity — withhold
+                        // it too (clarion-307668e2be).
+                        let blob = if crate::briefing_block_reason(entity).is_some() {
+                            Value::Null
+                        } else {
+                            blob.clone()
+                        };
                         if let Some(object) = row.as_object_mut() {
-                            object.insert("wardline".to_owned(), blob.clone());
+                            object.insert("wardline".to_owned(), blob);
                         }
                         row
                     })
@@ -200,7 +270,7 @@ impl ServerState {
 
                 let mut response = json!({
                     "entities": entities,
-                    "facet": { "tier": tier, "group": group },
+                    "facet": { "tier": tier, "group": group, "has_findings": has_findings },
                     "page": {
                         "total": total,
                         "offset": page.offset,
@@ -211,7 +281,15 @@ impl ServerState {
                     "scope_truncated": filter.scope_truncated(),
                     "scan_truncated": scan_truncated,
                 });
-                if total == 0 {
+                // L4: when a Wardline lookup failed, the `has_findings` filter
+                // could not fully evaluate — Filigree-only-finding entities may
+                // have been dropped. Attach an in-band degrade marker (symmetric
+                // with the single-entity `wardline_section_for_entity` path and
+                // the issues_for `issue_detail_unavailable` marker) so a short or
+                // empty result is never read as a confirmed "no entity matches".
+                if wardline_degraded {
+                    attach_wardline_degraded(&mut response);
+                } else if total == 0 {
                     attach_signal(
                         &mut response,
                         missing_signal(
@@ -229,6 +307,62 @@ impl ServerState {
     }
 }
 
+fn local_finding_anchor_ids(conn: &rusqlite::Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut set = HashSet::new();
+    let mut stmt = conn.prepare("SELECT DISTINCT entity_id FROM findings")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        set.insert(row.get::<_, String>(0)?);
+    }
+    Ok(set)
+}
+
+/// Does this entity carry a finding? A local finding-anchor row is definitive
+/// (`true`); otherwise the Filigree-side Wardline lookup decides. `degraded` is
+/// set to `true` whenever a needed Wardline lookup FAILED (transport/auth/
+/// paginated-hop truncation) so a `false` cannot be read as "confirmed none"
+/// (L4). On a lookup failure the entity is dropped from the `has_findings`
+/// result (enrich-only — a Filigree outage never breaks the core facet), but
+/// the caller attaches an in-band `wardline_unavailable` degrade marker so the
+/// empty/short result is never mistaken for an affirmative "no entity matches".
+fn entity_has_finding(
+    entity: &EntityRow,
+    local_finding_anchor_ids: Option<&HashSet<String>>,
+    client: Option<&std::sync::Arc<dyn crate::filigree::FiligreeLookup>>,
+    project_root: &std::path::Path,
+    wardline_cache: &mut HashMap<String, Option<Vec<crate::filigree::WardlineFinding>>>,
+    degraded: &mut bool,
+) -> bool {
+    if local_finding_anchor_ids.is_some_and(|ids| ids.contains(&entity.id)) {
+        return true;
+    }
+    let Some(client) = client else {
+        return false;
+    };
+    let Some(path) = entity.source_file_path.as_deref() else {
+        return false;
+    };
+    let Ok(path) = crate::project_relative_lookup_path(project_root, path) else {
+        return false;
+    };
+    let findings = wardline_cache
+        .entry(path.clone())
+        .or_insert_with(|| client.wardline_findings_for_path(&path).ok());
+    // `wardline_findings_for_path` returns Err on transport/auth failure AND, by
+    // design, on a paginated-hop truncation — both land here as `None`. Record
+    // the degrade so the caller can mark the response (instead of silently
+    // dropping the entity and claiming a confirmed-empty result).
+    if findings.is_none() {
+        *degraded = true;
+        return false;
+    }
+    findings.as_ref().is_some_and(|findings| {
+        !crate::wardline_reconcile::reconcile_for_entity(&entity.id, findings.clone())
+            .matched
+            .is_empty()
+    })
+}
+
 /// Merge a `facet` echo block into a response object.
 fn attach_facet(response: &mut Value, facet: Value) {
     if let Some(object) = response.as_object_mut() {
@@ -240,6 +374,27 @@ fn attach_facet(response: &mut Value, facet: Value) {
 fn attach_signal(response: &mut Value, signal: Value) {
     if let Some(object) = response.as_object_mut() {
         object.insert("signal".to_owned(), signal);
+    }
+}
+
+/// Attach the in-band Wardline-degrade marker to a faceted response (L4). Used
+/// when the `has_findings` filter could not reach Filigree to evaluate one or
+/// more candidates, so the result is "couldn't fully check", not "confirmed
+/// none". Mirrors the single-entity path's `wardline_unavailable` shape
+/// (`result_kind: "unavailable"`) and is mutually exclusive with the affirmative
+/// missing-signal a true confirmed-empty result carries.
+fn attach_wardline_degraded(response: &mut Value) {
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "wardline".to_owned(),
+            json!({
+                "result_kind": "unavailable",
+                "reason": "wardline_unavailable: one or more Filigree Wardline lookups failed \
+                           (transport/auth error or paginated-hop truncation); has_findings could \
+                           not be fully evaluated, so Filigree-only-finding entities may be missing \
+                           from this result — this is NOT a confirmed empty match",
+            }),
+        );
     }
 }
 
@@ -256,6 +411,18 @@ fn optional_facet(
         Some(_) => Err(ParamError::new(&format!(
             "{field} must be a string or number"
         ))),
+    }
+}
+
+/// Parse an optional boolean argument (`has_findings`). Absent / null → `false`.
+fn optional_bool(
+    arguments: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<bool, ParamError> {
+    match arguments.get(field) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ParamError::new(&format!("{field} must be a boolean"))),
     }
 }
 

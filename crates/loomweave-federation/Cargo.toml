@@ -1,5 +1,6 @@
 [package]
 name = "loomweave-federation"
+description = "Loomweave federation: shared HTTP types and config for Filigree/Wardline sibling exchange."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +11,8 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-loomweave-core = { path = "../loomweave-core", version = "1.0.0" }
+blake3.workspace = true
+loomweave-core = { path = "../loomweave-core", version = "1.1.0" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

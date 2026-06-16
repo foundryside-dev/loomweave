@@ -105,7 +105,7 @@ integrations:
     fs::write(dir.path().join("loomweave.yaml"), config_content).unwrap();
 
     // Create a dummy .loomweave dir so it passes the project layout checks
-    fs::create_dir_all(dir.path().join(".loomweave")).unwrap();
+    fs::create_dir_all(dir.path().join(".weft/loomweave")).unwrap();
 
     // Write a mock SARIF file
     let sarif_content = r#"{
@@ -217,7 +217,7 @@ integrations:
         ),
     )
     .unwrap();
-    fs::create_dir_all(dir.path().join(".loomweave")).unwrap();
+    fs::create_dir_all(dir.path().join(".weft/loomweave")).unwrap();
     let sarif_content = r#"{
       "version": "2.1.0",
       "runs": [{

@@ -1,4 +1,0 @@
-loomweave:
-  url: http://127.0.0.1:9111
-filigree:
-  url: http://127.0.0.1:8542/api/weft/scan-results

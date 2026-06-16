@@ -31,7 +31,7 @@ use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
-use loomweave_storage::contained_entity_ids;
+use loomweave_storage::{contained_entity_ids, entity_ids_in_namespace};
 
 use crate::ParamError;
 
@@ -149,16 +149,25 @@ pub(crate) use loomweave_storage::glob_match;
 /// Bound on entity ids materialised when resolving an entity-descendant scope.
 const SCOPE_DESCENDANT_CAP: usize = 50_000;
 
-/// A parsed `scope` argument. `scope?` accepts an entity id (its descendants)
+/// A parsed `scope` argument. `scope?` accepts an entity id (its descendants),
+/// a bare dotted qualname (`"specimen.dead_code"` — resolved to its entity),
 /// **or** a path glob (`"src/auth/**"`); omitted → the whole project.
 ///
 /// Disambiguation: a value that looks like a three-segment entity id
-/// (`plugin:kind:qualname`) with no `/` or `*` is an entity scope; anything else
-/// is a path glob.
+/// (`plugin:kind:qualname`) with no `/` or `*` is an entity scope; a value with
+/// a path sigil (`/` or `*`) is a path glob; anything else is a bare qualname,
+/// resolved against entity qualnames at [`RawScope::resolve`] time and only
+/// falling back to a path glob if nothing matches. This stops a package/module
+/// name like `"specimen"` from silently matching no file path (it resolves to
+/// the entity and its descendants instead).
 #[derive(Debug, Clone)]
 pub(crate) enum RawScope {
     Project,
     Entity(String),
+    /// A bare dotted qualname (`"specimen.dead_code"`): neither a full entity id
+    /// nor a path glob. Resolved to its entity id(s) at `resolve` time, with a
+    /// path-glob fallback when it matches no qualname.
+    Bare(String),
     PathGlob(String),
 }
 
@@ -178,14 +187,21 @@ impl RawScope {
     }
 
     fn classify(raw: &str) -> Self {
-        let looks_like_entity_id = !raw.contains('/')
-            && !raw.contains('*')
+        let has_path_sigil = raw.contains('/') || raw.contains('*');
+        let looks_like_entity_id = !has_path_sigil
             && raw.split(':').count() >= 3
             && raw.split(':').take(2).all(|seg| !seg.is_empty());
         if looks_like_entity_id {
             Self::Entity(raw.to_owned())
-        } else {
+        } else if has_path_sigil {
             Self::PathGlob(raw.to_owned())
+        } else {
+            // No path sigil and not a full entity id: a bare dotted qualname
+            // (`specimen`, `specimen.dead_code`). Resolve it as a qualname at
+            // `resolve()` time so a package/module name scopes correctly,
+            // instead of being treated as a path glob that silently matches
+            // nothing.
+            Self::Bare(raw.to_owned())
         }
     }
 
@@ -211,11 +227,34 @@ impl RawScope {
                     truncated: contained.truncated,
                 })
             }
+            RawScope::Bare(raw) => {
+                // A bare dotted scope is a NAMESPACE: select every entity whose
+                // qualname is `raw` or a descendant `raw.*`. This covers a package
+                // name (`specimen` → every module + their functions/classes, incl.
+                // sibling submodules) as well as a single module — broader and more
+                // correct than resolve-exact + `contains`-edges, which reached only
+                // one module's own members and returned nothing for a package name
+                // (lacuna-522ab56124: `scope="specimen"` → 0 on coupling /
+                // circular-import). A namespace that matches no entity falls back
+                // to a path glob so a filename-shaped token (`utils.py`) still
+                // behaves as before.
+                let (ids, truncated) = entity_ids_in_namespace(conn, raw, SCOPE_DESCENDANT_CAP)?;
+                if ids.is_empty() {
+                    return Ok(ScopeFilter::Path {
+                        pattern: raw.clone(),
+                    });
+                }
+                Ok(ScopeFilter::Ids {
+                    ids: ids.into_iter().collect(),
+                    truncated,
+                })
+            }
         }
     }
 }
 
 /// A resolved scope membership test over entity rows.
+#[derive(Debug)]
 pub(crate) enum ScopeFilter {
     /// Whole project — every entity is in scope.
     Project,
@@ -358,6 +397,121 @@ mod tests {
             RawScope::classify("src/auth/tokens.py"),
             RawScope::PathGlob(_)
         ));
+        // A bare dotted qualname (no path sigil, fewer than three colon
+        // segments) is neither an entity id nor a path glob — it is a qualname
+        // to be resolved, not silently matched as a path.
+        assert!(matches!(RawScope::classify("specimen"), RawScope::Bare(_)));
+        assert!(matches!(
+            RawScope::classify("specimen.dead_code"),
+            RawScope::Bare(_)
+        ));
+    }
+
+    /// A migrated in-memory store seeded with one Python module entity and a
+    /// child function reachable via a `contains` edge.
+    fn seeded_conn() -> rusqlite::Connection {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        loomweave_storage::schema::apply_migrations(&mut conn).expect("apply migrations");
+        let insert_entity = |id: &str| {
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, source_file_path, created_at, updated_at \
+                 ) VALUES (?1, 'python', ?2, ?1, ?1, '{}', 'deadbeef', \
+                    'specimen/dead_code.py', '2026-06-14T00:00:00.000Z', \
+                    '2026-06-14T00:00:00.000Z')",
+                rusqlite::params![id, id.split(':').nth(1).unwrap_or("module")],
+            )
+            .expect("insert entity");
+        };
+        insert_entity("python:module:specimen.dead_code");
+        insert_entity("python:function:specimen.dead_code.orphaned_helper");
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence) \
+             VALUES ('contains', 'python:module:specimen.dead_code', \
+                     'python:function:specimen.dead_code.orphaned_helper', 'resolved')",
+            [],
+        )
+        .expect("insert contains edge");
+        conn
+    }
+
+    #[test]
+    fn bare_qualname_scope_resolves_to_entity_and_descendants() {
+        let conn = seeded_conn();
+        let filter = RawScope::classify("specimen.dead_code")
+            .resolve(&conn)
+            .expect("resolve bare qualname");
+        match filter {
+            ScopeFilter::Ids { ids, .. } => {
+                assert!(ids.contains("python:module:specimen.dead_code"));
+                assert!(
+                    ids.contains("python:function:specimen.dead_code.orphaned_helper"),
+                    "descendant via contains edge must be in scope, got {ids:?}"
+                );
+            }
+            other => panic!("expected Ids scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_package_scope_includes_sibling_submodules() {
+        // lacuna-522ab56124 regression: a package name must select its sibling
+        // submodules (and their members), not just the package `__init__`'s own
+        // contents. `specimen.hub` is NOT a `contains`-child of the `specimen`
+        // module, so the old resolve-exact + contains-edges path returned only
+        // `python:module:specimen` and missed `specimen.hub.*` entirely (→ 0 on
+        // coupling / circular-import, which operate on the submodule entities).
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        loomweave_storage::schema::apply_migrations(&mut conn).expect("apply migrations");
+        for id in [
+            "python:module:specimen",
+            "python:module:specimen.hub",
+            "python:function:specimen.hub.dispatch",
+            "python:module:specimentary", // prefix-but-not-namespace: must NOT match
+        ] {
+            conn.execute(
+                "INSERT INTO entities ( \
+                    id, plugin_id, kind, name, short_name, properties, \
+                    content_hash, source_file_path, created_at, updated_at \
+                 ) VALUES (?1, 'python', ?2, ?1, ?1, '{}', 'deadbeef', NULL, \
+                    '2026-06-15T00:00:00.000Z', '2026-06-15T00:00:00.000Z')",
+                rusqlite::params![id, id.split(':').nth(1).unwrap_or("module")],
+            )
+            .expect("insert entity");
+        }
+        let filter = RawScope::classify("specimen")
+            .resolve(&conn)
+            .expect("resolve package scope");
+        match filter {
+            ScopeFilter::Ids { ids, .. } => {
+                assert!(ids.contains("python:module:specimen"), "{ids:?}");
+                assert!(
+                    ids.contains("python:module:specimen.hub"),
+                    "sibling submodule must be in a package scope, got {ids:?}"
+                );
+                assert!(
+                    ids.contains("python:function:specimen.hub.dispatch"),
+                    "submodule member must be in a package scope, got {ids:?}"
+                );
+                assert!(
+                    !ids.contains("python:module:specimentary"),
+                    "a prefix that is not a namespace boundary must NOT match: {ids:?}"
+                );
+            }
+            other => panic!("expected Ids scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_qualname_miss_falls_back_to_path_glob() {
+        let conn = seeded_conn();
+        // A token that matches no qualname falls back to a path glob rather than
+        // erroring — preserving the prior behaviour for filename-shaped tokens.
+        let filter = RawScope::classify("totally.bogus.name")
+            .resolve(&conn)
+            .expect("resolve unmatched bare token");
+        assert!(matches!(filter, ScopeFilter::Path { .. }));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Proves signoff A.2.8: the full Sprint 1 walking-skeleton pipeline works.
 //!
 //! Scenario:
-//!   1. `loomweave install` initialises `.loomweave/loomweave.db`.
+//!   1. `loomweave install` initialises `.weft/loomweave/loomweave.db`.
 //!   2. A `loomweave-plugin-fixture` binary is placed on a synthetic `$PATH`
 //!      alongside its `plugin.toml` (neighbour-discovery convention, L9).
 //!   3. A single source file `demo.mt` is created in the project root.
@@ -159,7 +159,7 @@ fn wp2_e2e_smoke_fixture_plugin_round_trip() {
     // 3. Set up the project directory.
     let project_dir = TempDir::new().expect("create project tempdir");
 
-    // 4. `loomweave install` to initialise `.loomweave/`.
+    // 4. `loomweave install` to initialise `.weft/loomweave/`.
     loomweave_bin()
         .args(["install", "--path"])
         .arg(project_dir.path())
@@ -190,7 +190,7 @@ fn wp2_e2e_smoke_fixture_plugin_round_trip() {
         .success();
 
     // 8. Verify the database — full round-trip identity assertions.
-    let db_path = project_dir.path().join(".loomweave/loomweave.db");
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
     let conn = Connection::open(&db_path).expect("open db");
 
     // Assert 1 + 2: exactly one run row with status "completed".
@@ -302,7 +302,7 @@ fn wp2_rlimit_as_oom_kill_is_reported_as_host_finding() {
         "OOM finding missing from analyze diagnostics.\nstdout: {stdout}\nstderr: {stderr}"
     );
 
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (run_status, stats_raw): (String, String) = conn
         .query_row("SELECT status, stats FROM runs LIMIT 1", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -412,7 +412,7 @@ ontology_version = "0.1.0"
 
     // 7. Verify the DB: run = 'failed', entity from fixture IS persisted.
     //    `fail_run` writes the reason into stats.failure_reason (JSON).
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (row_count, run_status, stats_raw): (i64, String, String) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(MAX(status), ''), COALESCE(MAX(stats), '') FROM runs",
@@ -590,7 +590,7 @@ ontology_version = "0.1.0"
     //    synthetic `core:project:*` finding anchor (REQ-ANALYZE-06, minted to
     //    hold the persisted crash findings) is excluded — it is not a
     //    plugin-produced entity.
-    let conn = Connection::open(project_dir.path().join(".loomweave/loomweave.db")).unwrap();
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let entity_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entities WHERE NOT (plugin_id = 'core' AND kind = 'project')",

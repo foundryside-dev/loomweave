@@ -1,0 +1,10 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Wardline">
+  
+  <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 4 V28"></path>
+    <path d="M6 10 H15"></path>
+    <path d="M6 16 H15"></path>
+    <path d="M6 22 H15"></path>
+    <path d="M18 16 L26 11 V21 L18 16Z" fill="currentColor"></path>
+  </g>
+</svg>

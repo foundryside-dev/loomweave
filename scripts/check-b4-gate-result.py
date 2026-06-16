@@ -201,12 +201,28 @@ def main() -> int:
     parser.add_argument(
         "--max-b5-reference-ratio",
         type=float,
-        default=float(os.environ.get("MAX_B5_REFERENCE_RATIO", "8.0")),
+        # reference_requests_per_b4_function_query = reference_requests_total /
+        # function_count. Like the p95 gate this tracks the per-file reference
+        # budget PYRIGHT_FILE_TIMEOUT_SECS: a larger budget processes more
+        # reference sites per file before cutoff, so more LSP requests are issued
+        # per function. The budget was raised 3s -> 10s (more-complete graphs on
+        # large files), which lifts this ratio to ~8.1 — right at the old 8.0
+        # gate, and faster runners process even more sites within 10s, so 8.0
+        # flakes. Raise to 12.0 (headroom over the observed ~8.1 + machine
+        # variance) while still catching a genuine request-fan-out regression.
+        default=float(os.environ.get("MAX_B5_REFERENCE_RATIO", "12.0")),
     )
     parser.add_argument(
         "--max-b5-p95-ms",
         type=int,
-        default=int(os.environ.get("MAX_B5_P95_MS", "5000")),
+        # Coupled to the Python plugin's per-file reference budget
+        # PYRIGHT_FILE_TIMEOUT_SECS (pyright_session.py): a single file's
+        # resolution is capped at that budget, so the p95 over a stress corpus
+        # tracks it. The budget was raised 3s -> 10s for more-complete graphs on
+        # large, heavily-typed files, which lifts the p95 ceiling accordingly;
+        # this gate moves with it (budget + margin) and still catches a
+        # regression that blows past the per-file budget.
+        default=int(os.environ.get("MAX_B5_P95_MS", "12000")),
     )
     args = parser.parse_args()
     if args.self_test:

@@ -66,7 +66,7 @@ ADR-002 defines a crash-loop breaker (>3 crashes in 60s → plugin disabled for 
 ### What is NOT in Layer 2 (explicit non-defences)
 
 - **Seccomp/landlock syscall sandbox.** Deferred to v0.2 with NG-16 (plugin hash-pinning). The reference Python plugin's `wardline.core.registry` import needs unconstrained `sys.path` access; a seccomp-tight ruleset breaks the reference plugin.
-- **Per-plugin CPU cap.** Plugin crash-loop breaker already catches runaway loops; explicit CPU cap adds complexity without closing a scored threat.
+- **Per-plugin CPU cap.** Plugin crash-loop breaker already catches runaway loops; explicit CPU cap adds complexity without closing a scored threat. *Amended by [ADR-050](./ADR-050-plugin-lifecycle-deadlines.md)*: the breaker only sees *crashed* plugins, never hung ones — the non-defence stands, but liveness is enforced by ADR-050's wall-clock lifecycle deadlines (handshake/file/shutdown), not the breaker, and `RLIMIT_CPU` is explicitly rejected there (cannot cover blocked-idle hangs; risks pyright's legitimately CPU-heavy runs).
 - **Outbound-network ACL on the plugin.** Python plugins may legitimately read package metadata at runtime; a default-deny network policy breaks ergonomics for a threat class (plugin exfiltration) that is better closed by hash-pinning (v0.2).
 - **Per-RPC rate limiting.** Crash-loop breaker + entity-count cap cover the DoS surface at v0.1 scale.
 
@@ -112,6 +112,8 @@ Use cgroup v2 (`systemd-run --user --scope` or direct cgroup mounts) for per-plu
 
 **Why rejected**: incremental control richness is not worth the cross-platform surface area at v0.1 scale.
 
+**Known limitation — process-count control.** `prlimit` cannot meaningfully bound a *single plugin's* process/thread count: `RLIMIT_NPROC` is enforced by the kernel against **every process/thread owned by the real UID system-wide**, not against the plugin's descendant tree. Any ceiling low enough to stop a fork-bomb is therefore also low enough to fail a legitimate `fork(2)` with `EAGAIN` once the operator's *unrelated* processes (an interactive session, other Weft daemons) push the per-UID count past it. Plugins that spawn a language server (e.g. the Python plugin's `pyright-langserver`, a Node process with many helper threads) are the acute case: the host therefore applies `RLIMIT_NPROC` only to plugins that do **not** declare the `pyright` runtime capability, and leaves it uncapped for those that do (relying on `RLIMIT_AS` + crash-loop supervision instead — see `host::effective_max_nproc`). cgroup v2 `pids.max` is the correct tool for a true per-plugin process ceiling and is the documented path if process-count bounding is ever required.
+
 ## Consequences
 
 ### Positive
@@ -127,6 +129,7 @@ Use cgroup v2 (`systemd-run --user --scope` or direct cgroup mounts) for per-plu
 - Plugin authors have one more contract to satisfy — the four limits are real and can bite a plugin that emits millions of noisy `LMWV-FACT-*` findings. Mitigation: the `expected_entities_per_file` manifest declaration produces a sanity-warning (`LMWV-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING`) well before the hard cap, so the first sign of trouble isn't a killed plugin.
 - The `prlimit` approach doesn't cover RSS only — `RLIMIT_AS` caps virtual memory, which overcounts for plugins that `mmap` large file ranges (e.g., tree-sitter's incremental parse buffers). Mitigation: default cap of 2 GiB is generous enough that a well-behaved plugin won't trip it; operators on constrained hosts who do trip it get a specific finding subcode.
 - Full sandbox is deferred; a malicious plugin that stays under the four caps can still exfiltrate source to a network destination. This is a known v0.2 gap and is named in the "NOT in Layer 2" list and in v0.1 release notes.
+- Language-server plugins (those declaring `capabilities.runtime.pyright`) run with **no** `RLIMIT_NPROC` cap, so their process *count* is not bounded — see the "process-count control" limitation under Alternative 4. `RLIMIT_AS` (per-process memory) and the crash-loop counter remain in force; the accepted residual risk is a fork-bomb from a *first-party* language-server plugin, which the system-wide `ulimit -u` still backstops.
 
 ### Neutral
 

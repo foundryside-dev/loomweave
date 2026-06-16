@@ -145,7 +145,7 @@ fn plugin_path(plugin_dir: &std::path::Path) -> std::ffi::OsString {
 }
 
 fn conn(project: &std::path::Path) -> Connection {
-    Connection::open(project.join(".loomweave/loomweave.db")).expect("open loomweave db")
+    Connection::open(project.join(".weft/loomweave/loomweave.db")).expect("open loomweave db")
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -232,11 +232,11 @@ fn resume_does_not_duplicate_secret_findings() {
     // every resume). Regression for the gap that the phase3 weak-modularity
     // finding alone did not cover.
     //
-    // Also load-bearing for Wave 2 / T3.1: this passes only because a file with
-    // an active secret finding is NEVER incrementally skipped (the resume run
-    // would otherwise skip the unchanged leaky file, re-anchoring its finding to
-    // the core file entity instead of the plugin entity → a duplicate id). If the
-    // secret carve-out in `analyze.rs` is removed, this test fails.
+    // Wave 2 / T3.1 + weft-4165f1ed71: the resume run incrementally SKIPS the
+    // unchanged leaky file, so this also exercises the skipped-file anchor
+    // seeding — the finding must re-anchor to the SAME plugin entity resolved
+    // from the committed rows (prior_anchor_by_file), never to the core file
+    // entity (which would flip the anchor-keyed id into a duplicate).
     let project = tempfile::tempdir().unwrap();
     let plugin = tempfile::tempdir().unwrap();
     write_secret_fixture_plugin(plugin.path());
@@ -307,6 +307,121 @@ fn resume_does_not_duplicate_secret_findings() {
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(run_rows, 1, "resume reuses the run row");
+}
+
+#[test]
+fn still_secret_stays_blocked_across_reanalysis() {
+    // Regression for clarion-3b87a7b174: a file that STILL contains a secret
+    // must keep `briefing_blocked` across every re-analysis path. The flag has
+    // no durable storage — `entities.briefing_blocked` (migration 0002) is a
+    // VIRTUAL generated column over the mutable `properties` JSON, re-derived
+    // from the scanner each run (writer.rs upserts `properties = excluded.
+    // properties` wholesale). So the only thing keeping a secret entity withheld
+    // is that every producer re-asserts the block on every run. This locks the
+    // invariant `still-secret ⇒ every entity of the file stays briefing_blocked`
+    // across (1) a full re-analysis that rewrites properties (changed body),
+    // (2) an incremental skip (unchanged), and (3) `--resume`. A future producer
+    // that rewrites a secret file's properties without re-stamping the block
+    // would silently re-expose it to briefings/federation; this test fails first.
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let leaky = project.path().join("leaky.sec");
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    // (total entities for the file, of which how many are NOT blocked).
+    let census = || {
+        let db = conn(project.path());
+        let total: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE source_file_path LIKE '%leaky.sec'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unblocked: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM entities \
+                   WHERE source_file_path LIKE '%leaky.sec' \
+                     AND json_extract(properties, '$.briefing_blocked') IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (total, unblocked)
+    };
+
+    // Run 1 — fresh analyze. The secret-bearing file is withheld.
+    analyze();
+    let (total, unblocked) = census();
+    assert!(
+        total >= 1,
+        "the secret file must produce at least one entity"
+    );
+    assert_eq!(
+        unblocked, 0,
+        "run 1: every entity of the secret file must be briefing_blocked",
+    );
+
+    // Run 2 — FULL re-analysis with a changed body that STILL contains the
+    // secret. The changed hash forces a non-skip, so the plugin re-runs and the
+    // writer rewrites `properties` wholesale: this is the exact properties-
+    // rewrite path the ticket worried about. The block must be re-asserted.
+    std::fs::write(
+        &leaky,
+        b"# key rotated, value unchanged\naws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+    analyze();
+    let (total, unblocked) = census();
+    assert!(total >= 1);
+    assert_eq!(
+        unblocked, 0,
+        "run 2 (full re-analysis, properties rewritten, secret remains): \
+         every entity must stay briefing_blocked",
+    );
+
+    // Run 3 — incremental skip (file unchanged since run 2). The rows are left
+    // untouched, so the block persists; lock it so a skip-path regression bites.
+    analyze();
+    let (_total, unblocked) = census();
+    assert_eq!(
+        unblocked, 0,
+        "run 3 (incremental skip, secret remains): block must persist",
+    );
+
+    // Run 4 — `--resume` the latest run. Resume re-runs the unconditional
+    // secret scan (it only changes finding `mark_unseen`), so the block must
+    // survive a resumed re-analysis too.
+    let run_id: String = conn(project.path())
+        .query_row(
+            "SELECT id FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    loomweave_bin()
+        .arg("analyze")
+        .args(["--resume", &run_id])
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+    let (_total, unblocked) = census();
+    assert_eq!(
+        unblocked, 0,
+        "run 4 (--resume, secret remains): block must survive a resumed re-analysis",
+    );
 }
 
 #[test]
@@ -417,7 +532,7 @@ fn baseline_suppresses_secret_and_emits_audit_match() {
     .unwrap();
     let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
     std::fs::write(
-        project.path().join(".loomweave/secrets-baseline.yaml"),
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
         format!(
             r#"
 version: "1.0"
@@ -480,7 +595,7 @@ fn missing_baseline_justification_degrades_to_finding() {
     .unwrap();
     let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
     std::fs::write(
-        project.path().join(".loomweave/secrets-baseline.yaml"),
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
         format!(
             r#"
 version: "1.0"
@@ -672,7 +787,7 @@ fn baseline_suppression_and_override_admission_are_audited_together() {
     .unwrap();
     let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
     std::fs::write(
-        project.path().join(".loomweave/secrets-baseline.yaml"),
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
         format!(
             r#"
 version: "1.0"
@@ -748,7 +863,7 @@ fn assert_invalid_baseline_aborts(raw_baseline: &str, expected_stderr: &str) {
     install_project(project.path());
     std::fs::write(project.path().join("leaky.sec"), b"nothing to see\n").unwrap();
     std::fs::write(
-        project.path().join(".loomweave/secrets-baseline.yaml"),
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
         raw_baseline,
     )
     .unwrap();
@@ -1009,5 +1124,395 @@ fn clean_sidecar_creates_anchor_without_block() {
     assert_eq!(
         blocked, None,
         "anchor on an always-clean sidecar must have no briefing_blocked"
+    );
+}
+
+// ── B10 (weft-7256739b31): per-run secret-finding dedup ────────────────────────
+
+/// B10(a) failing-first: a ROTATED secret at the same site (same file, same
+/// line, same detector rule) must UPSERT the same finding row, never mint a
+/// second one. Pre-fix the finding id hashed the evidence (which embeds
+/// `hashed_secret_hex`), so a value rotation minted a new id while the old row
+/// lingered (the full sweep is gated off on incremental runs — `mod_b.sec`
+/// unchanged → `skipped_files > 0`). Stable identity = anchor entity + rule +
+/// site (`file:line:detector`), exactly the lacuna dupe
+/// (`specimen/policy_boundaries.py:41`, two ids across two runs).
+#[test]
+fn rotated_secret_at_same_site_does_not_duplicate_finding() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let leaky = project.path().join("leaky.sec");
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+    // A second, never-changing file so run 2 is a genuinely incremental run
+    // (skipped_files > 0) and the full-pass stale sweep stays gated off.
+    std::fs::write(project.path().join("mod_b.sec"), b"nothing to see\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    analyze();
+    let first_id: String = conn(project.path())
+        .query_row(
+            "SELECT id FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // Rotate the secret VALUE in place: same file, same line, same detector.
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLF'\n").unwrap();
+    analyze();
+
+    let db = conn(project.path());
+    let skipped = latest_run_stats_value(project.path())["skipped_files"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        skipped >= 1,
+        "run 2 must be incremental (mod_b.sec skipped) so the full sweep gate is exercised"
+    );
+    let rows: Vec<String> = {
+        let mut stmt = db
+            .prepare("SELECT id FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "a rotated secret at the same site must not mint a duplicate finding row: {rows:?}"
+    );
+    assert_eq!(
+        rows[0], first_id,
+        "site-keyed identity: the rotated secret upserts the SAME finding id"
+    );
+}
+
+/// B10(a) failing-first, sweep half: a secret REMOVED from a re-walked file must
+/// retire its finding even on an INCREMENTAL run. The secret scan is a full pass
+/// every run (pre-ingest, before the skip partition), so its findings are always
+/// fully re-emitted — the scoped sweep can retire unreproduced `LMWV-SEC-*` /
+/// baseline rows without the full-pass `skipped_files == 0` gate the general
+/// sweep needs.
+#[test]
+fn removed_secret_is_swept_on_incremental_run() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let leaky = project.path().join("leaky.sec");
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+    // Unchanged second file keeps run 2 incremental (full sweep gated off).
+    std::fs::write(project.path().join("mod_b.sec"), b"nothing to see\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    analyze();
+    let count: i64 = conn(project.path())
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "run 1 must record the secret finding");
+
+    // Remove the secret (content change → leaky.sec is re-walked; mod_b.sec is
+    // skipped so the run is incremental).
+    std::fs::write(&leaky, b"all clean now\n").unwrap();
+    analyze();
+
+    let db = conn(project.path());
+    let skipped = latest_run_stats_value(project.path())["skipped_files"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(skipped >= 1, "run 2 must be incremental");
+    let count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "a vanished secret's finding must be retired by the scoped per-run sweep \
+         even when the run is incremental"
+    );
+}
+
+// ── clarion-3c4ed8e9fb: incremental baseline-add unblocks a skipped file ────────
+
+/// Failing-first regression for clarion-3c4ed8e9fb (clarion-55fc5aa885 §I11, the
+/// operator baseline workflow): run 1 analyzes an unacknowledged secret and
+/// blocks the file; the operator adds a `secrets-baseline.yaml` acknowledging the
+/// key; a PLAIN incremental run 2 must UNBLOCK the file — even though the file is
+/// byte-identical and therefore incrementally SKIPPED (never re-dispatched
+/// through the plugin host). Pre-fix the skipped file kept run 1's
+/// `briefing_blocked`, so it stayed withheld forever short of `--no-incremental`.
+/// The pre-ingest secret scan is a full pass every run, so the current verdict
+/// (now baseline-suppressed) is known and reconciled onto the skipped rows.
+#[test]
+fn baseline_added_after_block_unblocks_skipped_file_on_incremental_run() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let leaky = project.path().join("leaky.sec");
+    std::fs::write(&leaky, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    // Run 1 — no baseline yet: the file blocks. The plugin module entity plus the
+    // core file entity are both withheld.
+    analyze();
+    let blocked_before: i64 = conn(project.path())
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+               WHERE source_file_path LIKE '%leaky.sec' \
+                 AND json_extract(properties, '$.briefing_blocked') = 'secret_present'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_before, 2,
+        "run 1 must block both the plugin module entity and the core file entity"
+    );
+
+    // Operator acknowledges the example key in a baseline. This does NOT change
+    // leaky.sec's bytes, so run 2 incrementally SKIPS it.
+    let hashed_secret = sha1_hex(b"AKIAIOSFODNN7EXAMPLE");
+    std::fs::write(
+        project.path().join(".weft/loomweave/secrets-baseline.yaml"),
+        format!(
+            r#"
+version: "1.0"
+results:
+  "leaky.sec":
+    - type: "AWS Access Key"
+      hashed_secret: "{hashed_secret}"
+      line_number: 1
+      is_secret: false
+      justification: "Documented public AWS example key — false positive."
+"#
+        ),
+    )
+    .unwrap();
+
+    // Run 2 — plain incremental analyze. The file is skipped but must unblock.
+    analyze();
+    let stats = latest_run_stats_value(project.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "run 2 must incrementally skip the unchanged leaky.sec (the bug's trigger): {stats}"
+    );
+
+    let db = conn(project.path());
+    let blocked_after: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+               WHERE source_file_path LIKE '%leaky.sec' \
+                 AND json_extract(properties, '$.briefing_blocked') = 'secret_present'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_after, 0,
+        "baseline-added: a skipped file's entities must unblock to the current \
+         secret-scan verdict on a plain incremental run"
+    );
+    let baseline_hits: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-INFRA-SECRET-BASELINE-MATCH'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        baseline_hits >= 1,
+        "the baseline acknowledgement must emit a BASELINE-MATCH finding"
+    );
+}
+
+/// Inverse of the unblock fix: a file that NEWLY gains a secret (content change)
+/// must still block. A content change re-dispatches the file through the host
+/// (it is NOT skipped), so the host stamps the block directly — the
+/// reconciliation pass only touches the skipped partition and must not weaken
+/// this path. Locks the scanner-is-sole-authority invariant in the "toward
+/// blocked" direction.
+#[test]
+fn file_that_newly_gains_a_secret_still_blocks() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    let target = project.path().join("target.sec");
+    std::fs::write(&target, b"nothing to see\n").unwrap();
+    // A never-changing companion so run 2 is genuinely incremental.
+    std::fs::write(project.path().join("mod_b.sec"), b"still clean\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    // Run 1 — clean: nothing blocked.
+    analyze();
+    let blocked_before: i64 = conn(project.path())
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+               WHERE source_file_path LIKE '%target.sec' \
+                 AND json_extract(properties, '$.briefing_blocked') IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_before, 0,
+        "run 1 (clean): target.sec must not block"
+    );
+
+    // Introduce a secret. The content change re-dispatches target.sec.
+    std::fs::write(&target, b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n").unwrap();
+    analyze();
+    let stats = latest_run_stats_value(project.path());
+    assert!(
+        stats["skipped_files"].as_u64().unwrap_or(0) >= 1,
+        "run 2 must be incremental (mod_b.sec skipped): {stats}"
+    );
+    let blocked_after: i64 = conn(project.path())
+        .query_row(
+            "SELECT COUNT(*) FROM entities \
+               WHERE source_file_path LIKE '%target.sec' \
+                 AND json_extract(properties, '$.briefing_blocked') = 'secret_present'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_after, 2,
+        "a newly-secret-bearing file must block (plugin module + core file entity)"
+    );
+}
+
+/// Shared helper: the latest run's stats JSON (mirrors `analyze.rs`'s
+/// `latest_run_stats`, local to this suite).
+fn latest_run_stats_value(project_root: &std::path::Path) -> serde_json::Value {
+    let stats_raw: String = conn(project_root)
+        .query_row(
+            "SELECT stats FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query latest runs.stats");
+    serde_json::from_str(&stats_raw).expect("runs.stats JSON")
+}
+
+// ── B1 fixed point (weft-4165f1ed71): clean tree analyzes to 0 processed files ─
+
+/// B1 failing-first: a clean, unchanged tree must reach a FIXED POINT —
+/// "analyze; analyze again; the second run processes 0 files". Pre-fix, a file
+/// with an active secret finding was carved out of the incremental skip on
+/// EVERY run (its finding anchor could only be resolved from entities emitted
+/// in the same run), so lacuna re-processed exactly one python file forever.
+/// The anchor now resolves from the already-committed entity rows, the
+/// carve-out is gone, and the finding stays anchored to the plugin module
+/// entity with the same site-keyed id.
+#[test]
+fn unchanged_tree_with_secret_reaches_analyze_fixed_point() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(
+        project.path().join("leaky.sec"),
+        b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("clean.sec"), b"nothing to see\n").unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .arg("analyze")
+            .arg(project.path())
+            .env("PATH", plugin_path(plugin.path()))
+            .assert()
+            .success();
+    };
+
+    analyze();
+    let (first_id, first_anchor): (String, String) = conn(project.path())
+        .query_row(
+            "SELECT id, entity_id FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        first_anchor.starts_with("secretfixture:module:"),
+        "run 1 anchors the finding to the plugin module entity: {first_anchor}"
+    );
+
+    // Second run on the UNCHANGED tree: the fixed point. Every plugin file is
+    // skipped — including the secret-bearing one.
+    analyze();
+    let stats = latest_run_stats_value(project.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(2),
+        "an unchanged tree must skip every plugin file (fixed point): {stats}"
+    );
+
+    // And the finding is byte-stable: same single row, same id, same anchor.
+    let db = conn(project.path());
+    let rows: Vec<(String, String)> = {
+        let mut stmt = db
+            .prepare(
+                "SELECT id, entity_id FROM findings \
+                 WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "no duplicate row on the skipped path: {rows:?}"
+    );
+    assert_eq!(rows[0].0, first_id, "stable finding id across the skip");
+    assert_eq!(
+        rows[0].1, first_anchor,
+        "the skipped file's finding must stay anchored to the plugin module entity \
+         (resolved from the committed rows), never re-anchor to the core file entity"
     );
 }

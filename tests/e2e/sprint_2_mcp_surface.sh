@@ -35,6 +35,10 @@ PLUGIN_BIN="$VENV/bin/loomweave-plugin-python"
 
 DEMO_DIR="$(mktemp -d -t loomweave-mcp-demo-XXXXXX)"
 trap 'rm -rf "$DEMO_DIR"' EXIT
+# Hermetic install (clarion-c5e3cc2818): `loomweave install` registers a
+# Codex MCP entry in ~/.codex/config.toml unless this override points it
+# at a scratch-local file. Never mutate the operator's real config.
+export LOOMWEAVE_CODEX_CONFIG="$DEMO_DIR/codex-config.toml"
 log "scratch project: $DEMO_DIR"
 cd "$DEMO_DIR"
 cat > demo.py <<'PY'
@@ -59,13 +63,23 @@ def annotated(x: Marker) -> Marker:
     return x
 
 CONST_REF = world
+
+class Special(Marker):
+    pass
+
+def tagged(fn):
+    return fn
+
+@tagged
+def handler():
+    return world()
 PY
 
 export PATH="$REPO_ROOT/target/release:$VENV/bin:$PATH"
 
 log "running: loomweave install"
 loomweave install
-[ -f "$DEMO_DIR/.loomweave/loomweave.db" ] || fail ".loomweave/loomweave.db not created"
+[ -f "$DEMO_DIR/.weft/loomweave/loomweave.db" ] || fail ".weft/loomweave/loomweave.db not created"
 
 log "running: loomweave analyze ."
 loomweave analyze .
@@ -119,7 +133,7 @@ def assert_tool_ok(response: dict[str, object]) -> dict[str, object]:
     return envelope
 
 
-conn = sqlite3.connect(project_dir / ".loomweave" / "loomweave.db")
+conn = sqlite3.connect(project_dir / ".weft" / "loomweave" / "loomweave.db")
 world_hash = conn.execute(
     "SELECT content_hash FROM entities WHERE id = ?",
     ("python:function:demo.world",),
@@ -180,7 +194,11 @@ recording_fixture = [
         },
     }
 ]
-(project_dir / ".loomweave" / "openrouter-recording.json").write_text(
+# Write the recording fixture to the path the serve config points at. The store
+# moved under .weft/loomweave/ (ADR-046) but this fixture write lagged behind in
+# .weft/, so serve could never find it and exited 1 before any tool assertion —
+# the same outside-the-blocking-floor drift that hid the stale tool list.
+(project_dir / ".weft" / "loomweave" / "openrouter-recording.json").write_text(
     json.dumps(recording_fixture, separators=(",", ":")),
     encoding="utf-8",
 )
@@ -255,7 +273,7 @@ llm_policy:
   provider: recording
   model_id: anthropic/claude-sonnet-4.6
   session_token_ceiling: 1000000
-  recording_fixture_path: .loomweave/openrouter-recording.json
+  recording_fixture_path: .weft/loomweave/openrouter-recording.json
 serve:
   mcp:
     enable_write_tools: true
@@ -264,7 +282,7 @@ integrations:
     enabled: true
     base_url: http://127.0.0.1:{filigree_server.server_port}
     actor: loomweave-e2e
-    token_env: FILIGREE_API_TOKEN
+    token_env: WEFT_FEDERATION_TOKEN
     timeout_seconds: 2
 """.lstrip(),
     encoding="utf-8",
@@ -413,6 +431,39 @@ requests: list[tuple[str, dict[str, object]]] = [
         },
     ),
     (
+        "relations-in",
+        {
+            "jsonrpc": "2.0",
+            "id": "relations-in",
+            "method": "tools/call",
+            "params": {
+                "name": "entity_relation_list",
+                "arguments": {"id": "python:class:demo.Marker", "direction": "in"},
+            },
+        },
+    ),
+    (
+        "relations-out-decorator",
+        {
+            "jsonrpc": "2.0",
+            "id": "relations-out-decorator",
+            "method": "tools/call",
+            "params": {
+                "name": "entity_relation_list",
+                "arguments": {"id": "python:function:demo.tagged", "direction": "out"},
+            },
+        },
+    ),
+    (
+        "neighborhood-marker",
+        {
+            "jsonrpc": "2.0",
+            "id": "neighborhood-marker",
+            "method": "tools/call",
+            "params": {"name": "neighborhood", "arguments": {"id": "python:class:demo.Marker"}},
+        },
+    ),
+    (
         "context",
         {
             "jsonrpc": "2.0",
@@ -456,6 +507,10 @@ assert tool_names == [
     "subsystem_member_list",
     "entity_subsystem_get",
     "project_status_get",
+    "llm_config_get",
+    "llm_config_set",
+    "semantic_config_get",
+    "semantic_config_set",
     "entity_summary_preview_cost_get",
     "entity_source_get",
     "entity_call_site_list",
@@ -485,6 +540,9 @@ assert tool_names == [
     "entity_recent_change_list",
     "entity_dead_list",
     "entity_semantic_search_list",
+    "project_finding_list",
+    "entity_resolve",
+    "entity_relation_list",
 ], tool_names
 # Single-source check (clarion-71f0d6c3dd): the initialize `instructions` tool
 # enumeration is derived from list_tools(), so every advertised tool must appear
@@ -492,7 +550,7 @@ assert tool_names == [
 # without a second hardcoded list.
 for name in tool_names:
     assert name in init_result["instructions"], (name, init_result["instructions"])
-assert "leaf scope only" in tools[4]["description"]
+assert "leaf scope" in tools[4]["description"]
 
 entity_hit = assert_tool_ok(responses["entity-hit"])
 assert entity_hit["result"]["entity"]["id"] == "python:function:demo.hello", entity_hit
@@ -574,6 +632,41 @@ assert issues["stats_delta"]["filigree_requests_total"] >= 2, issues
 assert world_sei in filigree_requests, filigree_requests
 assert hello_sei in filigree_requests, filigree_requests
 assert issues["result"]["wardline_findings"]["result_kind"] == "no_matches", issues
+
+# Relation read surface (clarion-ae5b43ea40, direction semantics ADR-051):
+# "what subclasses Marker" is direction=in on inherits_from, through a REAL
+# analyze-built index — not a seeded DB.
+relations_in = assert_tool_ok(responses["relations-in"])
+rel_rows = relations_in["result"]["relations"]
+assert len(rel_rows) == 1, relations_in
+rel = rel_rows[0]
+assert rel["kind"] == "inherits_from", relations_in
+assert rel["entity"]["id"] == "python:class:demo.Special", relations_in
+assert rel["edge_confidence"] == "resolved", relations_in
+assert rel["line_text"] == "class Special(Marker):", relations_in
+assert rel["file"].endswith("demo.py"), relations_in
+assert rel["source_status"] == "ok", relations_in
+assert relations_in["result"]["truncated"] is False, relations_in
+
+# "what does @tagged decorate" is direction=out on the DECORATOR (the from
+# side); the anchor line is the @tagged token at the decoration site.
+relations_out = assert_tool_ok(responses["relations-out-decorator"])
+deco_rows = relations_out["result"]["relations"]
+assert len(deco_rows) == 1, relations_out
+deco = deco_rows[0]
+assert deco["kind"] == "decorates", relations_out
+assert deco["entity"]["id"] == "python:function:demo.handler", relations_out
+assert deco["line_text"] == "@tagged", relations_out
+assert deco["source_status"] == "ok", relations_out
+
+# The neighborhood overview carries the same edges as kind-tagged buckets.
+nb_marker = assert_tool_ok(responses["neighborhood-marker"])
+nb_rel_in = nb_marker["result"]["relations_in"]
+assert {(r["kind"], r["entity"]["id"]) for r in nb_rel_in} == {
+    ("inherits_from", "python:class:demo.Special")
+}, nb_marker
+assert nb_marker["result"]["truncated"]["relations_in"] is False, nb_marker
+assert nb_marker["result"]["relations_out"] == [], nb_marker
 
 context = responses["context"]["result"]
 ctx_text = context["contents"][0]["text"]

@@ -2,18 +2,18 @@
 
 Operator-facing reference for the constraints around Loomweave's local-state
 directory. v1.0 is local-first; the storage subsystem is plain SQLite under
-`.loomweave/`. The constraints below come straight out of
+`.weft/loomweave/`. The constraints below come straight out of
 [ADR-011](../adr/ADR-011-storage-architecture.md) (writer-actor + reader-pool
 over SQLite) and the v1.0 tag-cut gap-register entries DOC-11, STO-01,
 STO-04, and STO-05.
 
 ## 1. Local-first storage layout
 
-Per ADR-011, every Loomweave project keeps its state in a `.loomweave/`
+Per ADR-011, every Loomweave project keeps its state in a `.weft/loomweave/`
 directory at the project root:
 
 ```
-.loomweave/
+.weft/loomweave/
 ├── loomweave.db              SQLite database (entities, edges, runs, findings, summary_cache)
 ├── loomweave.db-wal          SQLite WAL companion file
 ├── loomweave.db-shm          SQLite shared-memory file
@@ -23,13 +23,13 @@ directory at the project root:
 ```
 
 There is no central server, no shared registry, no networked state.
-`loomweave install --path` creates `.loomweave/` on a new project root;
+`loomweave install --path` creates `.weft/loomweave/` on a new project root;
 `loomweave analyze` and `loomweave serve` both read and (in `analyze`'s case)
 write into it.
 
 ## 2. NFS is prohibited
 
-**`.loomweave/` MUST live on a local filesystem.** Do not place a project root
+**`.weft/loomweave/` MUST live on a local filesystem.** Do not place a project root
 on NFS, SMB, sshfs, or any other network filesystem and expect `loomweave
 analyze` or `loomweave serve` to behave correctly.
 
@@ -51,9 +51,9 @@ that workspace. Clone the project to local disk first.
 
 Only one `loomweave analyze` may run against a given project root at a time.
 The v1.0 binary enforces this with an exclusive `fs2` advisory lock on
-`.loomweave/loomweave.lock`, acquired at the start of `analyze` and held for the
+`.weft/loomweave/loomweave.lock`, acquired at the start of `analyze` and held for the
 writer-actor lifetime. A second `loomweave analyze` against the same
-`.loomweave/` fails fast with a clear "another loomweave analyze is in progress
+`.weft/loomweave/` fails fast with a clear "another loomweave analyze is in progress
 against this project" error rather than racing the first analyzer's run
 state. (See STO-01 in the v1.0 tag-cut gap register for the originating
 finding.)
@@ -82,7 +82,7 @@ The v1.0 supported backup procedure is a four-step shutdown-and-copy. There
 is no live `loomweave db backup` subcommand at v1.0 (deferred to v1.1, §6).
 
 1. **Ensure no `loomweave analyze` is running** against the project root.
-   The fs2 advisory lock on `.loomweave/loomweave.lock` will be released; a
+   The fs2 advisory lock on `.weft/loomweave/loomweave.lock` will be released; a
    subsequent `loomweave analyze` from a backup script would otherwise race
    with the backup.
 
@@ -95,7 +95,7 @@ is no live `loomweave db backup` subcommand at v1.0 (deferred to v1.1, §6).
    captures all committed state:
 
    ```bash
-   sqlite3 .loomweave/loomweave.db "PRAGMA wal_checkpoint(TRUNCATE);"
+   sqlite3 .weft/loomweave/loomweave.db "PRAGMA wal_checkpoint(TRUNCATE);"
    ```
 
    `TRUNCATE` mode is the strongest checkpoint — it flushes the WAL into
@@ -103,13 +103,13 @@ is no live `loomweave db backup` subcommand at v1.0 (deferred to v1.1, §6).
 
    **Why this step matters:** in WAL mode, committed pages live in
    `loomweave.db-wal` until a checkpoint folds them back into `loomweave.db`. A
-   naive `cp .loomweave/loomweave.db backup.db` during (or shortly after) a live
+   naive `cp .weft/loomweave/loomweave.db backup.db` during (or shortly after) a live
    `analyze` therefore captures a *torn* copy — the main database file is
    missing the most recent committed transactions, which are still sitting in
    the separate `-wal` file. Forcing a `TRUNCATE` checkpoint first guarantees
    `loomweave.db` is self-contained before the copy.
 
-4. **Copy `.loomweave/` to the backup location** with any standard tool
+4. **Copy `.weft/loomweave/` to the backup location** with any standard tool
    (`cp -a`, `rsync -a`, `tar`). All three of `loomweave.db`,
    `loomweave.db-wal`, and `loomweave.db-shm` should be present in the copy;
    after a successful TRUNCATE the WAL is empty but the file should still
@@ -121,8 +121,8 @@ To restore a backup:
 
 1. Stop any running `loomweave analyze` or `loomweave serve` against the
    project root.
-2. Replace the project's `.loomweave/` directory with the backup copy. The
-   `instance_id` file inside `.loomweave/` is part of the backup; restoring
+2. Replace the project's `.weft/loomweave/` directory with the backup copy. The
+   `instance_id` file inside `.weft/loomweave/` is part of the backup; restoring
    it preserves the project's federation identity (`/api/v1/_capabilities`
    `instance_id` stays stable across the restore).
 3. Run `loomweave analyze` to validate the restored database. A fresh analyze

@@ -1,7 +1,7 @@
 [plugin]
 name = "loomweave-plugin-python"
 plugin_id = "python"
-version = "1.0.0"
+version = "1.1.0"
 protocol_version = "1.0"
 # Bare basename per ADR-021 §Layer 1 + WP2 scrub commit eb0a41d — the host
 # refuses manifests whose `executable` carries any path component.
@@ -25,6 +25,11 @@ wardline_aware = true
 # v0.1 rejects `true` at initialize with LMWV-INFRA-MANIFEST-UNSUPPORTED-CAPABILITY.
 reads_outside_project_root = false
 
+# Declaring this sub-table marks the plugin as a language-server host: it spawns
+# pyright-langserver (Node). The host detects this and leaves RLIMIT_NPROC
+# uncapped for the plugin — RLIMIT_NPROC is per-UID-global and would otherwise
+# fail pyright's fork() with EAGAIN on a busy workstation (see ADR-021,
+# "process-count control", and host::effective_max_nproc).
 [capabilities.runtime.pyright]
 pin = "1.1.409"
 
@@ -32,19 +37,23 @@ pin = "1.1.409"
 # Sprint 2 B.2: classes + modules join the kind set. B.3 (ADR-026) adds
 # the first edge kind, `contains`. B.4* adds scan-time `calls` edges.
 # B.5* adds scan-time `references` edges. Phase 3 Task 3 adds scan-time
-# `imports` candidate edges.
+# `imports` candidate edges. clarion-43416be550 adds scan-time
+# `inherits_from` (subclass → base) + `decorates` (decorator → decorated)
+# relation edges, resolved through the same pyright reference machinery.
 entity_kinds = ["function", "class", "module"]
-edge_kinds = ["contains", "calls", "references", "imports"]
+edge_kinds = ["contains", "calls", "references", "imports", "inherits_from", "decorates"]
 # Per ADR-022: uppercase `LMWV-{PLUGIN_ID_UPPER}-`. Reserved at parse
 # against the LMWV-INFRA-* and LMWV-FACT-* namespaces.
 rule_id_prefix = "LMWV-PY-"
 # Bumps per ADR-027 when the entity/edge/rule set shifts. Phase 3 Task 3 is a
-# MINOR bump (additive `imports` edge kind). NOTE: ADR-007's summary-cache key
-# is the 5-tuple (entity_id, content_hash, prompt_template_id, model_tier,
-# guidance_fingerprint) — ontology_version is handshake-validation, NOT a
-# cache-key component. New edge rows miss the cache by component-1 of
-# the 5-tuple organically (no edges live in the 5-tuple yet anyway).
-ontology_version = "0.7.0"
+# MINOR bump (additive `imports` edge kind); 0.8.0 is the additive
+# `inherits_from` + `decorates` MINOR bump (clarion-43416be550). NOTE:
+# ADR-007's summary-cache key is the 5-tuple (entity_id, content_hash,
+# prompt_template_id, model_tier, guidance_fingerprint) — ontology_version is
+# handshake-validation, NOT a cache-key component. New edge rows miss the
+# cache by component-1 of the 5-tuple organically (no edges live in the
+# 5-tuple yet anyway).
+ontology_version = "0.8.0"
 
 [integrations.wardline]
 expected_descriptor_version = "wardline-generic-2"

@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use loomweave_core::{LeafSummaryPromptInput, McpErrorCode, build_leaf_summary_prompt};
 use serde_json::{Value, json};
 
-use loomweave_storage::{StorageError, contained_entity_ids, entity_by_id, has_any_alive_binding};
+use loomweave_storage::{
+    StorageError, contained_entity_ids, entity_by_id, has_any_alive_binding, resolve_entity_ref,
+};
 
 use crate::{
     IssuesForRead, ParamError, SUMMARY_MAX_OUTPUT_TOKENS, ServerState, SummaryRead, entity_json,
@@ -18,6 +20,24 @@ use crate::{
     storage_retryable, success_envelope, summary_cache_expired, summary_read_error,
     timestamp_day_index, tool_error_envelope, verified_source_excerpt,
 };
+
+/// Consumer-visible scope note for `worktree_dirty`, emitted on every path (N5).
+/// `worktree_dirty` measures UN-INDEXED UNTRACKED source, not the git
+/// working-tree state, so a bare `false`/`null` must not be read as "git clean".
+/// It is deliberately scoped to untracked source: a MODIFIED already-tracked
+/// source file does not set it — broadening detection would require working-tree
+/// hashing, which the untrusted-corpus posture forbids (see
+/// `loomweave_core::list_untracked_files` / `hardened_git`). Such edits surface
+/// via `staleness` (→ `stale`) instead, so a freshness/signing gate must require
+/// `staleness == fresh`, not `worktree_dirty == false` alone.
+const WORKTREE_DIRTY_NOTE: &str = "`worktree_dirty` reports UN-INDEXED UNTRACKED source files (an ignore-aware \
+     `git ls-files --others` scoped to ingested extensions), NOT the git working-tree \
+     state: a `false`/`null` value does NOT mean the git tree is clean. It is scoped to \
+     UNTRACKED source only — a MODIFIED already-tracked source file does not set this flag \
+     (broadening it would require working-tree hashing, declined under the untrusted-corpus \
+     posture); such edits surface via `staleness` (→ `stale`) instead. A freshness or \
+     signing gate must require `staleness == fresh`, not `worktree_dirty == false` alone. \
+     `null` = not a git work tree, git unavailable, or nothing ingested to scope against.";
 
 impl ServerState {
     pub(crate) async fn tool_source_for_entity(
@@ -35,7 +55,7 @@ impl ServerState {
         let payload = self
             .readers
             .with_reader(move |conn| {
-                let Some(entity) = entity_by_id(conn, &id_for_reader)? else {
+                let Some(entity) = resolve_entity_ref(conn, &id_for_reader)? else {
                     return Ok(None);
                 };
                 Ok(Some(source_for_entity_json(conn, &entity, context_lines)))
@@ -81,22 +101,38 @@ impl ServerState {
             return Ok(summary_read_error(read));
         };
 
-        // LLM policy posture (no provider call). `live` means a provider is
-        // wired AND config permits it; that is what makes a miss spend. A
-        // disabled/unconfigured LLM is therefore distinct from a cache miss.
-        let llm_enabled = self
-            .summary_llm
-            .as_ref()
-            .is_some_and(|llm| llm.config.enabled);
-        let live = self.summary_llm.is_some() && llm_enabled;
-        let allow_live_provider = self
-            .summary_llm
-            .as_ref()
-            .is_some_and(|llm| llm.config.allow_live_provider);
-        let provider = self.diagnostics.as_ref().map_or_else(
-            || if live { "configured" } else { "disabled" }.to_owned(),
-            |diag| diag.llm.provider.clone(),
-        );
+        // LLM policy posture (no provider call). Report `enabled` and
+        // `allow_live_provider` as the *configured* values from the diagnostics
+        // snapshot — the same source `project_status_get` reads — so the two
+        // tools never disagree (agent-first-feedback §2.2). `live` is the
+        // *effective* state: a live provider is wired and a miss would actually
+        // spend. When there is no diagnostics snapshot (a bare test harness),
+        // fall back to the wired provider's own config.
+        let (llm_enabled, allow_live_provider, live, provider) =
+            if let Some(diag) = self.diagnostics.as_ref() {
+                (
+                    diag.llm.enabled,
+                    diag.llm.allow_live_provider,
+                    diag.llm.live,
+                    diag.llm.provider.clone(),
+                )
+            } else {
+                let enabled = self
+                    .summary_llm
+                    .as_ref()
+                    .is_some_and(|llm| llm.config.enabled);
+                let allow = self
+                    .summary_llm
+                    .as_ref()
+                    .is_some_and(|llm| llm.config.allow_live_provider);
+                let live = self.summary_llm.is_some() && enabled;
+                (
+                    enabled,
+                    allow,
+                    live,
+                    if live { "configured" } else { "disabled" }.to_owned(),
+                )
+            };
 
         // Cache status without spending: a fresh row is a hit; a present-but-
         // expired row would be re-billed; absence is a miss.
@@ -174,7 +210,7 @@ impl ServerState {
         &self,
         _arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let db_path = self.project_root.join(".loomweave").join("loomweave.db");
+        let db_path = loomweave_core::store::db_path(&self.project_root);
         let root_display = self.project_root.display().to_string();
 
         let project_root = self.project_root.clone();
@@ -252,6 +288,34 @@ impl ServerState {
             );
         }
 
+        // C-12 (weft-4165f1ed71): this `staleness` value DERIVES from the same
+        // freshness oracle `index_diff_get` reports — the two surfaces cannot
+        // disagree. The note names the authority and discloses the verdict's
+        // residual blind spots (clarion-26c7e52027).
+        let staleness_note = match snapshot.staleness() {
+            crate::snapshot::Staleness::Fresh => Some(
+                "this verdict derives from the same computation as index_diff_get (the \
+                 authoritative freshness surface; call it for per-file detail). \"fresh\" \
+                 covers indexed-file mtimes/existence, the analyzed-vs-HEAD commit, staged \
+                 changes, and untracked source of indexed types — it does NOT detect \
+                 unstaged edits to never-indexed files or untracked files of types the \
+                 index has never ingested. If source was added or moved since the last \
+                 analyze, re-run `loomweave analyze`.",
+            ),
+            crate::snapshot::Staleness::StaleWorktree => Some(
+                "the working tree has untracked source files of already-indexed types that \
+                 the index has not seen (new modules not yet analyzed; see worktree_dirty). \
+                 Re-run `loomweave analyze` before relying on graph answers. This verdict \
+                 derives from the same computation as index_diff_get.",
+            ),
+            crate::snapshot::Staleness::Stale => Some(
+                "this verdict derives from the same computation as index_diff_get — call it \
+                 to see WHICH commit/file/staged-change signal fired. Re-run \
+                 `loomweave analyze` to refresh the index.",
+            ),
+            _ => None,
+        };
+
         let result = json!({
             "project_root": root_display,
             "db_path": db_path.display().to_string(),
@@ -269,6 +333,13 @@ impl ServerState {
                 "briefing_blocked": briefing_blocked,
             },
             "staleness": serde_json::to_value(snapshot.staleness()).unwrap_or(Value::Null),
+            "staleness_note": staleness_note,
+            "worktree_dirty": snapshot.worktree_dirty(),
+            // N5: `worktree_dirty` is a bare boolean a consumer (and legis, which
+            // gates signing on it) can misread as "git clean" on the false/null
+            // path. Disclose its scope on EVERY path — true, false, and null — so
+            // the meaning is readable without reading loomweave source.
+            "worktree_dirty_note": WORKTREE_DIRTY_NOTE,
             "scan_truncated": snapshot.scan_truncated(),
             "last_analyzed_at": snapshot.last_analyzed_at(),
             "git_sha": analyzed_git_sha,
@@ -283,6 +354,7 @@ impl ServerState {
             },
             "llm": self.llm_diagnostics_json(),
             "filigree": self.filigree_diagnostics_json(),
+            "loomweave_read_api": self.loomweave_read_api_json(),
         });
 
         Ok(success_envelope(result))
@@ -319,10 +391,12 @@ impl ServerState {
             .readers
             .with_reader(move |conn| {
                 let state = crate::index_diff::read_index_state(conn)?;
+                let untracked = crate::index_diff::compute_untracked_source(conn, &project_root);
                 Ok(success_envelope(crate::index_diff::build_report(
                     &project_root,
                     &state,
                     &git,
+                    untracked,
                     cap,
                 )))
             })
@@ -332,12 +406,29 @@ impl ServerState {
 
     pub(crate) fn llm_diagnostics_json(&self) -> Value {
         match &self.diagnostics {
-            Some(diag) => json!({
-                "provider": diag.llm.provider,
-                "live": diag.llm.live,
-                "allow_live_provider": diag.llm.allow_live_provider,
-                "cache_max_age_days": diag.llm.cache_max_age_days,
-            }),
+            Some(diag) => {
+                // Make a disabled provider self-healing (agent-first-feedback
+                // §3.11): carry the exact fix instead of a status code the agent
+                // must interpret. Null when already live.
+                let next_action = if diag.llm.live {
+                    Value::Null
+                } else {
+                    json!(
+                        "Live summaries are off; entity_summary_get is cache-only. Set \
+                         llm_policy.enabled: true + allow_live_provider: true and supply the \
+                         provider credential (e.g. OPENROUTER_API_KEY), then restart serve. Run \
+                         `loomweave config check` to verify."
+                    )
+                };
+                json!({
+                    "provider": diag.llm.provider,
+                    "enabled": diag.llm.enabled,
+                    "live": diag.llm.live,
+                    "allow_live_provider": diag.llm.allow_live_provider,
+                    "cache_max_age_days": diag.llm.cache_max_age_days,
+                    "next_action": next_action,
+                })
+            }
             None => Value::Null,
         }
     }
@@ -354,6 +445,22 @@ impl ServerState {
         }
     }
 
+    /// ADR-044: report the live read-API endpoint resolved from
+    /// `.weft/loomweave/ephemeral.port` (the reference reader; `doctor` reports the
+    /// same). Pass `None` config — `project_status` has no static loomweave URL
+    /// of its own; this surfaces whether serve is currently publishing.
+    pub(crate) fn loomweave_read_api_json(&self) -> Value {
+        let resolution = loomweave_federation::loomweave_url::resolve_loomweave_url(
+            None,
+            &self.project_root,
+            |name| std::env::var(name).ok(),
+        );
+        json!({
+            "resolved_url": resolution.resolved_url,
+            "resolution_source": resolution.source,
+        })
+    }
+
     pub(crate) async fn read_issues_for_entities(
         &self,
         entity_id: String,
@@ -361,13 +468,13 @@ impl ServerState {
     ) -> Result<Option<IssuesForRead>, StorageError> {
         self.readers
             .with_reader(move |conn| {
-                let Some(root) = entity_by_id(conn, &entity_id)? else {
+                let Some(root) = resolve_entity_ref(conn, &entity_id)? else {
                     return Ok(None);
                 };
                 let mut ids = vec![root.id.clone()];
                 let mut entity_cap_truncated = false;
                 if include_contained {
-                    let contained = contained_entity_ids(conn, &entity_id, 1_000)?;
+                    let contained = contained_entity_ids(conn, &root.id, 1_000)?;
                     entity_cap_truncated = contained.truncated;
                     ids.extend(contained.entity_ids);
                 }

@@ -39,8 +39,22 @@ use thiserror::Error;
 pub use super::host_findings::{
     FINDING_EDGE_FIELD_OVERSIZE, FINDING_ENTITY_FIELD_OVERSIZE, FINDING_ENTITY_ID_MISMATCH,
     FINDING_MALFORMED_EDGE, FINDING_MALFORMED_ENTITY, FINDING_MALFORMED_FINDING,
-    FINDING_MALFORMED_UNRESOLVED_CALL_SITE, FINDING_NON_UTF8_PATH, FINDING_UNDECLARED_EDGE_KIND,
-    FINDING_UNDECLARED_KIND, FINDING_UNSUPPORTED_CAPABILITY, HostFinding,
+    FINDING_MALFORMED_UNRESOLVED_CALL_SITE, FINDING_NON_UTF8_PATH, FINDING_PLUGIN_ABORTED,
+    FINDING_UNDECLARED_EDGE_KIND, FINDING_UNDECLARED_KIND, FINDING_UNSUPPORTED_CAPABILITY,
+    HostFinding,
+};
+// The B.3 per-field caps and the pure validators now live in `host_validate`
+// (clarion-2b8811da39). Re-export the public caps so existing paths
+// (`crate::plugin::host::MAX_ENTITY_FIELD_BYTES`, protocol.rs intra-doc links,
+// the host.rs test module) keep resolving, and bring the validators into scope
+// for `analyze_file` to call unqualified.
+pub use super::host_validate::{
+    MAX_ENTITY_EXTRA_BYTES, MAX_ENTITY_FIELD_BYTES, MAX_FINDING_SEVERITY_BYTES,
+    MAX_FINDING_SUBCODE_BYTES, MAX_PLUGIN_FINDINGS_PER_FILE, MAX_UNRESOLVED_CALLEE_EXPR_BYTES,
+};
+use super::host_validate::{
+    invalid_unresolved_call_site_reason, oversize_edge_field, oversize_field,
+    validate_plugin_finding,
 };
 use crate::entity_id::{EntityId, EntityIdError, entity_id};
 use crate::plugin::jail::{JailError, jail_to_string};
@@ -62,63 +76,35 @@ use crate::plugin::manifest::{Manifest, ManifestError};
 use crate::plugin::protocol::{
     AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence,
     ExitNotification, InitializeParams, InitializeResult, InitializedNotification, ProtocolError,
-    ResponseEnvelope, ResponsePayload, ShutdownParams, UnresolvedCallSite, make_notification,
-    make_request,
+    ResponseEnvelope, ResponsePayload, ShutdownParams, make_notification, make_request,
 };
 use crate::plugin::transport::{Frame, TransportError, read_frame, write_frame};
 
-/// Per-string length cap applied to [`RawEntity::id`], [`RawEntity::kind`],
-/// [`RawEntity::qualified_name`], and [`RawSource::file_path`].
+/// The `RLIMIT_NPROC` ceiling to apply to a plugin child, or `None` to leave
+/// `RLIMIT_NPROC` uncapped.
 ///
-/// 4 KiB is well above any legitimate identifier or path in a real codebase
-/// (the Linux `PATH_MAX` is 4096; Python fully-qualified names exceeding 1 KiB
-/// are absent from elspeth's 425k LOC baseline). The cap is a trust-boundary
-/// check, not a style constraint — pick a value that rejects `DoS` payloads
-/// without false-positing on pathological-but-legitimate inputs.
-pub const MAX_ENTITY_FIELD_BYTES: usize = 4 * 1024;
-
-/// Maximum UTF-8 byte length for one unresolved callee expression retained for
-/// query-time inferred dispatch.
-pub const MAX_UNRESOLVED_CALLEE_EXPR_BYTES: usize = 512;
-
-/// Maximum plugin-reported findings accepted from one `analyze_file` response.
-pub const MAX_PLUGIN_FINDINGS_PER_FILE: usize = 100;
-
-/// Maximum UTF-8 byte length for one plugin-reported finding subcode.
-pub const MAX_FINDING_SUBCODE_BYTES: usize = 128;
-
-/// Maximum UTF-8 byte length for one plugin-reported severity label.
-pub const MAX_FINDING_SEVERITY_BYTES: usize = 32;
-
-/// Per-entity cap on the total serialised size of the untyped passthrough
-/// maps [`RawEntity::extra`] and [`RawSource::extra`].
+/// Plugins that declare the `pyright` runtime capability spawn a Node-based
+/// language server, which itself spawns many helper threads/processes that
+/// inherit the plugin child's `RLIMIT_NPROC`. On Linux that limit is checked
+/// against **all** processes/threads for the real UID — not just descendants of
+/// the plugin — so it cannot bound a single plugin without being tripped by the
+/// user's unrelated processes (an interactive session, other Weft daemons, …).
+/// Any fixed ceiling low enough to stop a fork-bomb is therefore also low enough
+/// to fail a legitimate `fork(2)` with `EAGAIN` on a busy workstation. We leave
+/// `RLIMIT_NPROC` uncapped for language-server plugins and rely on `RLIMIT_AS`
+/// plus the host's crash-loop supervision instead. cgroups v2 `pids.max` is the
+/// correct tool for a true per-plugin process ceiling (future work).
 ///
-/// These flow into `properties_json` downstream (via
-/// `loomweave-cli::analyze::map_entity_to_record`) as `serde_json::to_string`
-/// output. Without a cap, a plugin could return 8 MiB frames consisting of
-/// one tiny `qualified_name` plus a multi-MiB `extra` map that lives in the
-/// database row and in every host-side clone until the run ends. 64 KiB is
-/// well above any legitimate plugin-declared properties bag (WP3's wardline
-/// payload is <2 KiB) while rejecting payload floods.
-pub const MAX_ENTITY_EXTRA_BYTES: usize = 64 * 1024;
-
-/// Pyright's Node-based language server spawns helper threads/processes and
-/// inherits the plugin child's `RLIMIT_NPROC`. On Linux that limit is checked
-/// against all processes/threads for the user, not just descendants of the
-/// plugin, so the Sprint-1 single-plugin ceiling is too low for B.4* call
-/// resolution on ordinary developer workstations.
+/// Non-pyright plugins keep the [`DEFAULT_MAX_NPROC`] fork-bomb guard.
 // Used only from the Linux pre_exec limit path and from unit tests; gate
 // to match so other release builds don't see it as dead code under
 // `-D warnings`.
 #[cfg(any(target_os = "linux", test))]
-const PYRIGHT_MAX_NPROC: u64 = 4096;
-
-#[cfg(any(target_os = "linux", test))]
-fn effective_max_nproc(manifest: &Manifest) -> u64 {
+fn effective_max_nproc(manifest: &Manifest) -> Option<u64> {
     if manifest.capabilities.runtime.pyright.is_some() {
-        PYRIGHT_MAX_NPROC
+        None
     } else {
-        DEFAULT_MAX_NPROC
+        Some(DEFAULT_MAX_NPROC)
     }
 }
 
@@ -217,191 +203,6 @@ pub struct RawSource {
 /// `extra` (serialised) → `source.extra` (serialised). The four scalar
 /// string fields are bounded by [`MAX_ENTITY_FIELD_BYTES`]; the two
 /// untyped passthrough maps are bounded by [`MAX_ENTITY_EXTRA_BYTES`].
-/// Per-string and serialised-map oversize check for [`RawEdge`].
-/// Mirrors [`oversize_field`] in spirit: rejects any plugin-controlled string
-/// or untyped passthrough map exceeding the B.3 per-field caps. Fields
-/// checked in a stable order so the finding deterministically names the
-/// first offender for the same input.
-fn oversize_edge_field(raw: &RawEdge) -> Option<(&'static str, usize)> {
-    for (name, len) in [
-        ("kind", raw.kind.len()),
-        ("from_id", raw.from_id.len()),
-        ("to_id", raw.to_id.len()),
-    ] {
-        if len > MAX_ENTITY_FIELD_BYTES {
-            return Some((name, len));
-        }
-    }
-    if !raw.extra.is_empty() {
-        let len = serde_json::to_vec(&raw.extra).map_or(0, |b| b.len());
-        if len > MAX_ENTITY_EXTRA_BYTES {
-            return Some(("extra", len));
-        }
-    }
-    if let Some(props) = &raw.properties {
-        let len = serde_json::to_vec(props).map_or(0, |b| b.len());
-        if len > MAX_ENTITY_EXTRA_BYTES {
-            return Some(("properties", len));
-        }
-    }
-    None
-}
-
-fn oversize_field(raw: &RawEntity) -> Option<(&'static str, usize)> {
-    for (name, len) in [
-        ("id", raw.id.len()),
-        ("kind", raw.kind.len()),
-        ("qualified_name", raw.qualified_name.len()),
-        ("source.file_path", raw.source.file_path.len()),
-    ] {
-        if len > MAX_ENTITY_FIELD_BYTES {
-            return Some((name, len));
-        }
-    }
-
-    // `extra` and `source.extra` flow to `properties_json` downstream. The
-    // check is by serialised byte length rather than entry count — a single
-    // entry with a multi-MiB Value is as toxic as many entries each small.
-    // Serialisation is the next-downstream step anyway (via
-    // loomweave-cli::analyze::map_entity_to_record), so the to_vec here is not
-    // an additional allocation beyond what we were already going to pay.
-    for (name, map) in [("extra", &raw.extra), ("source.extra", &raw.source.extra)] {
-        if map.is_empty() {
-            continue;
-        }
-        let len = serde_json::to_vec(map).map_or(0, |b| b.len());
-        if len > MAX_ENTITY_EXTRA_BYTES {
-            return Some((name, len));
-        }
-    }
-    if !raw.tags.is_empty() {
-        let len = serde_json::to_vec(&raw.tags).map_or(0, |b| b.len());
-        if len > MAX_ENTITY_EXTRA_BYTES {
-            return Some(("tags", len));
-        }
-    }
-
-    None
-}
-
-fn invalid_unresolved_call_site_reason(
-    site: &UnresolvedCallSite,
-    accepted_ids: &BTreeSet<String>,
-    file_len: Option<i64>,
-) -> Option<String> {
-    if !accepted_ids.contains(&site.caller_entity_id) {
-        return Some("caller entity was not accepted for this file".to_owned());
-    }
-    if site.site_ordinal < 0 {
-        return Some("site_ordinal is negative".to_owned());
-    }
-    if site.source_byte_start < 0 {
-        return Some("source_byte_start is negative".to_owned());
-    }
-    if site.source_byte_end <= site.source_byte_start {
-        return Some("source byte range is empty or reversed".to_owned());
-    }
-    if let Some(file_len) = file_len
-        && site.source_byte_end > file_len
-    {
-        return Some("source byte range exceeds analyzed file length".to_owned());
-    }
-    if site.callee_expr.is_empty() {
-        return Some("callee_expr is empty".to_owned());
-    }
-    if site.callee_expr.len() > MAX_UNRESOLVED_CALLEE_EXPR_BYTES {
-        return Some(format!(
-            "callee_expr exceeds {MAX_UNRESOLVED_CALLEE_EXPR_BYTES} bytes"
-        ));
-    }
-    None
-}
-
-fn stringify_finding_metadata_value(value: serde_json::Value) -> Result<String, String> {
-    match value {
-        serde_json::Value::Null => Ok("null".to_owned()),
-        serde_json::Value::Bool(v) => Ok(v.to_string()),
-        serde_json::Value::Number(v) => Ok(v.to_string()),
-        serde_json::Value::String(v) => Ok(v),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => serde_json::to_string(&value)
-            .map_err(|e| format!("metadata value is not serializable: {e}")),
-    }
-}
-
-fn validate_plugin_finding(
-    raw: AnalyzeFileFinding,
-    rule_id_prefix: &str,
-    analyzed_path: &Path,
-) -> Result<HostFinding, String> {
-    if raw.subcode.is_empty() {
-        return Err("subcode is empty".to_owned());
-    }
-    if raw.subcode.len() > MAX_FINDING_SUBCODE_BYTES {
-        return Err(format!("subcode exceeds {MAX_FINDING_SUBCODE_BYTES} bytes"));
-    }
-    if !raw.subcode.starts_with(rule_id_prefix) {
-        return Err(format!(
-            "subcode {:?} is outside manifest rule_id_prefix {:?}",
-            raw.subcode, rule_id_prefix
-        ));
-    }
-    if raw.message.is_empty() {
-        return Err("message is empty".to_owned());
-    }
-    if raw.message.len() > MAX_ENTITY_FIELD_BYTES {
-        return Err(format!("message exceeds {MAX_ENTITY_FIELD_BYTES} bytes"));
-    }
-    if !raw.metadata.is_empty() {
-        let len = serde_json::to_vec(&raw.metadata).map_or(0, |bytes| bytes.len());
-        if len > MAX_ENTITY_EXTRA_BYTES {
-            return Err(format!("metadata exceeds {MAX_ENTITY_EXTRA_BYTES} bytes"));
-        }
-    }
-
-    let mut metadata = BTreeMap::new();
-    if let Some(severity) = raw.severity {
-        if severity.is_empty() {
-            return Err("severity is empty".to_owned());
-        }
-        if severity.len() > MAX_FINDING_SEVERITY_BYTES {
-            return Err(format!(
-                "severity exceeds {MAX_FINDING_SEVERITY_BYTES} bytes"
-            ));
-        }
-        if !matches!(severity.as_str(), "info" | "warning" | "error") {
-            return Err(format!("unsupported severity {severity:?}"));
-        }
-        metadata.insert("severity".to_owned(), severity);
-    }
-    for (key, value) in raw.metadata {
-        if key.is_empty() {
-            return Err("metadata key is empty".to_owned());
-        }
-        if key.len() > MAX_ENTITY_FIELD_BYTES {
-            return Err(format!(
-                "metadata key exceeds {MAX_ENTITY_FIELD_BYTES} bytes"
-            ));
-        }
-        let value = stringify_finding_metadata_value(value)?;
-        if value.len() > MAX_ENTITY_FIELD_BYTES {
-            return Err(format!(
-                "metadata value for {key:?} exceeds {MAX_ENTITY_FIELD_BYTES} bytes"
-            ));
-        }
-        metadata.insert(key, value);
-    }
-    metadata.insert(
-        "anchor_file_path".to_owned(),
-        analyzed_path.to_string_lossy().into_owned(),
-    );
-
-    Ok(HostFinding::plugin_reported(
-        raw.subcode,
-        raw.message,
-        metadata,
-    ))
-}
-
 /// An entity that has passed all validation checks.
 ///
 /// Returned by [`PluginHost::analyze_file`] for each entity that survived the
@@ -639,6 +440,48 @@ impl
         project_root: &Path,
         executable: &Path,
     ) -> Result<(Self, std::process::Child), HostError> {
+        let (mut host, mut child) = Self::spawn_unhandshaken(manifest, project_root, executable)?;
+
+        // Reap on handshake failure. `std::process::Child::Drop` does NOT
+        // waitpid on Unix, so returning Err while `child` goes out of scope
+        // leaves a zombie per failed spawn. Covers both handshake error
+        // paths (transport/protocol and manifest capability refusal); the
+        // capability path already ran `do_shutdown()` but that does not
+        // reap either. Errors from kill/wait are best-effort — by this
+        // point the child's state is already anomalous.
+        if let Err(e) = host.handshake() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+
+        Ok((host, child))
+    }
+
+    /// Launch the plugin subprocess (sandbox limits applied, stderr drain
+    /// attached) WITHOUT performing the `initialize` handshake.
+    ///
+    /// The caller MUST call [`handshake`](PluginHost::handshake) before any
+    /// request, and owns kill+reap on handshake failure
+    /// (`std::process::Child::Drop` does not reap on Unix). The split exists
+    /// so a caller can put its own wall-clock deadline around the handshake —
+    /// a plugin may do whole-repo work inside `initialize` (the Rust plugin
+    /// builds its symbol table there), and a hung handshake must be killable
+    /// by a watchdog that already holds the child handle.
+    ///
+    /// [`spawn`](PluginHost::spawn) is the convenience wrapper that performs
+    /// the handshake inline and reaps on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Spawn`] under the same conditions as
+    /// [`spawn`](PluginHost::spawn) (bad executable, manifest/basename
+    /// mismatch, missing pipe handles).
+    pub fn spawn_unhandshaken(
+        manifest: Manifest,
+        project_root: &Path,
+        executable: &Path,
+    ) -> Result<(Self, std::process::Child), HostError> {
         let canonical_root = project_root
             .canonicalize()
             .map_err(|e| HostError::Spawn(format!("canonicalise project root: {e}")))?;
@@ -764,19 +607,6 @@ impl
         );
         host.stderr_tail = Some(stderr_tail);
         host.stderr_thread = Some(stderr_thread);
-
-        // Reap on handshake failure. `std::process::Child::Drop` does NOT
-        // waitpid on Unix, so returning Err while `child` goes out of scope
-        // leaves a zombie per failed spawn. Covers both handshake error
-        // paths (transport/protocol and manifest capability refusal); the
-        // capability path already ran `do_shutdown()` but that does not
-        // reap either. Errors from kill/wait are best-effort — by this
-        // point the child's state is already anomalous.
-        if let Err(e) = host.handshake() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
 
         Ok((host, child))
     }
@@ -1561,12 +1391,15 @@ ontology_version = "0.1.0"
     }
 
     #[test]
-    fn pyright_runtime_raises_process_ceiling_for_language_server() {
+    fn pyright_runtime_leaves_process_ceiling_uncapped_for_language_server() {
+        // Non-pyright plugins keep the fork-bomb guard.
         assert_eq!(
             effective_max_nproc(&compliant_manifest()),
-            DEFAULT_MAX_NPROC
+            Some(DEFAULT_MAX_NPROC)
         );
-        assert_eq!(effective_max_nproc(&pyright_manifest()), PYRIGHT_MAX_NPROC);
+        // Pyright plugins run with no RLIMIT_NPROC cap: the per-UID-global limit
+        // is the wrong tool for a language-server plugin (see effective_max_nproc).
+        assert_eq!(effective_max_nproc(&pyright_manifest()), None);
     }
 
     // ── Full end-to-end helper ────────────────────────────────────────────────

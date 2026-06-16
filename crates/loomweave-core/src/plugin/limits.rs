@@ -306,7 +306,14 @@ pub fn apply_prlimit_as(max_rss_mib: u64) -> std::io::Result<()> {
     setrlimit(Resource::RLIMIT_AS, bytes, bytes).map_err(std::io::Error::from)
 }
 
-/// Apply `RLIMIT_NOFILE` and `RLIMIT_NPROC` to the current process.
+/// Apply `RLIMIT_NOFILE` (always) and `RLIMIT_NPROC` (when `max_nproc` is
+/// `Some`) to the current process.
+///
+/// `max_nproc` is `None` for plugins that spawn a language server: `RLIMIT_NPROC`
+/// is a per-real-UID-global counter, so it cannot bound such a plugin without
+/// being tripped by the user's unrelated processes (see
+/// `host::effective_max_nproc`). Those plugins run with `RLIMIT_NOFILE` and
+/// `RLIMIT_AS` only.
 ///
 /// Called from the same `pre_exec` closure as [`apply_prlimit_as`]. Same
 /// async-signal-safety notes apply — `setrlimit` is on the POSIX AS-safe
@@ -318,11 +325,14 @@ pub fn apply_prlimit_as(max_rss_mib: u64) -> std::io::Result<()> {
 ///
 /// Returns `std::io::Error` on the first `setrlimit` failure.
 #[cfg(target_os = "linux")]
-pub fn apply_prlimit_nofile_nproc(max_nofile: u64, max_nproc: u64) -> std::io::Result<()> {
+pub fn apply_prlimit_nofile_nproc(max_nofile: u64, max_nproc: Option<u64>) -> std::io::Result<()> {
     use nix::sys::resource::{Resource, setrlimit};
 
     setrlimit(Resource::RLIMIT_NOFILE, max_nofile, max_nofile).map_err(std::io::Error::from)?;
-    setrlimit(Resource::RLIMIT_NPROC, max_nproc, max_nproc).map_err(std::io::Error::from)
+    if let Some(max_nproc) = max_nproc {
+        setrlimit(Resource::RLIMIT_NPROC, max_nproc, max_nproc).map_err(std::io::Error::from)?;
+    }
+    Ok(())
 }
 
 /// Non-Linux stub for [`apply_prlimit_nofile_nproc`].
@@ -330,7 +340,10 @@ pub fn apply_prlimit_nofile_nproc(max_nofile: u64, max_nproc: u64) -> std::io::R
 /// `nix` 0.28 does not expose `Resource::RLIMIT_NPROC` on macOS, so the real
 /// implementation stays restricted to Linux.
 #[cfg(not(target_os = "linux"))]
-pub fn apply_prlimit_nofile_nproc(_max_nofile: u64, _max_nproc: u64) -> std::io::Result<()> {
+pub fn apply_prlimit_nofile_nproc(
+    _max_nofile: u64,
+    _max_nproc: Option<u64>,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -589,7 +602,7 @@ pub fn apply_prlimit_nofile_nproc"
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn apply_prlimit_non_linux_stub_returns_ok() {
-        let result = apply_prlimit_nofile_nproc(DEFAULT_MAX_NOFILE, DEFAULT_MAX_NPROC);
+        let result = apply_prlimit_nofile_nproc(DEFAULT_MAX_NOFILE, Some(DEFAULT_MAX_NPROC));
         assert!(result.is_ok());
     }
 }
