@@ -18,8 +18,8 @@
 // Loomweave's site OWNS the authoritative SEI explanation — it is the
 // one member that MINTS the SEI every other member keys on (IA §3.3,
 // §4.2.1). Honest limits are mandatory and non-empty: Rust analysis is
-// parse-only, and v1.1.0 is a release candidate (v1.0.0 is the latest
-// tagged release — we do NOT reference a v1.1.0 release tag).
+// parse-only. v1.1.0 ships on PyPI as a wheel (uv tool install loomweave);
+// the GitHub Release also carries signed standalone binaries.
 // ============================================================
 import Layout from '@weft/site-kit/layouts/Layout.astro';
 import { Button, Badge, Tag, Banner, MemberMark, SeiTag, EnrichmentChip, FreshnessMeter } from '@weft/site-kit/components';
@@ -46,7 +46,6 @@ const REPO = me.repo;
 // Repo pointers for surface facts that move (versions / tool counts) — IA §5.1
 // template invariant 1: every moving number is a snapshot WITH a repo pointer.
 const README_URL = `${REPO}/blob/main/README.md`;
-const CARGO_URL = `${REPO}/blob/main/Cargo.toml`;
 const RELEASES_URL = `${REPO}/releases`;
 const RUST_LIMITS_URL = `${REPO}/blob/main/docs/operator/rust-known-limitations.md`;
 const GETTING_STARTED_URL = `${REPO}/blob/main/docs/operator/getting-started.md`;
@@ -56,19 +55,13 @@ const SEI_STANDARD_URL = `${HUB}/#spine`;
 // ('partial'/'planned' are NEVER styled as 'live'; IA §2.2, §3.2).
 const statusTone = (s) => (s === 'live' ? 'ok' : s === 'partial' ? 'warn' : 'neutral');
 
-// Curated quick-start (IA §5.1 block 4). v1.0.0 is the latest tagged release —
-// the v1.1 line is a release candidate built from source, so the install path
-// points at v1.0.0 (we do NOT reference a non-existent v1.1.0 release tag).
-// Built as a string so the shell ${TAG} stays literal while the repo URL is
-// sourced from kit data, not hardcoded.
+// Curated quick-start (IA §5.1 block 4). v1.1.0 ships on PyPI as a wheel — a
+// single `uv tool install loomweave` lands the CLI plus both language plugins
+// (loomweave-plugin-python / -rust are hard deps), so Rust + Python analysis are
+// on by default. No tarball, no source build for the common path.
 const quickStart =
-  '# install the binary + Python plugin from the current GitHub Release\n' +
-  '# v1.0.0 is the latest tagged release; the v1.1 line is a release candidate (build from source — see README)\n' +
-  'TAG=v1.0.0\n' +
-  'curl -L -o loomweave.tar.gz \\\n' +
-  '  "' + REPO + '/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"\n' +
-  'tar xzf loomweave.tar.gz\n' +
-  'install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/\n' +
+  '# install the loomweave CLI (+ Python & Rust plugins) from PyPI\n' +
+  'uv tool install loomweave    # or: pipx install loomweave\n' +
   '\n' +
   '# wire the agent, walk the corpus, serve the graph over MCP\n' +
   'loomweave install --path .   # init .weft/loomweave/, wire the MCP client + skill + hook\n' +
@@ -78,7 +71,7 @@ const quickStart =
 
 <Layout
   title="Loomweave — code structure + the federation's identity authority"
-  description="Loomweave turns a codebase into a queryable, identity-stable structural graph an agent reads instead of re-deriving by grep — and mints the SEI every other Weft member keys on. Rust core, deterministic extraction, local-first. Rust analysis is parse-only; v1.1.0 is a release candidate."
+  description="Loomweave turns a codebase into a queryable, identity-stable structural graph an agent reads instead of re-deriving by grep — and mints the SEI every other Weft member keys on. Rust core, deterministic extraction, local-first. Rust analysis is parse-only."
   member={SELF}
   breadcrumb
   repo={REPO}
@@ -88,7 +81,7 @@ const quickStart =
   {/* ---------------------------------------------------------------- */}
   <section class="hero">
     <div class="wrap">
-      <p class="eyebrow">Loomweave · code structure + identity authority · Rust</p>
+      <p class="weft-eyebrow">Loomweave · code structure + identity authority · Rust</p>
       <h1 class="hero__title">The federation's map — and its coordinate system.</h1>
       <p class="hero__sub">
         Turns a codebase into a queryable, identity-stable structural graph an agent
@@ -134,7 +127,7 @@ const quickStart =
   {/* ---------------------------------------------------------------- */}
   <section class="band">
     <div class="wrap">
-      <p class="eyebrow">What it is · the now</p>
+      <p class="weft-eyebrow">What it is · the now</p>
       <h2 class="h2">A structural graph an agent queries instead of re-grepping.</h2>
       <p class="lede">
         Loomweave walks a codebase, extracts entities — <code>functions</code>,
@@ -166,7 +159,7 @@ const quickStart =
   {/* ---------------------------------------------------------------- */}
   <section class="section">
     <div class="wrap">
-      <p class="eyebrow">Key capabilities</p>
+      <p class="weft-eyebrow">Key capabilities</p>
       <h2 class="h2">Structure, identity, and one-call orientation.</h2>
       <div class="grid grid--2">
         <article class="card cap">
@@ -221,7 +214,7 @@ const quickStart =
   {/* ---------------------------------------------------------------- */}
   <section id="usage" class="band">
     <div class="wrap">
-      <p class="eyebrow">Usage snapshot · install → analyze → serve</p>
+      <p class="weft-eyebrow">Usage snapshot · install → analyze → serve</p>
       <h2 class="h2">Install, walk the corpus, serve the graph.</h2>
       <p class="lede">
         <code>analyze</code> needs no LLM credentials — it is the fastest way to
@@ -237,8 +230,7 @@ const quickStart =
         A full walkthrough — fresh machine, a small public project, an MCP client,
         three questions — is in
         <a href={GETTING_STARTED_URL} rel="noopener">docs/operator/getting-started.md</a>.
-        The v1.1 release candidate can be built from a local checkout
-        (<code>cargo install --path crates/loomweave-cli</code>); see
+        Prefer to build from source? <code>cargo install --path crates/loomweave-cli</code>; see
         <a href={README_URL} rel="noopener">the README</a>.
       </p>
     </div>
@@ -249,7 +241,7 @@ const quickStart =
   {/* ---------------------------------------------------------------- */}
   <section class="section">
     <div class="wrap">
-      <p class="eyebrow">How it composes · value is the weave</p>
+      <p class="weft-eyebrow">How it composes · value is the weave</p>
       <h2 class="h2">Each pairing lights up a capability neither tool has alone.</h2>
       <p class="lede">
         These are Loomweave's rows of the combination matrix. Every pairing's status
@@ -286,7 +278,7 @@ const quickStart =
   {/* ---------------------------------------------------------------- */}
   <section class="band">
     <div class="wrap">
-      <p class="eyebrow">{SEI_SPINE.eyebrow}</p>
+      <p class="weft-eyebrow">{SEI_SPINE.eyebrow}</p>
       <h2 class="h2">{SEI_SPINE.heading}</h2>
       <p class="lede">{SEI_SPINE.body}</p>
 
@@ -322,12 +314,6 @@ const quickStart =
       <Banner client:visible tone="warn" title="Status & honest limits — stated in the open.">
         <ul class="limits">
           <li>
-            <strong>v1.1.0 is a release candidate (rc5).</strong> <code>v1.0.0</code>
-            is the latest tagged GitHub Release; the v1.1 line builds from source.
-            See <a href={CARGO_URL} rel="noopener">Cargo.toml</a> and
-            <a href={RELEASES_URL} rel="noopener">Releases</a>.
-          </li>
-          <li>
             <strong>Rust analysis is parse-only.</strong> Macro expansions and
             external-crate edge targets are not resolved; closures and nested
             functions fold into the nearest named item.
@@ -362,7 +348,7 @@ const quickStart =
   {/* ---------------------------------------------------------------- */}
   <section class="section">
     <div class="wrap">
-      <p class="eyebrow">Links · pointers to the authorities</p>
+      <p class="weft-eyebrow">Links · pointers to the authorities</p>
       <h2 class="h2">The repo owns the moving facts.</h2>
       <div class="links">
         <a class="links__item" href={REPO} rel="noopener">
@@ -411,11 +397,7 @@ const quickStart =
   /* Page-local layout. Brand atoms (colors, type, motifs) come ONLY from the
      site-kit token layer — no new colors, no dark mode (light theme only). */
   .wrap { max-width: var(--width-content); margin: 0 auto; padding: 0 36px; }
-  .eyebrow {
-    font: var(--type-mono-sm); text-transform: uppercase;
-    letter-spacing: var(--tracking-caps); color: var(--text-muted);
-    font-size: var(--text-xs); margin: 0 0 14px;
-  }
+  .weft-eyebrow { margin: 0 0 14px; }
   .h2 { font: var(--type-h1); color: var(--text-strong); margin: 0 0 16px; max-width: 26ch; }
   .lede { font: var(--type-body); color: var(--text-body); max-width: 66ch; margin: 0 0 26px; }
   .lede code, .cap__body code, .pair__cap code, .footnote code, .limits code {
@@ -424,15 +406,15 @@ const quickStart =
   .footnote { font: var(--type-body-sm); color: var(--text-muted); max-width: 66ch; margin: 20px 0 0; }
   .footnote a, .lede a, .limits a { color: var(--indigo-700); }
 
-  .section { padding: 64px 0; }
+  .section { padding: var(--space-10) 0; }
   .band {
-    padding: 64px 0; background: var(--bg-sunken);
+    padding: var(--space-10) 0; background: var(--bg-sunken);
     border-top: 1px solid var(--border-hairline);
     border-bottom: 1px solid var(--border-hairline);
   }
 
   /* hero */
-  .hero { padding: 64px 0; border-bottom: 1px solid var(--border-hairline); }
+  .hero { padding: var(--space-10) 0; border-bottom: 1px solid var(--border-hairline); }
   .hero__title {
     font: var(--type-display); color: var(--loom-900);
     letter-spacing: -0.025em; line-height: 1.05;
@@ -530,7 +512,7 @@ const quickStart =
   /* lacuna strip */
   .lacuna { padding: 40px 0; background: var(--bg-sunken); border-top: 1px solid var(--border-hairline); }
   .lacuna__inner { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-  .lacuna__dot { width: 12px; height: 12px; border-radius: 3px; flex: none; box-shadow: inset 0 0 0 1px rgba(0,0,0,.08); }
+  .lacuna__dot { width: 12px; height: 12px; border-radius: var(--radius-sm); flex: none; box-shadow: inset 0 0 0 1px var(--border-hairline); }
   .lacuna__copy { flex: 1 1 360px; }
   .lacuna__lead { font: var(--type-body); font-weight: var(--fw-semibold); color: var(--text-strong); margin: 0 0 2px; }
   .lacuna__sub { font: var(--type-body-sm); color: var(--text-muted); margin: 0; }
