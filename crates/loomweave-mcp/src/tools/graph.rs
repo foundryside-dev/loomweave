@@ -23,16 +23,16 @@ use crate::filigree::IssueDetail;
 
 use crate::{
     CallSiteKind, CallSiteRole, InferredDispatchStats, IssuesForAccumulator, ParamError, PathScope,
-    PathTraversal, ServerState, build_call_sites, call_graph_scope_excludes, callee_json,
-    caller_json, compact_execution_paths, entity_context_json, entity_json,
-    entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
-    flatten_storage_envelope_result, import_neighbors, issues_unavailable,
-    navigation_scope_excludes, optional_bool, optional_confidence, optional_usize,
-    parse_cursor_offset, path_truncation_reason, reference_neighbors_for, relation_neighbors,
-    required_i64, required_str, storage_retryable, success_envelope, success_envelope_with_stats,
-    success_envelope_with_truncation, success_envelope_with_truncation_and_stats,
-    tool_error_envelope, unresolved_match_fields, wardline_section_for_entity,
-    wardline_unavailable,
+    PathTraversal, ServerState, build_call_sites, build_unresolved_candidates,
+    call_graph_scope_excludes, callee_json, caller_json, caller_navigation_scope_excludes,
+    compact_execution_paths, entity_context_json, entity_json, entity_not_found_envelope,
+    entity_properties_json, envelope_from_storage_result, flatten_storage_envelope_result,
+    import_neighbors, issues_unavailable, navigation_scope_excludes, optional_bool,
+    optional_confidence, optional_usize, parse_cursor_offset, path_truncation_reason,
+    reference_neighbors_for, relation_neighbors, required_i64, required_str, storage_retryable,
+    success_envelope, success_envelope_with_stats, success_envelope_with_truncation,
+    success_envelope_with_truncation_and_stats, tool_error_envelope, unresolved_match_fields,
+    wardline_section_for_entity, wardline_unavailable,
 };
 
 /// The direction argument of [`ServerState::tool_relation_list`]: a single
@@ -218,11 +218,24 @@ impl ServerState {
                 // Honesty fields (clarion-df87b4f381): name-matched unresolved
                 // call sites are NOT in `callers`; say how many exist and where
                 // to see them, and name the blind spot in scope_excludes.
-                let (unresolved_name_matches, next_action) = match entity_by_id(conn, &entity_id)? {
-                    Some(target) => unresolved_match_fields(conn, &target)?,
-                    None => (0, Value::Null),
-                };
-                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
+                // Per-query honesty (clarion-76c31b730a): scope_excludes is now
+                // populated ONLY when THIS traversal actually skipped a candidate
+                // (a name-matched unresolved call site for this target), and the
+                // skipped sites themselves are surfaced as `unresolved_candidates`
+                // — the in-tool grep-fallback. An empty scope_excludes paired with
+                // `traversal_complete: true` confirms every candidate was searched.
+                let (unresolved_name_matches, next_action, unresolved_candidates) =
+                    match entity_by_id(conn, &entity_id)? {
+                        Some(target) => {
+                            let (count, next_action) = unresolved_match_fields(conn, &target)?;
+                            let candidates = build_unresolved_candidates(conn, &target)?;
+                            (count, next_action, candidates)
+                        }
+                        None => (0, Value::Null, Vec::new()),
+                    };
+                let scope_excludes =
+                    caller_navigation_scope_excludes(confidence, unresolved_name_matches > 0);
+                let traversal_complete = scope_excludes.is_empty();
                 Ok(success_envelope_with_stats(
                     json!({
                         "callers": page,
@@ -230,7 +243,9 @@ impl ServerState {
                         "truncated": has_more,
                         "unresolved_name_matches": unresolved_name_matches,
                         "next_action": next_action,
-                        "scope_excludes": navigation_scope_excludes(confidence, live_unresolved),
+                        "scope_excludes": scope_excludes,
+                        "traversal_complete": traversal_complete,
+                        "unresolved_candidates": unresolved_candidates,
                     }),
                     stats_delta,
                 ))
@@ -479,11 +494,18 @@ impl ServerState {
                     relation_neighbors(conn, &entity_id, ReferenceDirection::In, confidence)?;
                 let mut relations_out =
                     relation_neighbors(conn, &entity_id, ReferenceDirection::Out, confidence)?;
-                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
-                let scope_excludes = navigation_scope_excludes(confidence, live_unresolved);
                 // Honesty fields for the `callers` bucket (clarion-df87b4f381).
                 let (unresolved_name_matches, next_action) =
                     unresolved_match_fields(conn, &entity)?;
+                // Per-query honesty (clarion-76c31b730a): populate scope_excludes
+                // ONLY when this traversal skipped a name-matched candidate, and
+                // surface the skipped sites as `unresolved_candidates`. Empty
+                // scope_excludes + `traversal_complete: true` confirms the callers
+                // bucket searched every candidate.
+                let unresolved_candidates = build_unresolved_candidates(conn, &entity)?;
+                let scope_excludes =
+                    caller_navigation_scope_excludes(confidence, unresolved_name_matches > 0);
+                let traversal_complete = scope_excludes.is_empty();
                 // Bound EACH bucket independently and record whether it was
                 // trimmed in the sibling `truncated` map. A trimmed bucket directs
                 // the agent to the dedicated single-relation tool for the full
@@ -529,6 +551,8 @@ impl ServerState {
                     "unresolved_name_matches": unresolved_name_matches,
                     "next_action": next_action,
                     "scope_excludes": scope_excludes,
+                    "traversal_complete": traversal_complete,
+                    "unresolved_candidates": unresolved_candidates,
                 })))
             })
             .await;

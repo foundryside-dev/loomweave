@@ -4927,7 +4927,11 @@ async fn neighborhood_surfaces_import_edges_for_reverse_import_lookup() {
 // ── scope_excludes on graph-query results (clarion-0d204a3f16) ───────────────
 
 #[tokio::test]
-async fn callers_of_resolved_flags_attribute_receiver_scope_exclusion() {
+async fn callers_of_with_no_skipped_candidate_reports_traversal_complete() {
+    // Per-query honesty (clarion-76c31b730a): the blanket scope_excludes footer
+    // is gone. A target with NO name-matched unresolved call sites had nothing
+    // skipped, so scope_excludes is empty and traversal_complete confirms every
+    // candidate was searched — an empty callers list is now a true negative.
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);
 
@@ -4941,7 +4945,17 @@ async fn callers_of_resolved_flags_attribute_receiver_scope_exclusion() {
     assert_eq!(envelope["ok"], true);
     assert_eq!(
         envelope["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"])
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["result"]["traversal_complete"], true,
+        "nothing skipped -> traversal_complete: {envelope}"
+    );
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "{envelope}"
     );
 }
 
@@ -4989,10 +5003,13 @@ async fn neighborhood_module_rolls_up_references_and_flags_attribute_scope() {
     let excludes = envelope["result"]["scope_excludes"]
         .as_array()
         .expect("scope_excludes array");
+    // Per-query honesty (clarion-76c31b730a): the module has no name-matched
+    // unresolved call sites, so nothing was skipped — no blanket footer.
     assert!(
-        excludes.iter().any(|v| v == "attribute-receiver-calls"),
-        "module neighborhood must flag attribute-receiver-calls, got {excludes:?}"
+        excludes.is_empty(),
+        "no skipped candidate -> empty scope_excludes, got {excludes:?}"
     );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
     assert!(
         !excludes
             .iter()
@@ -5023,10 +5040,13 @@ async fn neighborhood_function_references_are_not_rolled_up() {
         envelope["result"]["references_rolled_up"], false,
         "symbol-level references are direct, not rolled up"
     );
+    // Per-query honesty (clarion-76c31b730a): nothing skipped for this target.
     assert_eq!(
         envelope["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"])
+        json!([]),
+        "{envelope}"
     );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
 }
 
 // ── unresolved name-matched call-site honesty (clarion-df87b4f381) ────────────
@@ -5081,6 +5101,21 @@ async fn callers_of_counts_unresolved_name_matches_and_names_the_blind_spot() {
         "next_action must point at the evidence tool: {envelope}"
     );
     assert!(next_action.contains("callee"), "{envelope}");
+    // Per-query honesty (clarion-76c31b730a): a skipped candidate means the
+    // traversal is incomplete, and the skipped site is surfaced as an
+    // unresolved_candidate (the in-tool grep-fallback).
+    assert_eq!(
+        envelope["result"]["traversal_complete"], false,
+        "a skipped candidate -> traversal_complete false: {envelope}"
+    );
+    let candidates = envelope["result"]["unresolved_candidates"]
+        .as_array()
+        .expect("unresolved_candidates array");
+    assert_eq!(candidates.len(), 1, "{envelope}");
+    assert_eq!(candidates[0]["callee_text"], "target", "{envelope}");
+    // A bare-name callee (no dot) is a dynamic dispatch, not an attribute
+    // receiver.
+    assert_eq!(candidates[0]["why"], "dynamic", "{envelope}");
 
     // The shared vocabulary also covers calls-only path traversal.
     let paths = call_tool(
@@ -5143,10 +5178,19 @@ async fn callers_of_without_unresolved_sites_reports_zero_matches_and_no_marker(
         envelope["result"]["next_action"].is_null(),
         "no matches -> no recovery pointer: {envelope}"
     );
+    // Per-query honesty (clarion-76c31b730a): no name-matched candidate was
+    // skipped, so scope_excludes is empty and traversal_complete is true — the
+    // blanket attribute-receiver footer no longer fires on a clean target.
     assert_eq!(
         envelope["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"]),
-        "an all-resolved project must not carry the unresolved marker: {envelope}"
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "{envelope}"
     );
 }
 
@@ -5177,11 +5221,135 @@ async fn callers_of_ignores_stale_unresolved_rows_in_count_and_marker() {
         envelope["result"]["unresolved_name_matches"], 0,
         "stale rows (content-hash mismatch) are not evidence: {envelope}"
     );
+    // Per-query honesty (clarion-76c31b730a): a stale row matched nothing live,
+    // so nothing was skipped — empty scope_excludes, traversal_complete true,
+    // and no unresolved_candidates surfaced.
     assert_eq!(
         envelope["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"]),
+        json!([]),
         "{envelope}"
     );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "{envelope}"
+    );
+}
+
+// ── per-query caller honesty (clarion-76c31b730a) ────────────────────────────
+//
+// scope_excludes is now populated ONLY when this traversal actually skipped a
+// name-matched candidate. When nothing was skipped, scope_excludes is empty
+// AND traversal_complete:true confirms every candidate was searched. The
+// skipped sites are surfaced as unresolved_candidates [{path, line,
+// callee_text, why}] — the in-tool grep-fallback.
+
+#[tokio::test]
+async fn callers_of_unresolved_candidates_classify_attribute_receiver_vs_dynamic() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // A dotted callee text is an attribute/method receiver the static
+        // resolver cannot bind; a bare name is a dynamic dispatch.
+        insert_unresolved_call_site(
+            &conn,
+            "python:function:demo.entry",
+            "site-attr",
+            "obj.target",
+        );
+        insert_unresolved_call_site(&conn, "python:function:demo.mid", "site-dyn", "target");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["traversal_complete"], false,
+        "{envelope}"
+    );
+    let candidates = envelope["result"]["unresolved_candidates"]
+        .as_array()
+        .expect("unresolved_candidates array");
+    assert_eq!(candidates.len(), 2, "{envelope}");
+    let why_for = |callee: &str| {
+        candidates
+            .iter()
+            .find(|c| c["callee_text"] == callee)
+            .and_then(|c| c["why"].as_str())
+            .unwrap_or_else(|| panic!("no candidate for {callee}: {envelope}"))
+    };
+    assert_eq!(why_for("obj.target"), "attribute-receiver", "{envelope}");
+    assert_eq!(why_for("target"), "dynamic", "{envelope}");
+    // Each candidate carries the call-site location (in-tool grep-fallback).
+    for c in candidates {
+        assert!(c["path"].is_string(), "candidate needs a path: {envelope}");
+        assert!(
+            c.get("line").is_some(),
+            "candidate needs a line field: {envelope}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn neighborhood_with_no_skipped_candidate_reports_traversal_complete() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_surfaces_unresolved_candidates_when_a_candidate_is_skipped() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["traversal_complete"], false,
+        "{envelope}"
+    );
+    let candidates = envelope["result"]["unresolved_candidates"]
+        .as_array()
+        .expect("unresolved_candidates array");
+    assert_eq!(candidates.len(), 1, "{envelope}");
+    assert_eq!(candidates[0]["callee_text"], "target", "{envelope}");
+    assert_eq!(candidates[0]["why"], "dynamic", "{envelope}");
 }
 
 #[tokio::test]

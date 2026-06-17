@@ -358,7 +358,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_callers_list",
-            description: "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. Reports scope_excludes and unresolved_name_matches so empty results stay honest.",
+            description: "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. scope_excludes is non-empty ONLY when a candidate was skipped; an empty scope_excludes with traversal_complete:true means every candidate was searched. Skipped sites surface as unresolved_candidates.",
             input_schema: id_confidence_cursor_schema(),
         },
         ToolDefinition {
@@ -395,7 +395,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_neighborhood_get",
-            description: "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit; reports scope_excludes and unresolved_name_matches.",
+            description: "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit. scope_excludes is non-empty only when a caller candidate was skipped; empty + traversal_complete:true confirms the callers bucket searched all candidates. Skipped sites surface as unresolved_candidates.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -3532,6 +3532,29 @@ pub(crate) fn navigation_scope_excludes(
     excludes
 }
 
+/// Per-query scope excludes for `entity_callers_list` / `entity_neighborhood_get`
+/// (clarion-76c31b730a). Unlike [`navigation_scope_excludes`] (which flags the
+/// whole attribute-receiver category on every resolved/ambiguous read), this is
+/// populated ONLY when THIS traversal actually skipped a candidate — i.e. a
+/// live unresolved call site whose textual callee name-matches the target
+/// (`unresolved_name_matches > 0`). When nothing was skipped it returns empty,
+/// and the caller pairs that with `traversal_complete: true` so an empty
+/// `callers` list reads as a true negative rather than an untrustable blind
+/// spot. `inferred` stays empty: its dispatch pass attempts the unresolved
+/// category, so it skips nothing.
+fn caller_navigation_scope_excludes(
+    confidence: EdgeConfidence,
+    skipped_a_candidate: bool,
+) -> Vec<&'static str> {
+    if !skipped_a_candidate || confidence == EdgeConfidence::Inferred {
+        return Vec::new();
+    }
+    // A skipped candidate is, by construction, an attribute-receiver or dynamic
+    // call site the static resolver could not bind — name both blind-spot
+    // categories that the traversal therefore did not search.
+    vec!["attribute-receiver-calls", "unresolved-static-calls"]
+}
+
 /// The `unresolved_name_matches` count + `next_action` recovery pointer for a
 /// caller-navigation result: how many live unresolved call sites name-match
 /// `target`, and where to see them. The pointer names `entity_call_site_list`
@@ -3552,6 +3575,48 @@ pub(crate) fn unresolved_match_fields(
         Value::Null
     };
     Ok((count, next_action))
+}
+
+/// Per-query honesty for the caller-navigation surface (clarion-76c31b730a):
+/// the actual call sites that textually name-match `target` but the static
+/// resolver could not bind into `callers` — the in-tool grep-fallback. Each
+/// candidate carries `{path, line, callee_text, why}` where `why` splits an
+/// attribute/method receiver (`obj.target(...)`, i.e. the dotted `callee_text`)
+/// from a bare dynamic dispatch (`target(...)` resolved through a variable).
+///
+/// This is the evidence behind a non-empty `scope_excludes` / `traversal_complete:
+/// false`: when this returns rows, the traversal skipped real candidates, so an
+/// empty `callers` list is NOT a true negative. Returns `[]` when nothing was
+/// skipped — paired with `traversal_complete: true`, that confirms every
+/// candidate was searched. Mirrors `build_call_sites`'s disclosure guards: a
+/// briefing-blocked owner's `line_text` is redacted, never the file content read.
+pub(crate) fn build_unresolved_candidates(
+    conn: &rusqlite::Connection,
+    target: &EntityRow,
+) -> Result<Vec<Value>, StorageError> {
+    let sites = unresolved_callers_for_target(conn, target, CALL_SITES_MAX)?;
+    let mut owner_meta: HashMap<String, OwnerMeta> = HashMap::new();
+    let mut file_content: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    let mut candidates = Vec::with_capacity(sites.len());
+    for site in sites {
+        let owner = resolve_owner(conn, &mut owner_meta, &site.caller_entity_id)?;
+        let anchor = anchor_line(&mut file_content, owner, Some(site.source_byte_start));
+        // A dotted callee text is an attribute/method receiver the static
+        // resolver cannot bind (e.g. `ctx.svc.target()`); anything else is a
+        // bare name resolved dynamically (through a variable / dispatch table).
+        let why = if site.callee_expr.contains('.') {
+            "attribute-receiver"
+        } else {
+            "dynamic"
+        };
+        candidates.push(json!({
+            "path": owner.path,
+            "line": anchor.line,
+            "callee_text": site.callee_expr,
+            "why": why,
+        }));
+    }
+    Ok(candidates)
 }
 
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
@@ -6118,7 +6183,7 @@ mod tests {
         assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
             tools[2].description,
-            "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. Reports scope_excludes and unresolved_name_matches so empty results stay honest."
+            "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. scope_excludes is non-empty ONLY when a candidate was skipped; an empty scope_excludes with traversal_complete:true means every candidate was searched. Skipped sites surface as unresolved_candidates."
         );
         assert_eq!(tools[3].name, "entity_execution_path_list");
         assert_eq!(
@@ -6138,7 +6203,7 @@ mod tests {
         assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
-            "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit; reports scope_excludes and unresolved_name_matches."
+            "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit. scope_excludes is non-empty only when a caller candidate was skipped; empty + traversal_complete:true confirms the callers bucket searched all candidates. Skipped sites surface as unresolved_candidates."
         );
         assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(
