@@ -228,7 +228,18 @@ impl ServerState {
                     match entity_by_id(conn, &entity_id)? {
                         Some(target) => {
                             let (count, next_action) = unresolved_match_fields(conn, &target)?;
-                            let candidates = build_unresolved_candidates(conn, &target)?;
+                            // Gate `unresolved_candidates` behind the same
+                            // `confidence != Inferred` check that drives
+                            // `caller_navigation_scope_excludes` (A1): the inferred
+                            // dispatch attempts the unresolved category, so it skips
+                            // nothing and scope_excludes is forced empty
+                            // (traversal_complete:true). Surfacing candidates here
+                            // anyway would contradict that completeness signal.
+                            let candidates = if confidence == EdgeConfidence::Inferred {
+                                Vec::new()
+                            } else {
+                                build_unresolved_candidates(conn, &target)?
+                            };
                             (count, next_action, candidates)
                         }
                         None => (0, Value::Null, Vec::new()),
@@ -502,7 +513,15 @@ impl ServerState {
                 // surface the skipped sites as `unresolved_candidates`. Empty
                 // scope_excludes + `traversal_complete: true` confirms the callers
                 // bucket searched every candidate.
-                let unresolved_candidates = build_unresolved_candidates(conn, &entity)?;
+                // Gate behind `confidence != Inferred` to mirror
+                // `caller_navigation_scope_excludes` (A1): an inferred traversal
+                // skips nothing, so it must not surface unresolved candidates
+                // alongside `traversal_complete: true`.
+                let unresolved_candidates = if confidence == EdgeConfidence::Inferred {
+                    Vec::new()
+                } else {
+                    build_unresolved_candidates(conn, &entity)?
+                };
                 let scope_excludes =
                     caller_navigation_scope_excludes(confidence, unresolved_name_matches > 0);
                 let traversal_complete = scope_excludes.is_empty();

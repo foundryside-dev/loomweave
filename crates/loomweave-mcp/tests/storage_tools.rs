@@ -5353,6 +5353,106 @@ async fn neighborhood_surfaces_unresolved_candidates_when_a_candidate_is_skipped
     assert_eq!(candidates[0]["why"], "dynamic", "{envelope}");
 }
 
+// A1 (review): `confidence=inferred` forces `scope_excludes` empty (the inferred
+// dispatch attempts the unresolved category, so it skips nothing) which sets
+// `traversal_complete: true`. `unresolved_candidates` MUST therefore also be
+// empty on the inferred path — surfacing name-matched-but-skipped sites there
+// would contradict the documented completeness contract ("empty scope_excludes
+// with traversal_complete:true means every candidate was searched"). These
+// tests exercise the write-tools-enabled posture, the only posture where
+// `confidence=inferred` is permitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_does_not_contradict_traversal_complete() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // A live unresolved call site that name-matches `target` — for the
+        // default `resolved` confidence this is a skipped candidate
+        // (traversal_complete:false + a non-empty unresolved_candidates row).
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(r#"{"edges":[]}"#));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    // Inferred dispatch attempts the unresolved category: scope_excludes is
+    // empty and the traversal is reported complete.
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    // ...so unresolved_candidates MUST be empty too — no contradiction.
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "inferred path must not surface candidates alongside traversal_complete:true: {envelope}"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn neighborhood_inferred_does_not_contradict_traversal_complete() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(r#"{"edges":[]}"#));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "inferred path must not surface candidates alongside traversal_complete:true: {envelope}"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn neighborhood_and_orientation_carry_unresolved_name_matches() {
     let (project, db_path) = open_project();
