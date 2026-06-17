@@ -3576,6 +3576,15 @@ fn caller_navigation_scope_excludes(
 /// `target`, and where to see them. The pointer names `entity_call_site_list`
 /// because it works in the default read-only posture, where `confidence=
 /// inferred` is rejected by the MCP tool policy (clarion-df87b4f381).
+///
+/// NOTE (clarion-2b87cd7a59 A1): unlike `unresolved_candidates`, the count and
+/// pointer are *not* gated behind `confidence != Inferred`. This is intentional,
+/// not the contradiction A1 closed. `unresolved_candidates` is a completeness
+/// claim — listing it alongside `traversal_complete: true` would assert "these
+/// were skipped" about a traversal that skipped nothing, so it is gated. The
+/// count/pointer are purely *informational*: "N name-matching sites exist; here
+/// is how to inspect them" stays true whether or not the inferred dispatch bound
+/// them, and gives the caller a navigation handle without claiming incompleteness.
 pub(crate) fn unresolved_match_fields(
     conn: &rusqlite::Connection,
     target: &EntityRow,
@@ -4321,17 +4330,59 @@ fn name_entropy(text: &str) -> f64 {
 }
 
 /// Entropy threshold above which a `name`/`id` field is itself treated as secret
-/// and re-withheld. Base64/hex secret blobs sit above ~4.0 bits/byte; ordinary
-/// identifiers (`LibraryService`, `app.auth.login`) stay well below ~3.5. The
-/// length floor avoids flagging short-but-varied names.
-const NAME_ENTROPY_REDACT_THRESHOLD: f64 = 4.0;
+/// and re-withheld. Real base64 secret blobs measure ~4.6–4.8 bits/byte (an
+/// AWS-key-shaped blob ≈ 4.63); long *descriptive* identifiers — Rust `::`
+/// paths, dotted qualnames, verbose `snake_case` — sit at ~4.0–4.2, so a 4.0
+/// floor over-redacted exactly this codebase's naming. 4.5 separates the two
+/// populations with margin. The length floor avoids flagging short-but-varied
+/// names. Defense-in-depth: `looks_like_identifier_path` exempts structurally
+/// recognisable locators even if a pathological one were to cross the floor.
+const NAME_ENTROPY_REDACT_THRESHOLD: f64 = 4.5;
 const NAME_ENTROPY_MIN_LEN: usize = 20;
+
+/// Whether `seg` is a single valid identifier — `[A-Za-z_][A-Za-z0-9_]*`. This
+/// is what rejects opaque blobs: base64 (`+`/`/`/`=`), base64url (`-`), and any
+/// token whose body strays outside identifier characters fails here.
+fn is_identifier_segment(seg: &str) -> bool {
+    let mut chars = seg.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether a value is structurally a code identifier / locator — a Rust `::`
+/// path or a dotted module path of 2+ valid identifier segments — rather than an
+/// opaque high-entropy blob. Such values are navigable structure, never a
+/// secret, so the redaction guard exempts them.
+///
+/// A `plugin:kind:qualname` locator is unwrapped first and ONLY its qualname is
+/// judged: a secret embedded *as* the qualname (`python:function:<blob>`) must
+/// still trip the guard, so we never exempt on the locator wrapper alone.
+/// Requiring every segment to be a valid identifier rejects `.`-delimited blobs
+/// (JWTs, base64 with `+`/`/`/`-`) that merely happen to contain a separator.
+fn looks_like_identifier_path(text: &str) -> bool {
+    // Unwrap a `plugin:kind:qualname` locator to its qualname; a bare value is
+    // judged as-is. (`split_once` twice tolerates `::` inside the qualname.)
+    let qualname = match text.split_once(':') {
+        Some((_plugin, rest)) => rest.split_once(':').map_or(rest, |(_kind, q)| q),
+        None => text,
+    };
+    let segments: Vec<&str> = if qualname.contains("::") {
+        qualname.split("::").collect()
+    } else {
+        qualname.split('.').collect()
+    };
+    segments.len() >= 2 && segments.iter().all(|seg| is_identifier_segment(seg))
+}
 
 /// Whether a single identity *value* (`name`, `short_name`, or the locator `id`)
 /// is itself high-entropy enough to be a secret, so the A3 identity-preserving
 /// projection must keep redacting that one field (clarion-719e7320f5 guard).
 fn name_value_is_secretlike(text: &str) -> bool {
-    text.len() >= NAME_ENTROPY_MIN_LEN && name_entropy(text) >= NAME_ENTROPY_REDACT_THRESHOLD
+    text.len() >= NAME_ENTROPY_MIN_LEN
+        && !looks_like_identifier_path(text)
+        && name_entropy(text) >= NAME_ENTROPY_REDACT_THRESHOLD
 }
 
 /// Project one identity *value* for a briefing-blocked row: the value verbatim,
@@ -7945,6 +7996,19 @@ mod tests {
         assert!(!super::name_value_is_secretlike("python:function:demo.mid"));
         // Short-but-varied names are not flagged (length floor).
         assert!(!super::name_value_is_secretlike("aB3xZ9"));
+        // Long *descriptive* identifiers stay navigable: verbose snake_case,
+        // Rust `::` paths, and deep dotted qualnames all measure ~4.0–4.2 and
+        // must survive the guard (the A3 over-redaction regression).
+        assert!(!super::name_value_is_secretlike(
+            "get_user_by_id_and_organization_with_permissions_check_v2"
+        ));
+        assert!(!super::name_value_is_secretlike(
+            "rust:function:crate::module::submodule::function_with_a_long_name"
+        ));
+        assert!(!super::name_value_is_secretlike(
+            "python:class:my.very.long.module.path.deeply.nested.HandlerClass"
+        ));
+        // A real base64 secret blob still trips the guard.
         assert!(super::name_value_is_secretlike(
             "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z"
         ));
