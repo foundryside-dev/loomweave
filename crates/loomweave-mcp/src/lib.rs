@@ -4329,60 +4329,32 @@ fn name_entropy(text: &str) -> f64 {
         .sum()
 }
 
-/// Entropy threshold above which a `name`/`id` field is itself treated as secret
-/// and re-withheld. Real base64 secret blobs measure ~4.6–4.8 bits/byte (an
-/// AWS-key-shaped blob ≈ 4.63); long *descriptive* identifiers — Rust `::`
-/// paths, dotted qualnames, verbose `snake_case` — sit at ~4.0–4.2, so a 4.0
-/// floor over-redacted exactly this codebase's naming. 4.5 separates the two
-/// populations with margin. The length floor avoids flagging short-but-varied
-/// names. Defense-in-depth: `looks_like_identifier_path` exempts structurally
-/// recognisable locators even if a pathological one were to cross the floor.
+/// Entropy threshold above which a path *segment* is itself treated as secret
+/// and its containing field re-withheld. Real base64 secret blobs measure
+/// ~4.6–4.8 bits/byte (an AWS-key-shaped blob ≈ 4.63); ordinary identifier
+/// segments — even verbose `snake_case` like `function_with_a_long_name` — sit
+/// below ~4.2, so this separates the two populations with margin. The length
+/// floor avoids flagging short-but-varied names.
 const NAME_ENTROPY_REDACT_THRESHOLD: f64 = 4.5;
 const NAME_ENTROPY_MIN_LEN: usize = 20;
-
-/// Whether `seg` is a single valid identifier — `[A-Za-z_][A-Za-z0-9_]*`. This
-/// is what rejects opaque blobs: base64 (`+`/`/`/`=`), base64url (`-`), and any
-/// token whose body strays outside identifier characters fails here.
-fn is_identifier_segment(seg: &str) -> bool {
-    let mut chars = seg.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Whether a value is structurally a code identifier / locator — a Rust `::`
-/// path or a dotted module path of 2+ valid identifier segments — rather than an
-/// opaque high-entropy blob. Such values are navigable structure, never a
-/// secret, so the redaction guard exempts them.
-///
-/// A `plugin:kind:qualname` locator is unwrapped first and ONLY its qualname is
-/// judged: a secret embedded *as* the qualname (`python:function:<blob>`) must
-/// still trip the guard, so we never exempt on the locator wrapper alone.
-/// Requiring every segment to be a valid identifier rejects `.`-delimited blobs
-/// (JWTs, base64 with `+`/`/`/`-`) that merely happen to contain a separator.
-fn looks_like_identifier_path(text: &str) -> bool {
-    // Unwrap a `plugin:kind:qualname` locator to its qualname; a bare value is
-    // judged as-is. (`split_once` twice tolerates `::` inside the qualname.)
-    let qualname = match text.split_once(':') {
-        Some((_plugin, rest)) => rest.split_once(':').map_or(rest, |(_kind, q)| q),
-        None => text,
-    };
-    let segments: Vec<&str> = if qualname.contains("::") {
-        qualname.split("::").collect()
-    } else {
-        qualname.split('.').collect()
-    };
-    segments.len() >= 2 && segments.iter().all(|seg| is_identifier_segment(seg))
-}
 
 /// Whether a single identity *value* (`name`, `short_name`, or the locator `id`)
 /// is itself high-entropy enough to be a secret, so the A3 identity-preserving
 /// projection must keep redacting that one field (clarion-719e7320f5 guard).
+///
+/// The value is judged PER PATH SEGMENT, splitting on `:`/`.` (so `::` yields
+/// empty segments the length floor discards). A `plugin:kind:qualname` locator
+/// and a dotted/`::` qualname are separator-delimited, so a secret embedded as
+/// ONE segment (`python:function:pkg.<blob>`) trips the guard even though the
+/// surrounding segments are ordinary words — while a long *descriptive*
+/// identifier stays navigable because none of its word-segments is high-entropy.
+/// Checking per-segment (not the whole string) is what closes the qualified-name
+/// hole: the blob's entropy is not diluted by the `pkg.`/`module::` prefix.
 fn name_value_is_secretlike(text: &str) -> bool {
-    text.len() >= NAME_ENTROPY_MIN_LEN
-        && !looks_like_identifier_path(text)
-        && name_entropy(text) >= NAME_ENTROPY_REDACT_THRESHOLD
+    text.split([':', '.']).any(|segment| {
+        segment.len() >= NAME_ENTROPY_MIN_LEN
+            && name_entropy(segment) >= NAME_ENTROPY_REDACT_THRESHOLD
+    })
 }
 
 /// Project one identity *value* for a briefing-blocked row: the value verbatim,
@@ -8008,9 +7980,15 @@ mod tests {
         assert!(!super::name_value_is_secretlike(
             "python:class:my.very.long.module.path.deeply.nested.HandlerClass"
         ));
-        // A real base64 secret blob still trips the guard.
+        // A real base64 secret blob still trips the guard...
         assert!(super::name_value_is_secretlike(
             "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z"
+        ));
+        // ...and so does a blob embedded as ONE segment of an otherwise valid
+        // qualified locator: per-segment entropy is not diluted by the prefix
+        // (the qualified-name hole, clarion review P1).
+        assert!(super::name_value_is_secretlike(
+            "python:function:pkg.aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z"
         ));
     }
 

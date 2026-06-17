@@ -614,7 +614,12 @@ Every slice is an existing pinned endpoint — WS4 adds **no new endpoint**:
 > cross-tool Wave 2 HTTP dossier the Wardline assembler builds, described below.
 > The two are independent: the MCP param normalizes finding fingerprints to the
 > bare form (stripping any `wlfp2:` prefix) within Loomweave's own output, and
-> omitting `include` leaves the pack byte-identical.
+> omitting `include` leaves the pack byte-identical. The `findings` section
+> mirrors `entity_finding_list`'s result (a `findings` array plus `page`
+> pagination metadata), so a consult agent can tell when findings were truncated
+> past the first page; `summary_available` is true only when the full summary
+> cache key (content hash + prompt template + model tier + guidance) is present
+> and unexpired — i.e. when `entity_summary_get` would serve from cache.
 
 | Dossier slice | Loomweave endpoint | Pinned at |
 |---|---|---|

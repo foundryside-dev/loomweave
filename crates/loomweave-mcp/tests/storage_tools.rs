@@ -6540,9 +6540,16 @@ async fn orientation_pack_dossier_with_all_sections() {
         dossier.get("wardline").is_some(),
         "dossier.wardline: {out:?}"
     );
+    // The findings section mirrors its source tool's result object (as wardline
+    // does): a `findings` array plus the `page` pagination metadata, so a caller
+    // can detect truncation past the first page (clarion review P2).
     assert!(
-        dossier["findings"].is_array(),
-        "dossier.findings array: {out:?}"
+        dossier["findings"]["findings"].is_array(),
+        "dossier.findings.findings array: {out:?}"
+    );
+    assert!(
+        dossier["findings"]["page"].is_object(),
+        "dossier.findings.page must carry pagination metadata: {out:?}"
     );
     assert!(dossier.get("issues").is_some(), "dossier.issues: {out:?}");
     // No summary cached for this entity → flagged false; dossier still assembled.
@@ -6669,9 +6676,9 @@ async fn orientation_pack_dossier_summary_available_true_when_cached() {
             key: SummaryCacheKey {
                 entity_id: "python:function:demo.entry".to_owned(),
                 content_hash,
-                prompt_template_id: "leaf-summary-v1".to_owned(),
-                model_tier: "balanced".to_owned(),
-                guidance_fingerprint: String::new(),
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
             },
             summary_json: r#"{"purpose":"demo"}"#.to_owned(),
             cost_usd: 0.0,
@@ -6697,6 +6704,106 @@ async fn orientation_pack_dossier_summary_available_true_when_cached() {
     assert_eq!(
         out["result"]["dossier"]["summary_available"], true,
         "summary_available must be true with a cached summary: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_summary_available_false_on_stale_cache_key() {
+    // Regression (clarion review P2): a cache row whose content_hash matches but
+    // whose model_tier (or template / guidance) has since changed must NOT report
+    // summary_available: true. entity_summary_get keys on the FULL SummaryCacheKey
+    // and would miss this row, refetching — so a content-hash-only availability
+    // check falsely tells a consult-mode caller it can skip generating.
+    let (project, db_path) = open_project();
+    let content_hash = expected_content_hash(project.path(), "python:function:demo.entry");
+    upsert_summary_cache(
+        &Connection::open(&db_path).expect("open sqlite"),
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash,
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                // Stale tier: the live read path resolves a different model id,
+                // so the full-key lookup misses this row.
+                model_tier: "anthropic/some-old-retired-model".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
+            },
+            summary_json: r#"{"purpose":"demo"}"#.to_owned(),
+            cost_usd: 0.0,
+            tokens_input: 0,
+            tokens_output: 0,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_accessed_at: "2026-01-01T00:00:00Z".to_owned(),
+            caller_count: 0,
+            fan_out: 0,
+            stale_semantic: false,
+        },
+    )
+    .expect("upsert summary cache");
+
+    let state = state_for(project.path(), &db_path);
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": ["findings"]}),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+    assert_eq!(
+        out["result"]["dossier"]["summary_available"], false,
+        "summary_available must be false when only content_hash matches a stale key: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_findings_surface_pagination_truncation() {
+    // Regression (clarion review P2): with more findings than the default page
+    // size, the dossier's findings section must carry `page` metadata showing
+    // truncation — otherwise include:["findings"] silently looks complete while
+    // omitting everything past the first page.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-findings",
+        "2026-01-01T00:00:00.000Z",
+        "completed",
+        Some("2026-01-01T00:00:01.000Z"),
+    );
+    // 51 findings on the primary entity: one more than the 50-row default page.
+    for i in 0..51 {
+        insert_finding(
+            &conn,
+            &format!("F{i:03}"),
+            "run-findings",
+            "python:function:demo.entry",
+        );
+    }
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": ["findings"]}),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+
+    let findings = &out["result"]["dossier"]["findings"];
+    let page = &findings["page"];
+    assert_eq!(
+        page["total"], 51,
+        "page.total must reflect all findings: {out:?}"
+    );
+    assert_eq!(
+        page["truncated"], true,
+        "page.truncated must flag the dropped tail: {out:?}"
+    );
+    assert_eq!(
+        findings["findings"].as_array().map(Vec::len),
+        Some(50),
+        "first page returns the 50-row default: {out:?}"
     );
 }
 
