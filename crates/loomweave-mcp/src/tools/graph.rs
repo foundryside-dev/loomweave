@@ -710,31 +710,26 @@ impl ServerState {
                 let has_more = offset.saturating_add(limit) < total;
                 let next_cursor = has_more.then(|| (offset + limit).to_string());
                 // Members are projected with their own compact shape (not
-                // `entity_json`), so the briefing-blocked gate is applied here via
-                // `entity_visibility` — a blocked member module (its file carries a
-                // secret) is redacted to withhold its id/name/path
-                // (clarion-307668e2be).
+                // `entity_json`). Under A3 (clarion-719e7320f5) a blocked member
+                // module (its file carries a secret) keeps its navigable id/name/
+                // path and rides the `briefing_blocked` flag — the secret is the
+                // file content, not the structural identity. `entity_visibility`
+                // supplies the block reason.
                 let members = all_members
                     .iter()
                     .skip(offset)
                     .take(limit)
                     .map(|member| {
-                        if let EntityVisibility::Blocked(reason) =
-                            entity_visibility(conn, &member.id)?
-                        {
-                            Ok(json!({
-                                "id": Value::Null,
-                                "name": Value::Null,
-                                "source_file_path": Value::Null,
-                                "briefing_blocked": reason
-                            }))
-                        } else {
-                            Ok(json!({
-                                "id": member.id,
-                                "name": member.name,
-                                "source_file_path": member.source_file_path
-                            }))
-                        }
+                        let briefing_blocked = match entity_visibility(conn, &member.id)? {
+                            EntityVisibility::Blocked(reason) => Value::String(reason),
+                            _ => Value::Null,
+                        };
+                        Ok(json!({
+                            "id": member.id,
+                            "name": member.name,
+                            "source_file_path": member.source_file_path,
+                            "briefing_blocked": briefing_blocked
+                        }))
                     })
                     .collect::<Result<Vec<_>, StorageError>>()?;
                 Ok(success_envelope(json!({
@@ -867,12 +862,13 @@ impl ServerState {
                 let next_cursor = has_more.then(|| (offset + limit).to_string());
                 let mut owner_meta: HashMap<String, crate::OwnerMeta> = HashMap::new();
                 let mut file_content: HashMap<String, Option<Vec<u8>>> = HashMap::new();
-                // Memoized candidate visibility: candidate ids are raw
-                // qualname-encoding locators, so a briefing-blocked candidate
-                // would hand back exactly the identity the neighbor stub
-                // withholds. Only ids resolving to VISIBLE entities pass
-                // (entity_resolve collapses blocked candidates for the same
-                // reason); a lookup error fails closed.
+                // Memoized candidate existence: candidate ids are raw
+                // qualname-encoding locators. Under A3 (clarion-719e7320f5) a
+                // briefing-blocked candidate keeps its navigable identity, so it
+                // may pass — but a candidate that resolves to NO entity row (a
+                // phantom alternative) must never be disclosed as a real
+                // alternative. So only `NotFound` is filtered; a lookup error
+                // still fails closed.
                 let mut candidate_visible: HashMap<String, bool> = HashMap::new();
                 let mut relations = Vec::new();
                 for edge in edges.into_iter().skip(offset).take(limit) {
@@ -922,7 +918,7 @@ impl ServerState {
                             *candidate_visible.entry((*cid).clone()).or_insert_with(|| {
                                 matches!(
                                     entity_visibility(conn, cid),
-                                    Ok(EntityVisibility::Visible)
+                                    Ok(EntityVisibility::Visible | EntityVisibility::Blocked(_))
                                 )
                             })
                         })

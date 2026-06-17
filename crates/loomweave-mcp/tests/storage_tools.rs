@@ -1110,7 +1110,7 @@ async fn subsystem_members_returns_member_modules() {
 }
 
 #[tokio::test]
-async fn subsystem_members_redacts_briefing_blocked_member() {
+async fn subsystem_members_blocked_member_keeps_navigable_identity() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).expect("open sqlite");
     let subsystem_id = seed_subsystem(&conn, project.path());
@@ -1122,24 +1122,22 @@ async fn subsystem_members_redacts_briefing_blocked_member() {
     let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
     assert_eq!(envelope["ok"], true, "{envelope}");
     let members = envelope["result"]["members"].as_array().unwrap();
-    // Member count stays honest; the blocked module is a redacted stub.
+    // Member count stays honest; the blocked module keeps its navigable identity.
     assert_eq!(members.len(), 2, "{envelope}");
     let blocked = members
         .iter()
         .find(|m| m["briefing_blocked"] == "secret_present")
-        .expect("blocked member present as a stub");
-    assert!(blocked["id"].is_null(), "{blocked}");
-    assert!(blocked["name"].is_null(), "{blocked}");
-    assert!(blocked["source_file_path"].is_null(), "{blocked}");
-    // The visible member is untouched; the blocked id never appears.
-    assert!(
-        members.iter().any(|m| m["id"] == "python:module:demo"),
-        "{envelope}"
-    );
-    assert!(
-        !envelope.to_string().contains("pkg.auth"),
-        "blocked member id leaked in subsystem_members: {envelope}"
-    );
+        .expect("blocked member present with identity");
+    // Under A3 the blocked member's id/name/path ride alongside the flag.
+    assert_eq!(blocked["id"], "python:module:pkg.auth", "{blocked}");
+    assert!(!blocked["name"].is_null(), "{blocked}");
+    assert!(!blocked["source_file_path"].is_null(), "{blocked}");
+    // The visible member carries a null `briefing_blocked` flag.
+    let visible = members
+        .iter()
+        .find(|m| m["id"] == "python:module:demo")
+        .expect("visible member present");
+    assert!(visible["briefing_blocked"].is_null(), "{visible}");
 }
 
 #[tokio::test]
@@ -3705,13 +3703,15 @@ fn mark_blocked(db_path: &std::path::Path, id: &str, reason: &str) {
     .expect("mark entity blocked");
 }
 
-/// Assert an entity projection is a redacted stub: every identity field null,
-/// only the block reason present.
-fn assert_redacted_identity(entity: &Value, reason: &str) {
-    assert_eq!(entity["briefing_blocked"], reason, "stub reason: {entity}");
+/// Assert a briefing-blocked entity projection keeps its navigable identity
+/// (clarion-719e7320f5, A3): `id`, `kind`, `name`, `short_name`,
+/// `source_file_path`, the line span and `content_hash` are PRESENT alongside
+/// the `briefing_blocked` flag; only the cross-tool `sei` binding key stays null.
+/// The secret is the file content, not the entity's structural identity.
+fn assert_blocked_identity_present(entity: &Value, reason: &str) {
+    assert_eq!(entity["briefing_blocked"], reason, "block reason: {entity}");
     for field in [
         "id",
-        "sei",
         "kind",
         "name",
         "short_name",
@@ -3721,10 +3721,14 @@ fn assert_redacted_identity(entity: &Value, reason: &str) {
         "content_hash",
     ] {
         assert!(
-            entity.get(field).is_none_or(Value::is_null),
-            "identity field `{field}` must be withheld for a blocked entity: {entity}"
+            entity.get(field).is_some_and(|v| !v.is_null()),
+            "identity field `{field}` must be PRESENT for a blocked entity: {entity}"
         );
     }
+    assert!(
+        entity["sei"].is_null(),
+        "SEI must stay null for a blocked entity (ADR-034): {entity}"
+    );
 }
 
 #[tokio::test]
@@ -3748,11 +3752,9 @@ async fn find_entity_redacts_briefing_blocked_identity() {
         .filter(|e| e["briefing_blocked"] == "secret_present")
         .collect();
     assert_eq!(blocked.len(), 1, "blocked entity still listed: {resp}");
-    assert_redacted_identity(blocked[0], "secret_present");
-    assert!(
-        !resp.to_string().contains("demo.mid"),
-        "blocked id leaked somewhere in find_entity response: {resp}"
-    );
+    assert_blocked_identity_present(blocked[0], "secret_present");
+    // The navigable locator IS exposed now (A3): identity is not the secret.
+    assert_eq!(blocked[0]["id"], "python:function:demo.mid", "{resp}");
 }
 
 #[tokio::test]
@@ -3764,22 +3766,23 @@ async fn entity_at_redacts_briefing_blocked_match_and_context() {
 
     let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 4})).await;
     assert_eq!(resp["ok"], true, "{resp}");
-    assert_redacted_identity(&resp["result"]["entity"], "secret_present");
+    assert_blocked_identity_present(&resp["result"]["entity"], "secret_present");
 
-    // The matched node in the containing stack is redacted; its ranges nulled.
+    // The matched node in the containing stack keeps its navigable identity (A3),
+    // and the ranges block keeps the line span — only the secret content hides.
     let stack = resp["result"]["entity_context"]["containing_stack"]
         .as_array()
         .unwrap();
     let matched_node = stack.last().expect("matched node present");
     assert_eq!(matched_node["briefing_blocked"], "secret_present", "{resp}");
-    assert!(matched_node["id"].is_null(), "{resp}");
+    assert_eq!(matched_node["id"], "python:function:demo.mid", "{resp}");
     assert!(
-        resp["result"]["entity_context"]["ranges"]["source_line_start"].is_null(),
-        "matched ranges leak the blocked line span: {resp}"
+        matched_node["sei"].is_null(),
+        "stack SEI must be null: {resp}"
     );
     assert!(
-        !resp.to_string().contains("demo.mid"),
-        "blocked id leaked in entity_at response: {resp}"
+        !resp["result"]["entity_context"]["ranges"]["source_line_start"].is_null(),
+        "matched ranges must expose the line span now (A3): {resp}"
     );
 }
 
@@ -3802,19 +3805,20 @@ async fn entity_at_redacts_blocked_alternative() {
         .iter()
         .find(|a| a["entity"]["briefing_blocked"] == "secret_present")
         .expect("blocked alternative present as a stub");
-    assert_redacted_identity(&blocked["entity"], "secret_present");
-    assert!(
-        !resp.to_string().contains("demo.target"),
-        "blocked alternative id leaked in entity_at response: {resp}"
+    assert_blocked_identity_present(&blocked["entity"], "secret_present");
+    assert_eq!(
+        blocked["entity"]["id"], "python:function:demo.target",
+        "{resp}"
     );
 }
 
 #[tokio::test]
-async fn orientation_suggested_reads_omit_blocked_callee() {
+async fn orientation_suggested_reads_offer_blocked_callee_drilldown() {
     let (project, db_path) = open_project();
-    // entry's first resolved callee is mid; block it. The suggested-reads drill
-    // into the first callee reads its id from the (now-redacted) packet, so the
-    // blocked id must not surface in suggested_next_reads.
+    // entry's first resolved callee is mid; block it. Under A3
+    // (clarion-719e7320f5) the blocked callee keeps its navigable id, so the
+    // suggested-reads drill-down into the first callee IS offered — the entity is
+    // reachable by locator even though its source content stays withheld.
     mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
     let state = state_for(project.path(), &db_path);
 
@@ -3826,15 +3830,15 @@ async fn orientation_suggested_reads_omit_blocked_callee() {
     .await;
     assert_eq!(resp["ok"], true, "{resp}");
     assert!(
-        !resp["result"]["suggested_next_reads"]
+        resp["result"]["suggested_next_reads"]
             .to_string()
-            .contains("demo.mid"),
-        "blocked callee id leaked in suggested_next_reads: {resp}"
+            .contains("python:function:demo.mid"),
+        "blocked callee drill-down should be offered now (A3): {resp}"
     );
 }
 
 #[tokio::test]
-async fn neighborhood_redacts_blocked_neighbor_including_stored_to_id() {
+async fn neighborhood_blocked_neighbor_keeps_navigable_identity() {
     let (project, db_path) = open_project();
     // demo.entry calls demo.mid (resolved). Block the callee.
     mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
@@ -3853,14 +3857,16 @@ async fn neighborhood_redacts_blocked_neighbor_including_stored_to_id() {
         .iter()
         .find(|c| c["entity"]["briefing_blocked"] == "secret_present")
         .expect("blocked callee present as a stub");
-    assert_redacted_identity(&blocked["entity"], "secret_present");
-    assert!(
-        blocked["stored_to_id"].is_null(),
-        "stored_to_id leaks the blocked callee id: {blocked}"
+    // Under A3 the blocked callee keeps its navigable identity; `stored_to_id`
+    // echoes the same (now non-secret) id.
+    assert_blocked_identity_present(&blocked["entity"], "secret_present");
+    assert_eq!(
+        blocked["entity"]["id"], "python:function:demo.mid",
+        "{resp}"
     );
-    assert!(
-        !resp.to_string().contains("demo.mid"),
-        "blocked id leaked in neighborhood response: {resp}"
+    assert_eq!(
+        blocked["stored_to_id"], "python:function:demo.mid",
+        "stored_to_id echoes the navigable callee id: {blocked}"
     );
 }
 
@@ -3917,7 +3923,7 @@ async fn orientation_refuses_for_blocked_primary() {
 }
 
 #[tokio::test]
-async fn orientation_redacts_blocked_node_in_execution_paths() {
+async fn orientation_keeps_blocked_node_navigable_in_execution_paths() {
     let (project, db_path) = open_project();
     // demo.target is a leaf reached via entry -> mid -> target (resolved).
     mark_blocked(&db_path, "python:function:demo.target", "secret_present");
@@ -3931,30 +3937,43 @@ async fn orientation_redacts_blocked_node_in_execution_paths() {
     .await;
     assert_eq!(resp["ok"], true, "{resp}");
 
-    // The blocked node is omitted from the node table...
+    // Under A3 the blocked node keeps its navigable identity in the node table,
+    // flagged briefing_blocked, with a null SEI.
     let nodes = resp["result"]["execution_paths"]["nodes"]
         .as_array()
         .unwrap();
+    let blocked_node = nodes
+        .iter()
+        .find(|n| n["id"] == "python:function:demo.target")
+        .expect("blocked node present with identity");
+    assert_eq!(blocked_node["briefing_blocked"], "secret_present", "{resp}");
     assert!(
-        nodes
-            .iter()
-            .all(|n| n["id"] != "python:function:demo.target"),
-        "blocked node leaked in execution_paths node table: {resp}"
+        blocked_node["sei"].is_null(),
+        "node SEI must be null: {resp}"
     );
-    // ...and replaced by the sentinel in the path arrays.
+    // …and its id rides through the path arrays unchanged (no sentinel).
     let paths = resp["result"]["execution_paths"]["paths"]
         .as_array()
         .unwrap();
+    let has_blocked_in_path = paths.iter().any(|p| {
+        p.as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "python:function:demo.target")
+    });
+    assert!(
+        has_blocked_in_path,
+        "blocked id should ride the path: {resp}"
+    );
     let has_sentinel = paths.iter().any(|p| {
         p.as_array()
             .unwrap()
             .iter()
             .any(|id| id == "[briefing-blocked]")
     });
-    assert!(has_sentinel, "expected [briefing-blocked] sentinel: {resp}");
     assert!(
-        !resp.to_string().contains("demo.target"),
-        "blocked id leaked somewhere in orientation pack: {resp}"
+        !has_sentinel,
+        "no sentinel for a navigable blocked node: {resp}"
     );
 }
 
@@ -7301,14 +7320,14 @@ async fn relation_list_redacts_blocked_neighbor_and_blocked_anchor_file() {
     let relations = resp["result"]["relations"].as_array().unwrap();
     assert_eq!(relations.len(), 1, "{resp}");
     let rel = &relations[0];
-    assert_redacted_identity(&rel["entity"], "secret_present");
+    // Under A3 the blocked neighbor keeps its navigable identity…
+    assert_blocked_identity_present(&rel["entity"], "secret_present");
+    assert_eq!(rel["entity"]["id"], "python:class:types.Child", "{rel}");
+    // …but the source-line *evidence* (the bytes behind the anchor) stays
+    // withheld — that is the secret content, not the identity.
     assert_eq!(rel["source_status"], "briefing_blocked", "{rel}");
     assert!(rel["line"].is_null(), "{rel}");
     assert_eq!(rel["line_text"], "", "{rel}");
-    assert!(
-        !resp.to_string().contains("types.Child"),
-        "blocked neighbor id leaked in relation_list response: {resp}"
-    );
 
     // Blocking the anchor FILE entity withholds line evidence even when both
     // endpoints are visible (the bytes behind the anchor are scanner-withheld).
@@ -7475,12 +7494,12 @@ async fn orientation_pack_includes_relation_neighbors() {
 }
 
 #[tokio::test]
-async fn relation_list_candidates_never_leak_blocked_ids() {
-    // An ambiguous edge's `candidates` carry raw entity ids, and the chosen
-    // FROM side conventionally appears in its own candidate list — so without
-    // filtering, a briefing-blocked neighbor's stubbed identity is recoverable
-    // verbatim from `candidates` on the same row (the entity_resolve surface
-    // collapses blocked candidates for exactly this reason).
+async fn relation_list_candidates_keep_blocked_drop_phantom() {
+    // An ambiguous edge's `candidates` carry raw entity ids. Under A3
+    // (clarion-719e7320f5) a briefing-blocked candidate that resolves to a real
+    // entity row keeps its navigable id and may appear, but a phantom candidate
+    // (`types.wrap_again` — no entity row) must still be filtered out: only ids
+    // resolvable to real entities pass.
     let (project, db_path) = open_project();
     seed_relation_fixture(project.path(), &db_path);
     {
@@ -7525,18 +7544,30 @@ async fn relation_list_candidates_never_leak_blocked_ids() {
     assert_eq!(resp["ok"], true, "{resp}");
     let relations = resp["result"]["relations"].as_array().unwrap();
     assert_eq!(relations.len(), 1, "{resp}");
-    assert_redacted_identity(&relations[0]["entity"], "secret_present");
+    // The blocked from-side neighbor keeps its navigable identity (A3)…
+    assert_blocked_identity_present(&relations[0]["entity"], "secret_present");
+    assert_eq!(
+        relations[0]["entity"]["id"], "python:function:types.wrap",
+        "{resp}"
+    );
+    // …and `types.wrap` survives as a real candidate, but the phantom
+    // `types.wrap_again` (no entity row) is filtered out.
+    let candidates = relations[0]["candidates"].as_array().unwrap();
     assert!(
-        !resp.to_string().contains("types.wrap"),
-        "blocked id leaked through candidates (or anywhere else): {resp}"
+        candidates.iter().any(|c| c == "python:function:types.wrap"),
+        "real blocked candidate should pass: {resp}"
+    );
+    assert!(
+        !resp.to_string().contains("types.wrap_again"),
+        "phantom candidate (no entity row) must not be disclosed: {resp}"
     );
 }
 
 #[tokio::test]
-async fn relation_list_visible_candidates_survive_blocked_sibling_filter() {
-    // The blocked-candidate filter must not throw away legitimate visible
-    // alternatives: with one blocked and one visible candidate, the visible
-    // id still passes through.
+async fn relation_list_real_candidates_survive_blocked_sibling() {
+    // Under A3 a blocked candidate that resolves to a real entity row keeps its
+    // navigable id, so with one blocked and one visible candidate BOTH pass —
+    // the only thing the filter still drops is a phantom (no-row) candidate.
     let (project, db_path) = open_project();
     seed_relation_fixture(project.path(), &db_path);
     {
@@ -7589,15 +7620,15 @@ async fn relation_list_visible_candidates_survive_blocked_sibling_filter() {
     .await;
     let relations = resp["result"]["relations"].as_array().unwrap();
     assert_eq!(relations.len(), 1, "{resp}");
-    // The visible chosen candidate passes; the blocked sibling is withheld.
+    // Both candidates resolve to real entity rows, so both pass (A3); the
+    // blocked sibling is navigable, not withheld.
     assert_eq!(
         relations[0]["candidates"],
-        json!(["python:function:types.wrap"]),
+        json!([
+            "python:function:types.wrap",
+            "python:function:types.wrap_again"
+        ]),
         "{resp}"
-    );
-    assert!(
-        !resp.to_string().contains("wrap_again"),
-        "blocked candidate id leaked: {resp}"
     );
 }
 

@@ -4187,7 +4187,7 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
     // caller-named entity's identity + remediation — builds identity via
     // `entity_identity_json` instead, bypassing this gate.
     if let Some(reason) = briefing_block_reason(entity) {
-        return blocked_entity_stub(&reason);
+        return blocked_entity_stub(entity, &reason);
     }
     let mut value = entity_identity_json(entity);
     if let Some(object) = value.as_object_mut() {
@@ -4199,24 +4199,81 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
     value
 }
 
-/// The identity projection of a briefing-blocked entity (ADR-013 secret scan).
+/// Shannon entropy (bits/byte) of a string, used by the briefing-block guard to
+/// detect the rare case where an entity *name* is itself a high-entropy token
+/// (e.g. a generated symbol embedding a secret). Mirrors the pre-ingest
+/// scanner's measure (`loomweave-scanner::entropy`) but kept local: the scan ran
+/// at ingest, this is only a read-path safety net for an identity field.
+fn name_entropy(text: &str) -> f64 {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let len = f64::from(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = f64::from(c) / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// Entropy threshold above which a `name`/`id` field is itself treated as secret
+/// and re-withheld. Base64/hex secret blobs sit above ~4.0 bits/byte; ordinary
+/// identifiers (`LibraryService`, `app.auth.login`) stay well below ~3.5. The
+/// length floor avoids flagging short-but-varied names.
+const NAME_ENTROPY_REDACT_THRESHOLD: f64 = 4.0;
+const NAME_ENTROPY_MIN_LEN: usize = 20;
+
+/// Whether a single identity *value* (`name`, `short_name`, or the locator `id`)
+/// is itself high-entropy enough to be a secret, so the A3 identity-preserving
+/// projection must keep redacting that one field (clarion-719e7320f5 guard).
+fn name_value_is_secretlike(text: &str) -> bool {
+    text.len() >= NAME_ENTROPY_MIN_LEN && name_entropy(text) >= NAME_ENTROPY_REDACT_THRESHOLD
+}
+
+/// Project one identity *value* for a briefing-blocked row: the value verbatim,
+/// unless it is itself high-entropy (a generated symbol embedding a secret), in
+/// which case that single field is re-withheld to JSON `null` (A3 guard).
+fn redact_secretlike(value: &str) -> Value {
+    if name_value_is_secretlike(value) {
+        Value::Null
+    } else {
+        json!(value)
+    }
+}
+
+/// The projection of a briefing-blocked entity (ADR-013 secret scan).
 ///
-/// Every identity field is withheld — only the block reason remains — so a
-/// discovery/structure MCP read acknowledges the entity exists without
-/// disclosing its name, path, or line span. Mirrors the federation read API,
-/// whose `BRIEFING_BLOCKED` response omits the same fields (ADR-034). The
-/// qualname-bearing `id` is nulled too: the locator itself encodes the name.
-fn blocked_entity_stub(reason: &str) -> Value {
+/// Per clarion-719e7320f5 (A3) the briefing-block flag rides ALONGSIDE a real,
+/// navigable identity — `id`/`kind`/`name`/`short_name`/`source_file_path`/line
+/// span/`content_hash` are all KEPT. The secret is the file *content*, not the
+/// entity's structural identity (`project_finding_list` already prints those same
+/// paths), so only the secret-bearing content (summary/source/docstring) is
+/// withheld — and those are never part of this projection to begin with. The
+/// cross-tool `sei` binding key stays null (ADR-034): a blocked row is navigable
+/// by locator but not bound across siblings.
+///
+/// Guard: in the rare case where a `name`/`short_name`/`id` is *itself*
+/// high-entropy (a generated symbol embedding a secret), that single field is
+/// re-withheld — the rest of the identity still rides along.
+fn blocked_entity_stub(entity: &EntityRow, reason: &str) -> Value {
     json!({
-        "id": Value::Null,
+        "id": redact_secretlike(&entity.id),
         "sei": Value::Null,
-        "kind": Value::Null,
-        "name": Value::Null,
-        "short_name": Value::Null,
-        "source_file_path": Value::Null,
-        "source_line_start": Value::Null,
-        "source_line_end": Value::Null,
-        "content_hash": Value::Null,
+        "kind": entity.kind,
+        "name": redact_secretlike(&entity.name),
+        "short_name": redact_secretlike(&entity.short_name),
+        "source_file_path": entity.source_file_path,
+        "source_line_start": entity.source_line_start,
+        "source_line_end": entity.source_line_end,
+        "content_hash": entity.content_hash,
         "briefing_blocked": reason,
     })
 }
@@ -4329,17 +4386,20 @@ fn span_len(entity: &EntityRow) -> Option<i64> {
 /// without the full `entity_json` payload.
 fn stack_entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
     // A blocked entity in the containing stack (the matched node, or a blocked
-    // ancestor module) is redacted to a stub — same identity-withholding as
-    // `entity_json` (clarion-307668e2be).
+    // ancestor module) keeps its navigable identity but rides the briefing-block
+    // flag (clarion-719e7320f5, A3): the secret is the file content, not the
+    // structural identity. The `sei` cross-tool binding key stays null. The
+    // high-entropy-name guard re-withholds id/name/short_name only when the
+    // value is itself secret-like.
     if let Some(reason) = briefing_block_reason(entity) {
         return json!({
-            "id": Value::Null,
+            "id": redact_secretlike(&entity.id),
             "sei": Value::Null,
-            "kind": Value::Null,
-            "short_name": Value::Null,
-            "name": Value::Null,
-            "source_line_start": Value::Null,
-            "source_line_end": Value::Null,
+            "kind": entity.kind,
+            "short_name": redact_secretlike(&entity.short_name),
+            "name": redact_secretlike(&entity.name),
+            "source_line_start": entity.source_line_start,
+            "source_line_end": entity.source_line_end,
             "briefing_blocked": reason,
         });
     }
@@ -4396,20 +4456,22 @@ fn entity_context_json(
         .collect();
     containing_stack.push(stack_entity_json(conn, matched));
 
-    // A blocked matched entity withholds its line span too — the ranges block
-    // would otherwise disclose exactly what the block hides (clarion-307668e2be).
+    // A blocked matched entity keeps its line span (clarion-719e7320f5, A3): the
+    // line numbers are structural identity, not the secret content the block
+    // hides — and `project_finding_list` already prints the same file+line. The
+    // `briefing_blocked` flag rides alongside.
+    let def = DefinitionSpan::from_entity(matched);
     let ranges = if let Some(reason) = briefing_block_reason(matched) {
         json!({
-            "source_line_start": Value::Null,
-            "source_line_end": Value::Null,
-            "decl_line": Value::Null,
-            "body_line_start": Value::Null,
-            "decorator_line_start": Value::Null,
-            "decorator_line_end": Value::Null,
+            "source_line_start": matched.source_line_start,
+            "source_line_end": matched.source_line_end,
+            "decl_line": def.decl_line,
+            "body_line_start": def.body_line_start,
+            "decorator_line_start": def.decorator_line_start,
+            "decorator_line_end": def.decorator_line_end,
             "briefing_blocked": reason,
         })
     } else {
-        let def = DefinitionSpan::from_entity(matched);
         json!({
             "source_line_start": matched.source_line_start,
             "source_line_end": matched.source_line_end,
@@ -5580,19 +5642,16 @@ fn callee_json(
     edge: &CallEdgeMatch,
 ) -> Result<Option<Value>, StorageError> {
     Ok(entity_by_id(conn, &edge.to_id)?.map(|entity| {
-        // `stored_to_id` echoes the callee's raw id, which leaks the qualname of
-        // a blocked callee even when `entity_json` redacts it (clarion-307668e2be).
-        let stored_to_id = if briefing_block_reason(&entity).is_some() {
-            Value::Null
-        } else {
-            json!(edge.stored_to_id)
-        };
+        // `stored_to_id` echoes the callee's raw id. A blocked callee now keeps
+        // its navigable identity in `entity_json` (clarion-719e7320f5, A3), so
+        // this id is no longer secret — it rides through unredacted, matching the
+        // exposed `entity.id`.
         json!({
             "entity": entity_json(conn, &entity),
             "edge_confidence": edge.confidence.as_str(),
             "source_byte_start": edge.source_byte_start,
             "source_byte_end": edge.source_byte_end,
-            "stored_to_id": stored_to_id
+            "stored_to_id": edge.stored_to_id
         })
     }))
 }
@@ -5626,26 +5685,30 @@ fn compact_execution_paths(
             node_ids.insert(id.clone());
         }
     }
-    // A briefing-blocked node is omitted from the node table (its id IS its
-    // qualname, so it cannot be projected) and its occurrences in the path
-    // arrays are replaced with a sentinel. The path keeps its shape — a flow
-    // *through* withheld territory — without disclosing which entity
-    // (clarion-307668e2be).
-    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    // A briefing-blocked node keeps its navigable identity in the node table
+    // (clarion-719e7320f5, A3) — flagged `briefing_blocked` — and its id rides
+    // through the path arrays unchanged: the secret is the file content, not the
+    // structural flow. The sentinel is retained only for the rare high-entropy
+    // node whose id is itself secret-like (the guard withholds that one id).
+    let mut secret_id: BTreeSet<String> = BTreeSet::new();
     let mut nodes = Vec::new();
     for id in &node_ids {
         if let Some(entity) = entity_by_id(conn, id)? {
-            if briefing_block_reason(&entity).is_some() {
-                blocked.insert(id.clone());
+            if let Some(reason) = briefing_block_reason(&entity) {
+                if name_value_is_secretlike(&entity.id) {
+                    secret_id.insert(id.clone());
+                } else {
+                    nodes.push(compact_blocked_node_json(&entity, &reason));
+                }
             } else {
                 nodes.push(compact_node_json(conn, &entity));
             }
         }
     }
-    if !blocked.is_empty() {
+    if !secret_id.is_empty() {
         for path in &mut paths {
             for id in path.iter_mut() {
-                if blocked.contains(id) {
+                if secret_id.contains(id) {
                     BRIEFING_BLOCKED_PATH_SENTINEL.clone_into(id);
                 }
             }
@@ -5687,6 +5750,24 @@ fn compact_node_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
         "source_file_path": entity.source_file_path,
         "source_line_start": entity.source_line_start,
         "source_line_end": entity.source_line_end
+    })
+}
+
+/// A path node for a briefing-blocked entity (clarion-719e7320f5, A3): the same
+/// navigable shape as [`compact_node_json`] plus the `briefing_blocked` flag.
+/// The `sei` cross-tool binding key stays null (no read-time join — and a blocked
+/// row is navigable by locator, not bound across siblings). The `short_name`
+/// guard re-withholds only the one field if it is itself high-entropy.
+fn compact_blocked_node_json(entity: &EntityRow, reason: &str) -> Value {
+    json!({
+        "id": redact_secretlike(&entity.id),
+        "sei": Value::Null,
+        "kind": entity.kind,
+        "short_name": redact_secretlike(&entity.short_name),
+        "source_file_path": entity.source_file_path,
+        "source_line_start": entity.source_line_start,
+        "source_line_end": entity.source_line_end,
+        "briefing_blocked": reason,
     })
 }
 
@@ -7695,6 +7776,78 @@ mod tests {
             content_hash: content_hash.map(str::to_owned),
             summary_json: None,
         }
+    }
+
+    #[test]
+    fn blocked_entity_stub_preserves_navigable_identity() {
+        // clarion-719e7320f5 (A3): the briefing-block projection keeps the
+        // navigable identity (id/kind/name/short_name/path/lines/hash) and rides
+        // the `briefing_blocked` flag; only the cross-tool `sei` stays null.
+        let mut entity = entity_row("python:function:app.login", "app.login", Some("abc123"));
+        entity.short_name = "login".to_owned();
+        entity.source_file_path = Some("app.py".to_owned());
+        entity.source_line_start = Some(10);
+        entity.source_line_end = Some(20);
+
+        let projection = super::blocked_entity_stub(&entity, "secret_present");
+        assert_eq!(projection["id"], "python:function:app.login");
+        assert_eq!(projection["kind"], "function");
+        assert_eq!(projection["name"], "app.login");
+        assert_eq!(projection["short_name"], "login");
+        assert_eq!(projection["source_file_path"], "app.py");
+        assert_eq!(projection["source_line_start"], 10);
+        assert_eq!(projection["source_line_end"], 20);
+        assert_eq!(projection["content_hash"], "abc123");
+        assert_eq!(projection["briefing_blocked"], "secret_present");
+        assert!(
+            projection["sei"].is_null(),
+            "SEI must stay null: {projection}"
+        );
+        // The secret-bearing content is never part of this projection.
+        for content in ["summary", "source", "docstring"] {
+            assert!(
+                projection.get(content).is_none(),
+                "{content} leaked: {projection}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_entity_stub_re_withholds_high_entropy_name_only() {
+        // The guard: a high-entropy name/id is itself secret-like, so that one
+        // field is re-withheld while the rest of the identity still rides along.
+        let secret = "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z";
+        let id = format!("python:function:{secret}");
+        let mut entity = entity_row(&id, secret, Some("abc123"));
+        entity.short_name = secret.to_owned();
+        entity.source_file_path = Some("g.py".to_owned());
+
+        let projection = super::blocked_entity_stub(&entity, "secret_present");
+        assert!(
+            projection["id"].is_null(),
+            "high-entropy id must be withheld"
+        );
+        assert!(projection["name"].is_null());
+        assert!(projection["short_name"].is_null());
+        // Non-secret structural identity still rides along.
+        assert_eq!(projection["kind"], "function");
+        assert_eq!(projection["source_file_path"], "g.py");
+        assert_eq!(projection["content_hash"], "abc123");
+        assert_eq!(projection["briefing_blocked"], "secret_present");
+    }
+
+    #[test]
+    fn name_value_is_secretlike_flags_secrets_not_ordinary_identifiers() {
+        // Ordinary identifiers (even long dotted qualnames) stay below the
+        // threshold; a base64/hex secret blob trips the guard.
+        assert!(!super::name_value_is_secretlike("LibraryService"));
+        assert!(!super::name_value_is_secretlike("app.auth.login"));
+        assert!(!super::name_value_is_secretlike("python:function:demo.mid"));
+        // Short-but-varied names are not flagged (length floor).
+        assert!(!super::name_value_is_secretlike("aB3xZ9"));
+        assert!(super::name_value_is_secretlike(
+            "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z"
+        ));
     }
 
     #[test]
