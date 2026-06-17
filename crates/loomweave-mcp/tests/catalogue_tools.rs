@@ -3829,3 +3829,288 @@ async fn find_dead_code_hoists_constant_facets_to_top_level() {
         }
     }
 }
+
+// ---- A5: app-scoped reachability roots + app_only filter (clarion-663aca16aa)
+
+/// The default mode is `explicit`: existing consumers see the same output, and
+/// the summary now declares `roots_mode: "explicit"` with no `roots_confidence`
+/// (roots are taken verbatim from emitted tags, not derived).
+#[tokio::test]
+async fn find_dead_code_explicit_roots_mode_is_default_and_reported() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    // Default == explicit; behaviour unchanged.
+    assert_eq!(env["result"]["summary"]["roots_mode"], "explicit", "{env}");
+    assert!(
+        env["result"]["summary"]["roots_confidence"].is_null(),
+        "explicit mode must not claim derived roots: {env}"
+    );
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(dead, vec!["python:function:orphan".to_owned()], "{env}");
+}
+
+/// Explicit mode preserves the honest-empty signal when no root tags exist —
+/// the regression surface the ticket flags. Passing `roots: "explicit"`
+/// explicitly is identical to the default.
+#[tokio::test]
+async fn find_dead_code_explicit_roots_preserves_honest_empty() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({"roots": "explicit"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+    assert!(
+        env["result"]["dead_code"].as_array().unwrap().is_empty(),
+        "{env}"
+    );
+}
+
+/// Auto mode derives roots from the same emitted tags Loomweave already has and
+/// declares the lower confidence (`roots_mode: "auto"`,
+/// `roots_confidence: "derived"`). It also relaxes the per-plugin missing-root
+/// exclusion: a plugin with no root tags of its own is still surveyed against
+/// the auto-derived global root set rather than excluded.
+#[tokio::test]
+async fn find_dead_code_auto_roots_seeds_from_tags_and_surveys_rootless_plugins() {
+    let (project, db, conn) = open_project();
+    // Python emits a root tag.
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    // A rootless plugin's dead leaf: excluded in explicit mode, surveyed in auto.
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:specimen_rs.dead",
+        "rust",
+        "function",
+        "specimen-rs/src/lib.rs",
+        "{}",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({"roots": "auto"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["summary"]["roots_mode"], "auto", "{env}");
+    assert_eq!(
+        env["result"]["summary"]["roots_confidence"], "derived",
+        "auto mode must declare derived-confidence roots: {env}"
+    );
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    // Both the python orphan and the rootless-plugin dead leaf are surveyed.
+    assert!(
+        dead.contains(&"python:function:orphan".to_owned()),
+        "auto mode surveys the python orphan: {env}"
+    );
+    assert!(
+        dead.contains(&"rust:function:specimen_rs.dead".to_owned()),
+        "auto mode surveys a rootless plugin against the derived roots: {env}"
+    );
+    // No plugins are excluded for missing root coverage in auto mode.
+    assert!(
+        env["result"]["excluded"]["plugins_without_roots"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "auto mode relaxes the per-plugin missing-root exclusion: {env}"
+    );
+}
+
+/// Auto mode with NO root tags anywhere still cannot fabricate roots: it stays
+/// honest-empty rather than flagging the whole corpus dead.
+#[tokio::test]
+async fn find_dead_code_auto_roots_honest_empty_when_no_tags() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({"roots": "auto"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+}
+
+/// `app_only: true` excludes test-tagged entities (and core-plugin entities)
+/// from the dead-code candidate set. A purely additive, opt-in read filter.
+#[tokio::test]
+async fn find_dead_code_app_only_excludes_tests() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    // A genuinely dead app function.
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    // A dead, test-tagged helper (e.g. tour.*-style or a test fixture).
+    insert_entity(
+        &conn,
+        "python:function:dead_test_helper",
+        "function",
+        "tests/helpers.py",
+        Some((10, 13)),
+    );
+    insert_tag(&conn, "python:function:dead_test_helper", "test");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Default: both dead functions appear.
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(dead.contains(&"python:function:orphan".to_owned()), "{env}");
+
+    // app_only: the test-tagged dead helper is filtered out.
+    let env = call_tool(&state, "find_dead_code", json!({"app_only": true})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "app_only must exclude the test-tagged dead helper: {env}"
+    );
+    assert_eq!(env["result"]["app_only"], true, "{env}");
+}
+
+/// `app_only: true` on coupling excludes test-tagged callers from the ranking so
+/// a hub's coupling drops to reflect only first-party app fan-in/out.
+#[tokio::test]
+async fn find_coupling_hotspots_app_only_excludes_test_tagged() {
+    let (project, db, conn) = open_project();
+    for id in ["hub", "app_caller", "test_caller"] {
+        insert_entity(
+            &conn,
+            &format!("python:function:{id}"),
+            "function",
+            "m.py",
+            Some((1, 2)),
+        );
+    }
+    insert_tag(&conn, "python:function:test_caller", "test");
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:app_caller",
+        "python:function:hub",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:test_caller",
+        "python:function:hub",
+        "resolved",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Default: hub fan_in counts both callers.
+    let env = call_tool(&state, "find_coupling_hotspots", json!({})).await;
+    let hub = env["result"]["hotspots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["entity"]["id"] == "python:function:hub")
+        .unwrap();
+    assert_eq!(hub["fan_in"], 2, "{env}");
+
+    // app_only: the test-tagged caller and the test entity itself are excluded.
+    let env = call_tool(&state, "find_coupling_hotspots", json!({"app_only": true})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["app_only"], true, "{env}");
+    let hub = env["result"]["hotspots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["entity"]["id"] == "python:function:hub")
+        .unwrap();
+    assert_eq!(
+        hub["fan_in"], 1,
+        "app_only must drop the test-tagged caller from fan-in: {env}"
+    );
+    // The test entity must not appear as a hotspot row.
+    assert!(
+        !env["result"]["hotspots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["entity"]["id"] == "python:function:test_caller"),
+        "app_only must exclude the test entity from the ranking: {env}"
+    );
+}

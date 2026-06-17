@@ -643,12 +643,13 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_coupling_hotspot_list",
-            description: "Entities ranked by coupling (distinct fan-in + fan-out), most-coupled first. `confidence` is a ceiling (default resolved). Optional `scope`. Bounded (limit default 20).",
+            description: "Entities ranked by coupling (distinct fan-in + fan-out), most-coupled first. `confidence` is a ceiling (default resolved). `app_only:true` drops test-tagged/non-first-party. Optional `scope`. Bounded (limit default 20).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "scope": {"type": "string", "minLength": 1},
                     "confidence": confidence_schema(),
+                    "app_only": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200},
                     "offset": {"type": "integer", "minimum": 0}
                 },
@@ -711,8 +712,18 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_dead_list",
-            description: "Entities unreachable from roots, optional scope. Conservative heuristic; root classification depends on plugin-emitted tags/exports.",
-            input_schema: scope_page_schema(false),
+            description: "Entities unreachable from roots, optional scope. Conservative heuristic; roots depend on plugin-emitted tags. `roots:\"auto\"` derives roots from tags (derived confidence); `app_only:true` drops test-tagged/non-first-party.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "minLength": 1},
+                    "roots": {"type": "string", "enum": ["explicit", "auto"]},
+                    "app_only": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "additionalProperties": false
+            }),
         },
         ToolDefinition {
             name: "entity_semantic_search_list",
@@ -6062,12 +6073,16 @@ mod tests {
     /// per-session context tax (clarion-e65354898d). Budget: each description
     /// ≤ 350 chars (what it answers, key args, one honesty caveat — depth
     /// belongs in the loomweave-workflow skill, fetched once on demand), and
-    /// the serialized catalogue ≤ 23 KB (~5.5k tokens at the observed ~4.2
+    /// the serialized catalogue ≤ 23.5 KB (~5.6k tokens at the observed ~4.2
     /// bytes/token; the pre-budget baseline was 46 KB / ~11k tokens). The
     /// budget was raised 22 → 23 KB for weft-ac59e8e730: the two config-set
     /// tools' inputSchemas were bare `{}` per property, and declaring real
     /// types/enums for the surface that can enable writes and live LLM spend
-    /// is worth ~0.7 KB.
+    /// is worth ~0.7 KB. Raised 23 → 23.5 KB for clarion-663aca16aa (A5): the
+    /// two heuristic-surface tools (`entity_dead_list`,
+    /// `entity_coupling_hotspot_list`) gained the opt-in, validation-bearing
+    /// `roots`/`app_only` params (typed schemas + the honesty caveats they
+    /// carry), worth ~0.25 KB.
     #[test]
     fn tools_list_fits_the_context_budget() {
         let tools = list_tools();
@@ -6082,8 +6097,8 @@ mod tests {
         }
         let serialized = serde_json::to_string(&tools).expect("serialize tools");
         assert!(
-            serialized.len() <= 23_000,
-            "serialized tools/list is {} bytes (budget 23000 ≈ 5.5k tokens)",
+            serialized.len() <= 23_500,
+            "serialized tools/list is {} bytes (budget 23500 ≈ 5.6k tokens)",
             serialized.len()
         );
     }
