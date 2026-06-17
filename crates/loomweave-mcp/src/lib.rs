@@ -481,13 +481,18 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_orientation_pack_get",
-            description: "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest.",
+            description: "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Optional `include` (wardline/findings/issues) folds a `dossier`. Bounded; `omitted` + degraded sections keep empties honest.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "entity": {"type": "string", "minLength": 1},
                     "file": {"type": "string", "minLength": 1},
-                    "line": {"type": "integer", "minimum": 1}
+                    "line": {"type": "integer", "minimum": 1},
+                    "include": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["wardline", "findings", "issues"]},
+                        "uniqueItems": true
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -6273,7 +6278,7 @@ mod tests {
         assert_eq!(tools[17].name, "entity_orientation_pack_get");
         assert_eq!(
             tools[17].description,
-            "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest."
+            "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Optional `include` (wardline/findings/issues) folds a `dossier`. Bounded; `omitted` + degraded sections keep empties honest."
         );
         assert_eq!(tools[18].name, "analyze_start");
         assert_eq!(

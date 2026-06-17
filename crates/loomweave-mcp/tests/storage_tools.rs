@@ -33,8 +33,9 @@ use loomweave_mcp::{
     list_tools,
 };
 use loomweave_storage::{
-    GuidanceProposal, GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer,
-    pragma, schema, upsert_guidance_sheet, upsert_summary_cache,
+    GuidanceProposal, GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey,
+    TaintFact, Writer, pragma, schema, upsert_guidance_sheet, upsert_summary_cache,
+    upsert_taint_fact,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -6352,6 +6353,250 @@ async fn orientation_pack_includes_wardline_findings() {
     assert!(
         out["result"]["issues"].get("wardline_findings").is_none(),
         "wardline_findings must not appear inside the issues section"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A4: entity dossier via `include` param on orientation_pack (clarion-2b87cd7a59)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn orientation_pack_dossier_absent_by_default() {
+    // AC (regression): omitting `include` leaves the pack byte-identical — no
+    // `dossier` key, not even null. The default path must not change.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert!(
+        resp["result"].get("dossier").is_none(),
+        "dossier must be absent when include is omitted: {resp:?}"
+    );
+
+    // An empty include array is also a no-op: no dossier.
+    let empty = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": []}),
+    )
+    .await;
+    assert!(
+        empty["result"].get("dossier").is_none(),
+        "dossier must be absent when include is an empty array: {empty:?}"
+    );
+    // Byte-identical to the omitted form.
+    assert_eq!(resp, empty);
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_with_all_sections() {
+    // AC: include:["wardline","findings","issues"] folds in a `dossier` object
+    // carrying all three sections plus the summary_available flag.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-dossier-all',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    drop(conn);
+
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_wardline_findings(vec![wf("demo.hello", "WLN-TAINT-001")]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({
+            "entity": "python:function:demo.hello",
+            "include": ["wardline", "findings", "issues"]
+        }),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+
+    let dossier = &out["result"]["dossier"];
+    assert!(dossier.is_object(), "dossier object: {out:?}");
+    assert!(
+        dossier.get("wardline").is_some(),
+        "dossier.wardline: {out:?}"
+    );
+    assert!(
+        dossier["findings"].is_array(),
+        "dossier.findings array: {out:?}"
+    );
+    assert!(dossier.get("issues").is_some(), "dossier.issues: {out:?}");
+    // No summary cached for this entity → flagged false; dossier still assembled.
+    assert_eq!(dossier["summary_available"], false, "{out:?}");
+
+    // Deterministic across re-runs.
+    let again = call_tool(
+        &state,
+        "orientation_pack",
+        json!({
+            "entity": "python:function:demo.hello",
+            "include": ["wardline", "findings", "issues"]
+        }),
+    )
+    .await;
+    assert_eq!(out, again);
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_partial_include() {
+    // AC: a single-section include yields only that key under dossier; the others
+    // are absent (not null).
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": ["wardline"]}),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+    let dossier = &out["result"]["dossier"];
+    assert!(dossier.get("wardline").is_some(), "{out:?}");
+    assert!(
+        dossier.get("findings").is_none(),
+        "findings must be absent for include:[wardline]: {out:?}"
+    );
+    assert!(
+        dossier.get("issues").is_none(),
+        "issues must be absent for include:[wardline]: {out:?}"
+    );
+    // summary_available is always present once dossier is built.
+    assert!(dossier.get("summary_available").is_some(), "{out:?}");
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_normalizes_fingerprints() {
+    // AC: the in-house `61dc497…` vs `wlfp2:61dc497…` split is killed — every
+    // fingerprint surfaced in the dossier is the bare canonical form. The opaque
+    // Wardline taint blob (the source of dossier.wardline) carries a wlfp2:
+    // fingerprint; the dossier must normalize it.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-dossier-fp',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    upsert_taint_fact(
+        &conn,
+        &TaintFact {
+            entity_id: "python:function:demo.hello".to_owned(),
+            wardline_json: json!({
+                "findings": [{
+                    "rule_id": "WLN-TAINT-001",
+                    "fingerprint": "wlfp2:61dc497abc"
+                }]
+            })
+            .to_string(),
+            scan_id: Some("scan-1".to_owned()),
+            content_hash_at_compute: Some("fake-hash-dossier-fp".to_owned()),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            sei: None,
+        },
+    )
+    .expect("seed taint fact");
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({
+            "entity": "python:function:demo.hello",
+            "include": ["wardline", "findings", "issues"]
+        }),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+
+    let dossier_wf = &out["result"]["dossier"]["wardline"];
+    let serialized = serde_json::to_string(dossier_wf).expect("serialize dossier wardline");
+    assert!(
+        !serialized.contains("wlfp2:"),
+        "dossier.wardline must carry no wlfp2: prefix: {serialized}"
+    );
+    assert!(
+        serialized.contains("61dc497abc"),
+        "dossier.wardline must keep the canonical bare hash: {serialized}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_summary_available_true_when_cached() {
+    // AC: summary_available is true exactly when a summary is cached for the
+    // entity's current content_hash.
+    let (project, db_path) = open_project();
+    let content_hash = expected_content_hash(project.path(), "python:function:demo.entry");
+    upsert_summary_cache(
+        &Connection::open(&db_path).expect("open sqlite"),
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash,
+                prompt_template_id: "leaf-summary-v1".to_owned(),
+                model_tier: "balanced".to_owned(),
+                guidance_fingerprint: String::new(),
+            },
+            summary_json: r#"{"purpose":"demo"}"#.to_owned(),
+            cost_usd: 0.0,
+            tokens_input: 0,
+            tokens_output: 0,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_accessed_at: "2026-01-01T00:00:00Z".to_owned(),
+            caller_count: 0,
+            fan_out: 0,
+            stale_semantic: false,
+        },
+    )
+    .expect("upsert summary cache");
+
+    let state = state_for(project.path(), &db_path);
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": ["findings"]}),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+    assert_eq!(
+        out["result"]["dossier"]["summary_available"], true,
+        "summary_available must be true with a cached summary: {out:?}"
     );
 }
 

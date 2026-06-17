@@ -39,6 +39,10 @@ impl ServerState {
             .filter(|value| !value.is_empty());
         let has_line = arguments.get("line").is_some();
 
+        // A4 (clarion-2b87cd7a59): optional `include` folds a composed `dossier`
+        // section. Absent / empty array → byte-identical to the pre-A4 packet.
+        let include = IncludeSet::parse(arguments)?;
+
         // `query_line == Some` selects the file/line form; `None` the entity form.
         let (query_line, normalized_path, entity_id_arg) = match (entity_arg, file_arg, has_line) {
             (Some(id), None, false) => (None, None, Some(id.to_owned())),
@@ -360,6 +364,18 @@ impl ServerState {
             )
         };
 
+        // A4 (clarion-2b87cd7a59): compose the opt-in `dossier`. Pure composition
+        // of existing read paths; only built when `include` names a section. The
+        // default (empty) path adds nothing, keeping the packet byte-identical.
+        let dossier = if include.any() {
+            Some(
+                self.build_orientation_dossier(&include, core.primary_id.as_deref(), &issues)
+                    .await,
+            )
+        } else {
+            None
+        };
+
         let health = json!({
             "index": core.freshness,
             // Whether this build understands SEIs (always true) and whether the
@@ -442,6 +458,11 @@ impl ServerState {
         if let Some(wardline) = wardline_findings {
             object.insert("wardline_findings".to_owned(), wardline);
         }
+        // A4: the composed dossier rides alongside (never replaces) the existing
+        // top-level sections, and only when `include` named at least one section.
+        if let Some(dossier) = dossier {
+            object.insert("dossier".to_owned(), dossier);
+        }
         object.insert("health".to_owned(), health);
         object.insert("warnings".to_owned(), json!(warnings));
         object.insert("suggested_next_reads".to_owned(), json!(suggested));
@@ -451,5 +472,175 @@ impl ServerState {
             packet,
             truncated.then_some("orientation-pack-bounds"),
         ))
+    }
+
+    /// Compose the opt-in `dossier` (A4, clarion-2b87cd7a59): pure composition of
+    /// existing read paths (`wardline_for`, `findings_for`) plus the already-built
+    /// `issues` section. Each section is gated on the matching `include` flag, so a
+    /// partial include emits only the requested keys. `summary_available` flags
+    /// whether a summary is cached for the primary's current content — the
+    /// load-bearing dependency for the (separate) summary surface — while the
+    /// wardline/findings/issues portions work headless. With no primary entity the
+    /// section degrades to honest-empty rather than failing the pack.
+    async fn build_orientation_dossier(
+        &self,
+        include: &IncludeSet,
+        primary_id: Option<&str>,
+        issues: &Value,
+    ) -> Value {
+        let mut dossier = serde_json::Map::new();
+
+        if include.wardline {
+            let wardline = match primary_id {
+                Some(id) => {
+                    let mut args = serde_json::Map::new();
+                    args.insert("id".to_owned(), json!(id));
+                    match self.tool_wardline_for(&args).await {
+                        Ok(envelope) => normalize_fingerprints(
+                            envelope.get("result").cloned().unwrap_or(Value::Null),
+                        ),
+                        Err(_) => json!({"available": false, "reason": "wardline lookup failed"}),
+                    }
+                }
+                None => json!({"available": false, "reason": "no primary entity"}),
+            };
+            dossier.insert("wardline".to_owned(), wardline);
+        }
+
+        if include.findings {
+            let findings = match primary_id {
+                Some(id) => {
+                    let mut args = serde_json::Map::new();
+                    args.insert("id".to_owned(), json!(id));
+                    match self.tool_findings_for(&args).await {
+                        Ok(envelope) => normalize_fingerprints(
+                            envelope
+                                .get("result")
+                                .and_then(|result| result.get("findings"))
+                                .cloned()
+                                .unwrap_or_else(|| Value::Array(Vec::new())),
+                        ),
+                        Err(_) => Value::Array(Vec::new()),
+                    }
+                }
+                None => Value::Array(Vec::new()),
+            };
+            dossier.insert("findings".to_owned(), findings);
+        }
+
+        if include.issues {
+            // Reuse the issues section the pack already computed — no second fetch.
+            dossier.insert("issues".to_owned(), normalize_fingerprints(issues.clone()));
+        }
+
+        dossier.insert(
+            "summary_available".to_owned(),
+            json!(self.primary_summary_available(primary_id).await),
+        );
+
+        Value::Object(dossier)
+    }
+
+    /// Whether a summary is cached for the primary entity's CURRENT content
+    /// (`summary_cache` row joined to the entity's live `content_hash`). The pack's
+    /// summary-dependent surface is load-bearing on this; the rest of the dossier
+    /// is not. Read-only; any lookup error degrades to `false` (fail-closed).
+    async fn primary_summary_available(&self, primary_id: Option<&str>) -> bool {
+        let Some(id) = primary_id.map(str::to_owned) else {
+            return false;
+        };
+        self.readers
+            .with_reader(move |conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) \
+                       FROM summary_cache c \
+                       JOIN entities e ON e.id = c.entity_id \
+                      WHERE c.entity_id = ?1 AND c.content_hash = e.content_hash",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .await
+            .unwrap_or(false)
+    }
+}
+
+/// Which dossier sections an `include` argument requested (A4). Default = none,
+/// which leaves the orientation packet byte-identical to its pre-A4 shape.
+#[derive(Default)]
+struct IncludeSet {
+    wardline: bool,
+    findings: bool,
+    issues: bool,
+}
+
+impl IncludeSet {
+    /// Parse the optional `include` array. Absent → all-false. The schema already
+    /// constrains the enum + uniqueness; this rejects a non-array / non-string
+    /// shape with a `ParamError` rather than silently ignoring it.
+    fn parse(arguments: &serde_json::Map<String, Value>) -> Result<Self, ParamError> {
+        let Some(raw) = arguments.get("include") else {
+            return Ok(Self::default());
+        };
+        let Some(items) = raw.as_array() else {
+            return Err(ParamError::new("include must be an array of strings"));
+        };
+        let mut set = Self::default();
+        for item in items {
+            let Some(name) = item.as_str() else {
+                return Err(ParamError::new("each include entry must be a string"));
+            };
+            match name {
+                "wardline" => set.wardline = true,
+                "findings" => set.findings = true,
+                "issues" => set.issues = true,
+                _ => {
+                    return Err(ParamError::new(
+                        "include entries must be one of: wardline, findings, issues",
+                    ));
+                }
+            }
+        }
+        Ok(set)
+    }
+
+    fn any(&self) -> bool {
+        self.wardline || self.findings || self.issues
+    }
+}
+
+/// Normalize every `fingerprint` string in a JSON tree to ONE canonical form by
+/// stripping the `wlfp2:` schema-version prefix (A4, clarion-2b87cd7a59). Wardline
+/// emits finding fingerprints in two forms (`61dc497…` vs `wlfp2:61dc497…`) for
+/// the same finding; folding them here kills that split inside Loomweave's own
+/// dossier output. Walks objects and arrays so a fingerprint at any depth (taint
+/// blob, finding row, issue match) is normalized. Pure structural rewrite.
+fn normalize_fingerprints(mut value: Value) -> Value {
+    normalize_fingerprints_in_place(&mut value);
+    value
+}
+
+fn normalize_fingerprints_in_place(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "fingerprint" {
+                    if let Value::String(fp) = child
+                        && let Some(bare) = fp.strip_prefix("wlfp2:")
+                    {
+                        *fp = bare.to_owned();
+                    }
+                } else {
+                    normalize_fingerprints_in_place(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                normalize_fingerprints_in_place(item);
+            }
+        }
+        _ => {}
     }
 }
