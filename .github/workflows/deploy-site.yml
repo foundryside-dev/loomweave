@@ -40,6 +40,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configure Pages
+        # Pin the Pages source to GitHub Actions (build_type=workflow); enables
+        # Pages if needed. Without this, deploy-pages fails when the repo is
+        # still set to "Deploy from a branch".
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
