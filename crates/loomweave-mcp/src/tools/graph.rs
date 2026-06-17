@@ -35,6 +35,37 @@ use crate::{
     wardline_unavailable,
 };
 
+/// The direction argument of [`ServerState::tool_relation_list`]: a single
+/// stored-edge direction, or `Both` (the default — clarion-057ff2b330) which
+/// unions the In and Out passes. `Both` is the only value not directly
+/// expressible as a [`ReferenceDirection`], so it needs this wrapper.
+#[derive(Debug, Clone, Copy)]
+enum RelationDirection {
+    Single(ReferenceDirection),
+    Both,
+}
+
+impl RelationDirection {
+    /// The edge passes this direction expands to, in response order: a single
+    /// direction is one pass; `Both` is In then Out.
+    fn passes(self) -> &'static [ReferenceDirection] {
+        match self {
+            Self::Single(ReferenceDirection::In) => &[ReferenceDirection::In],
+            Self::Single(ReferenceDirection::Out) => &[ReferenceDirection::Out],
+            Self::Both => &[ReferenceDirection::In, ReferenceDirection::Out],
+        }
+    }
+
+    /// The top-level `direction` echo for the response envelope.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Single(ReferenceDirection::In) => "in",
+            Self::Single(ReferenceDirection::Out) => "out",
+            Self::Both => "both",
+        }
+    }
+}
+
 impl ServerState {
     pub(crate) async fn tool_entity_at(
         &self,
@@ -808,10 +839,24 @@ impl ServerState {
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
         let requested_id = required_str(arguments, "id")?.to_owned();
+        // Direction defaults to "both" (clarion-057ff2b330): an omitted direction
+        // returns the in+out union rather than erroring, so an agent need not know
+        // a kind's positional convention (ADR-051) to ask "every relation on X".
+        // "in"/"out" keep their exact prior single-direction behavior.
         let direction = match arguments.get("direction") {
-            Some(Value::String(s)) if s == "in" => ReferenceDirection::In,
-            Some(Value::String(s)) if s == "out" => ReferenceDirection::Out,
-            _ => return Err(ParamError::new("direction must be \"in\" or \"out\"")),
+            None | Some(Value::Null) => RelationDirection::Both,
+            Some(Value::String(s)) if s == "in" => {
+                RelationDirection::Single(ReferenceDirection::In)
+            }
+            Some(Value::String(s)) if s == "out" => {
+                RelationDirection::Single(ReferenceDirection::Out)
+            }
+            Some(Value::String(s)) if s == "both" => RelationDirection::Both,
+            _ => {
+                return Err(ParamError::new(
+                    "direction must be \"in\", \"out\", or \"both\"",
+                ));
+            }
         };
         let kind = match arguments.get("kind") {
             None | Some(Value::Null) => None,
@@ -852,11 +897,19 @@ impl ServerState {
                 if let Some(reason) = crate::briefing_block_reason(&entity) {
                     return Ok(crate::blocked_entity_refusal(&reason));
                 }
-                let edges: Vec<_> =
-                    relation_edges_for_entity(conn, &entity.id, direction, kind.as_deref())?
-                        .into_iter()
-                        .filter(|edge| edge.confidence <= confidence)
-                        .collect();
+                // For "both", concatenate the In then Out passes, each edge
+                // tagged with the direction that produced it (the neighbor side
+                // and the per-relation `direction` field follow that tag). A
+                // single-direction request runs exactly one pass, unchanged.
+                let mut edges: Vec<(ReferenceDirection, _)> = Vec::new();
+                for &edge_dir in direction.passes() {
+                    edges.extend(
+                        relation_edges_for_entity(conn, &entity.id, edge_dir, kind.as_deref())?
+                            .into_iter()
+                            .filter(|edge| edge.confidence <= confidence)
+                            .map(|edge| (edge_dir, edge)),
+                    );
+                }
                 let total = edges.len();
                 let has_more = offset.saturating_add(limit) < total;
                 let next_cursor = has_more.then(|| (offset + limit).to_string());
@@ -871,8 +924,8 @@ impl ServerState {
                 // still fails closed.
                 let mut candidate_visible: HashMap<String, bool> = HashMap::new();
                 let mut relations = Vec::new();
-                for edge in edges.into_iter().skip(offset).take(limit) {
-                    let neighbor_id = match direction {
+                for (edge_dir, edge) in edges.into_iter().skip(offset).take(limit) {
+                    let neighbor_id = match edge_dir {
                         ReferenceDirection::In => &edge.from_id,
                         ReferenceDirection::Out => &edge.to_id,
                     };
@@ -925,6 +978,10 @@ impl ServerState {
                         .collect();
                     relations.push(json!({
                         "kind": edge.kind,
+                        "direction": match edge_dir {
+                            ReferenceDirection::In => "in",
+                            ReferenceDirection::Out => "out",
+                        },
                         "entity": entity_json(conn, &neighbor),
                         "edge_confidence": edge.confidence.as_str(),
                         "candidates": candidates,
@@ -941,10 +998,7 @@ impl ServerState {
                 }
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
-                    "direction": match direction {
-                        ReferenceDirection::In => "in",
-                        ReferenceDirection::Out => "out",
-                    },
+                    "direction": direction.as_str(),
                     "filters": {
                         "kind": kind,
                         "confidence": confidence.as_str(),

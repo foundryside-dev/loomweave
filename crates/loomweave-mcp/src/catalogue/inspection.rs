@@ -448,7 +448,15 @@ impl ServerState {
         // edge from loomweave-mcp onto loomweave-cli.
         const ENTITY_RESOLVE_BATCH_MAX: usize = 2000;
 
-        let Some(raw) = arguments.get("qualnames").and_then(Value::as_array) else {
+        // `identifiers` is a pure synonym for `qualnames` (clarion-057ff2b330):
+        // a sibling tool pasting "identifiers" (its own vocabulary) hits the
+        // same resolution pipeline. `qualnames` wins if both are present, for
+        // backward compatibility.
+        let Some(raw) = arguments
+            .get("qualnames")
+            .or_else(|| arguments.get("identifiers"))
+            .and_then(Value::as_array)
+        else {
             return Err(ParamError::new("qualnames must be a non-empty array"));
         };
         if raw.is_empty() {

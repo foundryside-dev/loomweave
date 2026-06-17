@@ -64,7 +64,7 @@ pub use query::{
     normalize_source_path, preferred_finding_anchor_by_file, reference_edges_for_entity,
     relation_edges_for_entity, resolve_entity_ref, resolve_file, resolve_file_catalog_entry,
     stored_secret_finding_anchor_by_file, subsystem_for_member, subsystem_members,
-    subsystem_of_entity, subsystem_total, unresolved_call_sites_for_caller,
+    subsystem_of_entity, subsystem_total, tags_for_entity, unresolved_call_sites_for_caller,
     unresolved_caller_count_for_target, unresolved_callers_for_target,
 };
 pub use reader::ReaderPool;

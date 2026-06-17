@@ -40,7 +40,7 @@ use loomweave_storage::{
     WriterCmd, call_edges_from, call_edges_targeting, containing_module_id,
     entity_briefing_block_reason, entity_by_id, import_edges_for_entity,
     inferred_edge_cache_key_id, module_reference_rollup, reference_edges_for_entity,
-    relation_edges_for_entity, resolve_entity_ref, sei_for_locator,
+    relation_edges_for_entity, resolve_entity_ref, sei_for_locator, tags_for_entity,
     unresolved_call_sites_for_caller, unresolved_caller_count_for_target,
     unresolved_callers_for_target,
 };
@@ -762,10 +762,16 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                         "minItems": 1,
                         "maxItems": 2000
                     },
+                    "identifiers": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": 2000
+                    },
                     "kind": {"type": "string", "minLength": 1},
                     "plugin": {"type": "string", "minLength": 1}
                 },
-                "required": ["qualnames"],
+                "anyOf": [{"required": ["qualnames"]}, {"required": ["identifiers"]}],
                 "additionalProperties": false
             }),
         },
@@ -776,7 +782,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "minLength": 1},
-                    "direction": {"type": "string", "enum": ["in", "out"]},
+                    "direction": {"type": "string", "enum": ["in", "out", "both"]},
                     "kind": {
                         "type": "string",
                         "enum": ["inherits_from", "decorates", "implements", "derives"]
@@ -785,7 +791,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "cursor": {"type": ["string", "null"]}
                 },
-                "required": ["id", "direction"],
+                "required": ["id"],
                 "additionalProperties": false
             }),
         },
@@ -4194,6 +4200,15 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
         object.insert(
             "sei".to_owned(),
             json!(sei_for_locator(conn, &entity.id).ok().flatten()),
+        );
+        // Inline the entity's own categorisation tags (clarion-057ff2b330) so a
+        // tool response shows them without a reverse-index `entity_tag_list`
+        // round-trip. Tags already live in `entity_tags`; this is read-only.
+        // Graceful-degrade to `[]` on any lookup error — a tag read must never
+        // fail the structural tool call (same posture as the SEI join above).
+        object.insert(
+            "tags".to_owned(),
+            json!(tags_for_entity(conn, &entity.id).unwrap_or_default()),
         );
     }
     value

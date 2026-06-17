@@ -7059,6 +7059,84 @@ async fn relation_list_answers_directional_queries_with_anchor_evidence() {
 }
 
 #[tokio::test]
+async fn relation_list_both_direction_unions_in_and_out() {
+    // A2 (clarion-057ff2b330): direction="both" returns the in+out union, each
+    // relation tagged with its own direction. Seed types.Child with BOTH a
+    // superclass (Base, out) and a subclass (Grand, in) so the union is visible.
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:class:types.Grand",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "inherits_from",
+            "python:class:types.Grand",
+            "python:class:types.Child",
+            "resolved",
+            None,
+            "core:file:types.py",
+            34,
+            38,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Child", "direction": "both"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["direction"], "both");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 2, "both must union in+out: {resp}");
+
+    let in_rel = relations
+        .iter()
+        .find(|r| r["direction"] == "in")
+        .expect("an in relation");
+    assert_eq!(in_rel["entity"]["id"], "python:class:types.Grand");
+    let out_rel = relations
+        .iter()
+        .find(|r| r["direction"] == "out")
+        .expect("an out relation");
+    assert_eq!(out_rel["entity"]["id"], "python:class:types.Base");
+}
+
+#[tokio::test]
+async fn relation_list_omitted_direction_defaults_to_both() {
+    // A2: omitting direction is NOT an error — it behaves as "both".
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["direction"], "both");
+    // Base has one subclass (Child, in) and no superclass (out), so the union is
+    // exactly the single in relation.
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    assert_eq!(relations[0]["direction"], "in");
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Child");
+}
+
+#[tokio::test]
 async fn relation_list_kind_filter_pagination_and_honest_empty() {
     let (project, db_path) = open_project();
     seed_relation_fixture(project.path(), &db_path);
@@ -7359,7 +7437,7 @@ fn tools_list_includes_entity_relation_list() {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "minLength": 1},
-                "direction": {"type": "string", "enum": ["in", "out"]},
+                "direction": {"type": "string", "enum": ["in", "out", "both"]},
                 "kind": {
                     "type": "string",
                     "enum": ["inherits_from", "decorates", "implements", "derives"]
@@ -7372,7 +7450,7 @@ fn tools_list_includes_entity_relation_list() {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "cursor": {"type": ["string", "null"]}
             },
-            "required": ["id", "direction"],
+            "required": ["id"],
             "additionalProperties": false
         })
     );

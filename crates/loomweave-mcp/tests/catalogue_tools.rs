@@ -2613,6 +2613,128 @@ async fn entity_resolve_resolves_qualname_to_id_and_sei() {
     assert_eq!(candidates[0]["kind"], "function");
 }
 
+// ---- A2 inline tags + arg aliases (clarion-057ff2b330) -----------------
+
+#[tokio::test]
+async fn entity_resolve_candidate_carries_inline_tags_sorted() {
+    // A2: the shared entity-row projection inlines the entity's own tags so an
+    // agent sees them without a reverse-index `entity_tag_list` round-trip. Tags
+    // arrive deduplicated and sorted for determinism.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_tag(&conn, "python:function:demo.entry", "test");
+    insert_tag(&conn, "python:function:demo.entry", "entry-point");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let candidates = env["result"]["results"][0]["candidates"]
+        .as_array()
+        .expect("candidates");
+    assert_eq!(
+        candidates[0]["tags"],
+        json!(["entry-point", "test"]),
+        "tags must be inline, deduplicated, and sorted: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_row_tags_default_to_empty_array_when_untagged() {
+    // An untagged entity carries `tags: []`, not a missing field, so a client
+    // can read the key unconditionally.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let candidates = env["result"]["results"][0]["candidates"]
+        .as_array()
+        .expect("candidates");
+    assert_eq!(candidates[0]["tags"], json!([]), "{env}");
+}
+
+#[tokio::test]
+async fn entity_resolve_accepts_identifiers_alias() {
+    // A2: `identifiers` is a pure synonym for `qualnames`.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let via_alias = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"identifiers": ["demo.entry"]}),
+    )
+    .await;
+    assert_eq!(via_alias["ok"], true, "{via_alias}");
+    assert_eq!(
+        via_alias["result"]["results"][0]["candidates"][0]["id"],
+        "python:function:demo.entry"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_qualnames_wins_when_both_present() {
+    // `qualnames` takes precedence over `identifiers` for backward compatibility.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({
+            "qualnames": ["demo.entry"],
+            "identifiers": ["no.such.thing"],
+        }),
+    )
+    .await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["results"][0]["qualname"], "demo.entry");
+    assert_eq!(env["result"]["results"][0]["result_kind"], "resolved");
+}
+
 #[tokio::test]
 async fn entity_resolve_full_locator_input_resolves_to_sei_gv_lw_5() {
     // GV-LW-5 (warpline interface-lock 2026-06-13, HX1): warpline resolves SEIs by
