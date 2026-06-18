@@ -794,13 +794,21 @@ impl ServerState {
                     .skip(offset)
                     .take(limit)
                     .map(|member| {
-                        let briefing_blocked = match entity_visibility(conn, &member.id)? {
-                            EntityVisibility::Blocked(reason) => Value::String(reason),
+                        let visibility = entity_visibility(conn, &member.id)?;
+                        let briefing_blocked = match &visibility {
+                            EntityVisibility::Blocked(reason) => Value::String(reason.clone()),
                             _ => Value::Null,
                         };
+                        let (id, name) = match visibility {
+                            EntityVisibility::Blocked(_) => (
+                                crate::redact_secretlike(&member.id),
+                                crate::redact_secretlike(&member.name),
+                            ),
+                            _ => (json!(member.id.clone()), json!(member.name.clone())),
+                        };
                         Ok(json!({
-                            "id": member.id,
-                            "name": member.name,
+                            "id": id,
+                            "name": name,
                             "source_file_path": member.source_file_path,
                             "briefing_blocked": briefing_blocked
                         }))
@@ -958,14 +966,6 @@ impl ServerState {
                 let next_cursor = has_more.then(|| (offset + limit).to_string());
                 let mut owner_meta: HashMap<String, crate::OwnerMeta> = HashMap::new();
                 let mut file_content: HashMap<String, Option<Vec<u8>>> = HashMap::new();
-                // Memoized candidate existence: candidate ids are raw
-                // qualname-encoding locators. Under A3 (clarion-719e7320f5) a
-                // briefing-blocked candidate keeps its navigable identity, so it
-                // may pass — but a candidate that resolves to NO entity row (a
-                // phantom alternative) must never be disclosed as a real
-                // alternative. So only `NotFound` is filtered; a lookup error
-                // still fails closed.
-                let mut candidate_visible: HashMap<String, bool> = HashMap::new();
                 let mut relations = Vec::new();
                 for (edge_dir, edge) in edges.into_iter().skip(offset).take(limit) {
                     let neighbor_id = match edge_dir {
@@ -1007,18 +1007,16 @@ impl ServerState {
                             json!(edge.source_byte_end),
                         )
                     };
-                    let candidates: Vec<&String> = edge
-                        .candidates
-                        .iter()
-                        .filter(|cid| {
-                            *candidate_visible.entry((*cid).clone()).or_insert_with(|| {
-                                matches!(
-                                    entity_visibility(conn, cid),
-                                    Ok(EntityVisibility::Visible | EntityVisibility::Blocked(_))
-                                )
-                            })
-                        })
-                        .collect();
+                    let mut candidates: Vec<Value> = Vec::new();
+                    for cid in &edge.candidates {
+                        match entity_visibility(conn, cid)? {
+                            EntityVisibility::Visible => candidates.push(json!(cid)),
+                            EntityVisibility::Blocked(_) => {
+                                candidates.push(crate::redact_secretlike(cid));
+                            }
+                            EntityVisibility::NotFound => {}
+                        }
+                    }
                     relations.push(json!({
                         "kind": edge.kind,
                         "direction": match edge_dir {

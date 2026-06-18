@@ -3573,9 +3573,10 @@ fn caller_navigation_scope_excludes(
 
 /// The `unresolved_name_matches` count + `next_action` recovery pointer for a
 /// caller-navigation result: how many live unresolved call sites name-match
-/// `target`, and where to see them. The pointer names `entity_call_site_list`
-/// because it works in the default read-only posture, where `confidence=
-/// inferred` is rejected by the MCP tool policy (clarion-df87b4f381).
+/// `target`, and where to inspect them. The pointer names
+/// `entity_call_site_list` because it works in the default read-only posture,
+/// where `confidence=inferred` is rejected by the MCP tool policy
+/// (clarion-df87b4f381).
 ///
 /// NOTE (clarion-2b87cd7a59 A1): unlike `unresolved_candidates`, the count and
 /// pointer are *not* gated behind `confidence != Inferred`. This is intentional,
@@ -3592,8 +3593,8 @@ pub(crate) fn unresolved_match_fields(
     let count = unresolved_caller_count_for_target(conn, target)?;
     let next_action = if count > 0 {
         json!(format!(
-            "{count} unresolved call site(s) name-match this entity and are NOT in `callers`; \
-             list them with entity_call_site_list id={id} role=callee",
+            "{count} unresolved call site(s) name-match this entity; \
+             inspect them with entity_call_site_list id={id} role=callee",
             id = target.id
         ))
     } else {
@@ -3634,10 +3635,15 @@ pub(crate) fn build_unresolved_candidates(
         } else {
             "dynamic"
         };
+        let callee_text = if owner.briefing_blocked {
+            Value::Null
+        } else {
+            json!(site.callee_expr)
+        };
         candidates.push(json!({
             "path": owner.path,
             "line": anchor.line,
-            "callee_text": site.callee_expr,
+            "callee_text": callee_text,
             "why": why,
         }));
     }
@@ -4360,7 +4366,7 @@ fn name_value_is_secretlike(text: &str) -> bool {
 /// Project one identity *value* for a briefing-blocked row: the value verbatim,
 /// unless it is itself high-entropy (a generated symbol embedding a secret), in
 /// which case that single field is re-withheld to JSON `null` (A3 guard).
-fn redact_secretlike(value: &str) -> Value {
+pub(crate) fn redact_secretlike(value: &str) -> Value {
     if name_value_is_secretlike(value) {
         Value::Null
     } else {

@@ -19,7 +19,7 @@
 
 [package]
 name = "loomweave-plugin-rust-dist"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/foundryside-dev/loomweave"
@@ -31,4 +31,4 @@ name = "loomweave-plugin-rust"
 path = "src/main.rs"
 
 [dependencies]
-loomweave-plugin-rust = { path = "../../crates/loomweave-plugin-rust", version = "1.2.0" }
+loomweave-plugin-rust = { path = "../../crates/loomweave-plugin-rust", version = "1.2.1" }

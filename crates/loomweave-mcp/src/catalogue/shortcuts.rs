@@ -339,25 +339,14 @@ impl ServerState {
             .with_reader(move |conn| {
                 let filter = scope.resolve(conn)?;
                 let (in_scope, scope_truncated) = filter.in_scope_ids(conn, &project_root)?;
-
-                // Roots = "called from outside" categorisations. Both modes seed
-                // from the same emitted tags; `auto` only changes the honesty
-                // reporting and relaxes the per-plugin missing-root exclusion.
-                let roots = ids_with_any_tag(conn, DEAD_CODE_ROOT_TAGS)?;
-                if roots.is_empty() {
-                    // No root tags (in either mode): honest-empty, never a
-                    // whole-corpus false positive.
+                let Some(reachability) = dead_code_reachability(conn, app_only)? else {
                     return Ok(dead_code_no_roots_envelope(&page, scope_truncated));
-                }
-
-                // Forward BFS over call+import edges across ALL confidence tiers
-                // (fail toward live). Reachability is whole-graph: an in-scope
-                // entity reached via an out-of-scope caller must not be flagged.
-                let (adjacency, scan_truncated) = call_import_adjacency(conn)?;
-                let barriers = ids_with_any_tag(conn, DEAD_CODE_BARRIER_TAGS)?;
-                let mut live: HashSet<String> = roots;
-                live.extend(barriers);
-                let reachable = forward_reachable(&adjacency, live);
+                };
+                let DeadCodeReachability {
+                    app_excluded,
+                    reachable,
+                    scan_truncated,
+                } = reachability;
 
                 let excluded = ids_with_any_tag(conn, DEAD_CODE_EXCLUDED_TAGS)?;
                 // Fail toward live: an entity whose name matches an unresolved
@@ -368,13 +357,6 @@ impl ServerState {
                 // false-flagged dead. Language-agnostic: a fully-resolving
                 // plugin (pyright-backed Python) leaves this set empty.
                 let unresolved_targets = entities_targeted_by_unresolved_call_sites(conn)?;
-                // app_only: drop test-tagged / non-first-party entities from the
-                // survey (read-only, computed on query). Empty set when off.
-                let app_excluded = if app_only {
-                    non_app_entity_ids(conn)?
-                } else {
-                    HashSet::new()
-                };
                 let CandidateSet {
                     mut candidates,
                     excluded_by_plugin,
@@ -872,6 +854,58 @@ fn non_app_entity_ids(conn: &rusqlite::Connection) -> loomweave_storage::Result<
     Ok(out)
 }
 
+struct DeadCodeReachability {
+    app_excluded: HashSet<String>,
+    reachable: HashSet<String>,
+    scan_truncated: bool,
+}
+
+fn dead_code_reachability(
+    conn: &rusqlite::Connection,
+    app_only: bool,
+) -> loomweave_storage::Result<Option<DeadCodeReachability>> {
+    // app_only: drop test-tagged / non-first-party entities from the survey and
+    // from the reachability graph (read-only, computed on query). Empty when off.
+    let app_excluded = if app_only {
+        non_app_entity_ids(conn)?
+    } else {
+        HashSet::new()
+    };
+
+    // Roots = "called from outside" categorisations. Both modes seed from the
+    // same emitted tags; `auto` only changes honesty reporting elsewhere.
+    let mut roots = ids_with_any_tag(conn, DEAD_CODE_ROOT_TAGS)?;
+    if app_only {
+        roots.retain(|id| !app_excluded.contains(id));
+    }
+    if roots.is_empty() {
+        return Ok(None);
+    }
+
+    // Forward BFS over call+import edges across all confidence tiers (fail
+    // toward live). Reachability is whole-graph: an in-scope entity reached via
+    // an out-of-scope caller must not be flagged.
+    let (adjacency, scan_truncated) = call_import_adjacency(conn)?;
+    let adjacency = if app_only {
+        app_only_adjacency(&adjacency, &app_excluded)
+    } else {
+        adjacency
+    };
+    let mut barriers = ids_with_any_tag(conn, DEAD_CODE_BARRIER_TAGS)?;
+    if app_only {
+        barriers.retain(|id| !app_excluded.contains(id));
+    }
+    let mut live: HashSet<String> = roots;
+    live.extend(barriers);
+    let reachable = forward_reachable(&adjacency, live);
+
+    Ok(Some(DeadCodeReachability {
+        app_excluded,
+        reachable,
+        scan_truncated,
+    }))
+}
+
 /// Entity ids carrying any of `tags` (one `IN` query, distinct ids).
 fn ids_with_any_tag(
     conn: &rusqlite::Connection,
@@ -1082,6 +1116,24 @@ fn call_import_adjacency(
     conn: &rusqlite::Connection,
 ) -> loomweave_storage::Result<(HashMap<String, Vec<String>>, bool)> {
     call_import_adjacency_with_cap(conn, EDGE_SCAN_CAP)
+}
+
+fn app_only_adjacency(
+    adjacency: &HashMap<String, Vec<String>>,
+    app_excluded: &HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    adjacency
+        .iter()
+        .filter(|(from, _)| !app_excluded.contains(*from))
+        .filter_map(|(from, targets)| {
+            let kept = targets
+                .iter()
+                .filter(|target| !app_excluded.contains(*target))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!kept.is_empty()).then(|| (from.clone(), kept))
+        })
+        .collect()
 }
 
 /// Per-entity `(fan_in, fan_out)` distinct-neighbour coupling over the call +

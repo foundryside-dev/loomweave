@@ -12,6 +12,32 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-06-18
+
+Maintenance patch for the `1.2.0` consult-surface release. (Cargo SemVer
+`1.2.1`; Python wheels `1.2.1`.)
+
+### Fixed
+
+- **Briefing-block redaction consistency.** `unresolved_candidates` no longer
+  echoes parsed callee text from briefing-blocked owners, and custom subsystem
+  member / relation-candidate projections now reuse the same high-entropy
+  identity guard as the canonical blocked entity stub.
+- **Dossier delegated-read honesty.** `entity_orientation_pack_get` now treats
+  delegated MCP envelopes as envelopes: `ok:false` from `entity_wardline_get` or
+  `entity_finding_list` becomes an explicit unavailable dossier section instead
+  of a silent `null` / empty result.
+- **`app_only` dead-code reachability.** `entity_dead_list app_only:true` removes
+  test-tagged and core-plugin entities from reachability roots and traversal
+  edges before computing liveness, so test-only reachability no longer suppresses
+  app dead-code candidates.
+- **Inferred caller hint wording.** `next_action` no longer claims unresolved
+  name matches are absent from `callers`, which was false after inferred dispatch
+  materialized a caller.
+- **Release reproducibility and public version pointers.** The standalone Rust
+  plugin distribution lockfile is regenerated for the current package versions,
+  and README / site release pointers now name the current release.
+
 ## [1.2.0] — 2026-06-18
 
 A consult-surface increment from dogfooding the MCP tools against a live Weft
@@ -687,7 +713,7 @@ to be updated in step (the peer pins/clients are being renamed together):
   working PoCs across all attribute sources; relates to the untrusted-corpus
   posture of ADR-021.
 
-## [1.2.0] — 2026-06-03
+## 1.2.0 planning history — 2026-06-03
 
 ### Added
 
@@ -1132,8 +1158,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.3.0...HEAD
-[1.3.0]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.3.0
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/foundryside-dev/loomweave/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/foundryside-dev/loomweave/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/foundryside-dev/loomweave/compare/v1.0.0...v1.0.1

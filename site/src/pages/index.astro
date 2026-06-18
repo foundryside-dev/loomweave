@@ -18,7 +18,7 @@
 // Loomweave's site OWNS the authoritative SEI explanation — it is the
 // one member that MINTS the SEI every other member keys on (IA §3.3,
 // §4.2.1). Honest limits are mandatory and non-empty: Rust analysis is
-// parse-only. v1.1.0 ships on PyPI as a wheel (uv tool install loomweave);
+// parse-only. v1.2.1 ships on PyPI as a wheel (uv tool install loomweave);
 // the GitHub Release also carries signed standalone binaries.
 // ============================================================
 import Layout from '@weft/site-kit/layouts/Layout.astro';
@@ -55,7 +55,7 @@ const SEI_STANDARD_URL = `${HUB}/#spine`;
 // ('partial'/'planned' are NEVER styled as 'live'; IA §2.2, §3.2).
 const statusTone = (s) => (s === 'live' ? 'ok' : s === 'partial' ? 'warn' : 'neutral');
 
-// Curated quick-start (IA §5.1 block 4). v1.1.0 ships on PyPI as a wheel — a
+// Curated quick-start (IA §5.1 block 4). v1.2.1 ships on PyPI as a wheel — a
 // single `uv tool install loomweave` lands the CLI plus both language plugins
 // (loomweave-plugin-python / -rust are hard deps), so Rust + Python analysis are
 // on by default. No tarball, no source build for the common path.
@@ -94,7 +94,7 @@ const quickStart =
         <Tag client:idle>Rust</Tag>
         <span class="hero__ver">
           <span class="hero__verlabel">version</span>
-          <a href={RELEASES_URL} rel="noopener">v1.1.0 · latest release</a>
+          <a href={RELEASES_URL} rel="noopener">v1.2.1 · latest release</a>
         </span>
       </div>
 

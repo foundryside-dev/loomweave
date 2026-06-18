@@ -6,18 +6,18 @@ relationships (`contains`, `calls`, `references`, `imports`, `implements`,
 `derives`, `inherits_from`, and `decorates`), persists the structural graph to a
 local SQLite store, and serves the result to consult-mode LLM agents over MCP. A
 coding agent that would otherwise re-explore the tree on every question reaches
-Loomweave first and asks a graph-aware tool. The current 1.1 release-candidate
-line ships a Rust core plus first-party Python and Rust language plugins.
+Loomweave first and asks a graph-aware tool. The current stable line ships a
+Rust core plus first-party Python and Rust language plugins.
 
 Part of the [Weft suite](docs/suite/weft.md) of code-archaeology, issue-tracking,
 and trust-topology tools.
 
 ## Status
 
-**v1.2.0 — latest stable release.** A consult-surface increment over `v1.1.0`:
-the `include` dossier on `entity_orientation_pack_get`, `app_only` scoping on the
-dead-code and coupling surfaces, and per-query caller honesty
-(`traversal_complete` / `unresolved_candidates`). Scope:
+**v1.2.1 — latest stable release.** A maintenance patch over `v1.2.0` that
+keeps the consult-surface additions (`include` dossiers, `app_only` scoping, and
+per-query caller honesty) while tightening redaction, release metadata, and
+reproducible plugin packaging. Scope:
 
 - **Python and Rust first-party plugins.** The Python plugin extracts modules,
   classes, functions, calls, references, decorators, and inheritance edges. The
@@ -89,13 +89,13 @@ and live LLM spend. The core tool families are:
 
 ```bash
 # 1. Install from the current GitHub Release
-TAG=v1.0.0
+TAG=v1.2.1
 curl -L -o loomweave-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf loomweave-x86_64-unknown-linux-gnu.tar.gz
 install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
 pipx install \
-  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-plugin-python-1.0.0.tar.gz"
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-plugin-python-1.2.1.tar.gz"
 
 # 2. Initialise a project
 cd /path/to/your/python/repo
@@ -108,8 +108,7 @@ loomweave analyze
 loomweave serve
 ```
 
-The current 1.1 release-candidate branch can also be installed from a local
-checkout while release assets are still being prepared:
+The current stable branch can also be installed from a local checkout:
 
 ```bash
 # From this repository checkout
@@ -119,7 +118,7 @@ pipx install ./packaging/rust-plugin-dist
 ```
 
 The `loomweave` PyPI package depends on both
-`loomweave-plugin-python==1.2.0` and `loomweave-plugin-rust==1.2.0`; a single
+`loomweave-plugin-python==1.2.1` and `loomweave-plugin-rust==1.2.1`; a single
 Python install lands the CLI and both plugin executables in the same environment.
 
 `loomweave install` is the one-step agent setup path: it initialises `.weft/loomweave/`,
