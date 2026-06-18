@@ -4048,6 +4048,57 @@ async fn find_dead_code_app_only_excludes_tests() {
     assert_eq!(env["result"]["app_only"], true, "{env}");
 }
 
+#[tokio::test]
+async fn find_dead_code_app_only_does_not_treat_test_roots_as_live_reachability() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:test_root",
+        "function",
+        "tests/test_app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:test_root", "test");
+    insert_entity(
+        &conn,
+        "python:function:app_helper",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    insert_calls_edge(
+        &conn,
+        "python:function:test_root",
+        "python:function:app_helper",
+        "resolved",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({"app_only": true})).await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:app_helper".to_owned()],
+        "app_only reachability must not let test roots suppress app dead-code candidates: {env}"
+    );
+}
+
 /// `app_only: true` on coupling excludes test-tagged callers from the ranking so
 /// a hub's coupling drops to reflect only first-party app fan-in/out.
 #[tokio::test]

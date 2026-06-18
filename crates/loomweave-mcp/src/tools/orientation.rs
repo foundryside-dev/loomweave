@@ -499,9 +499,12 @@ impl ServerState {
                     let mut args = serde_json::Map::new();
                     args.insert("id".to_owned(), json!(id));
                     match self.tool_wardline_for(&args).await {
-                        Ok(envelope) => normalize_fingerprints(
+                        Ok(envelope) if envelope_is_ok(&envelope) => normalize_fingerprints(
                             envelope.get("result").cloned().unwrap_or(Value::Null),
                         ),
+                        Ok(envelope) => {
+                            delegated_lookup_failed("wardline lookup failed", &envelope, None)
+                        }
                         Err(_) => json!({"available": false, "reason": "wardline lookup failed"}),
                     }
                 }
@@ -523,7 +526,7 @@ impl ServerState {
                         // them made include:["findings"] silently look complete.
                         // The redundant `entity` echo is removed — the dossier's
                         // primary entity is already in the pack.
-                        Ok(envelope) => {
+                        Ok(envelope) if envelope_is_ok(&envelope) => {
                             let mut result = envelope
                                 .get("result")
                                 .cloned()
@@ -533,6 +536,11 @@ impl ServerState {
                             }
                             normalize_fingerprints(result)
                         }
+                        Ok(envelope) => delegated_lookup_failed(
+                            "findings lookup failed",
+                            &envelope,
+                            Some(("findings", json!([]))),
+                        ),
                         Err(_) => json!({"findings": [], "available": false}),
                     }
                 }
@@ -626,6 +634,28 @@ impl IncludeSet {
     fn any(&self) -> bool {
         self.wardline || self.findings || self.issues
     }
+}
+
+fn envelope_is_ok(envelope: &Value) -> bool {
+    envelope.get("ok").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn delegated_lookup_failed(
+    reason: &str,
+    envelope: &Value,
+    empty_collection: Option<(&str, Value)>,
+) -> Value {
+    let mut object = serde_json::Map::new();
+    if let Some((key, value)) = empty_collection {
+        object.insert(key.to_owned(), value);
+    }
+    object.insert("available".to_owned(), json!(false));
+    object.insert("reason".to_owned(), json!(reason));
+    object.insert(
+        "error".to_owned(),
+        envelope.get("error").cloned().unwrap_or(Value::Null),
+    );
+    Value::Object(object)
 }
 
 /// Normalize every `fingerprint` string in a JSON tree to ONE canonical form by

@@ -1142,6 +1142,58 @@ async fn subsystem_members_blocked_member_keeps_navigable_identity() {
 }
 
 #[tokio::test]
+async fn subsystem_members_re_withholds_secretlike_blocked_identity_fields() {
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let subsystem_id = seed_subsystem(&conn, project.path());
+    let secret = "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z";
+    let secret_id = format!("python:module:{secret}");
+    let secret_source_path = project.path().join("secret_module.py");
+    std::fs::write(&secret_source_path, "def sentinel():\n    return True\n")
+        .expect("write secret module source");
+    insert_entity(
+        &conn,
+        &secret_id,
+        "module",
+        &secret_source_path,
+        Some((1, 2)),
+        None,
+    );
+    insert_edge(
+        &conn,
+        "in_subsystem",
+        &secret_id,
+        &subsystem_id,
+        "resolved",
+        None,
+    );
+    drop(conn);
+    mark_blocked(&db_path, &secret_id, "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let members = envelope["result"]["members"].as_array().unwrap();
+    let blocked = members
+        .iter()
+        .find(|m| m["briefing_blocked"] == "secret_present")
+        .expect("blocked secretlike member present");
+    assert!(
+        blocked["id"].is_null(),
+        "secretlike blocked id must be re-withheld: {blocked}"
+    );
+    assert!(
+        blocked["name"].is_null(),
+        "secretlike blocked name must be re-withheld: {blocked}"
+    );
+    assert!(
+        !envelope.to_string().contains(secret),
+        "secretlike identity leaked in subsystem members: {envelope}"
+    );
+}
+
+#[tokio::test]
 async fn subsystem_members_rejects_non_subsystem_id() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);
@@ -4118,6 +4170,13 @@ async fn callers_of_inferred_dispatches_and_materializes_recording_result() {
         envelope["result"]["callers"][0]["edge_confidence"],
         "inferred"
     );
+    let next_action = envelope["result"]["next_action"]
+        .as_str()
+        .expect("next_action string");
+    assert!(
+        !next_action.contains("NOT in `callers`"),
+        "inferred dispatch materialized the caller, so next_action must not claim unresolved sites are absent from callers: {envelope}"
+    );
     // Inferred (LLM) dispatch attempts the attribute-receiver cases, so nothing
     // is excluded from the search (clarion-0d204a3f16).
     assert_eq!(envelope["result"]["scope_excludes"], json!([]));
@@ -5296,6 +5355,45 @@ async fn callers_of_unresolved_candidates_classify_attribute_receiver_vs_dynamic
             "candidate needs a line field: {envelope}"
         );
     }
+}
+
+#[tokio::test]
+async fn callers_of_unresolved_candidates_redacts_callee_text_for_blocked_owner() {
+    let (project, db_path) = open_project();
+    let secret = "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z";
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(
+            &conn,
+            "python:function:demo.entry",
+            "site-secret-receiver",
+            &format!("{secret}.target"),
+        );
+    }
+    mark_blocked(&db_path, "python:function:demo.entry", "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let candidates = envelope["result"]["unresolved_candidates"]
+        .as_array()
+        .expect("unresolved_candidates array");
+    assert_eq!(candidates.len(), 1, "{envelope}");
+    assert!(
+        candidates[0]["callee_text"].is_null(),
+        "blocked owner must not echo parsed source callee text: {envelope}"
+    );
+    assert_eq!(candidates[0]["why"], "attribute-receiver", "{envelope}");
+    assert!(
+        !envelope.to_string().contains(secret),
+        "blocked owner callee expression leaked: {envelope}"
+    );
 }
 
 #[tokio::test]
@@ -6807,6 +6905,51 @@ async fn orientation_pack_dossier_findings_surface_pagination_truncation() {
     );
 }
 
+#[tokio::test]
+async fn orientation_pack_dossier_reports_delegated_tool_error_envelopes() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        conn.execute_batch(
+            "DROP TABLE findings;
+             DROP TABLE wardline_taint_facts;",
+        )
+        .expect("drop delegated-read tables");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({
+            "entity": "python:function:demo.entry",
+            "include": ["wardline", "findings"]
+        }),
+    )
+    .await;
+
+    assert_eq!(out["ok"], true, "{out:?}");
+    let dossier = &out["result"]["dossier"];
+    assert_eq!(dossier["wardline"]["available"], false, "{out:?}");
+    assert_eq!(
+        dossier["wardline"]["reason"], "wardline lookup failed",
+        "{out:?}"
+    );
+    assert!(
+        dossier["wardline"]["error"].is_object(),
+        "wardline error envelope must be preserved: {out:?}"
+    );
+    assert_eq!(dossier["findings"]["available"], false, "{out:?}");
+    assert_eq!(
+        dossier["findings"]["reason"], "findings lookup failed",
+        "{out:?}"
+    );
+    assert!(
+        dossier["findings"]["error"].is_object(),
+        "findings error envelope must be preserved: {out:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // FIX 1: metadata.wardline block surfaced in items
 // ---------------------------------------------------------------------------
@@ -7934,6 +8077,67 @@ async fn relation_list_confidence_gates_ambiguous_and_passes_candidates() {
             .unwrap()
             .is_empty(),
         "{base}"
+    );
+}
+
+#[tokio::test]
+async fn relation_list_re_withholds_secretlike_blocked_candidate_ids() {
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let secret = "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z";
+    let secret_id = format!("python:function:{secret}");
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let app_path = project.path().join("app.py");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:function:app.other",
+            "function",
+            &app_path,
+            Some((2, 3)),
+            Some("python:module:app"),
+        );
+        insert_entity(
+            &conn,
+            &secret_id,
+            "function",
+            &types_path,
+            Some((7, 8)),
+            Some("python:module:types"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "decorates",
+            "python:function:types.wrap",
+            "python:function:app.other",
+            "ambiguous",
+            Some(json!({"candidates": [secret_id]})),
+            "core:file:app.py",
+            1,
+            5,
+        );
+    }
+    mark_blocked(&db_path, &secret_id, "secret_present");
+    let state = state_for(project.path(), &db_path);
+
+    let ambiguous = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:function:app.other", "direction": "in", "confidence": "ambiguous"}),
+    )
+    .await;
+
+    assert_eq!(ambiguous["ok"], true, "{ambiguous}");
+    let relation = &ambiguous["result"]["relations"].as_array().unwrap()[0];
+    assert_eq!(
+        relation["candidates"],
+        json!([Value::Null]),
+        "secretlike blocked candidate id must be re-withheld: {ambiguous}"
+    );
+    assert!(
+        !ambiguous.to_string().contains(secret),
+        "secretlike relation candidate leaked: {ambiguous}"
     );
 }
 
