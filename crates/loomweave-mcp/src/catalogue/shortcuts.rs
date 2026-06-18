@@ -24,8 +24,8 @@ use crate::ParamError;
 use crate::ServerState;
 use crate::catalogue::{Page, RawScope, finalize_entity_page, missing_signal};
 use crate::{
-    entity_json, flatten_storage_envelope_result, optional_confidence, required_str,
-    success_envelope, tool_error_envelope,
+    entity_json, flatten_storage_envelope_result, optional_bool, optional_confidence,
+    optional_non_empty_string, required_str, success_envelope, tool_error_envelope,
 };
 
 /// Scan bound on edges materialised for a graph query.
@@ -100,6 +100,35 @@ const HOTSPOTS_PAGE_DEFAULT: usize = 20;
 const HOTSPOTS_PAGE_MAX: usize = 200;
 const CYCLES_PAGE_DEFAULT: usize = 50;
 const CYCLES_PAGE_MAX: usize = 200;
+
+/// Reachability-root sourcing mode for `find_dead_code` (clarion-663aca16aa,
+/// A5). `Explicit` (the default) takes roots verbatim from emitted root tags and
+/// keeps the empty-root honest-empty guard + per-plugin missing-root exclusion.
+/// `Auto` derives roots from the same emitted tags but declares the lower,
+/// derived confidence and relaxes the per-plugin exclusion (a rootless plugin is
+/// surveyed against the globally-derived root set rather than withheld).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootsMode {
+    Explicit,
+    Auto,
+}
+
+impl RootsMode {
+    fn parse(arguments: &serde_json::Map<String, Value>) -> std::result::Result<Self, ParamError> {
+        match optional_non_empty_string(arguments, "roots")?.as_deref() {
+            None | Some("explicit") => Ok(RootsMode::Explicit),
+            Some("auto") => Ok(RootsMode::Auto),
+            Some(_) => Err(ParamError::new("roots must be one of explicit, auto")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            RootsMode::Explicit => "explicit",
+            RootsMode::Auto => "auto",
+        }
+    }
+}
 
 /// The confidence strings included at or below a requested tier (the tier is a
 /// ceiling: `resolved` → resolved only; `inferred` → all).
@@ -208,6 +237,7 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         let scope = RawScope::parse(arguments)?;
         let confidence = optional_confidence(arguments)?;
+        let app_only = optional_bool(arguments, "app_only")?.unwrap_or(false);
         let page = Page::parse(arguments, HOTSPOTS_PAGE_DEFAULT, HOTSPOTS_PAGE_MAX)?;
         let project_root = self.project_root.clone();
         let result = self
@@ -216,37 +246,16 @@ impl ServerState {
                 let filter = scope.resolve(conn)?;
                 let (in_scope, scope_truncated) = filter.in_scope_ids(conn, &project_root)?;
                 let in_clause = confidence_in_clause(confidence);
+                // app_only: drop test-tagged / non-first-party entities both as
+                // hotspot rows AND from the fan-in/out edge counts, so a hub's
+                // coupling reflects only first-party app callers/callees.
+                let app_excluded = if app_only {
+                    non_app_entity_ids(conn)?
+                } else {
+                    HashSet::new()
+                };
 
-                let mut coupling: HashMap<String, (i64, i64)> = HashMap::new();
-                // Coupling is over the import/call edge graph (spec §3.3).
-                // Structural edges (contains, in_subsystem, guides,
-                // emits_finding) all carry confidence='resolved', so including
-                // them would make the ranking dominated by containment /
-                // membership fan-out, not actionable coupling.
-                let kinds =
-                    format!("(kind = 'calls' OR (kind = 'imports' AND {RUNTIME_IMPORT_EDGE_SQL}))");
-                // out-degree (distinct callees / targets)
-                let out_sql = format!(
-                    "SELECT from_id, COUNT(DISTINCT to_id) FROM edges \
-                     WHERE {kinds} AND confidence IN ({in_clause}) GROUP BY from_id"
-                );
-                let mut stmt = conn.prepare(&out_sql)?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    let id: String = row.get(0)?;
-                    coupling.entry(id).or_default().1 = row.get(1)?;
-                }
-                // in-degree (distinct callers / sources)
-                let in_sql = format!(
-                    "SELECT to_id, COUNT(DISTINCT from_id) FROM edges \
-                     WHERE {kinds} AND confidence IN ({in_clause}) GROUP BY to_id"
-                );
-                let mut stmt = conn.prepare(&in_sql)?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    let id: String = row.get(0)?;
-                    coupling.entry(id).or_default().0 = row.get(1)?;
-                }
+                let coupling = coupling_counts(conn, &in_clause, &app_excluded)?;
 
                 let mut ranked: Vec<(String, i64, i64)> = coupling
                     .into_iter()
@@ -284,6 +293,7 @@ impl ServerState {
                 Ok(success_envelope(json!({
                     "hotspots": hotspots,
                     "confidence": confidence.as_str(),
+                    "app_only": app_only,
                     "page": {
                         "total": total,
                         "offset": page.offset,
@@ -321,6 +331,8 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         let scope = RawScope::parse(arguments)?;
         let page = Page::parse(arguments, SHORTCUT_PAGE_DEFAULT, SHORTCUT_PAGE_MAX)?;
+        let roots_mode = RootsMode::parse(arguments)?;
+        let app_only = optional_bool(arguments, "app_only")?.unwrap_or(false);
         let project_root = self.project_root.clone();
         let result = self
             .readers
@@ -328,24 +340,14 @@ impl ServerState {
                 let filter = scope.resolve(conn)?;
                 let (in_scope, scope_truncated) = filter.in_scope_ids(conn, &project_root)?;
 
-                // Roots = "called from outside" categorisations.
+                // Roots = "called from outside" categorisations. Both modes seed
+                // from the same emitted tags; `auto` only changes the honesty
+                // reporting and relaxes the per-plugin missing-root exclusion.
                 let roots = ids_with_any_tag(conn, DEAD_CODE_ROOT_TAGS)?;
                 if roots.is_empty() {
-                    return Ok(success_envelope(json!({
-                        "dead_code": [],
-                        "page": {
-                            "total": 0, "offset": page.offset, "limit": page.limit,
-                            "returned": 0, "truncated": false,
-                        },
-                        "scope_truncated": scope_truncated,
-                        "scan_truncated": false,
-                        "signal": missing_signal(
-                            "entity_tags",
-                            "this index has no reachability root tags (entry-point / http-route / \
-                             test / data-model / cli-command / exported-api), so dead code cannot \
-                             be determined — this is NOT a guarantee there is no dead code",
-                        ),
-                    })));
+                    // No root tags (in either mode): honest-empty, never a
+                    // whole-corpus false positive.
+                    return Ok(dead_code_no_roots_envelope(&page, scope_truncated));
                 }
 
                 // Forward BFS over call+import edges across ALL confidence tiers
@@ -366,12 +368,26 @@ impl ServerState {
                 // false-flagged dead. Language-agnostic: a fully-resolving
                 // plugin (pyright-backed Python) leaves this set empty.
                 let unresolved_targets = entities_targeted_by_unresolved_call_sites(conn)?;
+                // app_only: drop test-tagged / non-first-party entities from the
+                // survey (read-only, computed on query). Empty set when off.
+                let app_excluded = if app_only {
+                    non_app_entity_ids(conn)?
+                } else {
+                    HashSet::new()
+                };
                 let CandidateSet {
                     mut candidates,
                     excluded_by_plugin,
                     blocked_reason_by_id,
                     entity_scan_truncated,
-                } = dead_code_candidate_set(conn, &reachable, &excluded, in_scope.as_ref())?;
+                } = dead_code_candidate_set(
+                    conn,
+                    &reachable,
+                    &excluded,
+                    in_scope.as_ref(),
+                    roots_mode,
+                    &app_excluded,
+                )?;
 
                 // Count the unresolved-call-site shield separately so the
                 // disclosure is exact, then remove the shielded candidates.
@@ -419,7 +435,9 @@ impl ServerState {
                         excluded.len(),
                         unresolved_call_site_suppressed,
                         withheld_count,
+                        roots_mode,
                     ),
+                    "app_only": app_only,
                     "dead_code": dead_code,
                     // The constant facets every candidate shares, hoisted.
                     "finding": {
@@ -467,6 +485,28 @@ const SHORTCUT_PAGE_DEFAULT: usize = 50;
 const SHORTCUT_PAGE_MAX: usize = 200;
 const CHURN_SCAN_CAP: usize = 50_000;
 
+/// The honest signal-unavailable envelope for `find_dead_code` when no
+/// reachability root tags exist — zero candidates, never a whole-corpus false
+/// positive. Identical in both `explicit` and `auto` modes: `auto` cannot
+/// fabricate roots from an empty tag set.
+fn dead_code_no_roots_envelope(page: &Page, scope_truncated: bool) -> Value {
+    success_envelope(json!({
+        "dead_code": [],
+        "page": {
+            "total": 0, "offset": page.offset, "limit": page.limit,
+            "returned": 0, "truncated": false,
+        },
+        "scope_truncated": scope_truncated,
+        "scan_truncated": false,
+        "signal": missing_signal(
+            "entity_tags",
+            "this index has no reachability root tags (entry-point / http-route / \
+             test / data-model / cli-command / exported-api), so dead code cannot \
+             be determined — this is NOT a guarantee there is no dead code",
+        ),
+    }))
+}
+
 /// Build the lead `summary` block for `find_dead_code` — the agent-first "state
 /// the breakdown up front" convention: counts by kind plus a confidence verdict,
 /// so the headline is self-qualifying and no agent is misled by a raw candidate
@@ -480,6 +520,7 @@ fn dead_code_summary(
     plugins_without_roots: usize,
     shielded_by_unresolved_calls: usize,
     withheld_secret: usize,
+    roots_mode: RootsMode,
 ) -> Value {
     let analysed = reachable.saturating_add(dead_candidates);
     let dead_pct = dead_candidates
@@ -507,6 +548,13 @@ fn dead_code_summary(
         },
         "confidence": if low_confidence { "low" } else { "moderate" },
         "advisory": advisory,
+        // How the reachability roots were sourced. `auto` derives them from
+        // emitted tags, so it declares the lower, derived confidence.
+        "roots_mode": roots_mode.as_str(),
+        "roots_confidence": match roots_mode {
+            RootsMode::Auto => json!("derived"),
+            RootsMode::Explicit => Value::Null,
+        },
     })
 }
 
@@ -807,6 +855,23 @@ fn test_tagged_subset(
     Ok(out)
 }
 
+/// Entity ids that are NOT first-party application code, for the opt-in
+/// `app_only` filter (clarion-663aca16aa, A5): an entity is excluded when it is
+/// (a) `test`-tagged or (b) owned by the `core` plugin (Loomweave's synthetic
+/// file/project/subsystem/guidance anchors — never app code; `tour.*`-style
+/// non-first-party fixtures land here too). Pure read over `entity_tags` +
+/// `entities`; no summary dependency, no re-analysis. A third-party plugin
+/// blocklist can extend this later without touching callers.
+fn non_app_entity_ids(conn: &rusqlite::Connection) -> loomweave_storage::Result<HashSet<String>> {
+    let mut out = ids_with_any_tag(conn, &["test"])?;
+    let mut stmt = conn.prepare("SELECT id FROM entities WHERE plugin_id = 'core'")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        out.insert(row.get::<_, String>(0)?);
+    }
+    Ok(out)
+}
+
 /// Entity ids carrying any of `tags` (one `IN` query, distinct ids).
 fn ids_with_any_tag(
     conn: &rusqlite::Connection,
@@ -899,21 +964,33 @@ fn dead_code_candidate_set(
     reachable: &HashSet<String>,
     excluded: &HashSet<String>,
     in_scope: Option<&HashSet<String>>,
+    roots_mode: RootsMode,
+    app_excluded: &HashSet<String>,
 ) -> loomweave_storage::Result<CandidateSet> {
     let (all_rows, entity_scan_truncated) = all_entity_rows(conn)?;
-    let plugins_with_roots = plugins_with_root_tags(conn)?;
+    // In `auto` mode roots are derived globally from emitted tags, so a plugin
+    // without root tags of its own is still surveyed against that set rather
+    // than withheld — the per-plugin missing-root exclusion only applies to the
+    // verbatim `explicit` mode.
+    let plugins_with_roots = match roots_mode {
+        RootsMode::Explicit => Some(plugins_with_root_tags(conn)?),
+        RootsMode::Auto => None,
+    };
     let mut excluded_by_plugin: BTreeMap<String, usize> = BTreeMap::new();
     let mut blocked_reason_by_id: HashMap<String, String> = HashMap::new();
 
     let mut candidates: Vec<String> = all_rows
         .into_iter()
         .filter(|row| !DEAD_CODE_NON_CODE_KINDS.contains(&row.kind.as_str()))
-        .filter(|row| {
-            if plugins_with_roots.contains(&row.plugin_id) {
-                true
-            } else {
-                *excluded_by_plugin.entry(row.plugin_id.clone()).or_default() += 1;
-                false
+        .filter(|row| match &plugins_with_roots {
+            None => true,
+            Some(plugins_with_roots) => {
+                if plugins_with_roots.contains(&row.plugin_id) {
+                    true
+                } else {
+                    *excluded_by_plugin.entry(row.plugin_id.clone()).or_default() += 1;
+                    false
+                }
             }
         })
         .map(|row| {
@@ -924,6 +1001,7 @@ fn dead_code_candidate_set(
         })
         .filter(|id| !reachable.contains(id))
         .filter(|id| !excluded.contains(id))
+        .filter(|id| !app_excluded.contains(id))
         .filter(|id| in_scope.is_none_or(|ids| ids.contains(id)))
         .collect();
     candidates.sort();
@@ -1004,6 +1082,54 @@ fn call_import_adjacency(
     conn: &rusqlite::Connection,
 ) -> loomweave_storage::Result<(HashMap<String, Vec<String>>, bool)> {
     call_import_adjacency_with_cap(conn, EDGE_SCAN_CAP)
+}
+
+/// Per-entity `(fan_in, fan_out)` distinct-neighbour coupling over the call +
+/// runtime-import edge graph (spec §3.3). Structural edges (`contains`,
+/// `in_subsystem`, `guides`, `emits_finding`) are excluded so the ranking
+/// reflects actionable coupling, not containment fan-out.
+///
+/// When `app_excluded` is non-empty (the opt-in `app_only` filter), an edge is
+/// dropped entirely if EITHER endpoint is excluded — so a test-tagged caller
+/// contributes to neither its own fan-out nor the hub's fan-in, and the
+/// excluded entity never surfaces as a hotspot row. The distinct counting is
+/// done in Rust (rather than `COUNT(DISTINCT …)` in SQL) so the endpoint
+/// exclusion composes cleanly; when `app_excluded` is empty this is identical
+/// to the previous aggregate.
+fn coupling_counts(
+    conn: &rusqlite::Connection,
+    in_clause: &str,
+    app_excluded: &HashSet<String>,
+) -> loomweave_storage::Result<HashMap<String, (i64, i64)>> {
+    let kinds = format!("(kind = 'calls' OR (kind = 'imports' AND {RUNTIME_IMPORT_EDGE_SQL}))");
+    let sql = format!(
+        "SELECT DISTINCT from_id, to_id FROM edges \
+         WHERE {kinds} AND confidence IN ({in_clause})"
+    );
+    let mut out_neighbours: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut in_neighbours: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let from: String = row.get(0)?;
+        let to: String = row.get(1)?;
+        if app_excluded.contains(&from) || app_excluded.contains(&to) {
+            continue;
+        }
+        out_neighbours
+            .entry(from.clone())
+            .or_default()
+            .insert(to.clone());
+        in_neighbours.entry(to).or_default().insert(from);
+    }
+    let mut coupling: HashMap<String, (i64, i64)> = HashMap::new();
+    for (id, tos) in out_neighbours {
+        coupling.entry(id).or_default().1 = i64::try_from(tos.len()).unwrap_or(i64::MAX);
+    }
+    for (id, froms) in in_neighbours {
+        coupling.entry(id).or_default().0 = i64::try_from(froms.len()).unwrap_or(i64::MAX);
+    }
+    Ok(coupling)
 }
 
 fn import_adjacency_for_cycles(
@@ -1207,24 +1333,32 @@ mod tests {
         // The lacuna shape: 141 candidates of ~391 analysed (36%) — implausibly
         // high, so the roots don't cover the corpus. Confidence must read LOW and
         // recruit the operator, not present 141 as a confident headline.
-        let s = dead_code_summary(141, 250, 1, 3, 5);
+        let s = dead_code_summary(141, 250, 1, 3, 5, RootsMode::Explicit);
         assert_eq!(s["confidence"], "low");
         assert!(s["advisory"].as_str().unwrap().contains("LOW CONFIDENCE"));
         assert_eq!(s["dead_candidates"], 141);
         assert_eq!(s["reachable"], 250);
         assert_eq!(s["not_analysed"]["withheld_secret"], 5);
         assert_eq!(s["not_analysed"]["plugins_without_roots"], 1);
+        // Explicit mode declares verbatim roots, no derived-confidence claim.
+        assert_eq!(s["roots_mode"], "explicit");
+        assert!(s["roots_confidence"].is_null());
 
         // A plausible dead share (a few orphans in a well-rooted corpus) reads
         // MODERATE with no advisory — the breakdown still leads, but no alarm.
-        let s = dead_code_summary(5, 400, 0, 0, 0);
+        let s = dead_code_summary(5, 400, 0, 0, 0, RootsMode::Explicit);
         assert_eq!(s["confidence"], "moderate");
         assert!(s["advisory"].is_null());
 
         // Degenerate: nothing analysed → no division panic, no false alarm.
-        let s = dead_code_summary(0, 0, 0, 0, 0);
+        let s = dead_code_summary(0, 0, 0, 0, 0, RootsMode::Explicit);
         assert_eq!(s["confidence"], "moderate");
         assert!(s["advisory"].is_null());
+
+        // Auto mode declares the derived-confidence roots.
+        let s = dead_code_summary(5, 400, 0, 0, 0, RootsMode::Auto);
+        assert_eq!(s["roots_mode"], "auto");
+        assert_eq!(s["roots_confidence"], "derived");
     }
 
     fn edge_scan_conn() -> rusqlite::Connection {

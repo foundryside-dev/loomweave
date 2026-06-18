@@ -1137,6 +1137,26 @@ pub fn known_entity_tags(conn: &Connection) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// The categorisation tags carried by a single entity, ordered and
+/// deduplicated. The inline-tags projection (clarion-057ff2b330) reads this so
+/// an entity row in a tool response shows its own tags without a reverse-index
+/// `entity_tag_list` round-trip. `DISTINCT` collapses the same tag emitted by
+/// more than one plugin; the ORDER BY keeps the array deterministic.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn tags_for_entity(conn: &Connection, entity_id: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT tag FROM entity_tags WHERE entity_id = ?1 ORDER BY tag")?;
+    let rows = stmt.query_map(params![entity_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Faceted catalog query: entities carrying `tag` (any plugin's
 /// `entity_tags.tag`), ordered by id, materialised up to `scan_cap`. Returns
 /// `(rows, scan_truncated)`. A blank tag is rejected; an unknown tag matches no

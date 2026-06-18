@@ -12,6 +12,67 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-06-18
+
+A consult-surface increment from dogfooding the MCP tools against a live Weft
+testbed: richer orientation, more honest traversal/availability signals, and
+app-scoped queries. Every addition is backward compatible — omitting the new
+params leaves responses byte-identical to `1.1.0`. (Cargo SemVer `1.2.0`; Python
+wheels `1.2.0`.)
+
+### Added
+
+- **Entity dossier via `include` on `entity_orientation_pack_get`**
+  (clarion-2b87cd7a59). An optional `include: ["wardline","findings","issues"]`
+  param folds a composed `dossier:{wardline,findings,issues,summary_available}`
+  into the consult-mode pack — pure read-path composition of existing surfaces,
+  no re-analysis. The `findings` section mirrors `entity_finding_list`'s result
+  (a `findings` array plus `page` pagination metadata, so truncation past the
+  first page is visible); `summary_available` is `true` only when
+  `entity_summary_get` would serve from cache (full cache key present and
+  unexpired). Finding fingerprints are normalized to one canonical form
+  (stripping any `wlfp2:` prefix) across the dossier. Omitting `include` (or an
+  empty array) leaves the packet byte-identical.
+- **App-scoped roots + `app_only` filter on dead-code and coupling surfaces**
+  (clarion-663aca16aa). `entity_dead_list` gains `roots: "auto"`, deriving
+  reachability roots from emitted tags and reporting `roots_mode` +
+  `roots_confidence` (explicit mode remains the default and is unchanged). Both
+  `entity_dead_list` and `entity_coupling_hotspot_list` gain opt-in
+  `app_only: true`, a read-path filter that drops test-tagged and non-first-party
+  (core-plugin) entities, removing excluded endpoints from both rows and
+  neighbour counts.
+- **Per-query caller honesty via `traversal_complete` + `unresolved_candidates`**
+  (clarion-76c31b730a). `entity_callers_list` and `entity_neighborhood_get` no
+  longer emit a blanket `scope_excludes` footer: `scope_excludes` is populated
+  ONLY when *this* traversal actually skipped a name-matched unresolved
+  candidate, otherwise it is `[]` paired with the new `traversal_complete: true`
+  — so an empty `callers` list reads as a true negative. Skipped sites surface as
+  the new `unresolved_candidates` `[{path, line, callee_text, why}]` in-tool
+  grep-fallback.
+- **Inline entity-row tags + arg aliases** (clarion-057ff2b330). Entity rows
+  carry their tags inline, and `entity_resolve` / `entity_relation_list` accept
+  argument aliases for friendlier consult-mode calls.
+
+### Fixed
+
+- **Secret content — not entity identity — is redacted in `briefing_blocked`
+  rows** (clarion-719e7320f5). A briefing-blocked entity now rides alongside its
+  real, navigable identity (`id`/`kind`/`name`/`source_file_path`/line span/
+  `content_hash`); only the secret-bearing file content stays withheld. A
+  read-path entropy guard re-withholds an identity field only when a single path
+  *segment* is itself a long, high-entropy blob (≥4.5 bits/byte) — so a secret
+  embedded as a qualname segment is still redacted, while long descriptive Rust
+  `::` paths, dotted qualnames, and verbose `snake_case` names stay navigable.
+- **`summary_available` in the dossier now matches the full summary cache key.**
+  It previously matched on `content_hash` alone, reporting `true` for a summary
+  whose template / model tier / guidance had since changed —
+  `entity_summary_get` keys on the full tuple and would miss it, so a consult
+  caller could wrongly skip generating. It now mirrors the summary tool's exact
+  gate (full key + expiry window).
+- **`unresolved_candidates` is gated behind `confidence != Inferred`** (A1). On
+  the inferred dispatch path `traversal_complete` is forced `true`; surfacing
+  skipped candidates there contradicted that completeness claim.
+
 ## [1.1.0] — 2026-06-15
 
 First stable **1.1.0** release — the GA of the `1.1.0rc1`–`rc10` candidate

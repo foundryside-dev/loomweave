@@ -14,8 +14,10 @@ and trust-topology tools.
 
 ## Status
 
-**v1.1.0 — latest stable release.** Cut over from the `rc` line to `main`,
-superseding `v1.0.0`. Scope:
+**v1.2.0 — latest stable release.** A consult-surface increment over `v1.1.0`:
+the `include` dossier on `entity_orientation_pack_get`, `app_only` scoping on the
+dead-code and coupling surfaces, and per-query caller honesty
+(`traversal_complete` / `unresolved_candidates`). Scope:
 
 - **Python and Rust first-party plugins.** The Python plugin extracts modules,
   classes, functions, calls, references, decorators, and inheritance edges. The
@@ -117,7 +119,7 @@ pipx install ./packaging/rust-plugin-dist
 ```
 
 The `loomweave` PyPI package depends on both
-`loomweave-plugin-python==1.1.0` and `loomweave-plugin-rust==1.1.0`; a single
+`loomweave-plugin-python==1.2.0` and `loomweave-plugin-rust==1.2.0`; a single
 Python install lands the CLI and both plugin executables in the same environment.
 
 `loomweave install` is the one-step agent setup path: it initialises `.weft/loomweave/`,

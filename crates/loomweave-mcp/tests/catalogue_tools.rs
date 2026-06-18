@@ -2310,13 +2310,16 @@ fn insert_blocked_entity(
     .expect("insert blocked entity");
 }
 
-/// Assert an entity projection is a redacted stub: every identity field null,
-/// only the block reason present.
-fn assert_redacted_identity(entity: &Value, reason: &str) {
-    assert_eq!(entity["briefing_blocked"], reason, "stub reason: {entity}");
+/// Assert a briefing-blocked entity projection keeps its navigable identity
+/// (clarion-719e7320f5, A3): `id`, `kind`, `name`, `short_name`,
+/// `source_file_path`, the line span and `content_hash` are PRESENT alongside
+/// the `briefing_blocked` flag, so the entity stays navigable; only the secret
+/// content is withheld, and the cross-tool SEI binding key stays null. The id is
+/// the qualname-bearing locator the caller pasted, so it appears verbatim.
+fn assert_blocked_identity_present(entity: &Value, reason: &str) {
+    assert_eq!(entity["briefing_blocked"], reason, "block reason: {entity}");
     for field in [
         "id",
-        "sei",
         "kind",
         "name",
         "short_name",
@@ -2326,8 +2329,19 @@ fn assert_redacted_identity(entity: &Value, reason: &str) {
         "content_hash",
     ] {
         assert!(
-            entity.get(field).is_none_or(Value::is_null),
-            "identity field `{field}` must be withheld for a blocked entity: {entity}"
+            entity.get(field).is_some_and(|v| !v.is_null()),
+            "identity field `{field}` must be PRESENT for a blocked entity: {entity}"
+        );
+    }
+    assert!(
+        entity["sei"].is_null(),
+        "SEI must stay null for a blocked entity (ADR-034): {entity}"
+    );
+    // The secret *content* never appears in the entity projection.
+    for leaked in ["summary", "source", "docstring"] {
+        assert!(
+            entity.get(leaked).is_none_or(Value::is_null),
+            "content field `{leaked}` must not appear in a blocked entity projection: {entity}"
         );
     }
 }
@@ -2363,11 +2377,9 @@ async fn find_by_kind_redacts_briefing_blocked_identity() {
         .iter()
         .find(|e| e["briefing_blocked"] == "secret_present")
         .expect("blocked entity stub present");
-    assert_redacted_identity(blocked, "secret_present");
-    assert!(
-        !env.to_string().contains("python:function:leaky"),
-        "blocked id leaked in find_by_kind response: {env}"
-    );
+    assert_blocked_identity_present(blocked, "secret_present");
+    // The navigable locator IS exposed now (A3): the identity is not the secret.
+    assert_eq!(blocked["id"], "python:function:leaky", "{env}");
 }
 
 #[tokio::test]
@@ -2420,11 +2432,8 @@ async fn search_semantic_redacts_briefing_blocked_identity() {
     assert_eq!(env["ok"], true, "{env}");
     let results = env["result"]["results"].as_array().unwrap();
     assert_eq!(results.len(), 1, "{env}");
-    assert_redacted_identity(&results[0]["entity"], "secret_present");
-    assert!(
-        !env.to_string().contains("python:function:login"),
-        "blocked id leaked in search_semantic response: {env}"
-    );
+    assert_blocked_identity_present(&results[0]["entity"], "secret_present");
+    assert_eq!(results[0]["entity"]["id"], "python:function:login", "{env}");
 }
 
 #[tokio::test]
@@ -2456,18 +2465,112 @@ async fn find_by_wardline_redacts_blocked_entity_and_withholds_blob() {
         .iter()
         .find(|e| e["briefing_blocked"] == "secret_present")
         .expect("blocked entity stub present");
-    assert_redacted_identity(blocked, "secret_present");
+    assert_blocked_identity_present(blocked, "secret_present");
+    // The entity's own navigable locator IS exposed now (A3).
+    assert_eq!(blocked["id"], "python:function:tainted", "{env}");
+    // …but the Wardline taint blob is source-derived *content*, so it stays
+    // withheld: the blob's embedded qualname must never leak.
     assert!(
         blocked["wardline"].is_null(),
-        "wardline blob leaks identity for a blocked entity: {blocked}"
+        "wardline blob must stay withheld for a blocked entity: {blocked}"
     );
     assert!(
         !env.to_string().contains("app.secrets.tainted"),
         "qualname leaked via the wardline blob: {env}"
     );
+}
+
+#[tokio::test]
+async fn coupling_hotspots_blocked_entity_keeps_navigable_identity() {
+    // clarion-719e7320f5 (A3): a briefing-blocked entity ranked into the
+    // coupling hotspots keeps its navigable identity (id/name/path/lines/hash)
+    // alongside the `briefing_blocked` flag — `project_finding_list` already
+    // prints those same paths, so the identity is not the secret.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:caller",
+        "function",
+        "a.py",
+        Some((1, 2)),
+    );
+    insert_blocked_entity(
+        &conn,
+        "python:function:hub",
+        "function",
+        "hub.py",
+        Some((3, 9)),
+        "secret_present",
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:caller",
+        "python:function:hub",
+        "resolved",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_coupling_hotspots", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let blocked = env["result"]["hotspots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| &h["entity"])
+        .find(|e| e["briefing_blocked"] == "secret_present")
+        .expect("blocked hotspot present with identity");
+    assert_blocked_identity_present(blocked, "secret_present");
+    assert_eq!(blocked["id"], "python:function:hub", "{env}");
+    assert_eq!(blocked["source_file_path"], "hub.py", "{env}");
+    assert_eq!(blocked["source_line_start"], 3, "{env}");
+    assert_eq!(blocked["source_line_end"], 9, "{env}");
+}
+
+#[tokio::test]
+async fn briefing_blocked_high_entropy_name_field_is_re_withheld() {
+    // The A3 guard: in the rare case where the name/id is ITSELF a high-entropy
+    // token (a generated symbol embedding a secret), that one field is
+    // re-withheld while the rest of the identity still rides along.
+    let (project, db, conn) = open_project();
+    // A long base64/hex-like high-entropy qualname (>= the entropy threshold).
+    let secret_name = "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z";
+    let id = format!("python:function:{secret_name}");
+    insert_blocked_entity(
+        &conn,
+        &id,
+        "function",
+        "g.py",
+        Some((1, 2)),
+        "secret_present",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_kind", json!({"kind": "function"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let blocked = env["result"]["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["briefing_blocked"] == "secret_present")
+        .expect("blocked entity present");
+    // The high-entropy id/name/short_name are re-withheld…
     assert!(
-        !env.to_string().contains("python:function:tainted"),
-        "blocked id leaked in find_by_wardline response: {env}"
+        blocked["id"].is_null(),
+        "high-entropy id must be re-withheld: {env}"
+    );
+    assert!(blocked["name"].is_null(), "{env}");
+    assert!(blocked["short_name"].is_null(), "{env}");
+    // …but the non-secret structural identity still rides along.
+    assert_eq!(blocked["kind"], "function", "{env}");
+    assert_eq!(blocked["source_file_path"], "g.py", "{env}");
+    assert_eq!(blocked["source_line_start"], 1, "{env}");
+    // The secret-bearing qualname must not leak anywhere.
+    assert!(
+        !env.to_string().contains(secret_name),
+        "high-entropy secret name leaked: {env}"
     );
 }
 
@@ -2508,6 +2611,128 @@ async fn entity_resolve_resolves_qualname_to_id_and_sei() {
     assert_eq!(candidates[0]["id"], "python:function:demo.entry");
     assert_eq!(candidates[0]["sei"], "loomweave:eid:demo-entry");
     assert_eq!(candidates[0]["kind"], "function");
+}
+
+// ---- A2 inline tags + arg aliases (clarion-057ff2b330) -----------------
+
+#[tokio::test]
+async fn entity_resolve_candidate_carries_inline_tags_sorted() {
+    // A2: the shared entity-row projection inlines the entity's own tags so an
+    // agent sees them without a reverse-index `entity_tag_list` round-trip. Tags
+    // arrive deduplicated and sorted for determinism.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    insert_tag(&conn, "python:function:demo.entry", "test");
+    insert_tag(&conn, "python:function:demo.entry", "entry-point");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let candidates = env["result"]["results"][0]["candidates"]
+        .as_array()
+        .expect("candidates");
+    assert_eq!(
+        candidates[0]["tags"],
+        json!(["entry-point", "test"]),
+        "tags must be inline, deduplicated, and sorted: {env}"
+    );
+}
+
+#[tokio::test]
+async fn entity_row_tags_default_to_empty_array_when_untagged() {
+    // An untagged entity carries `tags: []`, not a missing field, so a client
+    // can read the key unconditionally.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"qualnames": ["demo.entry"]}),
+    )
+    .await;
+
+    assert_eq!(env["ok"], true, "{env}");
+    let candidates = env["result"]["results"][0]["candidates"]
+        .as_array()
+        .expect("candidates");
+    assert_eq!(candidates[0]["tags"], json!([]), "{env}");
+}
+
+#[tokio::test]
+async fn entity_resolve_accepts_identifiers_alias() {
+    // A2: `identifiers` is a pure synonym for `qualnames`.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let via_alias = call_tool(
+        &state,
+        "entity_resolve",
+        json!({"identifiers": ["demo.entry"]}),
+    )
+    .await;
+    assert_eq!(via_alias["ok"], true, "{via_alias}");
+    assert_eq!(
+        via_alias["result"]["results"][0]["candidates"][0]["id"],
+        "python:function:demo.entry"
+    );
+}
+
+#[tokio::test]
+async fn entity_resolve_qualnames_wins_when_both_present() {
+    // `qualnames` takes precedence over `identifiers` for backward compatibility.
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:demo.entry",
+        "function",
+        "demo.py",
+        Some((1, 2)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(
+        &state,
+        "entity_resolve",
+        json!({
+            "qualnames": ["demo.entry"],
+            "identifiers": ["no.such.thing"],
+        }),
+    )
+    .await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["results"][0]["qualname"], "demo.entry");
+    assert_eq!(env["result"]["results"][0]["result_kind"], "resolved");
 }
 
 #[tokio::test]
@@ -2671,11 +2896,9 @@ async fn entity_resolve_collapses_briefing_blocked_candidate_to_stub() {
     let results = env["result"]["results"].as_array().expect("results array");
     assert_eq!(results[0]["result_kind"], "resolved");
     let candidate = &results[0]["candidates"][0];
-    assert_redacted_identity(candidate, "secret_in_source");
-    assert!(
-        !env.to_string().contains("python:function:secret.handler"),
-        "blocked locator leaked via entity_resolve: {env}"
-    );
+    assert_blocked_identity_present(candidate, "secret_in_source");
+    // The navigable locator IS exposed now (A3); the cross-tool SEI stays null.
+    assert_eq!(candidate["id"], "python:function:secret.handler", "{env}");
     assert!(
         !env.to_string().contains("loomweave:eid:secret"),
         "blocked SEI leaked via entity_resolve: {env}"
@@ -2807,11 +3030,11 @@ async fn entity_resolve_collapses_briefing_blocked_rust_candidate_to_stub() {
     let results = env["result"]["results"].as_array().expect("results array");
     assert_eq!(results[0]["result_kind"], "resolved");
     let candidate = &results[0]["candidates"][0];
-    assert_redacted_identity(candidate, "secret_in_source");
-    assert!(
-        !env.to_string()
-            .contains("rust:function:secret.rust_handler"),
-        "blocked rust locator leaked via entity_resolve: {env}"
+    assert_blocked_identity_present(candidate, "secret_in_source");
+    // The navigable locator IS exposed now (A3); the cross-tool SEI stays null.
+    assert_eq!(
+        candidate["id"], "rust:function:secret.rust_handler",
+        "{env}"
     );
     assert!(
         !env.to_string().contains("loomweave:eid:rust-secret"),
@@ -3162,10 +3385,14 @@ async fn entity_resolve_blocked_sei_entry_collapses_to_stub() {
     assert_eq!(env["ok"], true, "{env}");
     let results = env["result"]["results"].as_array().expect("results array");
     assert_eq!(results[0]["result_kind"], "resolved");
-    assert_redacted_identity(&results[0]["candidates"][0], "secret_in_source");
+    let candidate = &results[0]["candidates"][0];
+    assert_blocked_identity_present(candidate, "secret_in_source");
+    // The navigable locator IS exposed now (A3); the resolving SEI was the
+    // caller's own input, so it may echo, but the candidate row's SEI is null.
+    assert_eq!(candidate["id"], "python:function:secret.handler", "{env}");
     assert!(
-        !env.to_string().contains("python:function:secret.handler"),
-        "blocked locator leaked via SEI entry: {env}"
+        candidate["sei"].is_null(),
+        "candidate SEI must be null: {env}"
     );
 }
 
@@ -3259,12 +3486,9 @@ async fn entity_resolve_ambiguous_with_blocked_candidate_redacts_only_that_candi
     assert_eq!(candidates.len(), 2, "both candidates kept: {env}");
     // Sorted python < rust: the python candidate comes first, identity intact…
     assert_eq!(candidates[0]["id"], "python:function:dual.secret");
-    // …and the rust one is the redacted stub.
-    assert_redacted_identity(&candidates[1], "secret_in_source");
-    assert!(
-        !env.to_string().contains("rust:function:dual.secret"),
-        "blocked rust locator leaked via ambiguous entity_resolve: {env}"
-    );
+    // …and the rust one keeps its navigable identity but stays content-redacted.
+    assert_blocked_identity_present(&candidates[1], "secret_in_source");
+    assert_eq!(candidates[1]["id"], "rust:function:dual.secret", "{env}");
     assert!(
         !env.to_string().contains("loomweave:eid:dual-secret"),
         "blocked SEI leaked via ambiguous entity_resolve: {env}"
@@ -3604,4 +3828,289 @@ async fn find_dead_code_hoists_constant_facets_to_top_level() {
             );
         }
     }
+}
+
+// ---- A5: app-scoped reachability roots + app_only filter (clarion-663aca16aa)
+
+/// The default mode is `explicit`: existing consumers see the same output, and
+/// the summary now declares `roots_mode: "explicit"` with no `roots_confidence`
+/// (roots are taken verbatim from emitted tags, not derived).
+#[tokio::test]
+async fn find_dead_code_explicit_roots_mode_is_default_and_reported() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    // Default == explicit; behaviour unchanged.
+    assert_eq!(env["result"]["summary"]["roots_mode"], "explicit", "{env}");
+    assert!(
+        env["result"]["summary"]["roots_confidence"].is_null(),
+        "explicit mode must not claim derived roots: {env}"
+    );
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(dead, vec!["python:function:orphan".to_owned()], "{env}");
+}
+
+/// Explicit mode preserves the honest-empty signal when no root tags exist —
+/// the regression surface the ticket flags. Passing `roots: "explicit"`
+/// explicitly is identical to the default.
+#[tokio::test]
+async fn find_dead_code_explicit_roots_preserves_honest_empty() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({"roots": "explicit"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+    assert!(
+        env["result"]["dead_code"].as_array().unwrap().is_empty(),
+        "{env}"
+    );
+}
+
+/// Auto mode derives roots from the same emitted tags Loomweave already has and
+/// declares the lower confidence (`roots_mode: "auto"`,
+/// `roots_confidence: "derived"`). It also relaxes the per-plugin missing-root
+/// exclusion: a plugin with no root tags of its own is still surveyed against
+/// the auto-derived global root set rather than excluded.
+#[tokio::test]
+async fn find_dead_code_auto_roots_seeds_from_tags_and_surveys_rootless_plugins() {
+    let (project, db, conn) = open_project();
+    // Python emits a root tag.
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    // A rootless plugin's dead leaf: excluded in explicit mode, surveyed in auto.
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:specimen_rs.dead",
+        "rust",
+        "function",
+        "specimen-rs/src/lib.rs",
+        "{}",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({"roots": "auto"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["summary"]["roots_mode"], "auto", "{env}");
+    assert_eq!(
+        env["result"]["summary"]["roots_confidence"], "derived",
+        "auto mode must declare derived-confidence roots: {env}"
+    );
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    // Both the python orphan and the rootless-plugin dead leaf are surveyed.
+    assert!(
+        dead.contains(&"python:function:orphan".to_owned()),
+        "auto mode surveys the python orphan: {env}"
+    );
+    assert!(
+        dead.contains(&"rust:function:specimen_rs.dead".to_owned()),
+        "auto mode surveys a rootless plugin against the derived roots: {env}"
+    );
+    // No plugins are excluded for missing root coverage in auto mode.
+    assert!(
+        env["result"]["excluded"]["plugins_without_roots"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "auto mode relaxes the per-plugin missing-root exclusion: {env}"
+    );
+}
+
+/// Auto mode with NO root tags anywhere still cannot fabricate roots: it stays
+/// honest-empty rather than flagging the whole corpus dead.
+#[tokio::test]
+async fn find_dead_code_auto_roots_honest_empty_when_no_tags() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({"roots": "auto"})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+}
+
+/// `app_only: true` excludes test-tagged entities (and core-plugin entities)
+/// from the dead-code candidate set. A purely additive, opt-in read filter.
+#[tokio::test]
+async fn find_dead_code_app_only_excludes_tests() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    // A genuinely dead app function.
+    insert_entity(
+        &conn,
+        "python:function:orphan",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    // A dead, test-tagged helper (e.g. tour.*-style or a test fixture).
+    insert_entity(
+        &conn,
+        "python:function:dead_test_helper",
+        "function",
+        "tests/helpers.py",
+        Some((10, 13)),
+    );
+    insert_tag(&conn, "python:function:dead_test_helper", "test");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Default: both dead functions appear.
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(dead.contains(&"python:function:orphan".to_owned()), "{env}");
+
+    // app_only: the test-tagged dead helper is filtered out.
+    let env = call_tool(&state, "find_dead_code", json!({"app_only": true})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:orphan".to_owned()],
+        "app_only must exclude the test-tagged dead helper: {env}"
+    );
+    assert_eq!(env["result"]["app_only"], true, "{env}");
+}
+
+/// `app_only: true` on coupling excludes test-tagged callers from the ranking so
+/// a hub's coupling drops to reflect only first-party app fan-in/out.
+#[tokio::test]
+async fn find_coupling_hotspots_app_only_excludes_test_tagged() {
+    let (project, db, conn) = open_project();
+    for id in ["hub", "app_caller", "test_caller"] {
+        insert_entity(
+            &conn,
+            &format!("python:function:{id}"),
+            "function",
+            "m.py",
+            Some((1, 2)),
+        );
+    }
+    insert_tag(&conn, "python:function:test_caller", "test");
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:app_caller",
+        "python:function:hub",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "calls",
+        "python:function:test_caller",
+        "python:function:hub",
+        "resolved",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    // Default: hub fan_in counts both callers.
+    let env = call_tool(&state, "find_coupling_hotspots", json!({})).await;
+    let hub = env["result"]["hotspots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["entity"]["id"] == "python:function:hub")
+        .unwrap();
+    assert_eq!(hub["fan_in"], 2, "{env}");
+
+    // app_only: the test-tagged caller and the test entity itself are excluded.
+    let env = call_tool(&state, "find_coupling_hotspots", json!({"app_only": true})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(env["result"]["app_only"], true, "{env}");
+    let hub = env["result"]["hotspots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["entity"]["id"] == "python:function:hub")
+        .unwrap();
+    assert_eq!(
+        hub["fan_in"], 1,
+        "app_only must drop the test-tagged caller from fan-in: {env}"
+    );
+    // The test entity must not appear as a hotspot row.
+    assert!(
+        !env["result"]["hotspots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["entity"]["id"] == "python:function:test_caller"),
+        "app_only must exclude the test entity from the ranking: {env}"
+    );
 }

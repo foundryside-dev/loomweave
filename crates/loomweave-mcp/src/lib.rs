@@ -40,7 +40,7 @@ use loomweave_storage::{
     WriterCmd, call_edges_from, call_edges_targeting, containing_module_id,
     entity_briefing_block_reason, entity_by_id, import_edges_for_entity,
     inferred_edge_cache_key_id, module_reference_rollup, reference_edges_for_entity,
-    relation_edges_for_entity, resolve_entity_ref, sei_for_locator,
+    relation_edges_for_entity, resolve_entity_ref, sei_for_locator, tags_for_entity,
     unresolved_call_sites_for_caller, unresolved_caller_count_for_target,
     unresolved_callers_for_target,
 };
@@ -358,7 +358,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_callers_list",
-            description: "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. Reports scope_excludes and unresolved_name_matches so empty results stay honest.",
+            description: "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. scope_excludes is non-empty ONLY when a candidate was skipped; an empty scope_excludes with traversal_complete:true means every candidate was searched. Skipped sites surface as unresolved_candidates.",
             input_schema: id_confidence_cursor_schema(),
         },
         ToolDefinition {
@@ -395,7 +395,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_neighborhood_get",
-            description: "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit; reports scope_excludes and unresolved_name_matches.",
+            description: "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit. scope_excludes is non-empty only when a caller candidate was skipped; empty + traversal_complete:true confirms the callers bucket searched all candidates. Skipped sites surface as unresolved_candidates.",
             input_schema: id_confidence_schema(),
         },
         ToolDefinition {
@@ -481,13 +481,18 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_orientation_pack_get",
-            description: "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest.",
+            description: "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Optional `include` (wardline/findings/issues) folds a `dossier`. Bounded; `omitted` + degraded sections keep empties honest.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "entity": {"type": "string", "minLength": 1},
                     "file": {"type": "string", "minLength": 1},
-                    "line": {"type": "integer", "minimum": 1}
+                    "line": {"type": "integer", "minimum": 1},
+                    "include": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["wardline", "findings", "issues"]},
+                        "uniqueItems": true
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -643,12 +648,13 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_coupling_hotspot_list",
-            description: "Entities ranked by coupling (distinct fan-in + fan-out), most-coupled first. `confidence` is a ceiling (default resolved). Optional `scope`. Bounded (limit default 20).",
+            description: "Entities ranked by coupling (distinct fan-in + fan-out), most-coupled first. `confidence` is a ceiling (default resolved). `app_only:true` drops test-tagged/non-first-party. Optional `scope`. Bounded (limit default 20).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "scope": {"type": "string", "minLength": 1},
                     "confidence": confidence_schema(),
+                    "app_only": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200},
                     "offset": {"type": "integer", "minimum": 0}
                 },
@@ -711,8 +717,18 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_dead_list",
-            description: "Entities unreachable from roots, optional scope. Conservative heuristic; root classification depends on plugin-emitted tags/exports.",
-            input_schema: scope_page_schema(false),
+            description: "Entities unreachable from roots, optional scope. Conservative heuristic; roots depend on plugin-emitted tags. `roots:\"auto\"` derives roots from tags (derived confidence); `app_only:true` drops test-tagged/non-first-party.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "minLength": 1},
+                    "roots": {"type": "string", "enum": ["explicit", "auto"]},
+                    "app_only": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "additionalProperties": false
+            }),
         },
         ToolDefinition {
             name: "entity_semantic_search_list",
@@ -762,10 +778,16 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                         "minItems": 1,
                         "maxItems": 2000
                     },
+                    "identifiers": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": 2000
+                    },
                     "kind": {"type": "string", "minLength": 1},
                     "plugin": {"type": "string", "minLength": 1}
                 },
-                "required": ["qualnames"],
+                "anyOf": [{"required": ["qualnames"]}, {"required": ["identifiers"]}],
                 "additionalProperties": false
             }),
         },
@@ -776,7 +798,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "minLength": 1},
-                    "direction": {"type": "string", "enum": ["in", "out"]},
+                    "direction": {"type": "string", "enum": ["in", "out", "both"]},
                     "kind": {
                         "type": "string",
                         "enum": ["inherits_from", "decorates", "implements", "derives"]
@@ -785,7 +807,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "cursor": {"type": ["string", "null"]}
                 },
-                "required": ["id", "direction"],
+                "required": ["id"],
                 "additionalProperties": false
             }),
         },
@@ -3526,11 +3548,43 @@ pub(crate) fn navigation_scope_excludes(
     excludes
 }
 
+/// Per-query scope excludes for `entity_callers_list` / `entity_neighborhood_get`
+/// (clarion-76c31b730a). Unlike [`navigation_scope_excludes`] (which flags the
+/// whole attribute-receiver category on every resolved/ambiguous read), this is
+/// populated ONLY when THIS traversal actually skipped a candidate — i.e. a
+/// live unresolved call site whose textual callee name-matches the target
+/// (`unresolved_name_matches > 0`). When nothing was skipped it returns empty,
+/// and the caller pairs that with `traversal_complete: true` so an empty
+/// `callers` list reads as a true negative rather than an untrustable blind
+/// spot. `inferred` stays empty: its dispatch pass attempts the unresolved
+/// category, so it skips nothing.
+fn caller_navigation_scope_excludes(
+    confidence: EdgeConfidence,
+    skipped_a_candidate: bool,
+) -> Vec<&'static str> {
+    if !skipped_a_candidate || confidence == EdgeConfidence::Inferred {
+        return Vec::new();
+    }
+    // A skipped candidate is, by construction, an attribute-receiver or dynamic
+    // call site the static resolver could not bind — name both blind-spot
+    // categories that the traversal therefore did not search.
+    vec!["attribute-receiver-calls", "unresolved-static-calls"]
+}
+
 /// The `unresolved_name_matches` count + `next_action` recovery pointer for a
 /// caller-navigation result: how many live unresolved call sites name-match
 /// `target`, and where to see them. The pointer names `entity_call_site_list`
 /// because it works in the default read-only posture, where `confidence=
 /// inferred` is rejected by the MCP tool policy (clarion-df87b4f381).
+///
+/// NOTE (clarion-2b87cd7a59 A1): unlike `unresolved_candidates`, the count and
+/// pointer are *not* gated behind `confidence != Inferred`. This is intentional,
+/// not the contradiction A1 closed. `unresolved_candidates` is a completeness
+/// claim — listing it alongside `traversal_complete: true` would assert "these
+/// were skipped" about a traversal that skipped nothing, so it is gated. The
+/// count/pointer are purely *informational*: "N name-matching sites exist; here
+/// is how to inspect them" stays true whether or not the inferred dispatch bound
+/// them, and gives the caller a navigation handle without claiming incompleteness.
 pub(crate) fn unresolved_match_fields(
     conn: &rusqlite::Connection,
     target: &EntityRow,
@@ -3546,6 +3600,48 @@ pub(crate) fn unresolved_match_fields(
         Value::Null
     };
     Ok((count, next_action))
+}
+
+/// Per-query honesty for the caller-navigation surface (clarion-76c31b730a):
+/// the actual call sites that textually name-match `target` but the static
+/// resolver could not bind into `callers` — the in-tool grep-fallback. Each
+/// candidate carries `{path, line, callee_text, why}` where `why` splits an
+/// attribute/method receiver (`obj.target(...)`, i.e. the dotted `callee_text`)
+/// from a bare dynamic dispatch (`target(...)` resolved through a variable).
+///
+/// This is the evidence behind a non-empty `scope_excludes` / `traversal_complete:
+/// false`: when this returns rows, the traversal skipped real candidates, so an
+/// empty `callers` list is NOT a true negative. Returns `[]` when nothing was
+/// skipped — paired with `traversal_complete: true`, that confirms every
+/// candidate was searched. Mirrors `build_call_sites`'s disclosure guards: a
+/// briefing-blocked owner's `line_text` is redacted, never the file content read.
+pub(crate) fn build_unresolved_candidates(
+    conn: &rusqlite::Connection,
+    target: &EntityRow,
+) -> Result<Vec<Value>, StorageError> {
+    let sites = unresolved_callers_for_target(conn, target, CALL_SITES_MAX)?;
+    let mut owner_meta: HashMap<String, OwnerMeta> = HashMap::new();
+    let mut file_content: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    let mut candidates = Vec::with_capacity(sites.len());
+    for site in sites {
+        let owner = resolve_owner(conn, &mut owner_meta, &site.caller_entity_id)?;
+        let anchor = anchor_line(&mut file_content, owner, Some(site.source_byte_start));
+        // A dotted callee text is an attribute/method receiver the static
+        // resolver cannot bind (e.g. `ctx.svc.target()`); anything else is a
+        // bare name resolved dynamically (through a variable / dispatch table).
+        let why = if site.callee_expr.contains('.') {
+            "attribute-receiver"
+        } else {
+            "dynamic"
+        };
+        candidates.push(json!({
+            "path": owner.path,
+            "line": anchor.line,
+            "callee_text": site.callee_expr,
+            "why": why,
+        }));
+    }
+    Ok(candidates)
 }
 
 fn envelope_from_storage_result(result: Result<Value, StorageError>) -> Value {
@@ -4187,7 +4283,7 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
     // caller-named entity's identity + remediation — builds identity via
     // `entity_identity_json` instead, bypassing this gate.
     if let Some(reason) = briefing_block_reason(entity) {
-        return blocked_entity_stub(&reason);
+        return blocked_entity_stub(entity, &reason);
     }
     let mut value = entity_identity_json(entity);
     if let Some(object) = value.as_object_mut() {
@@ -4195,28 +4291,108 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
             "sei".to_owned(),
             json!(sei_for_locator(conn, &entity.id).ok().flatten()),
         );
+        // Inline the entity's own categorisation tags (clarion-057ff2b330) so a
+        // tool response shows them without a reverse-index `entity_tag_list`
+        // round-trip. Tags already live in `entity_tags`; this is read-only.
+        // Graceful-degrade to `[]` on any lookup error — a tag read must never
+        // fail the structural tool call (same posture as the SEI join above).
+        object.insert(
+            "tags".to_owned(),
+            json!(tags_for_entity(conn, &entity.id).unwrap_or_default()),
+        );
     }
     value
 }
 
-/// The identity projection of a briefing-blocked entity (ADR-013 secret scan).
+/// Shannon entropy (bits/byte) of a string, used by the briefing-block guard to
+/// detect the rare case where an entity *name* is itself a high-entropy token
+/// (e.g. a generated symbol embedding a secret). Mirrors the pre-ingest
+/// scanner's measure (`loomweave-scanner::entropy`) but kept local: the scan ran
+/// at ingest, this is only a read-path safety net for an identity field.
+fn name_entropy(text: &str) -> f64 {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let len = f64::from(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = f64::from(c) / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// Entropy threshold above which a path *segment* is itself treated as secret
+/// and its containing field re-withheld. Real base64 secret blobs measure
+/// ~4.6–4.8 bits/byte (an AWS-key-shaped blob ≈ 4.63); ordinary identifier
+/// segments — even verbose `snake_case` like `function_with_a_long_name` — sit
+/// below ~4.2, so this separates the two populations with margin. The length
+/// floor avoids flagging short-but-varied names.
+const NAME_ENTROPY_REDACT_THRESHOLD: f64 = 4.5;
+const NAME_ENTROPY_MIN_LEN: usize = 20;
+
+/// Whether a single identity *value* (`name`, `short_name`, or the locator `id`)
+/// is itself high-entropy enough to be a secret, so the A3 identity-preserving
+/// projection must keep redacting that one field (clarion-719e7320f5 guard).
 ///
-/// Every identity field is withheld — only the block reason remains — so a
-/// discovery/structure MCP read acknowledges the entity exists without
-/// disclosing its name, path, or line span. Mirrors the federation read API,
-/// whose `BRIEFING_BLOCKED` response omits the same fields (ADR-034). The
-/// qualname-bearing `id` is nulled too: the locator itself encodes the name.
-fn blocked_entity_stub(reason: &str) -> Value {
+/// The value is judged PER PATH SEGMENT, splitting on `:`/`.` (so `::` yields
+/// empty segments the length floor discards). A `plugin:kind:qualname` locator
+/// and a dotted/`::` qualname are separator-delimited, so a secret embedded as
+/// ONE segment (`python:function:pkg.<blob>`) trips the guard even though the
+/// surrounding segments are ordinary words — while a long *descriptive*
+/// identifier stays navigable because none of its word-segments is high-entropy.
+/// Checking per-segment (not the whole string) is what closes the qualified-name
+/// hole: the blob's entropy is not diluted by the `pkg.`/`module::` prefix.
+fn name_value_is_secretlike(text: &str) -> bool {
+    text.split([':', '.']).any(|segment| {
+        segment.len() >= NAME_ENTROPY_MIN_LEN
+            && name_entropy(segment) >= NAME_ENTROPY_REDACT_THRESHOLD
+    })
+}
+
+/// Project one identity *value* for a briefing-blocked row: the value verbatim,
+/// unless it is itself high-entropy (a generated symbol embedding a secret), in
+/// which case that single field is re-withheld to JSON `null` (A3 guard).
+fn redact_secretlike(value: &str) -> Value {
+    if name_value_is_secretlike(value) {
+        Value::Null
+    } else {
+        json!(value)
+    }
+}
+
+/// The projection of a briefing-blocked entity (ADR-013 secret scan).
+///
+/// Per clarion-719e7320f5 (A3) the briefing-block flag rides ALONGSIDE a real,
+/// navigable identity — `id`/`kind`/`name`/`short_name`/`source_file_path`/line
+/// span/`content_hash` are all KEPT. The secret is the file *content*, not the
+/// entity's structural identity (`project_finding_list` already prints those same
+/// paths), so only the secret-bearing content (summary/source/docstring) is
+/// withheld — and those are never part of this projection to begin with. The
+/// cross-tool `sei` binding key stays null (ADR-034): a blocked row is navigable
+/// by locator but not bound across siblings.
+///
+/// Guard: in the rare case where a `name`/`short_name`/`id` is *itself*
+/// high-entropy (a generated symbol embedding a secret), that single field is
+/// re-withheld — the rest of the identity still rides along.
+fn blocked_entity_stub(entity: &EntityRow, reason: &str) -> Value {
     json!({
-        "id": Value::Null,
+        "id": redact_secretlike(&entity.id),
         "sei": Value::Null,
-        "kind": Value::Null,
-        "name": Value::Null,
-        "short_name": Value::Null,
-        "source_file_path": Value::Null,
-        "source_line_start": Value::Null,
-        "source_line_end": Value::Null,
-        "content_hash": Value::Null,
+        "kind": entity.kind,
+        "name": redact_secretlike(&entity.name),
+        "short_name": redact_secretlike(&entity.short_name),
+        "source_file_path": entity.source_file_path,
+        "source_line_start": entity.source_line_start,
+        "source_line_end": entity.source_line_end,
+        "content_hash": entity.content_hash,
         "briefing_blocked": reason,
     })
 }
@@ -4329,17 +4505,20 @@ fn span_len(entity: &EntityRow) -> Option<i64> {
 /// without the full `entity_json` payload.
 fn stack_entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
     // A blocked entity in the containing stack (the matched node, or a blocked
-    // ancestor module) is redacted to a stub — same identity-withholding as
-    // `entity_json` (clarion-307668e2be).
+    // ancestor module) keeps its navigable identity but rides the briefing-block
+    // flag (clarion-719e7320f5, A3): the secret is the file content, not the
+    // structural identity. The `sei` cross-tool binding key stays null. The
+    // high-entropy-name guard re-withholds id/name/short_name only when the
+    // value is itself secret-like.
     if let Some(reason) = briefing_block_reason(entity) {
         return json!({
-            "id": Value::Null,
+            "id": redact_secretlike(&entity.id),
             "sei": Value::Null,
-            "kind": Value::Null,
-            "short_name": Value::Null,
-            "name": Value::Null,
-            "source_line_start": Value::Null,
-            "source_line_end": Value::Null,
+            "kind": entity.kind,
+            "short_name": redact_secretlike(&entity.short_name),
+            "name": redact_secretlike(&entity.name),
+            "source_line_start": entity.source_line_start,
+            "source_line_end": entity.source_line_end,
             "briefing_blocked": reason,
         });
     }
@@ -4396,20 +4575,22 @@ fn entity_context_json(
         .collect();
     containing_stack.push(stack_entity_json(conn, matched));
 
-    // A blocked matched entity withholds its line span too — the ranges block
-    // would otherwise disclose exactly what the block hides (clarion-307668e2be).
+    // A blocked matched entity keeps its line span (clarion-719e7320f5, A3): the
+    // line numbers are structural identity, not the secret content the block
+    // hides — and `project_finding_list` already prints the same file+line. The
+    // `briefing_blocked` flag rides alongside.
+    let def = DefinitionSpan::from_entity(matched);
     let ranges = if let Some(reason) = briefing_block_reason(matched) {
         json!({
-            "source_line_start": Value::Null,
-            "source_line_end": Value::Null,
-            "decl_line": Value::Null,
-            "body_line_start": Value::Null,
-            "decorator_line_start": Value::Null,
-            "decorator_line_end": Value::Null,
+            "source_line_start": matched.source_line_start,
+            "source_line_end": matched.source_line_end,
+            "decl_line": def.decl_line,
+            "body_line_start": def.body_line_start,
+            "decorator_line_start": def.decorator_line_start,
+            "decorator_line_end": def.decorator_line_end,
             "briefing_blocked": reason,
         })
     } else {
-        let def = DefinitionSpan::from_entity(matched);
         json!({
             "source_line_start": matched.source_line_start,
             "source_line_end": matched.source_line_end,
@@ -5580,19 +5761,16 @@ fn callee_json(
     edge: &CallEdgeMatch,
 ) -> Result<Option<Value>, StorageError> {
     Ok(entity_by_id(conn, &edge.to_id)?.map(|entity| {
-        // `stored_to_id` echoes the callee's raw id, which leaks the qualname of
-        // a blocked callee even when `entity_json` redacts it (clarion-307668e2be).
-        let stored_to_id = if briefing_block_reason(&entity).is_some() {
-            Value::Null
-        } else {
-            json!(edge.stored_to_id)
-        };
+        // `stored_to_id` echoes the callee's raw id. A blocked callee now keeps
+        // its navigable identity in `entity_json` (clarion-719e7320f5, A3), so
+        // this id is no longer secret — it rides through unredacted, matching the
+        // exposed `entity.id`.
         json!({
             "entity": entity_json(conn, &entity),
             "edge_confidence": edge.confidence.as_str(),
             "source_byte_start": edge.source_byte_start,
             "source_byte_end": edge.source_byte_end,
-            "stored_to_id": stored_to_id
+            "stored_to_id": edge.stored_to_id
         })
     }))
 }
@@ -5626,26 +5804,30 @@ fn compact_execution_paths(
             node_ids.insert(id.clone());
         }
     }
-    // A briefing-blocked node is omitted from the node table (its id IS its
-    // qualname, so it cannot be projected) and its occurrences in the path
-    // arrays are replaced with a sentinel. The path keeps its shape — a flow
-    // *through* withheld territory — without disclosing which entity
-    // (clarion-307668e2be).
-    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    // A briefing-blocked node keeps its navigable identity in the node table
+    // (clarion-719e7320f5, A3) — flagged `briefing_blocked` — and its id rides
+    // through the path arrays unchanged: the secret is the file content, not the
+    // structural flow. The sentinel is retained only for the rare high-entropy
+    // node whose id is itself secret-like (the guard withholds that one id).
+    let mut secret_id: BTreeSet<String> = BTreeSet::new();
     let mut nodes = Vec::new();
     for id in &node_ids {
         if let Some(entity) = entity_by_id(conn, id)? {
-            if briefing_block_reason(&entity).is_some() {
-                blocked.insert(id.clone());
+            if let Some(reason) = briefing_block_reason(&entity) {
+                if name_value_is_secretlike(&entity.id) {
+                    secret_id.insert(id.clone());
+                } else {
+                    nodes.push(compact_blocked_node_json(&entity, &reason));
+                }
             } else {
                 nodes.push(compact_node_json(conn, &entity));
             }
         }
     }
-    if !blocked.is_empty() {
+    if !secret_id.is_empty() {
         for path in &mut paths {
             for id in path.iter_mut() {
-                if blocked.contains(id) {
+                if secret_id.contains(id) {
                     BRIEFING_BLOCKED_PATH_SENTINEL.clone_into(id);
                 }
             }
@@ -5687,6 +5869,24 @@ fn compact_node_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
         "source_file_path": entity.source_file_path,
         "source_line_start": entity.source_line_start,
         "source_line_end": entity.source_line_end
+    })
+}
+
+/// A path node for a briefing-blocked entity (clarion-719e7320f5, A3): the same
+/// navigable shape as [`compact_node_json`] plus the `briefing_blocked` flag.
+/// The `sei` cross-tool binding key stays null (no read-time join — and a blocked
+/// row is navigable by locator, not bound across siblings). The `short_name`
+/// guard re-withholds only the one field if it is itself high-entropy.
+fn compact_blocked_node_json(entity: &EntityRow, reason: &str) -> Value {
+    json!({
+        "id": redact_secretlike(&entity.id),
+        "sei": Value::Null,
+        "kind": entity.kind,
+        "short_name": redact_secretlike(&entity.short_name),
+        "source_file_path": entity.source_file_path,
+        "source_line_start": entity.source_line_start,
+        "source_line_end": entity.source_line_end,
+        "briefing_blocked": reason,
     })
 }
 
@@ -5901,12 +6101,16 @@ mod tests {
     /// per-session context tax (clarion-e65354898d). Budget: each description
     /// ≤ 350 chars (what it answers, key args, one honesty caveat — depth
     /// belongs in the loomweave-workflow skill, fetched once on demand), and
-    /// the serialized catalogue ≤ 23 KB (~5.5k tokens at the observed ~4.2
+    /// the serialized catalogue ≤ 23.5 KB (~5.6k tokens at the observed ~4.2
     /// bytes/token; the pre-budget baseline was 46 KB / ~11k tokens). The
     /// budget was raised 22 → 23 KB for weft-ac59e8e730: the two config-set
     /// tools' inputSchemas were bare `{}` per property, and declaring real
     /// types/enums for the surface that can enable writes and live LLM spend
-    /// is worth ~0.7 KB.
+    /// is worth ~0.7 KB. Raised 23 → 23.5 KB for clarion-663aca16aa (A5): the
+    /// two heuristic-surface tools (`entity_dead_list`,
+    /// `entity_coupling_hotspot_list`) gained the opt-in, validation-bearing
+    /// `roots`/`app_only` params (typed schemas + the honesty caveats they
+    /// carry), worth ~0.25 KB.
     #[test]
     fn tools_list_fits_the_context_budget() {
         let tools = list_tools();
@@ -5921,8 +6125,8 @@ mod tests {
         }
         let serialized = serde_json::to_string(&tools).expect("serialize tools");
         assert!(
-            serialized.len() <= 23_000,
-            "serialized tools/list is {} bytes (budget 23000 ≈ 5.5k tokens)",
+            serialized.len() <= 23_500,
+            "serialized tools/list is {} bytes (budget 23500 ≈ 5.6k tokens)",
             serialized.len()
         );
     }
@@ -6022,7 +6226,7 @@ mod tests {
         assert_eq!(tools[2].name, "entity_callers_list");
         assert_eq!(
             tools[2].description,
-            "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. Reports scope_excludes and unresolved_name_matches so empty results stay honest."
+            "List callers. `confidence` resolved (default) | ambiguous | inferred. Bounded. scope_excludes is non-empty ONLY when a candidate was skipped; an empty scope_excludes with traversal_complete:true means every candidate was searched. Skipped sites surface as unresolved_candidates."
         );
         assert_eq!(tools[3].name, "entity_execution_path_list");
         assert_eq!(
@@ -6042,7 +6246,7 @@ mod tests {
         assert_eq!(tools[6].name, "entity_neighborhood_get");
         assert_eq!(
             tools[6].description,
-            "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit; reports scope_excludes and unresolved_name_matches."
+            "One-hop callers/callees/container/contained/references/imports/relations. Per-bucket limit. scope_excludes is non-empty only when a caller candidate was skipped; empty + traversal_complete:true confirms the callers bucket searched all candidates. Skipped sites surface as unresolved_candidates."
         );
         assert_eq!(tools[7].name, "subsystem_member_list");
         assert_eq!(
@@ -6097,7 +6301,7 @@ mod tests {
         assert_eq!(tools[17].name, "entity_orientation_pack_get");
         assert_eq!(
             tools[17].description,
-            "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Bounded; `omitted` + named degraded sections keep empties honest."
+            "One deterministic orientation packet for an `entity` id OR `file`+`line` (exactly one): primary entity, match evidence, one-hop neighbors, execution paths, Filigree issues, Wardline findings, health, suggested next reads. Optional `include` (wardline/findings/issues) folds a `dossier`. Bounded; `omitted` + degraded sections keep empties honest."
         );
         assert_eq!(tools[18].name, "analyze_start");
         assert_eq!(
@@ -7695,6 +7899,97 @@ mod tests {
             content_hash: content_hash.map(str::to_owned),
             summary_json: None,
         }
+    }
+
+    #[test]
+    fn blocked_entity_stub_preserves_navigable_identity() {
+        // clarion-719e7320f5 (A3): the briefing-block projection keeps the
+        // navigable identity (id/kind/name/short_name/path/lines/hash) and rides
+        // the `briefing_blocked` flag; only the cross-tool `sei` stays null.
+        let mut entity = entity_row("python:function:app.login", "app.login", Some("abc123"));
+        entity.short_name = "login".to_owned();
+        entity.source_file_path = Some("app.py".to_owned());
+        entity.source_line_start = Some(10);
+        entity.source_line_end = Some(20);
+
+        let projection = super::blocked_entity_stub(&entity, "secret_present");
+        assert_eq!(projection["id"], "python:function:app.login");
+        assert_eq!(projection["kind"], "function");
+        assert_eq!(projection["name"], "app.login");
+        assert_eq!(projection["short_name"], "login");
+        assert_eq!(projection["source_file_path"], "app.py");
+        assert_eq!(projection["source_line_start"], 10);
+        assert_eq!(projection["source_line_end"], 20);
+        assert_eq!(projection["content_hash"], "abc123");
+        assert_eq!(projection["briefing_blocked"], "secret_present");
+        assert!(
+            projection["sei"].is_null(),
+            "SEI must stay null: {projection}"
+        );
+        // The secret-bearing content is never part of this projection.
+        for content in ["summary", "source", "docstring"] {
+            assert!(
+                projection.get(content).is_none(),
+                "{content} leaked: {projection}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_entity_stub_re_withholds_high_entropy_name_only() {
+        // The guard: a high-entropy name/id is itself secret-like, so that one
+        // field is re-withheld while the rest of the identity still rides along.
+        let secret = "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z";
+        let id = format!("python:function:{secret}");
+        let mut entity = entity_row(&id, secret, Some("abc123"));
+        entity.short_name = secret.to_owned();
+        entity.source_file_path = Some("g.py".to_owned());
+
+        let projection = super::blocked_entity_stub(&entity, "secret_present");
+        assert!(
+            projection["id"].is_null(),
+            "high-entropy id must be withheld"
+        );
+        assert!(projection["name"].is_null());
+        assert!(projection["short_name"].is_null());
+        // Non-secret structural identity still rides along.
+        assert_eq!(projection["kind"], "function");
+        assert_eq!(projection["source_file_path"], "g.py");
+        assert_eq!(projection["content_hash"], "abc123");
+        assert_eq!(projection["briefing_blocked"], "secret_present");
+    }
+
+    #[test]
+    fn name_value_is_secretlike_flags_secrets_not_ordinary_identifiers() {
+        // Ordinary identifiers (even long dotted qualnames) stay below the
+        // threshold; a base64/hex secret blob trips the guard.
+        assert!(!super::name_value_is_secretlike("LibraryService"));
+        assert!(!super::name_value_is_secretlike("app.auth.login"));
+        assert!(!super::name_value_is_secretlike("python:function:demo.mid"));
+        // Short-but-varied names are not flagged (length floor).
+        assert!(!super::name_value_is_secretlike("aB3xZ9"));
+        // Long *descriptive* identifiers stay navigable: verbose snake_case,
+        // Rust `::` paths, and deep dotted qualnames all measure ~4.0–4.2 and
+        // must survive the guard (the A3 over-redaction regression).
+        assert!(!super::name_value_is_secretlike(
+            "get_user_by_id_and_organization_with_permissions_check_v2"
+        ));
+        assert!(!super::name_value_is_secretlike(
+            "rust:function:crate::module::submodule::function_with_a_long_name"
+        ));
+        assert!(!super::name_value_is_secretlike(
+            "python:class:my.very.long.module.path.deeply.nested.HandlerClass"
+        ));
+        // A real base64 secret blob still trips the guard...
+        assert!(super::name_value_is_secretlike(
+            "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z"
+        ));
+        // ...and so does a blob embedded as ONE segment of an otherwise valid
+        // qualified locator: per-segment entropy is not diluted by the prefix
+        // (the qualified-name hole, clarion review P1).
+        assert!(super::name_value_is_secretlike(
+            "python:function:pkg.aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z"
+        ));
     }
 
     #[test]

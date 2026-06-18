@@ -606,6 +606,21 @@ rename**. The participation contract is specified in full at
 [`docs/superpowers/specs/2026-06-02-loomweave-dossier-participation.md`](../superpowers/specs/2026-06-02-loomweave-dossier-participation.md).
 Every slice is an existing pinned endpoint — WS4 adds **no new endpoint**:
 
+> **Not to be confused with the MCP `dossier`.** `entity_orientation_pack_get`
+> accepts an optional `include: ["wardline","findings","issues"]` param (A4,
+> clarion-2b87cd7a59) that folds a composed `dossier:{wardline,findings,issues,
+> summary_available}` into the consult-mode pack. That is a **read-path, MCP-only
+> composition of Loomweave's own surfaces for a consult agent** — it is *not* the
+> cross-tool Wave 2 HTTP dossier the Wardline assembler builds, described below.
+> The two are independent: the MCP param normalizes finding fingerprints to the
+> bare form (stripping any `wlfp2:` prefix) within Loomweave's own output, and
+> omitting `include` leaves the pack byte-identical. The `findings` section
+> mirrors `entity_finding_list`'s result (a `findings` array plus `page`
+> pagination metadata), so a consult agent can tell when findings were truncated
+> past the first page; `summary_available` is true only when the full summary
+> cache key (content hash + prompt template + model tier + guidance) is present
+> and unexpired — i.e. when `entity_summary_get` would serve from cache.
+
 | Dossier slice | Loomweave endpoint | Pinned at |
 |---|---|---|
 | Identity + **content-axis** freshness | `POST /api/v1/identity/resolve` → `{ sei, content_hash, alive }` | [§SEI identity resolution](#post-apiv1identityresolve) |

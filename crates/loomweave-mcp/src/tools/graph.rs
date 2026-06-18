@@ -23,17 +23,48 @@ use crate::filigree::IssueDetail;
 
 use crate::{
     CallSiteKind, CallSiteRole, InferredDispatchStats, IssuesForAccumulator, ParamError, PathScope,
-    PathTraversal, ServerState, build_call_sites, call_graph_scope_excludes, callee_json,
-    caller_json, compact_execution_paths, entity_context_json, entity_json,
-    entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
-    flatten_storage_envelope_result, import_neighbors, issues_unavailable,
-    navigation_scope_excludes, optional_bool, optional_confidence, optional_usize,
-    parse_cursor_offset, path_truncation_reason, reference_neighbors_for, relation_neighbors,
-    required_i64, required_str, storage_retryable, success_envelope, success_envelope_with_stats,
-    success_envelope_with_truncation, success_envelope_with_truncation_and_stats,
-    tool_error_envelope, unresolved_match_fields, wardline_section_for_entity,
-    wardline_unavailable,
+    PathTraversal, ServerState, build_call_sites, build_unresolved_candidates,
+    call_graph_scope_excludes, callee_json, caller_json, caller_navigation_scope_excludes,
+    compact_execution_paths, entity_context_json, entity_json, entity_not_found_envelope,
+    entity_properties_json, envelope_from_storage_result, flatten_storage_envelope_result,
+    import_neighbors, issues_unavailable, navigation_scope_excludes, optional_bool,
+    optional_confidence, optional_usize, parse_cursor_offset, path_truncation_reason,
+    reference_neighbors_for, relation_neighbors, required_i64, required_str, storage_retryable,
+    success_envelope, success_envelope_with_stats, success_envelope_with_truncation,
+    success_envelope_with_truncation_and_stats, tool_error_envelope, unresolved_match_fields,
+    wardline_section_for_entity, wardline_unavailable,
 };
+
+/// The direction argument of [`ServerState::tool_relation_list`]: a single
+/// stored-edge direction, or `Both` (the default — clarion-057ff2b330) which
+/// unions the In and Out passes. `Both` is the only value not directly
+/// expressible as a [`ReferenceDirection`], so it needs this wrapper.
+#[derive(Debug, Clone, Copy)]
+enum RelationDirection {
+    Single(ReferenceDirection),
+    Both,
+}
+
+impl RelationDirection {
+    /// The edge passes this direction expands to, in response order: a single
+    /// direction is one pass; `Both` is In then Out.
+    fn passes(self) -> &'static [ReferenceDirection] {
+        match self {
+            Self::Single(ReferenceDirection::In) => &[ReferenceDirection::In],
+            Self::Single(ReferenceDirection::Out) => &[ReferenceDirection::Out],
+            Self::Both => &[ReferenceDirection::In, ReferenceDirection::Out],
+        }
+    }
+
+    /// The top-level `direction` echo for the response envelope.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Single(ReferenceDirection::In) => "in",
+            Self::Single(ReferenceDirection::Out) => "out",
+            Self::Both => "both",
+        }
+    }
+}
 
 impl ServerState {
     pub(crate) async fn tool_entity_at(
@@ -187,11 +218,35 @@ impl ServerState {
                 // Honesty fields (clarion-df87b4f381): name-matched unresolved
                 // call sites are NOT in `callers`; say how many exist and where
                 // to see them, and name the blind spot in scope_excludes.
-                let (unresolved_name_matches, next_action) = match entity_by_id(conn, &entity_id)? {
-                    Some(target) => unresolved_match_fields(conn, &target)?,
-                    None => (0, Value::Null),
-                };
-                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
+                // Per-query honesty (clarion-76c31b730a): scope_excludes is now
+                // populated ONLY when THIS traversal actually skipped a candidate
+                // (a name-matched unresolved call site for this target), and the
+                // skipped sites themselves are surfaced as `unresolved_candidates`
+                // — the in-tool grep-fallback. An empty scope_excludes paired with
+                // `traversal_complete: true` confirms every candidate was searched.
+                let (unresolved_name_matches, next_action, unresolved_candidates) =
+                    match entity_by_id(conn, &entity_id)? {
+                        Some(target) => {
+                            let (count, next_action) = unresolved_match_fields(conn, &target)?;
+                            // Gate `unresolved_candidates` behind the same
+                            // `confidence != Inferred` check that drives
+                            // `caller_navigation_scope_excludes` (A1): the inferred
+                            // dispatch attempts the unresolved category, so it skips
+                            // nothing and scope_excludes is forced empty
+                            // (traversal_complete:true). Surfacing candidates here
+                            // anyway would contradict that completeness signal.
+                            let candidates = if confidence == EdgeConfidence::Inferred {
+                                Vec::new()
+                            } else {
+                                build_unresolved_candidates(conn, &target)?
+                            };
+                            (count, next_action, candidates)
+                        }
+                        None => (0, Value::Null, Vec::new()),
+                    };
+                let scope_excludes =
+                    caller_navigation_scope_excludes(confidence, unresolved_name_matches > 0);
+                let traversal_complete = scope_excludes.is_empty();
                 Ok(success_envelope_with_stats(
                     json!({
                         "callers": page,
@@ -199,7 +254,9 @@ impl ServerState {
                         "truncated": has_more,
                         "unresolved_name_matches": unresolved_name_matches,
                         "next_action": next_action,
-                        "scope_excludes": navigation_scope_excludes(confidence, live_unresolved),
+                        "scope_excludes": scope_excludes,
+                        "traversal_complete": traversal_complete,
+                        "unresolved_candidates": unresolved_candidates,
                     }),
                     stats_delta,
                 ))
@@ -448,11 +505,26 @@ impl ServerState {
                     relation_neighbors(conn, &entity_id, ReferenceDirection::In, confidence)?;
                 let mut relations_out =
                     relation_neighbors(conn, &entity_id, ReferenceDirection::Out, confidence)?;
-                let live_unresolved = live_unresolved_call_sites_exist(conn)?;
-                let scope_excludes = navigation_scope_excludes(confidence, live_unresolved);
                 // Honesty fields for the `callers` bucket (clarion-df87b4f381).
                 let (unresolved_name_matches, next_action) =
                     unresolved_match_fields(conn, &entity)?;
+                // Per-query honesty (clarion-76c31b730a): populate scope_excludes
+                // ONLY when this traversal skipped a name-matched candidate, and
+                // surface the skipped sites as `unresolved_candidates`. Empty
+                // scope_excludes + `traversal_complete: true` confirms the callers
+                // bucket searched every candidate.
+                // Gate behind `confidence != Inferred` to mirror
+                // `caller_navigation_scope_excludes` (A1): an inferred traversal
+                // skips nothing, so it must not surface unresolved candidates
+                // alongside `traversal_complete: true`.
+                let unresolved_candidates = if confidence == EdgeConfidence::Inferred {
+                    Vec::new()
+                } else {
+                    build_unresolved_candidates(conn, &entity)?
+                };
+                let scope_excludes =
+                    caller_navigation_scope_excludes(confidence, unresolved_name_matches > 0);
+                let traversal_complete = scope_excludes.is_empty();
                 // Bound EACH bucket independently and record whether it was
                 // trimmed in the sibling `truncated` map. A trimmed bucket directs
                 // the agent to the dedicated single-relation tool for the full
@@ -498,6 +570,8 @@ impl ServerState {
                     "unresolved_name_matches": unresolved_name_matches,
                     "next_action": next_action,
                     "scope_excludes": scope_excludes,
+                    "traversal_complete": traversal_complete,
+                    "unresolved_candidates": unresolved_candidates,
                 })))
             })
             .await;
@@ -710,31 +784,26 @@ impl ServerState {
                 let has_more = offset.saturating_add(limit) < total;
                 let next_cursor = has_more.then(|| (offset + limit).to_string());
                 // Members are projected with their own compact shape (not
-                // `entity_json`), so the briefing-blocked gate is applied here via
-                // `entity_visibility` — a blocked member module (its file carries a
-                // secret) is redacted to withhold its id/name/path
-                // (clarion-307668e2be).
+                // `entity_json`). Under A3 (clarion-719e7320f5) a blocked member
+                // module (its file carries a secret) keeps its navigable id/name/
+                // path and rides the `briefing_blocked` flag — the secret is the
+                // file content, not the structural identity. `entity_visibility`
+                // supplies the block reason.
                 let members = all_members
                     .iter()
                     .skip(offset)
                     .take(limit)
                     .map(|member| {
-                        if let EntityVisibility::Blocked(reason) =
-                            entity_visibility(conn, &member.id)?
-                        {
-                            Ok(json!({
-                                "id": Value::Null,
-                                "name": Value::Null,
-                                "source_file_path": Value::Null,
-                                "briefing_blocked": reason
-                            }))
-                        } else {
-                            Ok(json!({
-                                "id": member.id,
-                                "name": member.name,
-                                "source_file_path": member.source_file_path
-                            }))
-                        }
+                        let briefing_blocked = match entity_visibility(conn, &member.id)? {
+                            EntityVisibility::Blocked(reason) => Value::String(reason),
+                            _ => Value::Null,
+                        };
+                        Ok(json!({
+                            "id": member.id,
+                            "name": member.name,
+                            "source_file_path": member.source_file_path,
+                            "briefing_blocked": briefing_blocked
+                        }))
                     })
                     .collect::<Result<Vec<_>, StorageError>>()?;
                 Ok(success_envelope(json!({
@@ -813,10 +882,24 @@ impl ServerState {
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
         let requested_id = required_str(arguments, "id")?.to_owned();
+        // Direction defaults to "both" (clarion-057ff2b330): an omitted direction
+        // returns the in+out union rather than erroring, so an agent need not know
+        // a kind's positional convention (ADR-051) to ask "every relation on X".
+        // "in"/"out" keep their exact prior single-direction behavior.
         let direction = match arguments.get("direction") {
-            Some(Value::String(s)) if s == "in" => ReferenceDirection::In,
-            Some(Value::String(s)) if s == "out" => ReferenceDirection::Out,
-            _ => return Err(ParamError::new("direction must be \"in\" or \"out\"")),
+            None | Some(Value::Null) => RelationDirection::Both,
+            Some(Value::String(s)) if s == "in" => {
+                RelationDirection::Single(ReferenceDirection::In)
+            }
+            Some(Value::String(s)) if s == "out" => {
+                RelationDirection::Single(ReferenceDirection::Out)
+            }
+            Some(Value::String(s)) if s == "both" => RelationDirection::Both,
+            _ => {
+                return Err(ParamError::new(
+                    "direction must be \"in\", \"out\", or \"both\"",
+                ));
+            }
         };
         let kind = match arguments.get("kind") {
             None | Some(Value::Null) => None,
@@ -857,26 +940,35 @@ impl ServerState {
                 if let Some(reason) = crate::briefing_block_reason(&entity) {
                     return Ok(crate::blocked_entity_refusal(&reason));
                 }
-                let edges: Vec<_> =
-                    relation_edges_for_entity(conn, &entity.id, direction, kind.as_deref())?
-                        .into_iter()
-                        .filter(|edge| edge.confidence <= confidence)
-                        .collect();
+                // For "both", concatenate the In then Out passes, each edge
+                // tagged with the direction that produced it (the neighbor side
+                // and the per-relation `direction` field follow that tag). A
+                // single-direction request runs exactly one pass, unchanged.
+                let mut edges: Vec<(ReferenceDirection, _)> = Vec::new();
+                for &edge_dir in direction.passes() {
+                    edges.extend(
+                        relation_edges_for_entity(conn, &entity.id, edge_dir, kind.as_deref())?
+                            .into_iter()
+                            .filter(|edge| edge.confidence <= confidence)
+                            .map(|edge| (edge_dir, edge)),
+                    );
+                }
                 let total = edges.len();
                 let has_more = offset.saturating_add(limit) < total;
                 let next_cursor = has_more.then(|| (offset + limit).to_string());
                 let mut owner_meta: HashMap<String, crate::OwnerMeta> = HashMap::new();
                 let mut file_content: HashMap<String, Option<Vec<u8>>> = HashMap::new();
-                // Memoized candidate visibility: candidate ids are raw
-                // qualname-encoding locators, so a briefing-blocked candidate
-                // would hand back exactly the identity the neighbor stub
-                // withholds. Only ids resolving to VISIBLE entities pass
-                // (entity_resolve collapses blocked candidates for the same
-                // reason); a lookup error fails closed.
+                // Memoized candidate existence: candidate ids are raw
+                // qualname-encoding locators. Under A3 (clarion-719e7320f5) a
+                // briefing-blocked candidate keeps its navigable identity, so it
+                // may pass — but a candidate that resolves to NO entity row (a
+                // phantom alternative) must never be disclosed as a real
+                // alternative. So only `NotFound` is filtered; a lookup error
+                // still fails closed.
                 let mut candidate_visible: HashMap<String, bool> = HashMap::new();
                 let mut relations = Vec::new();
-                for edge in edges.into_iter().skip(offset).take(limit) {
-                    let neighbor_id = match direction {
+                for (edge_dir, edge) in edges.into_iter().skip(offset).take(limit) {
+                    let neighbor_id = match edge_dir {
                         ReferenceDirection::In => &edge.from_id,
                         ReferenceDirection::Out => &edge.to_id,
                     };
@@ -922,13 +1014,17 @@ impl ServerState {
                             *candidate_visible.entry((*cid).clone()).or_insert_with(|| {
                                 matches!(
                                     entity_visibility(conn, cid),
-                                    Ok(EntityVisibility::Visible)
+                                    Ok(EntityVisibility::Visible | EntityVisibility::Blocked(_))
                                 )
                             })
                         })
                         .collect();
                     relations.push(json!({
                         "kind": edge.kind,
+                        "direction": match edge_dir {
+                            ReferenceDirection::In => "in",
+                            ReferenceDirection::Out => "out",
+                        },
                         "entity": entity_json(conn, &neighbor),
                         "edge_confidence": edge.confidence.as_str(),
                         "candidates": candidates,
@@ -945,10 +1041,7 @@ impl ServerState {
                 }
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
-                    "direction": match direction {
-                        ReferenceDirection::In => "in",
-                        ReferenceDirection::Out => "out",
-                    },
+                    "direction": direction.as_str(),
                     "filters": {
                         "kind": kind,
                         "confidence": confidence.as_str(),

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "loomweave"
-version = "1.1.0"
+version = "1.2.0"
 description = "Loomweave — graph-aware code archaeology (Rust core)"
 readme = "../../README.md"
 requires-python = ">=3.11"
@@ -22,8 +22,8 @@ classifiers = [
 # instead, move loomweave-plugin-rust to an [project.optional-dependencies]
 # `rust` extra (installed via `loomweave[rust]`).
 dependencies = [
-    "loomweave-plugin-python==1.1.0",
-    "loomweave-plugin-rust==1.1.0",
+    "loomweave-plugin-python==1.2.0",
+    "loomweave-plugin-rust==1.2.0",
 ]
 
 [project.urls]

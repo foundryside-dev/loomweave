@@ -33,8 +33,9 @@ use loomweave_mcp::{
     list_tools,
 };
 use loomweave_storage::{
-    GuidanceProposal, GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey, Writer,
-    pragma, schema, upsert_guidance_sheet, upsert_summary_cache,
+    GuidanceProposal, GuidanceSheetInput, ReaderPool, SummaryCacheEntry, SummaryCacheKey,
+    TaintFact, Writer, pragma, schema, upsert_guidance_sheet, upsert_summary_cache,
+    upsert_taint_fact,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -1110,7 +1111,7 @@ async fn subsystem_members_returns_member_modules() {
 }
 
 #[tokio::test]
-async fn subsystem_members_redacts_briefing_blocked_member() {
+async fn subsystem_members_blocked_member_keeps_navigable_identity() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).expect("open sqlite");
     let subsystem_id = seed_subsystem(&conn, project.path());
@@ -1122,24 +1123,22 @@ async fn subsystem_members_redacts_briefing_blocked_member() {
     let envelope = call_tool(&state, "subsystem_members", json!({"id": subsystem_id})).await;
     assert_eq!(envelope["ok"], true, "{envelope}");
     let members = envelope["result"]["members"].as_array().unwrap();
-    // Member count stays honest; the blocked module is a redacted stub.
+    // Member count stays honest; the blocked module keeps its navigable identity.
     assert_eq!(members.len(), 2, "{envelope}");
     let blocked = members
         .iter()
         .find(|m| m["briefing_blocked"] == "secret_present")
-        .expect("blocked member present as a stub");
-    assert!(blocked["id"].is_null(), "{blocked}");
-    assert!(blocked["name"].is_null(), "{blocked}");
-    assert!(blocked["source_file_path"].is_null(), "{blocked}");
-    // The visible member is untouched; the blocked id never appears.
-    assert!(
-        members.iter().any(|m| m["id"] == "python:module:demo"),
-        "{envelope}"
-    );
-    assert!(
-        !envelope.to_string().contains("pkg.auth"),
-        "blocked member id leaked in subsystem_members: {envelope}"
-    );
+        .expect("blocked member present with identity");
+    // Under A3 the blocked member's id/name/path ride alongside the flag.
+    assert_eq!(blocked["id"], "python:module:pkg.auth", "{blocked}");
+    assert!(!blocked["name"].is_null(), "{blocked}");
+    assert!(!blocked["source_file_path"].is_null(), "{blocked}");
+    // The visible member carries a null `briefing_blocked` flag.
+    let visible = members
+        .iter()
+        .find(|m| m["id"] == "python:module:demo")
+        .expect("visible member present");
+    assert!(visible["briefing_blocked"].is_null(), "{visible}");
 }
 
 #[tokio::test]
@@ -3705,13 +3704,15 @@ fn mark_blocked(db_path: &std::path::Path, id: &str, reason: &str) {
     .expect("mark entity blocked");
 }
 
-/// Assert an entity projection is a redacted stub: every identity field null,
-/// only the block reason present.
-fn assert_redacted_identity(entity: &Value, reason: &str) {
-    assert_eq!(entity["briefing_blocked"], reason, "stub reason: {entity}");
+/// Assert a briefing-blocked entity projection keeps its navigable identity
+/// (clarion-719e7320f5, A3): `id`, `kind`, `name`, `short_name`,
+/// `source_file_path`, the line span and `content_hash` are PRESENT alongside
+/// the `briefing_blocked` flag; only the cross-tool `sei` binding key stays null.
+/// The secret is the file content, not the entity's structural identity.
+fn assert_blocked_identity_present(entity: &Value, reason: &str) {
+    assert_eq!(entity["briefing_blocked"], reason, "block reason: {entity}");
     for field in [
         "id",
-        "sei",
         "kind",
         "name",
         "short_name",
@@ -3721,10 +3722,14 @@ fn assert_redacted_identity(entity: &Value, reason: &str) {
         "content_hash",
     ] {
         assert!(
-            entity.get(field).is_none_or(Value::is_null),
-            "identity field `{field}` must be withheld for a blocked entity: {entity}"
+            entity.get(field).is_some_and(|v| !v.is_null()),
+            "identity field `{field}` must be PRESENT for a blocked entity: {entity}"
         );
     }
+    assert!(
+        entity["sei"].is_null(),
+        "SEI must stay null for a blocked entity (ADR-034): {entity}"
+    );
 }
 
 #[tokio::test]
@@ -3748,11 +3753,9 @@ async fn find_entity_redacts_briefing_blocked_identity() {
         .filter(|e| e["briefing_blocked"] == "secret_present")
         .collect();
     assert_eq!(blocked.len(), 1, "blocked entity still listed: {resp}");
-    assert_redacted_identity(blocked[0], "secret_present");
-    assert!(
-        !resp.to_string().contains("demo.mid"),
-        "blocked id leaked somewhere in find_entity response: {resp}"
-    );
+    assert_blocked_identity_present(blocked[0], "secret_present");
+    // The navigable locator IS exposed now (A3): identity is not the secret.
+    assert_eq!(blocked[0]["id"], "python:function:demo.mid", "{resp}");
 }
 
 #[tokio::test]
@@ -3764,22 +3767,23 @@ async fn entity_at_redacts_briefing_blocked_match_and_context() {
 
     let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 4})).await;
     assert_eq!(resp["ok"], true, "{resp}");
-    assert_redacted_identity(&resp["result"]["entity"], "secret_present");
+    assert_blocked_identity_present(&resp["result"]["entity"], "secret_present");
 
-    // The matched node in the containing stack is redacted; its ranges nulled.
+    // The matched node in the containing stack keeps its navigable identity (A3),
+    // and the ranges block keeps the line span — only the secret content hides.
     let stack = resp["result"]["entity_context"]["containing_stack"]
         .as_array()
         .unwrap();
     let matched_node = stack.last().expect("matched node present");
     assert_eq!(matched_node["briefing_blocked"], "secret_present", "{resp}");
-    assert!(matched_node["id"].is_null(), "{resp}");
+    assert_eq!(matched_node["id"], "python:function:demo.mid", "{resp}");
     assert!(
-        resp["result"]["entity_context"]["ranges"]["source_line_start"].is_null(),
-        "matched ranges leak the blocked line span: {resp}"
+        matched_node["sei"].is_null(),
+        "stack SEI must be null: {resp}"
     );
     assert!(
-        !resp.to_string().contains("demo.mid"),
-        "blocked id leaked in entity_at response: {resp}"
+        !resp["result"]["entity_context"]["ranges"]["source_line_start"].is_null(),
+        "matched ranges must expose the line span now (A3): {resp}"
     );
 }
 
@@ -3802,19 +3806,20 @@ async fn entity_at_redacts_blocked_alternative() {
         .iter()
         .find(|a| a["entity"]["briefing_blocked"] == "secret_present")
         .expect("blocked alternative present as a stub");
-    assert_redacted_identity(&blocked["entity"], "secret_present");
-    assert!(
-        !resp.to_string().contains("demo.target"),
-        "blocked alternative id leaked in entity_at response: {resp}"
+    assert_blocked_identity_present(&blocked["entity"], "secret_present");
+    assert_eq!(
+        blocked["entity"]["id"], "python:function:demo.target",
+        "{resp}"
     );
 }
 
 #[tokio::test]
-async fn orientation_suggested_reads_omit_blocked_callee() {
+async fn orientation_suggested_reads_offer_blocked_callee_drilldown() {
     let (project, db_path) = open_project();
-    // entry's first resolved callee is mid; block it. The suggested-reads drill
-    // into the first callee reads its id from the (now-redacted) packet, so the
-    // blocked id must not surface in suggested_next_reads.
+    // entry's first resolved callee is mid; block it. Under A3
+    // (clarion-719e7320f5) the blocked callee keeps its navigable id, so the
+    // suggested-reads drill-down into the first callee IS offered — the entity is
+    // reachable by locator even though its source content stays withheld.
     mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
     let state = state_for(project.path(), &db_path);
 
@@ -3826,15 +3831,15 @@ async fn orientation_suggested_reads_omit_blocked_callee() {
     .await;
     assert_eq!(resp["ok"], true, "{resp}");
     assert!(
-        !resp["result"]["suggested_next_reads"]
+        resp["result"]["suggested_next_reads"]
             .to_string()
-            .contains("demo.mid"),
-        "blocked callee id leaked in suggested_next_reads: {resp}"
+            .contains("python:function:demo.mid"),
+        "blocked callee drill-down should be offered now (A3): {resp}"
     );
 }
 
 #[tokio::test]
-async fn neighborhood_redacts_blocked_neighbor_including_stored_to_id() {
+async fn neighborhood_blocked_neighbor_keeps_navigable_identity() {
     let (project, db_path) = open_project();
     // demo.entry calls demo.mid (resolved). Block the callee.
     mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
@@ -3853,14 +3858,16 @@ async fn neighborhood_redacts_blocked_neighbor_including_stored_to_id() {
         .iter()
         .find(|c| c["entity"]["briefing_blocked"] == "secret_present")
         .expect("blocked callee present as a stub");
-    assert_redacted_identity(&blocked["entity"], "secret_present");
-    assert!(
-        blocked["stored_to_id"].is_null(),
-        "stored_to_id leaks the blocked callee id: {blocked}"
+    // Under A3 the blocked callee keeps its navigable identity; `stored_to_id`
+    // echoes the same (now non-secret) id.
+    assert_blocked_identity_present(&blocked["entity"], "secret_present");
+    assert_eq!(
+        blocked["entity"]["id"], "python:function:demo.mid",
+        "{resp}"
     );
-    assert!(
-        !resp.to_string().contains("demo.mid"),
-        "blocked id leaked in neighborhood response: {resp}"
+    assert_eq!(
+        blocked["stored_to_id"], "python:function:demo.mid",
+        "stored_to_id echoes the navigable callee id: {blocked}"
     );
 }
 
@@ -3917,7 +3924,7 @@ async fn orientation_refuses_for_blocked_primary() {
 }
 
 #[tokio::test]
-async fn orientation_redacts_blocked_node_in_execution_paths() {
+async fn orientation_keeps_blocked_node_navigable_in_execution_paths() {
     let (project, db_path) = open_project();
     // demo.target is a leaf reached via entry -> mid -> target (resolved).
     mark_blocked(&db_path, "python:function:demo.target", "secret_present");
@@ -3931,30 +3938,43 @@ async fn orientation_redacts_blocked_node_in_execution_paths() {
     .await;
     assert_eq!(resp["ok"], true, "{resp}");
 
-    // The blocked node is omitted from the node table...
+    // Under A3 the blocked node keeps its navigable identity in the node table,
+    // flagged briefing_blocked, with a null SEI.
     let nodes = resp["result"]["execution_paths"]["nodes"]
         .as_array()
         .unwrap();
+    let blocked_node = nodes
+        .iter()
+        .find(|n| n["id"] == "python:function:demo.target")
+        .expect("blocked node present with identity");
+    assert_eq!(blocked_node["briefing_blocked"], "secret_present", "{resp}");
     assert!(
-        nodes
-            .iter()
-            .all(|n| n["id"] != "python:function:demo.target"),
-        "blocked node leaked in execution_paths node table: {resp}"
+        blocked_node["sei"].is_null(),
+        "node SEI must be null: {resp}"
     );
-    // ...and replaced by the sentinel in the path arrays.
+    // …and its id rides through the path arrays unchanged (no sentinel).
     let paths = resp["result"]["execution_paths"]["paths"]
         .as_array()
         .unwrap();
+    let has_blocked_in_path = paths.iter().any(|p| {
+        p.as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "python:function:demo.target")
+    });
+    assert!(
+        has_blocked_in_path,
+        "blocked id should ride the path: {resp}"
+    );
     let has_sentinel = paths.iter().any(|p| {
         p.as_array()
             .unwrap()
             .iter()
             .any(|id| id == "[briefing-blocked]")
     });
-    assert!(has_sentinel, "expected [briefing-blocked] sentinel: {resp}");
     assert!(
-        !resp.to_string().contains("demo.target"),
-        "blocked id leaked somewhere in orientation pack: {resp}"
+        !has_sentinel,
+        "no sentinel for a navigable blocked node: {resp}"
     );
 }
 
@@ -4908,7 +4928,11 @@ async fn neighborhood_surfaces_import_edges_for_reverse_import_lookup() {
 // ── scope_excludes on graph-query results (clarion-0d204a3f16) ───────────────
 
 #[tokio::test]
-async fn callers_of_resolved_flags_attribute_receiver_scope_exclusion() {
+async fn callers_of_with_no_skipped_candidate_reports_traversal_complete() {
+    // Per-query honesty (clarion-76c31b730a): the blanket scope_excludes footer
+    // is gone. A target with NO name-matched unresolved call sites had nothing
+    // skipped, so scope_excludes is empty and traversal_complete confirms every
+    // candidate was searched — an empty callers list is now a true negative.
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);
 
@@ -4922,7 +4946,17 @@ async fn callers_of_resolved_flags_attribute_receiver_scope_exclusion() {
     assert_eq!(envelope["ok"], true);
     assert_eq!(
         envelope["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"])
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["result"]["traversal_complete"], true,
+        "nothing skipped -> traversal_complete: {envelope}"
+    );
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "{envelope}"
     );
 }
 
@@ -4970,10 +5004,13 @@ async fn neighborhood_module_rolls_up_references_and_flags_attribute_scope() {
     let excludes = envelope["result"]["scope_excludes"]
         .as_array()
         .expect("scope_excludes array");
+    // Per-query honesty (clarion-76c31b730a): the module has no name-matched
+    // unresolved call sites, so nothing was skipped — no blanket footer.
     assert!(
-        excludes.iter().any(|v| v == "attribute-receiver-calls"),
-        "module neighborhood must flag attribute-receiver-calls, got {excludes:?}"
+        excludes.is_empty(),
+        "no skipped candidate -> empty scope_excludes, got {excludes:?}"
     );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
     assert!(
         !excludes
             .iter()
@@ -5004,10 +5041,13 @@ async fn neighborhood_function_references_are_not_rolled_up() {
         envelope["result"]["references_rolled_up"], false,
         "symbol-level references are direct, not rolled up"
     );
+    // Per-query honesty (clarion-76c31b730a): nothing skipped for this target.
     assert_eq!(
         envelope["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"])
+        json!([]),
+        "{envelope}"
     );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
 }
 
 // ── unresolved name-matched call-site honesty (clarion-df87b4f381) ────────────
@@ -5062,6 +5102,21 @@ async fn callers_of_counts_unresolved_name_matches_and_names_the_blind_spot() {
         "next_action must point at the evidence tool: {envelope}"
     );
     assert!(next_action.contains("callee"), "{envelope}");
+    // Per-query honesty (clarion-76c31b730a): a skipped candidate means the
+    // traversal is incomplete, and the skipped site is surfaced as an
+    // unresolved_candidate (the in-tool grep-fallback).
+    assert_eq!(
+        envelope["result"]["traversal_complete"], false,
+        "a skipped candidate -> traversal_complete false: {envelope}"
+    );
+    let candidates = envelope["result"]["unresolved_candidates"]
+        .as_array()
+        .expect("unresolved_candidates array");
+    assert_eq!(candidates.len(), 1, "{envelope}");
+    assert_eq!(candidates[0]["callee_text"], "target", "{envelope}");
+    // A bare-name callee (no dot) is a dynamic dispatch, not an attribute
+    // receiver.
+    assert_eq!(candidates[0]["why"], "dynamic", "{envelope}");
 
     // The shared vocabulary also covers calls-only path traversal.
     let paths = call_tool(
@@ -5124,10 +5179,19 @@ async fn callers_of_without_unresolved_sites_reports_zero_matches_and_no_marker(
         envelope["result"]["next_action"].is_null(),
         "no matches -> no recovery pointer: {envelope}"
     );
+    // Per-query honesty (clarion-76c31b730a): no name-matched candidate was
+    // skipped, so scope_excludes is empty and traversal_complete is true — the
+    // blanket attribute-receiver footer no longer fires on a clean target.
     assert_eq!(
         envelope["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"]),
-        "an all-resolved project must not carry the unresolved marker: {envelope}"
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "{envelope}"
     );
 }
 
@@ -5158,11 +5222,235 @@ async fn callers_of_ignores_stale_unresolved_rows_in_count_and_marker() {
         envelope["result"]["unresolved_name_matches"], 0,
         "stale rows (content-hash mismatch) are not evidence: {envelope}"
     );
+    // Per-query honesty (clarion-76c31b730a): a stale row matched nothing live,
+    // so nothing was skipped — empty scope_excludes, traversal_complete true,
+    // and no unresolved_candidates surfaced.
     assert_eq!(
         envelope["result"]["scope_excludes"],
-        json!(["attribute-receiver-calls"]),
+        json!([]),
         "{envelope}"
     );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "{envelope}"
+    );
+}
+
+// ── per-query caller honesty (clarion-76c31b730a) ────────────────────────────
+//
+// scope_excludes is now populated ONLY when this traversal actually skipped a
+// name-matched candidate. When nothing was skipped, scope_excludes is empty
+// AND traversal_complete:true confirms every candidate was searched. The
+// skipped sites are surfaced as unresolved_candidates [{path, line,
+// callee_text, why}] — the in-tool grep-fallback.
+
+#[tokio::test]
+async fn callers_of_unresolved_candidates_classify_attribute_receiver_vs_dynamic() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // A dotted callee text is an attribute/method receiver the static
+        // resolver cannot bind; a bare name is a dynamic dispatch.
+        insert_unresolved_call_site(
+            &conn,
+            "python:function:demo.entry",
+            "site-attr",
+            "obj.target",
+        );
+        insert_unresolved_call_site(&conn, "python:function:demo.mid", "site-dyn", "target");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["traversal_complete"], false,
+        "{envelope}"
+    );
+    let candidates = envelope["result"]["unresolved_candidates"]
+        .as_array()
+        .expect("unresolved_candidates array");
+    assert_eq!(candidates.len(), 2, "{envelope}");
+    let why_for = |callee: &str| {
+        candidates
+            .iter()
+            .find(|c| c["callee_text"] == callee)
+            .and_then(|c| c["why"].as_str())
+            .unwrap_or_else(|| panic!("no candidate for {callee}: {envelope}"))
+    };
+    assert_eq!(why_for("obj.target"), "attribute-receiver", "{envelope}");
+    assert_eq!(why_for("target"), "dynamic", "{envelope}");
+    // Each candidate carries the call-site location (in-tool grep-fallback).
+    for c in candidates {
+        assert!(c["path"].is_string(), "candidate needs a path: {envelope}");
+        assert!(
+            c.get("line").is_some(),
+            "candidate needs a line field: {envelope}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn neighborhood_with_no_skipped_candidate_reports_traversal_complete() {
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn neighborhood_surfaces_unresolved_candidates_when_a_candidate_is_skipped() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["traversal_complete"], false,
+        "{envelope}"
+    );
+    let candidates = envelope["result"]["unresolved_candidates"]
+        .as_array()
+        .expect("unresolved_candidates array");
+    assert_eq!(candidates.len(), 1, "{envelope}");
+    assert_eq!(candidates[0]["callee_text"], "target", "{envelope}");
+    assert_eq!(candidates[0]["why"], "dynamic", "{envelope}");
+}
+
+// A1 (review): `confidence=inferred` forces `scope_excludes` empty (the inferred
+// dispatch attempts the unresolved category, so it skips nothing) which sets
+// `traversal_complete: true`. `unresolved_candidates` MUST therefore also be
+// empty on the inferred path — surfacing name-matched-but-skipped sites there
+// would contradict the documented completeness contract ("empty scope_excludes
+// with traversal_complete:true means every candidate was searched"). These
+// tests exercise the write-tools-enabled posture, the only posture where
+// `confidence=inferred` is permitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callers_of_inferred_does_not_contradict_traversal_complete() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        // A live unresolved call site that name-matches `target` — for the
+        // default `resolved` confidence this is a skipped candidate
+        // (traversal_complete:false + a non-empty unresolved_candidates row).
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(r#"{"edges":[]}"#));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "callers_of",
+        json!({"id": "python:function:demo.target", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    // Inferred dispatch attempts the unresolved category: scope_excludes is
+    // empty and the traversal is reported complete.
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    // ...so unresolved_candidates MUST be empty too — no contradiction.
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "inferred path must not surface candidates alongside traversal_complete:true: {envelope}"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn neighborhood_inferred_does_not_contradict_traversal_complete() {
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        insert_unresolved_call_site(&conn, "python:function:demo.entry", "site-bare", "target");
+    }
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnyInferredProvider::new(r#"{"edges":[]}"#));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target", "confidence": "inferred"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["scope_excludes"],
+        json!([]),
+        "{envelope}"
+    );
+    assert_eq!(envelope["result"]["traversal_complete"], true, "{envelope}");
+    assert_eq!(
+        envelope["result"]["unresolved_candidates"],
+        json!([]),
+        "inferred path must not surface candidates alongside traversal_complete:true: {envelope}"
+    );
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -6169,6 +6457,357 @@ async fn orientation_pack_includes_wardline_findings() {
 }
 
 // ---------------------------------------------------------------------------
+// A4: entity dossier via `include` param on orientation_pack (clarion-2b87cd7a59)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn orientation_pack_dossier_absent_by_default() {
+    // AC (regression): omitting `include` leaves the pack byte-identical — no
+    // `dossier` key, not even null. The default path must not change.
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp:?}");
+    assert!(
+        resp["result"].get("dossier").is_none(),
+        "dossier must be absent when include is omitted: {resp:?}"
+    );
+
+    // An empty include array is also a no-op: no dossier.
+    let empty = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": []}),
+    )
+    .await;
+    assert!(
+        empty["result"].get("dossier").is_none(),
+        "dossier must be absent when include is an empty array: {empty:?}"
+    );
+    // Byte-identical to the omitted form.
+    assert_eq!(resp, empty);
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_with_all_sections() {
+    // AC: include:["wardline","findings","issues"] folds in a `dossier` object
+    // carrying all three sections plus the summary_available flag.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-dossier-all',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    drop(conn);
+
+    let client = Arc::new(
+        FakeFiligreeClient::default()
+            .with_wardline_findings(vec![wf("demo.hello", "WLN-TAINT-001")]),
+    );
+    let state = state_for_filigree(project.path(), &db_path, client);
+
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({
+            "entity": "python:function:demo.hello",
+            "include": ["wardline", "findings", "issues"]
+        }),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+
+    let dossier = &out["result"]["dossier"];
+    assert!(dossier.is_object(), "dossier object: {out:?}");
+    assert!(
+        dossier.get("wardline").is_some(),
+        "dossier.wardline: {out:?}"
+    );
+    // The findings section mirrors its source tool's result object (as wardline
+    // does): a `findings` array plus the `page` pagination metadata, so a caller
+    // can detect truncation past the first page (clarion review P2).
+    assert!(
+        dossier["findings"]["findings"].is_array(),
+        "dossier.findings.findings array: {out:?}"
+    );
+    assert!(
+        dossier["findings"]["page"].is_object(),
+        "dossier.findings.page must carry pagination metadata: {out:?}"
+    );
+    assert!(dossier.get("issues").is_some(), "dossier.issues: {out:?}");
+    // No summary cached for this entity → flagged false; dossier still assembled.
+    assert_eq!(dossier["summary_available"], false, "{out:?}");
+
+    // Deterministic across re-runs.
+    let again = call_tool(
+        &state,
+        "orientation_pack",
+        json!({
+            "entity": "python:function:demo.hello",
+            "include": ["wardline", "findings", "issues"]
+        }),
+    )
+    .await;
+    assert_eq!(out, again);
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_partial_include() {
+    // AC: a single-section include yields only that key under dossier; the others
+    // are absent (not null).
+    let (project, db_path) = open_project();
+    let state = state_for(project.path(), &db_path);
+
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": ["wardline"]}),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+    let dossier = &out["result"]["dossier"];
+    assert!(dossier.get("wardline").is_some(), "{out:?}");
+    assert!(
+        dossier.get("findings").is_none(),
+        "findings must be absent for include:[wardline]: {out:?}"
+    );
+    assert!(
+        dossier.get("issues").is_none(),
+        "issues must be absent for include:[wardline]: {out:?}"
+    );
+    // summary_available is always present once dossier is built.
+    assert!(dossier.get("summary_available").is_some(), "{out:?}");
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_normalizes_fingerprints() {
+    // AC: the in-house `61dc497…` vs `wlfp2:61dc497…` split is killed — every
+    // fingerprint surfaced in the dossier is the bare canonical form. The opaque
+    // Wardline taint blob (the source of dossier.wardline) carries a wlfp2:
+    // fingerprint; the dossier must normalize it.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "INSERT INTO entities (
+            id, plugin_id, kind, name, short_name, parent_id, source_file_path,
+            source_line_start, source_line_end, properties, content_hash,
+            created_at, updated_at
+         ) VALUES (
+            'python:function:demo.hello', 'python', 'function',
+            'python:function:demo.hello', 'demo.hello', NULL,
+            'src/demo.py', 1, 3, '{}', 'fake-hash-dossier-fp',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        [],
+    )
+    .expect("insert demo.hello entity");
+    upsert_taint_fact(
+        &conn,
+        &TaintFact {
+            entity_id: "python:function:demo.hello".to_owned(),
+            wardline_json: json!({
+                "findings": [{
+                    "rule_id": "WLN-TAINT-001",
+                    "fingerprint": "wlfp2:61dc497abc"
+                }]
+            })
+            .to_string(),
+            scan_id: Some("scan-1".to_owned()),
+            content_hash_at_compute: Some("fake-hash-dossier-fp".to_owned()),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            sei: None,
+        },
+    )
+    .expect("seed taint fact");
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({
+            "entity": "python:function:demo.hello",
+            "include": ["wardline", "findings", "issues"]
+        }),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+
+    let dossier_wf = &out["result"]["dossier"]["wardline"];
+    let serialized = serde_json::to_string(dossier_wf).expect("serialize dossier wardline");
+    assert!(
+        !serialized.contains("wlfp2:"),
+        "dossier.wardline must carry no wlfp2: prefix: {serialized}"
+    );
+    assert!(
+        serialized.contains("61dc497abc"),
+        "dossier.wardline must keep the canonical bare hash: {serialized}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_summary_available_true_when_cached() {
+    // AC: summary_available is true exactly when a summary is cached for the
+    // entity's current content_hash.
+    let (project, db_path) = open_project();
+    let content_hash = expected_content_hash(project.path(), "python:function:demo.entry");
+    upsert_summary_cache(
+        &Connection::open(&db_path).expect("open sqlite"),
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash,
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                model_tier: "anthropic/claude-sonnet-4.6".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
+            },
+            summary_json: r#"{"purpose":"demo"}"#.to_owned(),
+            cost_usd: 0.0,
+            tokens_input: 0,
+            tokens_output: 0,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_accessed_at: "2026-01-01T00:00:00Z".to_owned(),
+            caller_count: 0,
+            fan_out: 0,
+            stale_semantic: false,
+        },
+    )
+    .expect("upsert summary cache");
+
+    let state = state_for(project.path(), &db_path);
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": ["findings"]}),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+    assert_eq!(
+        out["result"]["dossier"]["summary_available"], true,
+        "summary_available must be true with a cached summary: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_summary_available_false_on_stale_cache_key() {
+    // Regression (clarion review P2): a cache row whose content_hash matches but
+    // whose model_tier (or template / guidance) has since changed must NOT report
+    // summary_available: true. entity_summary_get keys on the FULL SummaryCacheKey
+    // and would miss this row, refetching — so a content-hash-only availability
+    // check falsely tells a consult-mode caller it can skip generating.
+    let (project, db_path) = open_project();
+    let content_hash = expected_content_hash(project.path(), "python:function:demo.entry");
+    upsert_summary_cache(
+        &Connection::open(&db_path).expect("open sqlite"),
+        &SummaryCacheEntry {
+            key: SummaryCacheKey {
+                entity_id: "python:function:demo.entry".to_owned(),
+                content_hash,
+                prompt_template_id: LEAF_SUMMARY_PROMPT_TEMPLATE_ID.to_owned(),
+                // Stale tier: the live read path resolves a different model id,
+                // so the full-key lookup misses this row.
+                model_tier: "anthropic/some-old-retired-model".to_owned(),
+                guidance_fingerprint: "guidance-empty".to_owned(),
+            },
+            summary_json: r#"{"purpose":"demo"}"#.to_owned(),
+            cost_usd: 0.0,
+            tokens_input: 0,
+            tokens_output: 0,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_accessed_at: "2026-01-01T00:00:00Z".to_owned(),
+            caller_count: 0,
+            fan_out: 0,
+            stale_semantic: false,
+        },
+    )
+    .expect("upsert summary cache");
+
+    let state = state_for(project.path(), &db_path);
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": ["findings"]}),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+    assert_eq!(
+        out["result"]["dossier"]["summary_available"], false,
+        "summary_available must be false when only content_hash matches a stale key: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_pack_dossier_findings_surface_pagination_truncation() {
+    // Regression (clarion review P2): with more findings than the default page
+    // size, the dossier's findings section must carry `page` metadata showing
+    // truncation — otherwise include:["findings"] silently looks complete while
+    // omitting everything past the first page.
+    let (project, db_path) = open_project();
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    insert_run(
+        &conn,
+        "run-findings",
+        "2026-01-01T00:00:00.000Z",
+        "completed",
+        Some("2026-01-01T00:00:01.000Z"),
+    );
+    // 51 findings on the primary entity: one more than the 50-row default page.
+    for i in 0..51 {
+        insert_finding(
+            &conn,
+            &format!("F{i:03}"),
+            "run-findings",
+            "python:function:demo.entry",
+        );
+    }
+    drop(conn);
+
+    let state = state_for(project.path(), &db_path);
+    let out = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry", "include": ["findings"]}),
+    )
+    .await;
+    assert_eq!(out["ok"], true, "{out:?}");
+
+    let findings = &out["result"]["dossier"]["findings"];
+    let page = &findings["page"];
+    assert_eq!(
+        page["total"], 51,
+        "page.total must reflect all findings: {out:?}"
+    );
+    assert_eq!(
+        page["truncated"], true,
+        "page.truncated must flag the dropped tail: {out:?}"
+    );
+    assert_eq!(
+        findings["findings"].as_array().map(Vec::len),
+        Some(50),
+        "first page returns the 50-row default: {out:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // FIX 1: metadata.wardline block surfaced in items
 // ---------------------------------------------------------------------------
 
@@ -7040,6 +7679,84 @@ async fn relation_list_answers_directional_queries_with_anchor_evidence() {
 }
 
 #[tokio::test]
+async fn relation_list_both_direction_unions_in_and_out() {
+    // A2 (clarion-057ff2b330): direction="both" returns the in+out union, each
+    // relation tagged with its own direction. Seed types.Child with BOTH a
+    // superclass (Base, out) and a subclass (Grand, in) so the union is visible.
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let types_path = project.path().join("types.py");
+        insert_entity(
+            &conn,
+            "python:class:types.Grand",
+            "class",
+            &types_path,
+            Some((4, 5)),
+            Some("python:module:types"),
+        );
+        insert_relation_edge_row(
+            &conn,
+            "inherits_from",
+            "python:class:types.Grand",
+            "python:class:types.Child",
+            "resolved",
+            None,
+            "core:file:types.py",
+            34,
+            38,
+        );
+    }
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Child", "direction": "both"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["direction"], "both");
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 2, "both must union in+out: {resp}");
+
+    let in_rel = relations
+        .iter()
+        .find(|r| r["direction"] == "in")
+        .expect("an in relation");
+    assert_eq!(in_rel["entity"]["id"], "python:class:types.Grand");
+    let out_rel = relations
+        .iter()
+        .find(|r| r["direction"] == "out")
+        .expect("an out relation");
+    assert_eq!(out_rel["entity"]["id"], "python:class:types.Base");
+}
+
+#[tokio::test]
+async fn relation_list_omitted_direction_defaults_to_both() {
+    // A2: omitting direction is NOT an error — it behaves as "both".
+    let (project, db_path) = open_project();
+    seed_relation_fixture(project.path(), &db_path);
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "entity_relation_list",
+        json!({"id": "python:class:types.Base"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["direction"], "both");
+    // Base has one subclass (Child, in) and no superclass (out), so the union is
+    // exactly the single in relation.
+    let relations = resp["result"]["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 1, "{resp}");
+    assert_eq!(relations[0]["direction"], "in");
+    assert_eq!(relations[0]["entity"]["id"], "python:class:types.Child");
+}
+
+#[tokio::test]
 async fn relation_list_kind_filter_pagination_and_honest_empty() {
     let (project, db_path) = open_project();
     seed_relation_fixture(project.path(), &db_path);
@@ -7301,14 +8018,14 @@ async fn relation_list_redacts_blocked_neighbor_and_blocked_anchor_file() {
     let relations = resp["result"]["relations"].as_array().unwrap();
     assert_eq!(relations.len(), 1, "{resp}");
     let rel = &relations[0];
-    assert_redacted_identity(&rel["entity"], "secret_present");
+    // Under A3 the blocked neighbor keeps its navigable identity…
+    assert_blocked_identity_present(&rel["entity"], "secret_present");
+    assert_eq!(rel["entity"]["id"], "python:class:types.Child", "{rel}");
+    // …but the source-line *evidence* (the bytes behind the anchor) stays
+    // withheld — that is the secret content, not the identity.
     assert_eq!(rel["source_status"], "briefing_blocked", "{rel}");
     assert!(rel["line"].is_null(), "{rel}");
     assert_eq!(rel["line_text"], "", "{rel}");
-    assert!(
-        !resp.to_string().contains("types.Child"),
-        "blocked neighbor id leaked in relation_list response: {resp}"
-    );
 
     // Blocking the anchor FILE entity withholds line evidence even when both
     // endpoints are visible (the bytes behind the anchor are scanner-withheld).
@@ -7340,7 +8057,7 @@ fn tools_list_includes_entity_relation_list() {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "minLength": 1},
-                "direction": {"type": "string", "enum": ["in", "out"]},
+                "direction": {"type": "string", "enum": ["in", "out", "both"]},
                 "kind": {
                     "type": "string",
                     "enum": ["inherits_from", "decorates", "implements", "derives"]
@@ -7353,7 +8070,7 @@ fn tools_list_includes_entity_relation_list() {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "cursor": {"type": ["string", "null"]}
             },
-            "required": ["id", "direction"],
+            "required": ["id"],
             "additionalProperties": false
         })
     );
@@ -7475,12 +8192,12 @@ async fn orientation_pack_includes_relation_neighbors() {
 }
 
 #[tokio::test]
-async fn relation_list_candidates_never_leak_blocked_ids() {
-    // An ambiguous edge's `candidates` carry raw entity ids, and the chosen
-    // FROM side conventionally appears in its own candidate list — so without
-    // filtering, a briefing-blocked neighbor's stubbed identity is recoverable
-    // verbatim from `candidates` on the same row (the entity_resolve surface
-    // collapses blocked candidates for exactly this reason).
+async fn relation_list_candidates_keep_blocked_drop_phantom() {
+    // An ambiguous edge's `candidates` carry raw entity ids. Under A3
+    // (clarion-719e7320f5) a briefing-blocked candidate that resolves to a real
+    // entity row keeps its navigable id and may appear, but a phantom candidate
+    // (`types.wrap_again` — no entity row) must still be filtered out: only ids
+    // resolvable to real entities pass.
     let (project, db_path) = open_project();
     seed_relation_fixture(project.path(), &db_path);
     {
@@ -7525,18 +8242,30 @@ async fn relation_list_candidates_never_leak_blocked_ids() {
     assert_eq!(resp["ok"], true, "{resp}");
     let relations = resp["result"]["relations"].as_array().unwrap();
     assert_eq!(relations.len(), 1, "{resp}");
-    assert_redacted_identity(&relations[0]["entity"], "secret_present");
+    // The blocked from-side neighbor keeps its navigable identity (A3)…
+    assert_blocked_identity_present(&relations[0]["entity"], "secret_present");
+    assert_eq!(
+        relations[0]["entity"]["id"], "python:function:types.wrap",
+        "{resp}"
+    );
+    // …and `types.wrap` survives as a real candidate, but the phantom
+    // `types.wrap_again` (no entity row) is filtered out.
+    let candidates = relations[0]["candidates"].as_array().unwrap();
     assert!(
-        !resp.to_string().contains("types.wrap"),
-        "blocked id leaked through candidates (or anywhere else): {resp}"
+        candidates.iter().any(|c| c == "python:function:types.wrap"),
+        "real blocked candidate should pass: {resp}"
+    );
+    assert!(
+        !resp.to_string().contains("types.wrap_again"),
+        "phantom candidate (no entity row) must not be disclosed: {resp}"
     );
 }
 
 #[tokio::test]
-async fn relation_list_visible_candidates_survive_blocked_sibling_filter() {
-    // The blocked-candidate filter must not throw away legitimate visible
-    // alternatives: with one blocked and one visible candidate, the visible
-    // id still passes through.
+async fn relation_list_real_candidates_survive_blocked_sibling() {
+    // Under A3 a blocked candidate that resolves to a real entity row keeps its
+    // navigable id, so with one blocked and one visible candidate BOTH pass —
+    // the only thing the filter still drops is a phantom (no-row) candidate.
     let (project, db_path) = open_project();
     seed_relation_fixture(project.path(), &db_path);
     {
@@ -7589,15 +8318,15 @@ async fn relation_list_visible_candidates_survive_blocked_sibling_filter() {
     .await;
     let relations = resp["result"]["relations"].as_array().unwrap();
     assert_eq!(relations.len(), 1, "{resp}");
-    // The visible chosen candidate passes; the blocked sibling is withheld.
+    // Both candidates resolve to real entity rows, so both pass (A3); the
+    // blocked sibling is navigable, not withheld.
     assert_eq!(
         relations[0]["candidates"],
-        json!(["python:function:types.wrap"]),
+        json!([
+            "python:function:types.wrap",
+            "python:function:types.wrap_again"
+        ]),
         "{resp}"
-    );
-    assert!(
-        !resp.to_string().contains("wrap_again"),
-        "blocked candidate id leaked: {resp}"
     );
 }
 
