@@ -423,8 +423,9 @@ pub(crate) enum FreshnessOverall {
     /// No completed analyze run exists.
     NeverAnalyzed,
     /// A drift signal fired: commit mismatch, HEAD newer than the analyze,
-    /// a modified/missing indexed file, or a staged change touching an
-    /// indexed path.
+    /// a modified indexed file, or a staged change touching an indexed path.
+    /// A *missing* indexed file is NOT a drift signal — it is an expected
+    /// never-pruned tombstone (clarion-23a44085f9); see [`compute_freshness`].
     Drift,
     /// No drift signal fired, but the working tree holds UNTRACKED source of
     /// an already-indexed file type the index has never seen (ADR-045,
@@ -526,10 +527,18 @@ pub(crate) fn compute_freshness(
         }));
     }
 
+    // A missing indexed file is NOT a drift signal (clarion-23a44085f9). The
+    // `entities` table is cumulative and never-pruned by design (REQ-ANALYZE-04,
+    // loomweave-storage cache.rs): a deleted source file leaves its entity rows
+    // behind as a tombstone (load-bearing for move-stable SEI rebind and
+    // cross-product bindings). Re-analyze never removes them, so gating freshness
+    // on `missing` would wedge `overall` at Drift forever for any repo that ever
+    // deleted a file — an unachievable "re-analyze to fix". The tombstones are
+    // still surfaced in `missing_files` (informational); genuine drift comes from
+    // the commit clock, modified files, and staged changes.
     let drift_signal = commit_mismatch == Some(true)
         || (commit_mismatch.is_none() && head_newer_than_analyze == Some(true))
         || !file_drift.modified.is_empty()
-        || !file_drift.missing.is_empty()
         || dirty_indexed_count > 0;
 
     // Verdict: drift if any signal fired; stale_worktree if otherwise clean but
@@ -714,6 +723,14 @@ pub(crate) fn build_report(
              project anchor); a directory mtime is not a modification signal and is \
              excluded"
         ));
+    }
+    if !missing.is_empty() || missing_omitted > 0 {
+        notes.push(
+            "missing_files are never-pruned tombstones (deleted source whose entity rows \
+             the index retains by design, REQ-ANALYZE-04); they are informational and do \
+             NOT make the index stale — re-analyze cannot clear them (clarion-23a44085f9)."
+                .to_owned(),
+        );
     }
 
     json!({
@@ -1144,7 +1161,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_indexed_file_is_reported() {
+    fn missing_indexed_file_is_reported_but_does_not_gate_freshness() {
+        // clarion-23a44085f9: a missing indexed file is a never-pruned tombstone
+        // (entities are cumulative by design, REQ-ANALYZE-04), so re-analyze can
+        // never clear it. It must be REPORTED in missing_files but must NOT flip
+        // the verdict to drift — otherwise any repo that ever deleted a file is
+        // wedged stale forever. Here nothing else fired (no commit info, no
+        // modified/staged files), so a tombstone-only index is fresh.
         let dir = tempfile::tempdir().unwrap();
         let abs = dir.path().join("gone.py").to_string_lossy().into_owned();
         let state = state_with_file(&abs, 4, "2999-01-01T00:00:00.000Z");
@@ -1152,14 +1175,36 @@ mod tests {
             dir.path(),
             &state,
             &git_facts(None, &[]),
-            None,
+            Some(false),
             DEFAULT_MAX_ENTRIES,
         );
-        assert_eq!(report["drift_detected"], true);
+        assert_eq!(report["overall"], "fresh", "{report}");
+        assert_eq!(report["drift_detected"], false, "{report}");
         let missing = report["missing_files"].as_array().unwrap();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0]["path"], abs);
         assert_eq!(missing[0]["indexed_entities"], 4);
+    }
+
+    #[test]
+    fn missing_file_does_not_mask_a_real_drift_signal() {
+        // A tombstone is non-gating, but a genuine signal alongside it (here a
+        // committed-out checkout: commit_mismatch) must still drive drift.
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("gone.py").to_string_lossy().into_owned();
+        let mut state = state_with_file(&abs, 4, "2999-01-01T00:00:00.000Z");
+        state.analyzed_commit = Some("indexed-commit".to_owned());
+        let report = build_report(
+            dir.path(),
+            &state,
+            &git_facts_with_commit("checked-out-commit", Some("2000-01-01T00:00:00+00:00"), &[]),
+            Some(false),
+            DEFAULT_MAX_ENTRIES,
+        );
+        assert_eq!(report["overall"], "drift", "{report}");
+        assert_eq!(report["commit_mismatch"], true);
+        // The tombstone is still surfaced even though drift came from elsewhere.
+        assert_eq!(report["missing_files"].as_array().unwrap().len(), 1);
     }
 
     /// REGRESSION (clarion-4b5a8aff54): `gather_git_facts` gathers facts against

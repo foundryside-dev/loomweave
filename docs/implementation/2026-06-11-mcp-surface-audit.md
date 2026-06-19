@@ -43,7 +43,7 @@ Evidence (live, at HEAD):
   cross-crate calls — the actual reason the list is empty — are not named.
 - The documented recovery path is **unavailable in the default posture**: the
   skill says "re-query at `inferred` before concluding nothing calls this", but
-  in read-only mode (`enable_write_tools: false`, the default)
+  in explicit read-only mode (`enable_write_tools: false`)
   `confidence=inferred` is rejected with a policy error
   (`-32602: confidence=inferred/all is disabled by MCP tool policy…`). The
   escape hatch is gated off exactly where it's most needed.

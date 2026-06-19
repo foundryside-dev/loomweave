@@ -442,11 +442,11 @@ mod tests {
         assert_eq!(snap.entity_count, 3);
         assert_eq!(snap.subsystem_count, 1);
         assert_eq!(snap.finding_count, 1);
-        // The ingested `a.py` does not exist under /nonexistent-root and sits at
-        // the (unwatched) project root, so the per-file scan stats it, gets
-        // NotFound, and reports the file as deleted-since-analyze → Stale
-        // (clarion-e687941a8c).
-        assert_eq!(snap.staleness, Staleness::Stale);
+        // The ingested `a.py` does not exist under /nonexistent-root, so the
+        // per-file scan stats it and gets NotFound. A missing indexed file is a
+        // never-pruned tombstone, not actionable staleness (clarion-23a44085f9,
+        // superseding clarion-e687941a8c): with no other drift signal it is Fresh.
+        assert_eq!(snap.staleness, Staleness::Fresh);
     }
 
     #[test]
@@ -652,12 +652,15 @@ mod tests {
     }
 
     #[test]
-    fn deleted_top_level_source_file_reports_stale() {
-        // A recorded source file that no longer exists on disk was deleted since
-        // the last analyze: that is staleness, not Unknown (clarion-e687941a8c).
-        // `gone.py` sits at the (unwatched) project root, so the structural pass
-        // can't see it and the per-file scan's NotFound drives the verdict. A
-        // deletion is environmental, so `degraded` stays false.
+    fn deleted_top_level_source_file_is_a_tombstone_not_stale() {
+        // A recorded source file that no longer exists on disk is a never-pruned
+        // tombstone: the `entities` table is cumulative by design (REQ-ANALYZE-04),
+        // so re-analyze can never remove its rows. Gating freshness on it wedged
+        // the index permanently stale (clarion-23a44085f9, superseding the prior
+        // deleted-file-is-stale verdict of clarion-e687941a8c). `gone.py` is
+        // missing under /nonexistent-root and no other drift signal fires, so the
+        // verdict is Fresh — and a deletion is environmental, so `degraded` stays
+        // false.
         let (_dir, conn) = migrated_conn();
         insert_entity(&conn, "python:module:a", "module", Some("gone.py"));
         conn.execute(
@@ -667,7 +670,7 @@ mod tests {
         )
         .unwrap();
         let snap = project_snapshot(&conn, std::path::Path::new("/nonexistent-root"));
-        assert_eq!(snap.staleness, Staleness::Stale, "{snap:?}");
+        assert_eq!(snap.staleness, Staleness::Fresh, "{snap:?}");
         assert!(
             !snap.degraded,
             "a deleted source file is environmental, not degraded: {snap:?}"

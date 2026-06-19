@@ -559,13 +559,21 @@ pub struct ServeConfig {
     pub http: HttpReadConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServeConfig {
     /// Enable MCP tools that can mutate state, spawn processes, or call an LLM.
-    /// Default false: `loomweave serve` exposes consult-mode read tools unless an
-    /// operator explicitly opts into write-capable MCP operations.
+    /// Default true for the local agent loop; set false for consult-mode
+    /// read-only sessions.
     pub enable_write_tools: bool,
+}
+
+impl Default for McpServeConfig {
+    fn default() -> Self {
+        Self {
+            enable_write_tools: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1722,19 +1730,19 @@ serve:
     }
 
     #[test]
-    fn mcp_write_tools_default_false_and_can_be_enabled() {
-        assert!(!McpConfig::default().serve.mcp.enable_write_tools);
+    fn mcp_write_tools_default_true_and_can_be_disabled() {
+        assert!(McpConfig::default().serve.mcp.enable_write_tools);
 
         let cfg = McpConfig::from_yaml_str(
             r"
 serve:
   mcp:
-    enable_write_tools: true
+    enable_write_tools: false
 ",
         )
         .expect("parse MCP write-tool policy");
 
-        assert!(cfg.serve.mcp.enable_write_tools);
+        assert!(!cfg.serve.mcp.enable_write_tools);
     }
 
     #[test]

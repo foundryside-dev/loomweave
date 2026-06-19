@@ -89,7 +89,7 @@ yet; `project_status_get` and `entity_orientation_pack_get` report
 † **Write-gated.** `entity_summary_get`, `analyze_start`,
 `analyze_cancel`, `propose_guidance`, and `promote_guidance` are registered only
 when `serve.mcp.enable_write_tools: true` is set in `loomweave.yaml` (default
-`false`). When the gate is off they do not appear in `tools/list` and a call
+`true` for the local agent loop). When the gate is off they do not appear in `tools/list` and a call
 returns a tool-disabled error — run `loomweave config check` to see the active
 policy. `entity_summary_get` additionally requires the live LLM provider to be
 enabled (`llm_policy.enabled: true` + `allow_live_provider: true`), or it
@@ -116,9 +116,9 @@ caller set. (Relation edges are never LLM-inferred, so for
 
 **`"inferred"` is policy-gated.** It may call an LLM and write inferred-edge
 cache rows, so it is rejected (`-32602`) unless the server runs with
-`serve.mcp.enable_write_tools: true` — and the default is `false`. Do not plan
-on `"inferred"` as your recovery path unless `project_status_get` shows write
-tools enabled.
+`serve.mcp.enable_write_tools: true`. If an operator has explicitly disabled
+write tools, do not plan on `"inferred"` as your recovery path unless
+`project_status_get` shows write tools enabled.
 
 Of those, `entity_callers_list` / `entity_neighborhood_get` /
 `entity_execution_path_list` also return a `scope_excludes` array listing
@@ -351,6 +351,42 @@ a real guidance fingerprint.
 2. **Navigate.** Feed that `id` into `entity_callers_list`,
    `entity_neighborhood_get`, `entity_execution_path_list`, or
    `entity_summary_get`. Chain results' IDs to keep walking.
+
+## Manual scanning (re-index on demand)
+
+The graph only reflects the last `analyze`. When the working tree moves,
+`project_status_get` reports `staleness: "stale"` and graph answers ("what calls
+X") can be out of date. You don't have to leave the session to fix that — re-scan
+in place with the `analyze_*` tools.
+
+**A refresh may already be running.** The `loomweave hook session-start` hook
+auto-starts ONE detached background `loomweave analyze` whenever it finds a stale
+index at session start (single-shot, non-blocking). So if you opened on a stale
+index, a re-scan is likely already in flight — `analyze_status_get` (below) shows
+it. The manual flow here is for staleness that appears *mid-session*, or when the
+hook isn't wired.
+
+The `analyze_*` tools are write-gated (the † tools above): available whenever
+`serve.mcp.enable_write_tools: true`, which is the **default for the local agent
+loop**. The cycle:
+
+1. **Check.** `project_status_get` for the `staleness` verdict (or `index_diff_get`
+   for *which* commit / file / staged change fired). `fresh` → stop; re-scanning
+   wastes work.
+2. **Start.** `analyze_start {}` launches a background pass and returns a
+   `run_id` immediately — it does not block.
+3. **Poll.** `analyze_status_get {"run_id": "<id>"}` until `status` is terminal
+   (`completed` / `failed` / `cancelled`); the response carries progress.
+4. **Cancel** (optional). `analyze_cancel {"run_id": "<id>"}` group-kills the
+   plugin + Pyright.
+
+After a `completed` run the graph is current — re-issue your `entity_find` /
+navigation calls to pick up the refreshed entities and edges.
+
+**If `analyze_start` is missing from `tools/list`,** write tools are off for this
+server. Confirm with `loomweave config check`, then either set
+`serve.mcp.enable_write_tools: true` (`llm_config_set` can do this) and reconnect,
+or run `loomweave analyze <path>` at the shell.
 
 ## Gotchas (read before hunting for a subsystem)
 

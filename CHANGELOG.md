@@ -12,6 +12,40 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-06-19
+
+Feature release on top of `1.2.1`. (Cargo SemVer `1.3.0`; Python wheels `1.3.0`.)
+
+### Added
+
+- **Auto-refresh on session start.** The `loomweave hook session-start` hook now
+  starts ONE detached, non-blocking `loomweave analyze` when it finds a stale
+  index — stdio to `/dev/null`, in its own process group, never waited on, so it
+  never blocks session start. The analyze advisory lock keeps it single-shot. A
+  fresh index (or a spawn failure) falls back to the existing manual-analyze
+  nudge. The `loomweave-workflow` skill gains a clearer "Manual scanning"
+  section describing the `analyze_*` cycle and this auto-refresh.
+
+### Changed
+
+- **MCP write tools default on for the local agent loop.**
+  `serve.mcp.enable_write_tools` now defaults to `true`, so the on-demand
+  `analyze_start` / `analyze_status_get` / `analyze_cancel` and
+  `entity_summary_get` tools register out of the box. Consult-mode read-only
+  sessions opt back out with `enable_write_tools: false`. `loomweave config
+  check` now reports the effective MCP write-tools state.
+
+### Fixed
+
+- **Deletion tombstones no longer wedge the index stale (clarion-23a44085f9).**
+  The `entities` table is cumulative and never-pruned by design (REQ-ANALYZE-04),
+  so a deleted source file leaves its rows behind as a tombstone. The freshness
+  oracle previously gated on missing indexed files, which meant any repo that
+  ever deleted a file read `stale` forever (re-analyze could never clear it).
+  Missing files are now reported informationally in `missing_files` but no longer
+  drive the freshness verdict; commit mismatch, HEAD-newer, modified files, and
+  staged changes still do. Supersedes clarion-e687941a8c.
+
 ## [1.2.1] — 2026-06-18
 
 Maintenance patch for the `1.2.0` consult-surface release. (Cargo SemVer

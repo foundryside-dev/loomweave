@@ -27,7 +27,80 @@ pub fn session_start(path: &Path) -> anyhow::Result<()> {
     // (2) Snapshot.
     let outcome = load_snapshot(path);
     print_snapshot(path, &outcome);
+
+    // (3) Single-shot background refresh. A stale index nudges the agent to run
+    //     `loomweave analyze` — but the agent rarely does, so kick it off here
+    //     ourselves: spawn ONE detached analyze and return immediately. The hook
+    //     must never block session start, so we never wait on the child; the
+    //     analyze advisory lock (`analyze_lock.rs`) makes a colliding run a clean
+    //     no-op, so this is single-shot in practice.
+    if should_trigger_background_analyze(&outcome) {
+        trigger_background_analyze(path);
+    }
     Ok(())
+}
+
+/// Whether a stale index should kick off a background re-analyze.
+///
+/// True only for a readable, *present* index whose freshness check says the
+/// working tree moved since the last run (`Stale` / `StaleWorktree`). A fresh
+/// index, a missing / never-analyzed db, or an unreadable db never triggers —
+/// auto-analyze is a *refresh*, not a bootstrap (bootstrap stays the explicit
+/// `loomweave install` + `loomweave analyze` path), and re-analyzing a fresh
+/// index every session is wasted work.
+fn should_trigger_background_analyze(outcome: &SnapshotOutcome) -> bool {
+    let SnapshotOutcome::Ready(snapshot) = outcome else {
+        return false;
+    };
+    snapshot.db_present()
+        && matches!(
+            snapshot.staleness(),
+            Staleness::Stale | Staleness::StaleWorktree
+        )
+}
+
+/// Spawn a detached `loomweave analyze <path>` and return without waiting.
+///
+/// Fail-soft: a spawn failure degrades to the manual `loomweave analyze` nudge
+/// the snapshot already printed — it never errors out of the session-start hook.
+fn trigger_background_analyze(project_root: &Path) {
+    match spawn_detached_analyze(project_root) {
+        Ok(()) => println!(
+            "Loomweave: index is stale — started a background `loomweave analyze` \
+             just now (detached, non-blocking). No need to run it manually; re-query \
+             Loomweave once it finishes to pick up the refreshed graph."
+        ),
+        Err(err) => {
+            tracing::warn!(error = %err, "background analyze spawn failed");
+        }
+    }
+}
+
+/// Spawn `loomweave analyze <project_root>` as a fire-and-forget child:
+/// stdio to `/dev/null`, in its own process group, never waited on.
+///
+/// The new process group (set via the *safe* `process_group(0)`, not a
+/// `pre_exec(setsid)` that would widen the crate's unsafe surface) detaches the
+/// analyze from the hook's group, so the agent harness reaping the `SessionStart`
+/// hook cannot signal the in-flight analyze. The `Child` handle is dropped
+/// immediately — we never `wait()` — so the call returns at once and the OS
+/// reparents the analyze when this hook process exits.
+fn spawn_detached_analyze(project_root: &Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("analyze")
+        .arg(project_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    cmd.spawn().map(|_child| ())
 }
 
 /// What [`load_snapshot`] could establish about the `.weft/loomweave/` index.
@@ -268,6 +341,72 @@ mod tests {
             "fixture must be Fresh: {snapshot:?}"
         );
         (db_dir, snapshot)
+    }
+
+    /// Build a `Stale` snapshot: one ingested source file that exists and is
+    /// *newer* than a completed run (the mtime path → `Stale` in a non-git
+    /// tempdir). Mirrors [`fresh_snapshot`] with the run pushed into the past.
+    fn stale_snapshot(project_root: &Path) -> (tempfile::TempDir, ProjectSnapshot) {
+        std::fs::write(project_root.join("a.py"), "x = 1\n").unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(db_dir.path().join("loomweave.db")).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, properties, source_file_path, created_at, updated_at) \
+             VALUES ('python:module:a', 'python', 'module', 'a', 'a', '{}', 'a.py', \
+                     '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        let snapshot = project_snapshot(&conn, project_root);
+        assert_eq!(
+            snapshot.staleness(),
+            Staleness::Stale,
+            "fixture must be Stale: {snapshot:?}"
+        );
+        (db_dir, snapshot)
+    }
+
+    #[test]
+    fn stale_index_triggers_background_analyze() {
+        let root = tempfile::tempdir().unwrap();
+        let (_db, snapshot) = stale_snapshot(root.path());
+        assert!(
+            should_trigger_background_analyze(&SnapshotOutcome::Ready(snapshot)),
+            "a present, stale index must trigger the single-shot background analyze"
+        );
+    }
+
+    #[test]
+    fn fresh_index_does_not_trigger_background_analyze() {
+        let root = tempfile::tempdir().unwrap();
+        let (_db, snapshot) = fresh_snapshot(root.path(), None);
+        assert!(
+            !should_trigger_background_analyze(&SnapshotOutcome::Ready(snapshot)),
+            "a fresh index must NOT re-analyze — that would be wasted work every session"
+        );
+    }
+
+    #[test]
+    fn missing_and_unreadable_db_never_trigger_background_analyze() {
+        // A never-analyzed project bootstraps via explicit install+analyze, not a
+        // background refresh; an unreadable db cannot be safely re-analyzed blind.
+        assert!(
+            !should_trigger_background_analyze(&SnapshotOutcome::Ready(missing_db_snapshot())),
+            "missing db must not trigger a background analyze"
+        );
+        assert!(
+            !should_trigger_background_analyze(&SnapshotOutcome::DbUnreadable),
+            "unreadable db must not trigger a background analyze"
+        );
     }
 
     #[test]
