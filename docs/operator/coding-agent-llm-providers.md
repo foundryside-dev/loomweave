@@ -25,17 +25,17 @@ Prefer the config helpers over hand-editing `loomweave.yaml`:
 loomweave config llm set \
   --enable \
   --allow-live \
-  --provider codex_sidecar \
-  --enable-write-tools
+  --provider codex_sidecar
 ```
 
 Use `loomweave config llm status` or `loomweave config check` to inspect the
 effective state. The same bootstrap surface is available over MCP:
 `llm_config_get` reads the current config and `llm_config_set` updates
 `loomweave.yaml` fields such as `enabled`, `provider`, `allow_live_provider`,
-and `enable_write_tools`. Reconnect or restart `loomweave serve` after changing
-provider or write-tool policy, because the active server loads those settings at
-startup.
+and `enable_write_tools`. Write tools are enabled by default for the local agent
+loop; set `serve.mcp.enable_write_tools: false` for consult-mode read-only
+sessions. Reconnect or restart `loomweave serve` after changing provider or
+write-tool policy, because the active server loads those settings at startup.
 
 ## Codex CLI
 

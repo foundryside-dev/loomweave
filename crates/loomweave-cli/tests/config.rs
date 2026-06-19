@@ -109,12 +109,16 @@ fn config_example_rejects_unknown_provider() {
 }
 
 #[test]
-fn config_check_reports_disabled_default_when_file_absent() {
+fn config_check_reports_defaults_when_file_absent() {
     let dir = tempfile::tempdir().unwrap();
     let (code, stdout, _) = config(dir.path(), &["check"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("absent"), "out: {stdout}");
     assert!(stdout.contains("cache-only"), "out: {stdout}");
+    assert!(
+        stdout.contains("MCP write tools:       true"),
+        "out: {stdout}"
+    );
 }
 
 #[test]

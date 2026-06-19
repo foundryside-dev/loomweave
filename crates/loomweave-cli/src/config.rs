@@ -32,8 +32,8 @@ version: 1
 #      claude_sidecar / codex_sidecar to drive a locally-authenticated
 #      coding-agent CLI (canonical values: claude_cli / codex_cli)
 #      (no API key stored in this file).
-# `loomweave config llm set --enable --allow-live --provider codex_sidecar
-# --enable-write-tools` updates these fields without hand-editing.
+# `loomweave config llm set --enable --allow-live --provider codex_sidecar`
+# updates these fields without hand-editing.
 # `loomweave config check` prints the resulting effective state and any warnings.
 llm_policy:
   enabled: false
@@ -93,7 +93,9 @@ integrations:
     timeout_seconds: 5
 serve:
   mcp:
-    enable_write_tools: false
+    # ON by default for the local agent loop. Set false for consult-mode
+    # read-only sessions.
+    enable_write_tools: true
   http:
     enabled: false
     # The read-API port is auto-selected per project (deterministic, with an
@@ -352,6 +354,10 @@ fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
     println!(
         "Effective model:       {}",
         config.llm.effective_model_label()
+    );
+    println!(
+        "MCP write tools:       {}",
+        config.serve.mcp.enable_write_tools
     );
     match &selection {
         Ok(sel) => {
@@ -658,7 +664,7 @@ mod tests {
             !config.llm.enabled,
             "stub ships with LLM disabled by default"
         );
-        assert!(!config.serve.mcp.enable_write_tools);
+        assert!(config.serve.mcp.enable_write_tools);
     }
 
     #[test]

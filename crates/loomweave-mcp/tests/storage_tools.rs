@@ -5116,8 +5116,9 @@ async fn neighborhood_function_references_are_not_rolled_up() {
 // target, an empty/short `callers` list is not a true negative. The navigation
 // surface must say so: an `unresolved_name_matches` count, the
 // `unresolved-static-calls` scope_excludes marker, and a `next_action` pointer
-// at the evidence tool (`entity_call_site_list role=callee`), which works in
-// the default read-only posture where `confidence=inferred` is policy-gated.
+// at the evidence tool (`entity_call_site_list role=callee`), which also works
+// when an operator explicitly disables write tools and `confidence=inferred` is
+// policy-gated.
 
 #[tokio::test]
 async fn callers_of_counts_unresolved_name_matches_and_names_the_blind_spot() {

@@ -248,9 +248,15 @@ pub fn tool_metadata(name: &str) -> ToolMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpToolPolicy {
     pub enable_write_tools: bool,
+}
+
+impl Default for McpToolPolicy {
+    fn default() -> Self {
+        Self::allow_write_tools()
+    }
 }
 
 impl McpToolPolicy {
@@ -3574,9 +3580,9 @@ fn caller_navigation_scope_excludes(
 /// The `unresolved_name_matches` count + `next_action` recovery pointer for a
 /// caller-navigation result: how many live unresolved call sites name-match
 /// `target`, and where to inspect them. The pointer names
-/// `entity_call_site_list` because it works in the default read-only posture,
-/// where `confidence=inferred` is rejected by the MCP tool policy
-/// (clarion-df87b4f381).
+/// `entity_call_site_list` because it also works when an operator explicitly
+/// disables write tools, where `confidence=inferred` is rejected by the MCP tool
+/// policy (clarion-df87b4f381).
 ///
 /// NOTE (clarion-2b87cd7a59 A1): unlike `unresolved_candidates`, the count and
 /// pointer are *not* gated behind `confidence != Inferred`. This is intentional,
@@ -6407,11 +6413,11 @@ mod tests {
             );
         }
 
-        // Under the default read-only policy, the advertised list matches the
+        // Under an explicit read-only policy, the advertised list matches the
         // registered list exactly — gated write tools are absent from the list
         // but named in the gate note.
-        let read_only = super::server_instructions(McpToolPolicy::default());
-        let registered = super::list_tools_for_policy(McpToolPolicy::default());
+        let read_only = super::server_instructions(McpToolPolicy::read_only());
+        let registered = super::list_tools_for_policy(McpToolPolicy::read_only());
         for tool in &registered {
             assert!(
                 read_only.contains(tool.name),
@@ -6421,7 +6427,7 @@ mod tests {
         }
         assert!(
             registered.len() < super::list_tools().len(),
-            "default policy should gate at least one write tool"
+            "read-only policy should gate at least one write tool"
         );
         // The gate note names the write tools and how to enable them.
         assert!(read_only.contains("enable_write_tools"), "{read_only}");
@@ -6819,7 +6825,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_request_wraps_read_only_tools_by_default() {
+    fn tools_list_request_wraps_write_tools_by_default() {
         let response = super::handle_json_rpc(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": "tools-1",
@@ -6836,9 +6842,9 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect();
         assert!(tool_names.contains(&"entity_at"));
-        assert!(!tool_names.contains(&"analyze_start"));
-        assert!(!tool_names.contains(&"propose_guidance"));
-        assert!(!tool_names.contains(&"promote_guidance"));
+        assert!(tool_names.contains(&"analyze_start"));
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
         assert_eq!(response["result"]["tools"][0]["name"], "entity_at");
         assert_eq!(
             response["result"]["tools"][0]["metadata"]["read_only"],
@@ -6857,7 +6863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_policy_hides_and_blocks_write_tools_by_default() {
+    async fn server_policy_advertises_write_tools_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("loomweave.db");
         {
@@ -6888,25 +6894,8 @@ mod tests {
         assert!(names.contains(&"llm_config_set"));
         assert!(names.contains(&"semantic_config_get"));
         assert!(names.contains(&"semantic_config_set"));
-        assert!(!names.contains(&"analyze_start"));
-        assert!(!names.contains(&"entity_summary_get"));
-
-        let blocked = state
-            .handle_json_rpc(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "blocked",
-                "method": "tools/call",
-                "params": {"name": "analyze_start", "arguments": {}}
-            }))
-            .await
-            .expect("tools/call response");
-        assert_eq!(blocked["error"]["code"], -32601);
-        assert!(
-            blocked["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("tool disabled by MCP tool policy")
-        );
+        assert!(names.contains(&"analyze_start"));
+        assert!(names.contains(&"entity_summary_get"));
     }
 
     #[tokio::test]
@@ -7413,8 +7402,8 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect();
         assert!(tool_names.contains(&"entity_at"));
-        assert!(!tool_names.contains(&"propose_guidance"));
-        assert!(!tool_names.contains(&"promote_guidance"));
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
     }
 
     #[test]
@@ -7495,8 +7484,8 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect();
         assert!(tool_names.contains(&"entity_at"));
-        assert!(!tool_names.contains(&"propose_guidance"));
-        assert!(!tool_names.contains(&"promote_guidance"));
+        assert!(tool_names.contains(&"propose_guidance"));
+        assert!(tool_names.contains(&"promote_guidance"));
     }
 
     #[test]
