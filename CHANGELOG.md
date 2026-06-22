@@ -15,7 +15,8 @@ only when an incompatible change is made to that surface. See
 ## [1.3.1] — 2026-06-22
 
 Patch release on top of `1.3.0`. (Cargo SemVer `1.3.1`; Python wheels `1.3.1`.)
-Documentation and operator-guidance only — no code or API change.
+Operator-guidance docs plus a transitive-dependency security bump — no runtime
+or API change.
 
 ### Changed
 
@@ -32,6 +33,12 @@ Documentation and operator-guidance only — no code or API change.
   valid-skip: `index_diff_get` shows the drift disjoint from the files/entities
   the task touches (it *scopes* drift, it does not *overturn* the verdict — both
   surfaces derive from one freshness oracle). The `Fresh` note is unchanged.
+
+### Security
+
+- Bumped the transitive Python build/tooling dependency `msgpack` `1.1.2` →
+  `1.2.1` (via `cachecontrol[filecache]`) to clear GHSA-6v7p-g79w-8964. Lockfile
+  only (`plugins/python/uv.lock`); no runtime or API change.
 
 ## [1.3.0] — 2026-06-19
 
