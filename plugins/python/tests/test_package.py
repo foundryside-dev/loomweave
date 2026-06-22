@@ -47,7 +47,7 @@ def test_manifest_declares_current_v1_ontology_only() -> None:
     assert manifest["integrations"]["wardline"]["expected_descriptor_version"] == (
         EXPECTED_DESCRIPTOR_VERSION
     )
-    assert manifest["ontology"]["ontology_version"] == "0.8.0"
+    assert manifest["ontology"]["ontology_version"] == "0.9.0"
     assert manifest["ontology"]["entity_kinds"] == ["function", "class", "module"]
     assert manifest["ontology"]["edge_kinds"] == [
         "contains",

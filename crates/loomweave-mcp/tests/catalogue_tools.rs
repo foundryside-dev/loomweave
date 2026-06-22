@@ -4099,6 +4099,85 @@ async fn find_dead_code_app_only_does_not_treat_test_roots_as_live_reachability(
     );
 }
 
+/// clarion-4ec50f3d92: a module that declares no `__all__` whose public surface
+/// is reached only through paths static analysis cannot follow here (a test, but
+/// equally framework dispatch / DI / a CLI in a real app). The Python plugin's
+/// no-`__all__` fallback tags public module-level defs/classes `public-surface`;
+/// that tag is a reachability root, so in `app_only` mode (tests excluded as
+/// roots) the public surface and its transitive internals stay live instead of
+/// reading as mostly dead. Genuinely-unused private code is still flagged.
+#[tokio::test]
+async fn find_dead_code_public_surface_root_rescues_library_api_in_app_only() {
+    let (project, db, conn) = open_project();
+    // Public library surface from a no-__all__ module → public-surface root.
+    insert_entity(
+        &conn,
+        "python:function:lib.public_api",
+        "function",
+        "lib.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:lib.public_api", "public-surface");
+    // Internal implementations reachable only from the public API (not from any
+    // test root) — kept live transitively by the public-surface root. A real
+    // library has many internals per genuine orphan, so the post-fix dead share
+    // is plausible rather than implausibly high.
+    for (idx, line) in [(6i64, 10i64), (11, 15), (16, 20)].into_iter().enumerate() {
+        let id = format!("python:function:lib.internal_impl_{idx}");
+        insert_entity(&conn, &id, "function", "lib.py", Some(line));
+        insert_calls_edge(&conn, "python:function:lib.public_api", &id, "resolved");
+    }
+    // The only caller of the public API is a test — in app_only this root is
+    // excluded, so without the public-surface root both lib functions would read
+    // as dead (the implausible over-report this ticket fixes).
+    insert_entity(
+        &conn,
+        "python:function:tests.test_api",
+        "function",
+        "tests/test_lib.py",
+        Some((1, 4)),
+    );
+    insert_tag(&conn, "python:function:tests.test_api", "test");
+    insert_calls_edge(
+        &conn,
+        "python:function:tests.test_api",
+        "python:function:lib.public_api",
+        "resolved",
+    );
+    // Genuinely dead: a private internal nothing calls.
+    insert_entity(
+        &conn,
+        "python:function:lib._orphan",
+        "function",
+        "lib.py",
+        Some((21, 24)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({"app_only": true})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    // Only the genuine orphan is dead; the public API and its internal callee are
+    // kept live by the public-surface root despite tests being excluded.
+    assert_eq!(
+        dead,
+        vec!["python:function:lib._orphan".to_owned()],
+        "public-surface must root the library API in app_only mode: {env}"
+    );
+    // The dead share is now plausible (1 dead of 5 analysed = 20%; test_api is in
+    // the DB and counts toward `analysed` even though its `test` tag is not a root
+    // in app_only), so the verdict is no longer the implausible LOW-confidence
+    // band (threshold > 25%).
+    assert_eq!(env["result"]["summary"]["confidence"], "moderate", "{env}");
+    assert!(env["result"]["summary"]["advisory"].is_null(), "{env}");
+}
+
 /// `app_only: true` on coupling excludes test-tagged callers from the ranking so
 /// a hub's coupling drops to reflect only first-party app fan-in/out.
 #[tokio::test]

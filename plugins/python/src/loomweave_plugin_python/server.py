@@ -34,7 +34,7 @@ from loomweave_plugin_python.pyright_session import PyrightRunState, PyrightSess
 from loomweave_plugin_python.stdout_guard import install_stdio
 from loomweave_plugin_python.wardline_descriptor import WardlineVocabulary, load_wardline_descriptor
 
-ONTOLOGY_VERSION = "0.8.0"
+ONTOLOGY_VERSION = "0.9.0"
 
 # Plugin-side Content-Length sanity cap. Matches the host's ADR-021 §2b
 # default (8 MiB) so the plugin never emits a frame the host would kill us

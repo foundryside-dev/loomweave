@@ -1058,7 +1058,10 @@ class _WalkState:
     seen_ids: set[str]
     file_path: str
     wardline_vocabulary: WardlineVocabulary | None = None
-    exported_names: set[str] = field(default_factory=set)
+    # ``None`` means no ``__all__`` was declared (triggers the public-surface
+    # heuristic); a set (possibly empty) means ``__all__`` was declared
+    # explicitly (clarion-4ec50f3d92).
+    exported_names: set[str] | None = None
     duplicate_entities_dropped: int = 0
 
 
@@ -1274,16 +1277,39 @@ def _attach_wardline_entity_metadata(
         }
 
 
-def _module_export_names(tree: ast.Module) -> set[str]:
-    exported: set[str] = set()
+def _module_export_names(tree: ast.Module) -> set[str] | None:
+    """Names declared in a module-level ``__all__``, or ``None`` when no
+    ``__all__`` is declared at all (clarion-4ec50f3d92).
+
+    The ``None`` vs empty-set distinction is load-bearing for the public-surface
+    fallback: an explicit ``__all__ = []`` declares an *empty* public surface
+    (no roots), whereas the *absence* of ``__all__`` triggers the PEP 8
+    public-surface heuristic in :func:`_function_tags` / :func:`_class_tags`.
+    Both plain (``__all__ = [...]``) and annotated (``__all__: list[str] = [...]``)
+    assignments count as a declaration so an annotated ``__all__`` is never
+    mistaken for an absent one. A non-literal value (``__all__ = a + b``, an
+    alias, a comprehension) or an annotation-only stub (``__all__: list[str]``
+    with no value) counts as a declaration but contributes no names — i.e. it is
+    treated as an explicit *empty* surface, which suppresses ``public-surface``;
+    this matches the prior behaviour for non-literal ``__all__`` (no names were
+    ever extracted from it). Bare ``__all__ += [...]`` (``ast.AugAssign`` without a
+    prior ``=`` assignment) is intentionally not handled: it is a runtime
+    ``NameError`` and so unreachable in valid Python."""
+    exported: set[str] | None = None
     for statement in tree.body:
-        if not isinstance(statement, ast.Assign):
+        if isinstance(statement, ast.Assign):
+            targets: list[ast.expr] = statement.targets
+            value: ast.expr | None = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+            value = statement.value
+        else:
             continue
-        if not any(
-            isinstance(target, ast.Name) and target.id == "__all__" for target in statement.targets
-        ):
+        if not any(isinstance(target, ast.Name) and target.id == "__all__" for target in targets):
             continue
-        match statement.value:
+        if exported is None:
+            exported = set()
+        match value:
             case ast.List(elts=elts) | ast.Tuple(elts=elts) | ast.Set(elts=elts):
                 for elt in elts:
                     if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
@@ -1321,16 +1347,18 @@ def _is_module_level(parents: list[ast.AST]) -> bool:
 def _function_tags(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     parents: list[ast.AST],
-    exported_names: set[str],
+    exported_names: set[str] | None,
 ) -> set[str]:
     tags: set[str] = set()
-    if _is_module_level(parents) and node.name == "main":
-        tags.add("entry-point")
-    if _is_module_level(parents) and node.name in exported_names:
-        tags.add("exported-api")
-    if node.name.startswith("test_") or any(
+    module_level = _is_module_level(parents)
+    is_test = node.name.startswith("test_") or any(
         isinstance(parent, ast.ClassDef) and parent.name.startswith("Test") for parent in parents
-    ):
+    )
+    if module_level and node.name == "main":
+        tags.add("entry-point")
+    if module_level:
+        tags.update(_module_surface_tag(node.name, exported_names, is_test=is_test))
+    if is_test:
         tags.add("test")
     decorator_names = _decorator_names(node)
     if any(_last_name(name) in _HTTP_ROUTE_DECORATOR_NAMES for name in decorator_names):
@@ -1340,11 +1368,38 @@ def _function_tags(
     return tags
 
 
-def _class_tags(node: ast.ClassDef, parents: list[ast.AST], exported_names: set[str]) -> set[str]:
+def _module_surface_tag(name: str, exported_names: set[str] | None, *, is_test: bool) -> set[str]:
+    """Root tag for a module-level public entity (clarion-4ec50f3d92).
+
+    With a declared ``__all__`` (``exported_names is not None``) only listed
+    names are ``exported-api`` — the declaration is **authoritative**: a name the
+    author explicitly exported is an exported root regardless of its spelling
+    (so a ``Test``/``test_``-named or underscore-prefixed name listed in
+    ``__all__`` still gets ``exported-api``). With no ``__all__`` at all
+    (``None``) every non-underscore, non-test module-level def/class is the
+    module's public surface by PEP 8 convention, tagged ``public-surface``: a
+    reachability root of lower confidence than a declared export. It is a
+    fail-toward-live posture for public code invoked from outside the static call
+    graph (a library's consumers, or an app's framework-dispatched / DI / CLI
+    handlers), so a codebase that does not exhaustively declare ``__all__`` is not
+    read as mostly dead. ``is_test`` gates only this inferred fallback — test
+    entities are already roots via the ``test`` tag and are not a module's public
+    API; it never suppresses a declared export."""
+    if exported_names is None:
+        if is_test or name.startswith("_"):
+            return set()
+        return {"public-surface"}
+    return {"exported-api"} if name in exported_names else set()
+
+
+def _class_tags(
+    node: ast.ClassDef, parents: list[ast.AST], exported_names: set[str] | None
+) -> set[str]:
     tags: set[str] = set()
-    if _is_module_level(parents) and node.name in exported_names:
-        tags.add("exported-api")
-    if node.name.startswith("Test"):
+    is_test = node.name.startswith("Test")
+    if _is_module_level(parents):
+        tags.update(_module_surface_tag(node.name, exported_names, is_test=is_test))
+    if is_test:
         tags.add("test")
     decorator_names = _decorator_names(node)
     base_names = [_expr_qualified_name(base) for base in node.bases]
