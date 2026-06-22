@@ -61,6 +61,16 @@ const DEAD_CODE_ROOT_TAGS: &[&str] = &[
     "data-model",
     "cli-command",
     "exported-api",
+    // `public-surface` (clarion-4ec50f3d92): the Python plugin's PEP 8 fallback —
+    // a non-underscore module-level def/class in a module that declares no
+    // `__all__` at all. A lower-confidence (inferred) root than a *declared*
+    // `exported-api`; a fail-toward-live posture for public code invoked from
+    // outside the static call graph (library consumers, or an app's
+    // framework-dispatched / DI / CLI handlers), so a codebase that does not
+    // exhaustively declare `__all__` is not read as ~entirely dead. Enrich-only:
+    // a module *with* `__all__` emits no `public-surface`, so well-declared
+    // modules are byte-identical to before.
+    "public-surface",
     "wardline:external_boundary",
     "wardline:trusted",
 ];
@@ -483,8 +493,12 @@ fn dead_code_no_roots_envelope(page: &Page, scope_truncated: bool) -> Value {
         "signal": missing_signal(
             "entity_tags",
             "this index has no reachability root tags (entry-point / http-route / \
-             test / data-model / cli-command / exported-api), so dead code cannot \
-             be determined — this is NOT a guarantee there is no dead code",
+             test / data-model / cli-command / exported-api / public-surface), so \
+             dead code cannot be determined — this is NOT a guarantee there is no \
+             dead code. The levers are source-level: declare `__all__` (or, with \
+             no `__all__`, public module-level defs/classes are auto-tagged \
+             `public-surface`) and add entry-point / cli-command / http-route \
+             decorators to public entry functions",
         ),
     }))
 }
@@ -513,11 +527,14 @@ fn dead_code_summary(
     let advisory = low_confidence.then(|| {
         format!(
             "{dead_pct}% of analysed entities ({dead_candidates}/{analysed}) are unreachable \
-             from the configured reachability roots — implausibly high, so the roots likely do \
-             not cover this corpus (e.g. a library exercised only by tests). Treat these \
-             candidates as LOW CONFIDENCE: configure entry-point roots (tag cli-command / \
-             entry-point / test / exported-api / data-model entities) before relying on \
-             dead-code detection."
+             from the reachability roots — implausibly high, so the roots likely do not cover \
+             this corpus (e.g. code reached through framework dispatch, dependency injection, a \
+             CLI, or tests that static analysis cannot follow). Treat these candidates as LOW \
+             CONFIDENCE. There is no roots config knob; the levers are source-level: declare \
+             `__all__` to mark a module's public surface (non-underscore module-level \
+             defs/classes are auto-tagged `public-surface` roots when a module declares no \
+             `__all__`), and add entry-point / cli-command / http-route decorators to \
+             externally-invoked entry points, before relying on dead-code detection."
         )
     });
     json!({
@@ -1411,6 +1428,51 @@ mod tests {
         let s = dead_code_summary(5, 400, 0, 0, 0, RootsMode::Auto);
         assert_eq!(s["roots_mode"], "auto");
         assert_eq!(s["roots_confidence"], "derived");
+    }
+
+    #[test]
+    fn dead_code_advisory_points_at_real_levers_not_a_nonexistent_knob() {
+        // clarion-4ec50f3d92: the LOW-confidence advisory must recruit the
+        // *actual* levers — declaring `__all__`, adding entry-point/cli/http
+        // decorators — never a "configure roots" knob that loomweave.yaml does
+        // not have.
+        let s = dead_code_summary(141, 250, 1, 3, 5, RootsMode::Explicit);
+        let advisory = s["advisory"]
+            .as_str()
+            .expect("low-confidence advisory present");
+        assert!(advisory.contains("LOW CONFIDENCE"));
+        assert!(
+            advisory.contains("__all__"),
+            "advisory names the real lever: {advisory}"
+        );
+        assert!(
+            !advisory.contains("configure entry-point roots"),
+            "advisory must not name a config knob that does not exist: {advisory}"
+        );
+        assert!(
+            !advisory.contains("configure roots"),
+            "advisory must not imply a roots config knob: {advisory}"
+        );
+    }
+
+    #[test]
+    fn dead_code_no_roots_envelope_recruits_real_levers() {
+        // clarion-4ec50f3d92: the signal-unavailable envelope must point at the
+        // source-level levers, not imply a config knob.
+        let page = Page {
+            limit: 50,
+            offset: 0,
+        };
+        let envelope = dead_code_no_roots_envelope(&page, false);
+        let rendered = serde_json::to_string(&envelope).expect("serialise envelope");
+        assert!(
+            rendered.contains("__all__"),
+            "envelope names the real lever: {rendered}"
+        );
+        assert!(
+            !rendered.contains("configure"),
+            "envelope must not imply a config knob: {rendered}"
+        );
     }
 
     fn edge_scan_conn() -> rusqlite::Connection {

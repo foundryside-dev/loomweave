@@ -47,13 +47,15 @@ edge_kinds = ["contains", "calls", "references", "imports", "inherits_from", "de
 rule_id_prefix = "LMWV-PY-"
 # Bumps per ADR-027 when the entity/edge/rule set shifts. Phase 3 Task 3 is a
 # MINOR bump (additive `imports` edge kind); 0.8.0 is the additive
-# `inherits_from` + `decorates` MINOR bump (clarion-43416be550). NOTE:
+# `inherits_from` + `decorates` MINOR bump (clarion-43416be550); 0.9.0 is the
+# additive `public-surface` reachability-root tag (clarion-4ec50f3d92) — a
+# no-`__all__` library's public defs/classes are now tagged as roots. NOTE:
 # ADR-007's summary-cache key is the 5-tuple (entity_id, content_hash,
 # prompt_template_id, model_tier, guidance_fingerprint) — ontology_version is
 # handshake-validation, NOT a cache-key component. New edge rows miss the
 # cache by component-1 of the 5-tuple organically (no edges live in the
 # 5-tuple yet anyway).
-ontology_version = "0.8.0"
+ontology_version = "0.9.0"
 
 [integrations.wardline]
 expected_descriptor_version = "wardline-generic-2"

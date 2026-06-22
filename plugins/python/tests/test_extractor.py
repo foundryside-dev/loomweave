@@ -1262,6 +1262,225 @@ class Config:
     assert "data-model" in config["tags"]
 
 
+def test_no_dunder_all_tags_public_module_surface_as_public_surface() -> None:
+    """clarion-4ec50f3d92: a module with no ``__all__`` falls back to the PEP 8
+    public-surface heuristic — non-underscore module-level defs/classes become
+    ``public-surface`` reachability roots (a lower-confidence root than a
+    declared ``exported-api``), while private, nested, and test entities do not."""
+
+    source = """\
+def public_fn():
+    pass
+
+
+def _private_fn():
+    pass
+
+
+def main():
+    pass
+
+
+def test_thing():
+    assert True
+
+
+class PublicClass:
+    def method(self):
+        pass
+
+
+class _PrivateClass:
+    pass
+
+
+class TestThing:
+    pass
+"""
+    entities, _ = extract(source, "lib.py")
+    by_id = {e["id"]: e for e in entities}
+
+    def tags(entity_id: str) -> list[str]:
+        return by_id[entity_id].get("tags", [])
+
+    # Public module-level def/class → public-surface, never exported-api
+    # (nothing was *declared*).
+    assert "public-surface" in tags("python:function:lib.public_fn")
+    assert "exported-api" not in tags("python:function:lib.public_fn")
+    assert "public-surface" in tags("python:class:lib.PublicClass")
+
+    # A no-__all__ module-level `main` is both an entry-point and public surface;
+    # the two roots coexist (pinned so a future reader does not assume exclusivity).
+    assert "entry-point" in tags("python:function:lib.main")
+    assert "public-surface" in tags("python:function:lib.main")
+
+    # Underscore-prefixed names are non-public by convention → no root.
+    assert "public-surface" not in tags("python:function:lib._private_fn")
+    assert "public-surface" not in tags("python:class:lib._PrivateClass")
+
+    # Nested defs are not module-level public surface.
+    assert "public-surface" not in tags("python:function:lib.PublicClass.method")
+
+    # Test entities are already roots via the ``test`` tag; they are not the
+    # library's public API and must not be double-tagged public-surface.
+    assert "test" in tags("python:function:lib.test_thing")
+    assert "public-surface" not in tags("python:function:lib.test_thing")
+    assert "test" in tags("python:class:lib.TestThing")
+    assert "public-surface" not in tags("python:class:lib.TestThing")
+
+
+def test_dunder_all_present_suppresses_public_surface_heuristic() -> None:
+    """clarion-4ec50f3d92: when ``__all__`` is declared it is authoritative —
+    only listed names are ``exported-api`` and the public-surface heuristic does
+    not fire for unlisted public names."""
+
+    source = """\
+__all__ = ["exported_fn", "ExportedClass"]
+
+
+def exported_fn():
+    pass
+
+
+def public_unlisted_fn():
+    pass
+
+
+class ExportedClass:
+    pass
+
+
+class UnlistedClass:
+    pass
+"""
+    entities, _ = extract(source, "lib.py")
+    by_id = {e["id"]: e for e in entities}
+
+    def tags(entity_id: str) -> list[str]:
+        return by_id[entity_id].get("tags", [])
+
+    assert "exported-api" in tags("python:function:lib.exported_fn")
+    assert "public-surface" not in tags("python:function:lib.exported_fn")
+    assert "exported-api" in tags("python:class:lib.ExportedClass")
+    # exported-api and public-surface are mutually exclusive for a listed name.
+    assert "public-surface" not in tags("python:function:lib.exported_fn")
+    assert "public-surface" not in tags("python:class:lib.ExportedClass")
+
+    # A declared __all__ means unlisted public names are deliberately not API.
+    assert "exported-api" not in tags("python:function:lib.public_unlisted_fn")
+    assert "public-surface" not in tags("python:function:lib.public_unlisted_fn")
+    assert "exported-api" not in tags("python:class:lib.UnlistedClass")
+    assert "public-surface" not in tags("python:class:lib.UnlistedClass")
+
+
+def test_annotated_dunder_all_is_a_declaration() -> None:
+    """clarion-4ec50f3d92 (review follow-up): an annotated ``__all__: list[str] =
+    [...]`` is a declaration like a plain assignment — listed names get
+    ``exported-api`` and the public-surface heuristic does not fire for unlisted
+    public names. Pins the ``ast.AnnAssign`` branch of ``_module_export_names``."""
+
+    source = """\
+__all__: list[str] = ["exported_fn"]
+
+
+def exported_fn():
+    pass
+
+
+def public_unlisted_fn():
+    pass
+"""
+    entities, _ = extract(source, "lib.py")
+    by_id = {e["id"]: e for e in entities}
+
+    def tags(entity_id: str) -> list[str]:
+        return by_id[entity_id].get("tags", [])
+
+    assert "exported-api" in tags("python:function:lib.exported_fn")
+    assert "public-surface" not in tags("python:function:lib.exported_fn")
+    # __all__ is declared (just annotated) → heuristic suppressed for unlisted.
+    assert "exported-api" not in tags("python:function:lib.public_unlisted_fn")
+    assert "public-surface" not in tags("python:function:lib.public_unlisted_fn")
+
+
+def test_annotated_empty_dunder_all_declares_empty_surface() -> None:
+    """clarion-4ec50f3d92 (review follow-up): annotated ``__all__: list[str] = []``
+    is an explicit empty surface, identical to the plain empty case — no
+    public-surface."""
+
+    source = """\
+__all__: list[str] = []
+
+
+def public_fn():
+    pass
+"""
+    entities, _ = extract(source, "lib.py")
+    by_id = {e["id"]: e for e in entities}
+    fn_tags = by_id["python:function:lib.public_fn"].get("tags", [])
+    assert "public-surface" not in fn_tags
+    assert "exported-api" not in fn_tags
+
+
+def test_empty_dunder_all_declares_empty_public_surface() -> None:
+    """clarion-4ec50f3d92: ``__all__ = []`` is an *explicit* empty public
+    surface — distinct from the absence of ``__all__`` — so the public-surface
+    heuristic must not fire."""
+
+    source = """\
+__all__ = []
+
+
+def public_fn():
+    pass
+"""
+    entities, _ = extract(source, "lib.py")
+    by_id = {e["id"]: e for e in entities}
+    fn_tags = by_id["python:function:lib.public_fn"].get("tags", [])
+
+    assert "public-surface" not in fn_tags
+    assert "exported-api" not in fn_tags
+
+
+def test_dunder_all_membership_is_authoritative_over_test_name() -> None:
+    """clarion-4ec50f3d92 (review follow-up): a declared ``__all__`` is
+    authoritative. A ``Test``/``test_``-named name explicitly listed in
+    ``__all__`` keeps ``exported-api`` — the test-name heuristic gates only the
+    *inferred* ``public-surface`` fallback, never a declared export (mirrors
+    ADR-053's 'the declaration is authoritative' principle)."""
+
+    source = """\
+__all__ = ["TestableThing", "test_vector_exported"]
+
+
+class TestableThing:
+    pass
+
+
+def test_vector_exported():
+    pass
+
+
+class TestUnlisted:
+    pass
+"""
+    entities, _ = extract(source, "lib.py")
+    by_id = {e["id"]: e for e in entities}
+
+    def tags(entity_id: str) -> list[str]:
+        return by_id[entity_id].get("tags", [])
+
+    # Declared in __all__ → exported-api, even though test-named.
+    assert "exported-api" in tags("python:class:lib.TestableThing")
+    assert "exported-api" in tags("python:function:lib.test_vector_exported")
+    # Still also classified as tests (both are reachability roots, no conflict).
+    assert "test" in tags("python:class:lib.TestableThing")
+    assert "test" in tags("python:function:lib.test_vector_exported")
+    # A test-named class NOT in __all__ gets neither exported-api nor public-surface.
+    assert "exported-api" not in tags("python:class:lib.TestUnlisted")
+    assert "public-surface" not in tags("python:class:lib.TestUnlisted")
+
+
 def _wardline_vocabulary(
     *,
     confidence_basis: Literal["descriptor", "descriptor_version_skew"] = "descriptor",
