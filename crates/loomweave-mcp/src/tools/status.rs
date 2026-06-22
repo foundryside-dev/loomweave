@@ -206,6 +206,7 @@ impl ServerState {
         })))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn tool_project_status(
         &self,
         _arguments: &serde_json::Map<String, Value>,
@@ -304,14 +305,25 @@ impl ServerState {
             ),
             crate::snapshot::Staleness::StaleWorktree => Some(
                 "the working tree has untracked source files of already-indexed types that \
-                 the index has not seen (new modules not yet analyzed; see worktree_dirty). \
-                 Re-run `loomweave analyze` before relying on graph answers. This verdict \
-                 derives from the same computation as index_diff_get.",
+                 the index has never seen (new modules not yet analyzed; see worktree_dirty) \
+                 — graph answers about that new code are answers about code the index cannot \
+                 see, read-only orientation included. index_diff_get cannot clear this: there \
+                 is no indexed entity to diff the new file against. Re-run `loomweave analyze` \
+                 before relying on graph answers — it is incremental (only the new/changed \
+                 files are extracted; unchanged files are skipped by content hash) and runs \
+                 detached without blocking. This verdict derives from the same computation as \
+                 index_diff_get.",
             ),
             crate::snapshot::Staleness::Stale => Some(
-                "this verdict derives from the same computation as index_diff_get — call it \
-                 to see WHICH commit/file/staged-change signal fired. Re-run \
-                 `loomweave analyze` to refresh the index.",
+                "the index describes a past version of the tree; graph answers may name code \
+                 that has moved or changed, and read-only reads are exactly where that goes \
+                 uncaught — a stale graph confidently returns the OLD shape. This verdict \
+                 derives from the same computation as index_diff_get — call it to see WHICH \
+                 commit/file/staged-change signal fired and whether the drift even intersects \
+                 your target (it scopes the drift; it does not overturn this verdict). Re-run \
+                 `loomweave analyze` to refresh: it is incremental (unchanged files are \
+                 skipped by content hash; only changed/new files are re-extracted), so the \
+                 refresh cost scales with the delta, not the whole tree.",
             ),
             _ => None,
         };

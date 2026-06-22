@@ -12,6 +12,27 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-06-22
+
+Patch release on top of `1.3.0`. (Cargo SemVer `1.3.1`; Python wheels `1.3.1`.)
+Documentation and operator-guidance only — no code or API change.
+
+### Changed
+
+- **Stale-index refresh discipline.** Rewrote the `loomweave-workflow` skill's
+  "Manual scanning" section and the `StaleWorktree` / `Stale` `staleness_note`
+  strings (`project_status_get`) to stop agents under-refreshing a stale index
+  on "it's just research / read-only" reasoning. The guidance now leads with the
+  fact that a Loomweave answer is a claim *about the source tree as of the last
+  analyze* — so read-only orientation is exactly where stale poisons the result —
+  states the real refresh cost (analyze is incremental: unchanged files are
+  skipped by whole-file content hash; `analyze_start` is non-blocking; the
+  advisory lock makes a second runner a clean no-op), and carries a
+  rationalization table plus red-flags. It permits exactly one observable
+  valid-skip: `index_diff_get` shows the drift disjoint from the files/entities
+  the task touches (it *scopes* drift, it does not *overturn* the verdict — both
+  surfaces derive from one freshness oracle). The `Fresh` note is unchanged.
+
 ## [1.3.0] — 2026-06-19
 
 Feature release on top of `1.2.1`. (Cargo SemVer `1.3.0`; Python wheels `1.3.0`.)
