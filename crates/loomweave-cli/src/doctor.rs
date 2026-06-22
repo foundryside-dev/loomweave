@@ -85,6 +85,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_db_tracked(&project_root, fix);
     tally += check_gitignore_current(&project_root, fix);
     tally += check_loomweave_dir(&project_root);
+    tally += check_index_integrity(&project_root, fix);
     println!("--- llm ---");
     tally += check_llm_provider(&project_root);
 
@@ -170,6 +171,7 @@ impl DoctorJsonCheck {
 fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
     let mut checks = vec![
         check_loomweave_dir_json(project_root),
+        check_index_integrity_json(project_root, fix),
         check_index_freshness_json(project_root),
         check_plugin_availability_json(),
         check_skill_json(project_root, fix),
@@ -368,6 +370,219 @@ fn check_loomweave_dir(project_root: &Path) -> Tally {
             ),
             Some("upgrade loomweave to match or exceed the schema version of the database"),
         ),
+    }
+}
+
+/// Outcome of the index-integrity check (clarion-abda98c869 recovery). Shared by
+/// the text and JSON paths so they cannot drift.
+enum IntegrityOutcome {
+    /// No healthy index to check — the `.weft/loomweave.schema` check owns that
+    /// state; integrity stays silent rather than double-reporting.
+    Skipped,
+    Healthy,
+    /// Corruption found, `--fix` not requested.
+    Found {
+        stale: usize,
+        mismatches: usize,
+        sample: Vec<String>,
+    },
+    /// `--fix` ran and fully restored integrity.
+    Repaired {
+        removed_files: usize,
+        removed_entities: usize,
+    },
+    /// `--fix` removed stale rows but residual corruption remains (needs a full
+    /// re-analyze), or repair could not run.
+    ResidualAfterFix {
+        removed_files: usize,
+        removed_entities: usize,
+        residual: usize,
+    },
+    /// Opening/repairing the DB errored (e.g. busy under a running `serve`).
+    Error(String),
+}
+
+/// Detect (and, under `--fix`, repair) index-integrity corruption: stale
+/// vanished-from-disk file entities and the `LMWV-INFRA-PARENT-CONTAINS-MISMATCH`
+/// invariant violations a file→package refactor leaves behind. Only runs on a
+/// healthy, migrated index (the schema check owns the other states).
+fn index_integrity_outcome(project_root: &Path, fix: bool) -> IntegrityOutcome {
+    if !matches!(
+        classify_index_db_health(project_root),
+        IndexDbHealth::Healthy
+    ) {
+        return IntegrityOutcome::Skipped;
+    }
+    let db_path = loomweave_core::store::db_path(project_root);
+
+    if fix {
+        match repair_index_integrity(&db_path, project_root) {
+            Ok(report) => {
+                let residual = report.residual.stale_file_entities.len()
+                    + report.residual.parent_contains_mismatches.len();
+                if residual == 0 {
+                    IntegrityOutcome::Repaired {
+                        removed_files: report.removed_file_entities,
+                        removed_entities: report.removed_entities_total,
+                    }
+                } else {
+                    IntegrityOutcome::ResidualAfterFix {
+                        removed_files: report.removed_file_entities,
+                        removed_entities: report.removed_entities_total,
+                        residual,
+                    }
+                }
+            }
+            Err(err) => IntegrityOutcome::Error(err.to_string()),
+        }
+    } else {
+        match check_index_integrity_readonly(&db_path, project_root) {
+            Ok(report) if report.is_healthy() => IntegrityOutcome::Healthy,
+            Ok(report) => {
+                let sample = report
+                    .stale_file_entities
+                    .iter()
+                    .map(|s| format!("stale file: {}", s.path))
+                    .chain(
+                        report
+                            .parent_contains_mismatches
+                            .iter()
+                            .map(|m| m.detail.clone()),
+                    )
+                    .take(3)
+                    .collect();
+                IntegrityOutcome::Found {
+                    stale: report.stale_file_entities.len(),
+                    mismatches: report.parent_contains_mismatches.len(),
+                    sample,
+                }
+            }
+            Err(err) => IntegrityOutcome::Error(err.to_string()),
+        }
+    }
+}
+
+fn check_index_integrity_readonly(
+    db_path: &Path,
+    project_root: &Path,
+) -> Result<loomweave_storage::integrity::IntegrityReport> {
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open index {} read-only", db_path.display()))?;
+    loomweave_storage::pragma::apply_read_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    loomweave_storage::integrity::check_integrity(&conn, project_root)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn repair_index_integrity(
+    db_path: &Path,
+    project_root: &Path,
+) -> Result<loomweave_storage::integrity::RepairReport> {
+    let mut conn = Connection::open(db_path)
+        .with_context(|| format!("open index {} for repair", db_path.display()))?;
+    loomweave_storage::pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    loomweave_storage::integrity::repair_integrity(&mut conn, project_root)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+const INTEGRITY_REBUILD_HINT: &str = "stop any running `loomweave serve`, then run `loomweave analyze --no-incremental` \
+     to fully rebuild the graph";
+
+/// Text-path index-integrity check.
+fn check_index_integrity(project_root: &Path, fix: bool) -> Tally {
+    match index_integrity_outcome(project_root, fix) {
+        IntegrityOutcome::Skipped => Tally::default(),
+        IntegrityOutcome::Healthy => {
+            ok("index integrity: no stale entities or parent/contains mismatches")
+        }
+        IntegrityOutcome::Found {
+            stale,
+            mismatches,
+            sample,
+        } => problem(
+            &format!(
+                "index integrity: {stale} stale file entit{} + {mismatches} parent/contains \
+                 mismatch{} (e.g. {})",
+                if stale == 1 { "y" } else { "ies" },
+                if mismatches == 1 { "" } else { "es" },
+                sample.first().map_or("—", String::as_str),
+            ),
+            Some("loomweave doctor --fix --path . (surgically removes stale rows)"),
+        ),
+        IntegrityOutcome::Repaired {
+            removed_files,
+            removed_entities,
+        } => ok(&format!(
+            "index integrity: repaired — removed {removed_files} stale file entit{} \
+             ({removed_entities} entit{} total); index is now consistent",
+            if removed_files == 1 { "y" } else { "ies" },
+            if removed_entities == 1 { "y" } else { "ies" },
+        )),
+        IntegrityOutcome::ResidualAfterFix {
+            removed_files,
+            removed_entities,
+            residual,
+        } => problem(
+            &format!(
+                "index integrity: removed {removed_files} stale file entit{} ({removed_entities} \
+                 total) but {residual} violation{} remain that surgical repair cannot fix",
+                if removed_files == 1 { "y" } else { "ies" },
+                if residual == 1 { "" } else { "s" },
+            ),
+            Some(INTEGRITY_REBUILD_HINT),
+        ),
+        IntegrityOutcome::Error(err) => problem(
+            &format!("index integrity: check/repair failed: {err}"),
+            Some("ensure no `loomweave serve` holds the database, then retry"),
+        ),
+    }
+}
+
+/// JSON-path twin of [`check_index_integrity`].
+fn check_index_integrity_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    const ID: &str = "index.integrity";
+    match index_integrity_outcome(project_root, fix) {
+        IntegrityOutcome::Skipped => {
+            DoctorJsonCheck::ok(ID, "no healthy index to check (see .weft/loomweave.schema)")
+        }
+        IntegrityOutcome::Healthy => {
+            DoctorJsonCheck::ok(ID, "no stale entities or parent/contains mismatches")
+        }
+        IntegrityOutcome::Found {
+            stale,
+            mismatches,
+            sample,
+        } => DoctorJsonCheck::problem(
+            ID,
+            format!(
+                "{stale} stale file entities + {mismatches} parent/contains mismatches \
+                 (run with --fix to repair); examples: {}",
+                sample.join("; ")
+            ),
+        ),
+        IntegrityOutcome::Repaired {
+            removed_files,
+            removed_entities,
+        } => DoctorJsonCheck::fixed(
+            ID,
+            format!(
+                "repaired — removed {removed_files} stale file entities ({removed_entities} \
+                 entities total); index is now consistent"
+            ),
+        ),
+        IntegrityOutcome::ResidualAfterFix {
+            removed_files,
+            removed_entities,
+            residual,
+        } => DoctorJsonCheck::problem(
+            ID,
+            format!(
+                "removed {removed_files} stale file entities ({removed_entities} total) but \
+                 {residual} violations remain; {INTEGRITY_REBUILD_HINT}"
+            ),
+        ),
+        IntegrityOutcome::Error(err) => {
+            DoctorJsonCheck::problem(ID, format!("check/repair failed: {err}"))
+        }
     }
 }
 

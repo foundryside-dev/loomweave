@@ -11,6 +11,7 @@ pub mod error;
 pub mod findings;
 pub mod glob;
 pub mod guidance;
+pub mod integrity;
 pub mod pragma;
 pub mod prior_index;
 pub mod query;
