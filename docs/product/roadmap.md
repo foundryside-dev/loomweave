@@ -55,8 +55,9 @@ count → 0.
 
 - Python entity-kind coverage beyond function/class/module — module-level
   consts/vars, type aliases (clarion-a0ecac062f; additive under ADR-027).
-- Rust plugin categorisation-tag parity so pure-Rust dead-code analysis works
-  (clarion-e1899a109f).
+- Rust plugin categorisation-tag parity so pure-Rust dead-code analysis works —
+  visibility/entry-point/test/handler reachability roots, the Rust analog of the
+  Python `public-surface` work (clarion-05fdd0490e; supersedes clarion-e1899a109f).
 - ADR-021's `plugin_limits.*` loomweave.yaml config surface
   (clarion-271287b54b).
 - `references` envelope extension: match/let pattern paths + discriminant

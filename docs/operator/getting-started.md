@@ -421,6 +421,9 @@ for the v1.0 → v2.0 trajectory.
 
 ## Where to go next
 
+- [Language support](./language-support.md) — what each language plugin (Python,
+  Rust) extracts and tags, side by side: entity/edge kinds, categorisation tags,
+  and which tools (e.g. dead-code) work per language.
 - [Operator notes index](./README.md) — OpenRouter, runtime topology,
   secret scanning, federation contracts, coding-agent LLM providers.
 - [Design ladder](../loomweave/1.0/README.md) — requirements → system-design →
