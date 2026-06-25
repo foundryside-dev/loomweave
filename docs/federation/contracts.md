@@ -708,9 +708,13 @@ is re-established at the governance boundary, never assumed from the store.
 The SEI matcher consumes a typed, locator-level git-rename signal behind the
 `GitRenameSource` trait (SEI spec §6). `legis` owns the git interface, so it is
 the intended external supplier: `LegisGitRenameSource`
-(`crates/loomweave-cli/src/sei_git.rs`) reads `legis`'s
-`GET /git/renames?rev_range=…` and feeds the **same** file→locator translation as
-the v1 `ShellGitRenameSource`, behind the same trait — no matcher change.
+(`crates/loomweave-cli/src/sei_git.rs`) reads the **committed** leg of `legis`'s
+additive superset endpoint `GET /git/rename-feed?base=…&head=HEAD` and feeds the
+**same** file→locator translation as the v1 `ShellGitRenameSource`, behind the
+same trait — no matcher change. (`legis` pins each `committed[]` entry
+byte-identical to the legacy `/git/renames` array with a contract-lock test, so
+the re-point is transparent to the matcher; the feed's `working_tree` leg is not
+consumed — Loomweave's working-tree window is the shell source's job, below.)
 Selection is enrich-only and **capability-aware** (`select_git_rename_source`):
 `ShellGitRenameSource` is the default and the fallback; `legis` is consulted only
 when configured (`--legis-url`) **and** reachable. Unset/unreachable `legis`
