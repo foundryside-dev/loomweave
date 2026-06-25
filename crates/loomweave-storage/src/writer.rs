@@ -278,11 +278,17 @@ fn run_actor(
             }
             WriterCmd::UpsertPriorIndex {
                 entries,
+                plugin_markers,
                 recorded_at,
                 ack,
             } => {
                 let res = query_time_write(conn, &mut state, commits_observed, |conn| {
-                    crate::prior_index::replace_prior_index(conn, &entries, &recorded_at)
+                    crate::prior_index::replace_prior_index_and_markers(
+                        conn,
+                        &entries,
+                        &plugin_markers,
+                        &recorded_at,
+                    )
                 });
                 reply(ack, res);
             }

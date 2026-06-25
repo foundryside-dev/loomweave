@@ -42,6 +42,30 @@ pub struct PriorIndexEntry {
     pub signature: Option<String>,
 }
 
+/// The tag-schema marker a plugin last analysed the index under
+/// (`plugin_index_meta`, migration 0011 — clarion-e12d424f1d).
+///
+/// `analyze` compares the live manifest's `(version, ontology_version)` against
+/// the stored marker and forces a full re-dispatch of that plugin's files when
+/// EITHER component moves (or no row exists yet). The incremental skip otherwise
+/// keys only on a file's byte content, so a plugin upgrade that changes the
+/// emitted vocabulary (e.g. ADR-053/054 reachability-root tags) would leave
+/// unchanged files carrying stale `entity_tags` and false-flag the public
+/// surface as dead. The marker is rewritten in the SAME transaction as the
+/// prior-index snapshot (see [`replace_prior_index_and_markers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginIndexMarker {
+    /// `[plugin].plugin_id` — the marker's primary key.
+    pub plugin_id: String,
+    /// `[plugin].version` — bumps on any plugin release (enforced by the
+    /// workspace/rust-manifest lockstep checks).
+    pub plugin_version: String,
+    /// `[ontology].ontology_version` — the declared vocabulary version. The
+    /// semantic tag-schema signal, but not gate-enforced for every plugin, so
+    /// the comparison keys on the PAIR (re-dispatch if either moved).
+    pub ontology_version: String,
+}
+
 /// Upsert one prior-index row (`INSERT OR REPLACE` on the `locator` PK).
 /// `recorded_at` is the ISO-8601 UTC stamp written to the row (the run's
 /// completion time).
@@ -165,6 +189,78 @@ pub fn clear_prior_index(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Load the per-plugin tag-schema markers (`plugin_index_meta`, migration
+/// 0011), keyed by `plugin_id`. Read once at the start of a re-index by the
+/// incremental fast path; a plugin with no row is absent from the map and
+/// treated as "marker unknown → force full re-dispatch" by the caller.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails.
+pub fn load_plugin_index_markers(conn: &Connection) -> Result<HashMap<String, PluginIndexMarker>> {
+    let mut stmt =
+        conn.prepare("SELECT plugin_id, plugin_version, ontology_version FROM plugin_index_meta")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PluginIndexMarker {
+            plugin_id: row.get::<_, String>(0)?,
+            plugin_version: row.get::<_, String>(1)?,
+            ontology_version: row.get::<_, String>(2)?,
+        })
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let marker = row.map_err(StorageError::from)?;
+        out.insert(marker.plugin_id.clone(), marker);
+    }
+    Ok(out)
+}
+
+/// Upsert one plugin tag-schema marker (`INSERT … ON CONFLICT(plugin_id)`).
+/// Unlike the prior-index snapshot (a full replace), markers are upserted: a
+/// run only touches the plugins it actually dispatched, leaving other plugins'
+/// markers intact. `recorded_at` is the run's completion stamp.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the statement fails.
+pub fn upsert_plugin_index_marker(
+    conn: &Connection,
+    marker: &PluginIndexMarker,
+    recorded_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO plugin_index_meta \
+            (plugin_id, plugin_version, ontology_version, recorded_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(plugin_id) DO UPDATE SET \
+            plugin_version   = excluded.plugin_version, \
+            ontology_version = excluded.ontology_version, \
+            recorded_at      = excluded.recorded_at",
+        params![
+            marker.plugin_id,
+            marker.plugin_version,
+            marker.ontology_version,
+            recorded_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// Clear + re-insert the prior-index snapshot inside an already-open
+/// transaction. Shared by [`replace_prior_index`] and
+/// [`replace_prior_index_and_markers`] so the two cannot drift.
+fn write_prior_index_rows(
+    tx: &Connection,
+    entries: &[PriorIndexEntry],
+    recorded_at: &str,
+) -> Result<()> {
+    clear_prior_index(tx)?;
+    for entry in entries {
+        upsert_prior_index_entry(tx, entry, recorded_at)?;
+    }
+    Ok(())
+}
+
 /// Replace the entire prior-index snapshot with `entries`, atomically: a single
 /// transaction clears the table and inserts every entry, so a mid-flush failure
 /// rolls back to the previous snapshot rather than leaving a half-cleared one.
@@ -186,9 +282,35 @@ pub fn replace_prior_index(
     recorded_at: &str,
 ) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    clear_prior_index(&tx)?;
-    for entry in entries {
-        upsert_prior_index_entry(&tx, entry, recorded_at)?;
+    write_prior_index_rows(&tx, entries, recorded_at)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Rewrite the prior-index snapshot AND upsert the per-plugin tag-schema markers
+/// in ONE transaction (the end-of-run index commit — clarion-e12d424f1d). Doing
+/// both atomically guarantees the marker never advances without the snapshot it
+/// describes: a crash between the two cannot leave a plugin marked "current" at
+/// a vocabulary the index was never re-dispatched under, which would re-arm the
+/// false-dead bug this fix closes.
+///
+/// `entries` fully replace the snapshot (stale rows dropped); `markers` are
+/// upserted (only the plugins that ran this time are touched).
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if any statement fails; the transaction is
+/// rolled back without commit on error.
+pub fn replace_prior_index_and_markers(
+    conn: &Connection,
+    entries: &[PriorIndexEntry],
+    markers: &[PluginIndexMarker],
+    recorded_at: &str,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    write_prior_index_rows(&tx, entries, recorded_at)?;
+    for marker in markers {
+        upsert_plugin_index_marker(&tx, marker, recorded_at)?;
     }
     tx.commit()?;
     Ok(())
@@ -264,6 +386,65 @@ mod tests {
         upsert_prior_index_entry(&conn, &entry("python:function:a", "h"), "t0").unwrap();
         clear_prior_index(&conn).unwrap();
         assert!(load_prior_index(&conn).unwrap().is_empty());
+    }
+
+    fn marker(plugin_id: &str, version: &str, ontology: &str) -> PluginIndexMarker {
+        PluginIndexMarker {
+            plugin_id: plugin_id.to_owned(),
+            plugin_version: version.to_owned(),
+            ontology_version: ontology.to_owned(),
+        }
+    }
+
+    #[test]
+    fn plugin_marker_upsert_then_load_roundtrips() {
+        let conn = migrated_conn();
+        upsert_plugin_index_marker(&conn, &marker("python", "1.3.1", "0.9.0"), "t0").unwrap();
+        let loaded = load_plugin_index_markers(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded.get("python"),
+            Some(&marker("python", "1.3.1", "0.9.0"))
+        );
+    }
+
+    #[test]
+    fn plugin_marker_upsert_overwrites_per_plugin_and_leaves_others() {
+        // A re-run touches only the plugin it dispatched: the upsert advances
+        // that plugin's marker and leaves every other plugin's marker intact —
+        // the per-plugin (not table-wide) semantics the force-full decision
+        // relies on.
+        let conn = migrated_conn();
+        upsert_plugin_index_marker(&conn, &marker("python", "1.3.1", "0.9.0"), "t0").unwrap();
+        upsert_plugin_index_marker(&conn, &marker("rust", "1.3.1", "0.6.0"), "t0").unwrap();
+
+        // The rust plugin upgrades its ontology; python is untouched this run.
+        upsert_plugin_index_marker(&conn, &marker("rust", "1.3.1", "0.7.0"), "t1").unwrap();
+
+        let loaded = load_plugin_index_markers(&conn).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["rust"].ontology_version, "0.7.0");
+        assert_eq!(
+            loaded["python"].ontology_version, "0.9.0",
+            "the unrelated plugin's marker must survive a single-plugin upsert"
+        );
+    }
+
+    #[test]
+    fn replace_prior_index_and_markers_commits_both_atomically() {
+        let conn = migrated_conn();
+        replace_prior_index_and_markers(
+            &conn,
+            &[entry("python:function:a", "a0")],
+            &[marker("python", "1.3.1", "0.9.0")],
+            "t0",
+        )
+        .unwrap();
+        assert_eq!(load_prior_index(&conn).unwrap().len(), 1);
+        assert_eq!(
+            load_plugin_index_markers(&conn).unwrap()["python"],
+            marker("python", "1.3.1", "0.9.0")
+        );
     }
 
     #[test]

@@ -161,6 +161,32 @@ Additive tag-vocabulary change: Rust plugin `ontology_version` **0.5.0 →
 `scripts/check-rust-plugin-manifest-lockstep.py`), `serve.rs`'s `initialize`
 response, and the `docs/operator/language-support.md` table.
 
+### Incremental re-analysis must re-dispatch when the tag schema moves (clarion-e12d424f1d)
+
+A tag-vocabulary change has a second, load-bearing obligation. The incremental
+`analyze` fast path (Wave 2 / T3.1) skips a file purely on its whole-file
+content hash. Adding the root tags above changes only the *emitted tags*, not
+the *source bytes*, so a plain `analyze` after a plugin upgrade would silently
+skip every unchanged file and keep its pre-upgrade `entity_tags` — which carry
+no root tags. The dead-code survey then false-flags the unchanged public
+surface as dead (its per-plugin honest-empty guard is all-or-nothing and is
+defeated the moment one re-edited file re-tags). Because false-dead public API
+is the exact error this whole feature exists to prevent (error-cost asymmetry,
+above), this cannot be left to operator discipline.
+
+**Invariant.** Any plugin change to the emitted tag/entity/edge vocabulary
+**MUST** bump `ontology_version` (or, failing that, `[plugin].version`). Loomweave
+persists a per-plugin `(version, ontology_version)` marker (`plugin_index_meta`,
+migration 0011) and, on the next `analyze`, **forces a full re-dispatch of that
+plugin's files when either component moved** — even on an incremental run. The
+marker is rewritten in the same transaction as the prior-index snapshot, and
+only on a fully-successful run, so it can never advance past an index the new
+vocabulary was actually written into. An index with no marker yet (first run
+after this shipped) re-dispatches once, healing any skew an earlier silent
+upgrade left behind. The comparison keys on the *pair* because `ontology_version`
+is not gate-enforced for every plugin; `[plugin].version` bumps on any release
+and is the conservative backstop.
+
 ## Increment 2 (implemented): framework handlers + `pub`-method rooting
 
 A focused framework-attribute survey (a 6-agent taxonomy sweep across the Rust
