@@ -116,6 +116,24 @@ fn no_mangle_ffi_export_is_entry_point_and_exported_api() {
     );
 }
 
+#[test]
+fn unsafe_no_mangle_ffi_export_is_entry_point_and_exported_api() {
+    // Edition 2024 makes bare `#[no_mangle]` a hard error; real FFI code writes
+    // `#[unsafe(no_mangle)]`, which syn parses as `Meta::List { path: "unsafe",
+    // tokens: "no_mangle" }`. The export ident lives one level in — it must
+    // still root, or every edition-2024 FFI export reads as dead (the
+    // under-rooting failure ADR-054 fights).
+    let m = tags_by_id(
+        "k",
+        "k.m",
+        "#[unsafe(no_mangle)]\npub extern \"C\" fn ffi() {}\n",
+    );
+    assert_eq!(
+        tags(&m, "rust:function:k.m.ffi"),
+        ["entry-point", "exported-api"]
+    );
+}
+
 // ---- test -----------------------------------------------------------------
 
 #[test]
@@ -216,6 +234,22 @@ fn export_name_ffi_export_is_entry_point() {
         "k",
         "k.m",
         "#[export_name = \"my_export\"]\npub extern \"C\" fn exported() {}\n",
+    );
+    assert_eq!(
+        tags(&m, "rust:function:k.m.exported"),
+        ["entry-point", "exported-api"]
+    );
+}
+
+#[test]
+fn unsafe_export_name_ffi_export_is_entry_point() {
+    // Edition-2024 wrapped form (see `unsafe_no_mangle_…`): `#[unsafe(export_name
+    // = "…")]` parses as `unsafe(<NameValue>)`, so the inner `export_name` ident
+    // must be reached through the wrapper.
+    let m = tags_by_id(
+        "k",
+        "k.m",
+        "#[unsafe(export_name = \"my_export\")]\npub extern \"C\" fn exported() {}\n",
     );
     assert_eq!(
         tags(&m, "rust:function:k.m.exported"),

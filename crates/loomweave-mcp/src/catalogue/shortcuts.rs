@@ -1072,11 +1072,11 @@ struct CandidateSet {
 ///
 /// - non-code KINDS (file anchors, the project anchor, subsystems, guidance)
 ///   are never dead-CODE candidates;
-/// - a plugin that emitted NO reachability root tags (the Rust plugin today —
-///   binary/lib roots unsupported) would have its ENTIRE entity set
-///   false-flagged dead, so its entities are excluded and counted for the
-///   in-band scope marker instead — a wrong answer is worse than an honest
-///   scope statement (the dogfooded `specimen-rs/src/main.rs` false positive).
+/// - a plugin that emitted NO reachability root tags would have its ENTIRE
+///   entity set false-flagged dead, so its entities are excluded and counted
+///   for the in-band scope marker instead — a wrong answer is worse than an
+///   honest scope statement (the Rust plugin hit this before ADR-054 gave it
+///   root tags; cf. the dogfooded `specimen-rs/src/main.rs` false positive).
 fn dead_code_candidate_set(
     conn: &rusqlite::Connection,
     reachable: &HashSet<String>,
