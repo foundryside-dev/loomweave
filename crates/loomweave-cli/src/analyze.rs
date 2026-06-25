@@ -3728,6 +3728,15 @@ fn host_finding_to_record(
 }
 
 fn host_finding_anchor_id(hf: &HostFinding, project_root: &Path, project_anchor: &str) -> String {
+    // Precedence: an explicit entity anchor (clarion-48af930f2a — the
+    // duplicate-locator finding anchors to the colliding entity so the shadow is
+    // queryable from the entity read path) wins; else a file-path anchor
+    // resolved to its core file entity; else the file-less project anchor. The
+    // entity-id anchor is taken verbatim — the FK is enforced at insert, and the
+    // emitter only sets it for an entity it has already streamed to the store.
+    if let Some(entity_id) = hf.metadata.get("anchor_entity_id") {
+        return entity_id.clone();
+    }
     hf.metadata
         .get("anchor_file_path")
         .and_then(|path| core_file_entity_id(project_root, Path::new(path)).ok())

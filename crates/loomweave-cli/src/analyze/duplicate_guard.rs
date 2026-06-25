@@ -38,8 +38,10 @@ use loomweave_core::HostFinding;
 /// Plugin-neutral rule id (deliberately not `LMWV-RUST-*`/`LMWV-PY-*`; the
 /// legacy plugin-prefixed names are a known wart, clarion-a65cb18b02).
 /// Severity is ERROR — see `infra_severity` — because the absorbed collision
-/// is silent data loss.
-pub(crate) const DUPLICATE_LOCATOR_RULE_ID: &str = "LMWV-DUPLICATE-LOCATOR";
+/// is silent data loss. The string lives in `loomweave-core` so the detector
+/// here and the storage-side disclosure query agree on one constant
+/// (clarion-48af930f2a).
+pub(crate) use loomweave_core::DUPLICATE_LOCATOR_RULE_ID;
 
 /// Per-plugin, per-run duplicate-locator tracker. One `HashMap<id, path>`
 /// across the run's entities is fine at the 100k-entity scale `analyze`
@@ -150,13 +152,17 @@ impl DuplicateLocatorGuard {
             second_path.to_owned(),
         );
         metadata.insert("shape".to_owned(), shape.as_str().to_owned());
-        // Anchor the finding to a real file (the first-seen declaration) so it
-        // carries a `source_file_path` and reaches Filigree's scan-results emit.
-        // Without this, `host_finding_anchor_id` falls back to the file-less
-        // project anchor (`core:project:*`), which the emit skips as
-        // `skipped_no_path` — leaving the duplicate-locator lacuna untrackable
-        // in Filigree (the residual half of the dogfood's Friction A).
-        metadata.insert("anchor_file_path".to_owned(), first_path.to_owned());
+        // Anchor the finding to the COLLIDING ENTITY (the survivor row), not a
+        // file (clarion-48af930f2a). `host_finding_anchor_id` prefers this key,
+        // so `findings.entity_id` becomes the chimeric id — which makes the
+        // shadow queryable from the entity read path (`entity_finding_list` /
+        // the `collision` projection in `entity_json`) instead of silently
+        // resolving to a clean row. The entity carries its own
+        // `source_file_path`, so the Filigree scan-results emit still gets a real
+        // path via `findings_for_emit`'s join (the file-anchor workaround for the
+        // dogfood's Friction A is now subsumed — the entity is always a better
+        // anchor than its file).
+        metadata.insert("anchor_entity_id".to_owned(), entity_id.to_owned());
         Some(HostFinding {
             subcode: DUPLICATE_LOCATOR_RULE_ID.to_owned(),
             message: format!(

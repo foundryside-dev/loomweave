@@ -3,10 +3,12 @@
 //! The writer absorbs a colliding entity id via `ON CONFLICT(id) DO UPDATE`
 //! (last-write-wins) — deliberately, because the absorption is load-bearing
 //! for incremental upserts. These tests assert that the host's analyze path
-//! nevertheless SURFACES a collision as a project-level
-//! `LMWV-DUPLICATE-LOCATOR` ERROR finding, and — just as important — that the
-//! alarm stays silent on every legitimate-recurrence shape (unchanged
-//! re-analysis, genuine moves, the clarion-6ec7317628 module dual-claim).
+//! nevertheless SURFACES a collision as an entity-anchored
+//! `LMWV-DUPLICATE-LOCATOR` ERROR finding (anchored to the colliding entity
+//! since clarion-48af930f2a, so the shadow is queryable from the entity read
+//! path), and — just as important — that the alarm stays silent on every
+//! legitimate-recurrence shape (unchanged re-analysis, genuine moves, the
+//! clarion-6ec7317628 module dual-claim).
 //!
 //! Driven through the fixture plugin's content-driven `gadget <name>` lines
 //! (each emits a `fixture:gadget:<name>` entity) and the
@@ -153,6 +155,23 @@ fn single_finding(conn: &Connection, rule_id: &str) -> (String, String, String) 
     .expect("query finding")
 }
 
+/// The `entity_id` anchor column of the single `rule_id` finding.
+fn finding_entity_id(conn: &Connection, rule_id: &str) -> String {
+    conn.query_row(
+        "SELECT entity_id FROM findings WHERE rule_id = ?1",
+        [rule_id],
+        |row| row.get(0),
+    )
+    .expect("query finding entity_id")
+}
+
+fn entity_row_count(conn: &Connection, id: &str) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM entities WHERE id = ?1", [id], |row| {
+        row.get(0)
+    })
+    .expect("query entity row count")
+}
+
 /// In-run, same-file shape: one file emits the same gadget id twice (three
 /// times, in fact — proving one finding per id per run, not per occurrence).
 /// The run still completes (the alarm detects; it does not block).
@@ -181,9 +200,10 @@ fn in_run_same_file_duplicate_emits_single_error_finding() {
         "evidence must carry the same-file shape; got {evidence}"
     );
     assert!(
-        evidence.contains("anchor_file_path"),
-        "finding must carry anchor_file_path so it reaches Filigree's emit \
-         (a file-less project anchor is skipped as skipped_no_path); got {evidence}"
+        evidence.contains("anchor_entity_id"),
+        "finding must anchor to the colliding entity (clarion-48af930f2a) so it \
+         is queryable from the entity read path AND still reaches Filigree's \
+         emit with a real path via the entity's own source_file_path; got {evidence}"
     );
 
     // The run committed: the entity row exists despite the collision.
@@ -359,4 +379,73 @@ fn file_scope_same_file_duplicate_is_flagged() {
         evidence.contains("in_run_same_file"),
         "evidence must carry the same-file shape; got {evidence}"
     );
+}
+
+/// clarion-48af930f2a: the duplicate-locator finding must anchor to the
+/// COLLIDING ENTITY (the survivor row), not the file — so an entity-scoped read
+/// (`entity_finding_list` / the `collision` projection in `entity_json`) on the
+/// shadowed declaration surfaces the chimera instead of returning a clean row.
+/// And the disclosure must follow the standing finding lifecycle: it survives a
+/// no-op incremental run (loomweave's normal mode) and clears only on a clean
+/// full pass that re-walks the files and no longer reproduces the collision.
+#[test]
+fn duplicate_locator_finding_anchors_to_entity_and_follows_lifecycle() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    write_source(&project_dir, "alpha.mt", "gadget shared.item\n");
+    write_source(&project_dir, "beta.mt", "gadget shared.item\n");
+
+    // Run 1 (full): the cross-file collision fires.
+    analyze(&project_dir, &new_path, &[]);
+    {
+        let conn = open_db(&project_dir);
+        assert_eq!(
+            finding_count(&conn, RULE_ID),
+            1,
+            "run 1 must surface the collision exactly once"
+        );
+        // The anchor is the colliding ENTITY, not a `core:file:*` row. This is
+        // what makes the shadow queryable from the entity read path.
+        assert_eq!(
+            finding_entity_id(&conn, RULE_ID),
+            "fixture:gadget:shared.item",
+            "the finding must anchor to the colliding entity id, not the file"
+        );
+        // The survivor row exists under that id (one row per id, by design).
+        assert_eq!(entity_row_count(&conn, "fixture:gadget:shared.item"), 1);
+    }
+
+    // Run 2 (incremental no-op): nothing changed, so neither file is dispatched
+    // and the collision is not re-detected. The disclosure must NOT be swept —
+    // the general stale-finding sweep is gated to a clean full pass.
+    analyze(&project_dir, &new_path, &[]);
+    {
+        let conn = open_db(&project_dir);
+        assert_eq!(
+            finding_count(&conn, RULE_ID),
+            1,
+            "a no-op incremental run must not retire the still-valid collision"
+        );
+        assert_eq!(
+            finding_entity_id(&conn, RULE_ID),
+            "fixture:gadget:shared.item",
+            "the anchor must remain the colliding entity across an incremental no-op"
+        );
+    }
+
+    // Run 3 (resolution): remove one declaration and force a full re-pass. The
+    // collision no longer reproduces, so the stale disclosure is retired.
+    fs::remove_file(project_dir.path().join("beta.mt")).expect("remove beta.mt");
+    analyze(&project_dir, &new_path, &["--no-incremental"]);
+    {
+        let conn = open_db(&project_dir);
+        assert_eq!(
+            finding_count(&conn, RULE_ID),
+            0,
+            "a clean full pass that no longer reproduces the collision must clear it"
+        );
+        // The surviving declaration is still in the graph, now uncontested.
+        assert_eq!(entity_row_count(&conn, "fixture:gadget:shared.item"), 1);
+    }
 }

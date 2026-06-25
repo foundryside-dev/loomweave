@@ -41,6 +41,7 @@ pub use plugin::{
     CrashLoopBreaker,
     CrashLoopState,
     // discovery (Task 5) — callers enumerate plugins
+    DUPLICATE_LOCATOR_RULE_ID,
     DiscoveredPlugin,
     DiscoveryError,
     EdgeConfidence,

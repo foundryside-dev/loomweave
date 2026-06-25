@@ -12,6 +12,17 @@ use crate::plugin::limits::{
 };
 use crate::plugin::protocol::UnresolvedCallSite;
 
+/// Emitted when two source declarations assemble the SAME entity locator/id and
+/// the writer's `ON CONFLICT(id) DO UPDATE` upsert absorbs the collision as
+/// silent last-write-wins data loss (clarion-b19fe90c3e detection;
+/// clarion-48af930f2a disclosure). Deliberately plugin-neutral (not
+/// `LMWV-RUST-*`/`LMWV-PY-*`): the collision is a host-side store property that
+/// every language plugin can hit. Defined here — the single source of truth —
+/// so the analyze-side detector, the storage-side disclosure query, and any
+/// reader agree on one string rather than three drifting copies
+/// (cf. clarion-570e9ac203, the broader tag-vocabulary seam).
+pub const DUPLICATE_LOCATOR_RULE_ID: &str = "LMWV-DUPLICATE-LOCATOR";
+
 /// Emitted when a plugin emits an entity whose `kind` is not in the manifest's
 /// `entity_kinds` list (ADR-022 ontology boundary).
 pub const FINDING_UNDECLARED_KIND: &str = "LMWV-INFRA-PLUGIN-UNDECLARED-KIND";

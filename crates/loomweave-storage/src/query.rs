@@ -1157,6 +1157,93 @@ pub fn tags_for_entity(conn: &Connection, entity_id: &str) -> Result<Vec<String>
     Ok(out)
 }
 
+/// Disclosure that a same-locator collision was absorbed into this id's single
+/// row by the writer's `ON CONFLICT(id) DO UPDATE` upsert (last-write-wins).
+///
+/// This is the *honest ceiling* (clarion-48af930f2a): the stored row is a
+/// chimera of two declarations and the shadowed declaration's edges were already
+/// collapsed during analyze, so this discloses the unreliability — it does not
+/// recover the lost declaration. Surfaced on the entity read path so a consumer
+/// querying the shadowed id sees the collision instead of a clean-looking row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatorCollision {
+    /// The distinct source declarations that assemble this id (the survivor's
+    /// path plus the shadowed one), deduped and sorted for a stable projection.
+    pub declarations: Vec<String>,
+    /// Which collision rule fired (`in_run_same_file` / `in_run_cross_file` /
+    /// `cross_run_unchanged_file`); `None` if the finding carried no shape.
+    pub shape: Option<String>,
+}
+
+/// Disclose a same-locator collision for `entity_id`, derived from the standing
+/// `LMWV-DUPLICATE-LOCATOR` finding anchored to it (the finding's
+/// `entity_id` is the colliding id since clarion-48af930f2a).
+///
+/// Read **regardless of finding status**: suppressing a finding is a status
+/// flip (`open`→`suppressed`), the row persists, and the data-loss fact it
+/// records persists with it — so a suppressed finding must still disclose the
+/// chimera here rather than silently hide it. The standing full-pass stale
+/// sweep is what clears the disclosure once the collision genuinely resolves.
+///
+/// Returns `Ok(None)` when the entity has no such finding. A finding whose
+/// `evidence` JSON is unparseable degrades to a shapeless, declaration-less
+/// disclosure (`Some` with empty fields) rather than an error — the collision
+/// fact is more important than its metadata.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Sqlite`] if the query fails to execute.
+pub fn duplicate_locator_collision(
+    conn: &Connection,
+    entity_id: &str,
+) -> Result<Option<LocatorCollision>> {
+    // At most one LMWV-DUPLICATE-LOCATOR finding exists per id per run (the
+    // guard dedups), and the content-keyed id collapses recurrences to one row;
+    // take the most recently updated should two distinct collision shapes ever
+    // coexist for one id.
+    let evidence: Option<String> = conn
+        .query_row(
+            "SELECT evidence FROM findings \
+              WHERE entity_id = ?1 AND rule_id = ?2 \
+              ORDER BY updated_at DESC, id DESC \
+              LIMIT 1",
+            params![entity_id, loomweave_core::DUPLICATE_LOCATOR_RULE_ID],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    // `evidence` is `{"plugin_id": "...", "metadata": {...}}` (see the analyze
+    // host's `host_finding_to_record`). Pull the colliding paths + shape from
+    // the metadata; tolerate a missing/garbled shape rather than failing the
+    // read.
+    let metadata = serde_json::from_str::<serde_json::Value>(&evidence)
+        .ok()
+        .and_then(|v| v.get("metadata").cloned());
+    let str_field = |key: &str| -> Option<String> {
+        metadata
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    };
+    let mut declarations: Vec<String> = [
+        str_field("first_source_file_path"),
+        str_field("colliding_source_file_path"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|p| !p.is_empty())
+    .collect();
+    declarations.sort();
+    declarations.dedup();
+    Ok(Some(LocatorCollision {
+        declarations,
+        shape: str_field("shape"),
+    }))
+}
+
 /// Faceted catalog query: entities carrying `tag` (any plugin's
 /// `entity_tags.tag`), ordered by id, materialised up to `scan_cap`. Returns
 /// `(rows, scan_truncated)`. A blank tag is rejected; an unknown tag matches no
@@ -2402,5 +2489,141 @@ mod current_file_hash_tests {
     fn missing_path_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(current_file_hash(dir.path(), "does/not/exist.py"), None);
+    }
+}
+
+#[cfg(test)]
+mod duplicate_locator_collision_tests {
+    use super::*;
+
+    const COLLIDING_ID: &str = "python:class:specimen.colliding.ShelfMark";
+
+    /// In-memory DB with the real schema; seeds the colliding entity every
+    /// finding references (`foreign_keys` is ON, so the FKs are enforced).
+    fn migrated_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO entities \
+             (id, plugin_id, kind, name, short_name, source_file_path, properties, \
+              content_hash, created_at, updated_at) \
+             VALUES (?1, 'python', 'class', 'ShelfMark', 'ShelfMark', \
+                     '/specimen/colliding/__init__.py', '{}', 'h', 't', 't')",
+            params![COLLIDING_ID],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Insert a duplicate-locator finding anchored to `COLLIDING_ID`, carrying
+    /// the analyze-shaped `evidence` envelope. `status` exercises the
+    /// suppression-survival contract.
+    fn insert_collision_finding(conn: &Connection, status: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO runs (id, started_at, config, stats, status) \
+             VALUES ('run-1', 't', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        let evidence = serde_json::json!({
+            "plugin_id": "python",
+            "metadata": {
+                "entity_id": COLLIDING_ID,
+                "anchor_entity_id": COLLIDING_ID,
+                "first_source_file_path": "/specimen/colliding/__init__.py",
+                "colliding_source_file_path": "/specimen/colliding.py",
+                "shape": "in_run_cross_file",
+            }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO findings ( \
+                id, tool, tool_version, run_id, rule_id, kind, severity, \
+                entity_id, related_entities, message, evidence, properties, \
+                supports, supported_by, status, created_at, updated_at \
+             ) VALUES ( \
+                'core:finding:infra:dup', 'loomweave', '0', 'run-1', ?1, 'defect', 'ERROR', \
+                ?2, '[]', 'm', ?3, '{}', \
+                '[]', '[]', ?4, 't', 't' \
+             )",
+            params![
+                loomweave_core::DUPLICATE_LOCATOR_RULE_ID,
+                COLLIDING_ID,
+                evidence,
+                status
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn no_finding_means_no_collision() {
+        let conn = migrated_conn();
+        assert_eq!(
+            duplicate_locator_collision(&conn, COLLIDING_ID).unwrap(),
+            None,
+            "an entity with no duplicate-locator finding discloses nothing"
+        );
+    }
+
+    #[test]
+    fn open_finding_discloses_both_declarations_and_shape() {
+        let conn = migrated_conn();
+        insert_collision_finding(&conn, "open");
+        let disclosure = duplicate_locator_collision(&conn, COLLIDING_ID)
+            .unwrap()
+            .expect("collision must be disclosed");
+        assert_eq!(
+            disclosure.declarations,
+            vec![
+                "/specimen/colliding.py".to_owned(),
+                "/specimen/colliding/__init__.py".to_owned(),
+            ],
+            "both colliding declarations are disclosed, sorted + deduped"
+        );
+        assert_eq!(disclosure.shape.as_deref(), Some("in_run_cross_file"));
+    }
+
+    #[test]
+    fn suppressed_finding_still_discloses_the_chimera() {
+        // The crux: suppression is a status flip, the row persists, and the
+        // data-loss fact persists with it — so the disclosure must survive.
+        let conn = migrated_conn();
+        insert_collision_finding(&conn, "suppressed");
+        assert!(
+            duplicate_locator_collision(&conn, COLLIDING_ID)
+                .unwrap()
+                .is_some(),
+            "a suppressed duplicate-locator finding must NOT hide the collision"
+        );
+    }
+
+    #[test]
+    fn other_rule_findings_do_not_masquerade_as_collisions() {
+        let conn = migrated_conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO runs (id, started_at, config, stats, status) \
+             VALUES ('run-1', 't', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO findings ( \
+                id, tool, tool_version, run_id, rule_id, kind, severity, \
+                entity_id, related_entities, message, evidence, properties, \
+                supports, supported_by, status, created_at, updated_at \
+             ) VALUES ( \
+                'core:finding:other', 'loomweave', '0', 'run-1', 'LMWV-OTHER', 'defect', 'WARN', \
+                ?1, '[]', 'm', '{}', '{}', \
+                '[]', '[]', 'open', 't', 't' \
+             )",
+            params![COLLIDING_ID],
+        )
+        .unwrap();
+        assert_eq!(
+            duplicate_locator_collision(&conn, COLLIDING_ID).unwrap(),
+            None,
+            "only LMWV-DUPLICATE-LOCATOR findings disclose a collision"
+        );
     }
 }
