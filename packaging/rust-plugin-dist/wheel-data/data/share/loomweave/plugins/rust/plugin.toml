@@ -53,8 +53,17 @@ rule_id_prefix = "LMWV-RUST-"
 # no gate enforces the Rust plugin ontology_version (every check-*.py confirmed).
 # 0.5.0: additive edge kinds `derives` + `references` (Phase 2 completion,
 # plan 2026-06-10 — ADR-027 MINOR).
+# 0.6.0: additive reachability-root categorisation tags `exported-api` /
+# `entry-point` / `test` / `allow-dead-code` (ADR-054 increment 1,
+# clarion-05fdd0490e — ADR-027 MINOR). Tags are not manifest-gated (the host
+# validates size, not membership), so this bump is documentation +
+# cache-invalidation, not a wire contract; bumped anyway per ADR-027.
+# 0.7.0: additive framework-attribute tags `http-route` / `cli-command` /
+# `framework-handler` (actix/rocket routes, clap derives, pyo3/proc-macro
+# entry-points, rstest runners) + `pub`-method rooting (ADR-054 increment 2 —
+# ADR-027 MINOR).
 # Lockstep with the `serve.rs` handshake constant.
-ontology_version = "0.5.0"
+ontology_version = "0.7.0"
 
 [ontology.roles]
 file_scope = ["module"]

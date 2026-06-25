@@ -686,6 +686,27 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 HashMap::new(),
             )
         };
+    // clarion-e12d424f1d: the per-plugin tag-schema markers from the last
+    // successful run, keyed by plugin_id. Each plugin's live manifest
+    // (version, ontology_version) is compared against its stored marker below;
+    // a mismatch (or absence) forces a full re-dispatch of that plugin's files,
+    // so a plugin upgrade that changed the emitted vocabulary (e.g. ADR-053/054
+    // root tags) never leaves unchanged files carrying stale entity_tags. Empty
+    // under `--no-incremental` (everything re-dispatches regardless), but the
+    // markers are still re-stamped after the run so the next incremental run
+    // sees current values.
+    let prior_plugin_markers: HashMap<String, loomweave_storage::PluginIndexMarker> = if incremental
+    {
+        Connection::open(&db_path)
+            .ok()
+            .and_then(|conn| loomweave_storage::load_plugin_index_markers(&conn).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    // The markers to persist after a fully-successful run — one per dispatched
+    // plugin, recording the (version, ontology_version) the index now reflects.
+    let mut current_plugin_markers: Vec<loomweave_storage::PluginIndexMarker> = Vec::new();
     // Locators of skipped-unchanged entities — fed into the SEI matcher's
     // current-locator union AND re-appended to the prior-index rebuild below.
     let mut retained_locators: HashSet<String> = HashSet::new();
@@ -785,6 +806,43 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             continue;
         }
 
+        // clarion-e12d424f1d: record the marker this plugin is analysing the
+        // index under (persisted only on a fully-successful run, alongside the
+        // prior-index snapshot), and decide whether its tag schema moved since
+        // the last run. The comparison keys on BOTH `version` (bumps on any
+        // release) and `ontology_version` (the declared vocabulary version): a
+        // mismatch on EITHER — or no stored marker at all — forces a full
+        // re-dispatch of this plugin's files, even on an incremental run. This
+        // is the only signal that distinguishes "plugin emits no roots" from
+        // "plugin emits roots but this index's unchanged files predate them",
+        // which the MCP dead-code survey's all-or-nothing guard cannot.
+        let plugin_version = plugin.manifest.plugin.version.clone();
+        let ontology_version = plugin.manifest.ontology.ontology_version.clone();
+        let plugin_tag_schema_changed = match prior_plugin_markers.get(&plugin_id) {
+            Some(prior) => {
+                prior.plugin_version != plugin_version || prior.ontology_version != ontology_version
+            }
+            // No recorded marker: a fresh plugin, or the first run after this
+            // fix shipped against an index built by a (possibly already
+            // upgraded) plugin. Re-dispatch to heal any pre-existing skew —
+            // the safe, fail-toward-work direction.
+            None => true,
+        };
+        if incremental && plugin_tag_schema_changed && !prior_plugin_markers.is_empty() {
+            tracing::info!(
+                plugin_id = %plugin_id,
+                plugin_version = %plugin_version,
+                ontology_version = %ontology_version,
+                "plugin tag-schema marker changed since last run; forcing full re-dispatch \
+                 of this plugin's files (clarion-e12d424f1d)"
+            );
+        }
+        current_plugin_markers.push(loomweave_storage::PluginIndexMarker {
+            plugin_id: plugin_id.clone(),
+            plugin_version,
+            ontology_version,
+        });
+
         // Wave 2 / T3.1: partition into files to re-analyse (changed, new,
         // unhashable → fail toward work) and files to skip (whole-file hash
         // identical to the prior run). Each skipped file's prior entities stay
@@ -793,9 +851,21 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // A secret-bearing UNCHANGED file skips too (weft-4165f1ed71): its
         // finding anchor is seeded from the committed rows below, so the skip
         // no longer re-anchors (and thereby duplicates) the finding.
-        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) = plugin_files
-            .into_iter()
-            .partition(|path| file_needs_reanalysis(&project_root, path, &prior_file_hashes));
+        //
+        // clarion-e12d424f1d: when this plugin's tag schema moved, skip the
+        // byte-hash consultation entirely and re-dispatch every file (in-memory
+        // only — the stored per-file hashes are never mutated). The hashes are
+        // keyed on the core `file` entity, not per language plugin, so there is
+        // nothing plugin-scoped to clear; overriding the partition is both the
+        // correct scope and the safe one.
+        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
+            if plugin_tag_schema_changed {
+                (plugin_files, Vec::new())
+            } else {
+                plugin_files.into_iter().partition(|path| {
+                    file_needs_reanalysis(&project_root, path, &prior_file_hashes)
+                })
+            };
         // Locators of THIS plugin's skipped-unchanged entities. These rows stay in
         // the committed DB untouched this run (they are guarded against orphan
         // deletion via `retained_locators` below — see the SEI matcher's
@@ -1479,6 +1549,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             if let Err(e) = writer
                 .send_wait(|ack| WriterCmd::UpsertPriorIndex {
                     entries: prior_index_entries,
+                    plugin_markers: current_plugin_markers,
                     recorded_at: iso8601_now(),
                     ack,
                 })

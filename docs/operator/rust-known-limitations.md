@@ -126,11 +126,17 @@ override only if a real repo/analyzer trips it in practice.
 This is a known limitation, not an error.
 
 **Why.** The dead-code (and related categorisation) views are driven by
-tags the language plugin emits; the Rust plugin does not yet emit those
-categorisation tags, so a pure-Rust index has no data to populate them
-(tracked as **clarion-e1899a109f**). The structural tools (`entity_find`,
-`entity_callers_list`, `entity_neighborhood_get`, and the edge surfaces) are
-unaffected.
+reachability-root tags the language plugin emits (`exported-api`, `entry-point`,
+`test`, …); the Rust plugin emits **no** categorisation tags, so a pure-Rust
+index has no roots and the engine excludes its entities rather than
+false-flagging the whole crate dead. The Python plugin does emit these (including
+the no-`__all__` `public-surface` heuristic, ADR-053); the Rust analog —
+visibility → `exported-api`, `fn main`/bin → `entry-point`, `#[test]` → `test`,
+route/CLI attribute macros → handlers — is tracked as **clarion-05fdd0490e**. The
+structural tools (`entity_find`, `entity_callers_list`,
+`entity_neighborhood_get`, and the edge surfaces) are unaffected. For a
+side-by-side of what each plugin extracts and tags, see
+[language-support.md](./language-support.md).
 
 ## Unnamed `const _` items are not entities
 

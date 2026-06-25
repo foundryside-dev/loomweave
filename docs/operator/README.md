@@ -5,6 +5,11 @@ Practical notes for configuring and running Loomweave.
 - [Getting started](./getting-started.md) — single-flow walkthrough: install,
   analyse a small repo, connect an MCP client, ask three questions, verify
   the secret-block. Target ≤15 minutes end-to-end.
+- [Language support](./language-support.md) — what each language plugin (Python,
+  Rust) extracts and tags, side by side: entity/edge kinds, categorisation tags,
+  and which tools work per language (e.g. dead-code is Python-only today).
+- [Rust analysis: known limitations](./rust-known-limitations.md) — what Rust
+  analysis does and does not resolve (macros, external edges, dead-code roots).
 - [OpenRouter LLM provider](./openrouter.md) — API key, model ID, attribution
   headers, and token-ceiling configuration.
 - [Coding-agent LLM providers](./coding-agent-llm-providers.md) — Codex CLI

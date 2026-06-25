@@ -842,7 +842,7 @@ fn migrations_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut conn = open_fresh(&tempdir);
     schema::apply_migrations(&mut conn).expect("second apply should be a no-op");
-    assert_eq!(schema::applied_count(&conn).unwrap(), 10);
+    assert_eq!(schema::applied_count(&conn).unwrap(), 11);
     let tables_after = table_names(&conn);
     assert!(tables_after.contains(&"entities".to_owned()));
 }
@@ -856,7 +856,7 @@ fn schema_migrations_records_each_applied_migration() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 10);
+    assert_eq!(count, 11);
     let names: Vec<String> = {
         let mut stmt = conn
             .prepare("SELECT name FROM schema_migrations ORDER BY version")
@@ -877,8 +877,45 @@ fn schema_migrations_records_each_applied_migration() {
             "0008_run_owner_heartbeat",
             "0009_drop_fts_content_text",
             "0010_dedupe_findings_drop_run_scoped_ids",
+            "0011_plugin_index_meta",
         ]
     );
+}
+
+// ----------------------------------------------------------------------------
+// Migration 0011 — per-plugin tag-schema marker (clarion-e12d424f1d). Records
+// the (plugin_version, ontology_version) each plugin last analysed the index
+// under, so `analyze` can force a full re-dispatch of a plugin's files when its
+// emitted tag vocabulary moves. Pins the table shape the analyze force-full
+// decision and the marker round-trip depend on.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn migration_0011_creates_plugin_index_meta_table() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    assert!(
+        table_names(&conn).contains(&"plugin_index_meta".to_owned()),
+        "migration 0011 must create plugin_index_meta"
+    );
+    let columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('plugin_index_meta')")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        rows.map(std::result::Result::unwrap).collect()
+    };
+    for expected in &[
+        "plugin_id",
+        "plugin_version",
+        "ontology_version",
+        "recorded_at",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == expected),
+            "missing plugin_index_meta.{expected} in {columns:?}"
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------

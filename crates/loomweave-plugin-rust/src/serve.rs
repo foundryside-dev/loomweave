@@ -129,7 +129,7 @@ pub fn run() -> ! {
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                     // Lockstep with plugin.toml `[ontology].ontology_version`
                     // (ADR-027). Bump both together.
-                    ontology_version: "0.5.0".to_owned(),
+                    ontology_version: "0.7.0".to_owned(),
                     capabilities: serde_json::json!({}),
                 };
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());

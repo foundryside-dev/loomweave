@@ -15,7 +15,7 @@ pub use loomweave_core::EdgeConfidence;
 
 use crate::cache::{InferredEdgeCacheEntry, SummaryCacheEntry, SummaryCacheKey};
 use crate::error::StorageError;
-use crate::prior_index::PriorIndexEntry;
+use crate::prior_index::{PluginIndexMarker, PriorIndexEntry};
 use crate::sei::{SeiBindingRecord, SeiLineageEntry};
 use crate::unresolved::UnresolvedCallSiteRecord;
 use crate::wardline_taint::TaintFact;
@@ -264,14 +264,22 @@ pub enum WriterCmd {
     /// resolve qualnames.
     UpsertWardlineTaintFact { fact: Box<TaintFact>, ack: Ack<()> },
     /// Rewrite the prior-index snapshot to exactly the current run's entities
-    /// (Wave 0 / WS3). FULL-SNAPSHOT REPLACE — clears `sei_prior_index` and
-    /// inserts every entry in one transaction, so stale rows from the prior run
-    /// are removed (despite the `Upsert` name, this is a whole-table replace).
+    /// (Wave 0 / WS3) AND upsert the per-plugin tag-schema markers
+    /// (clarion-e12d424f1d), in ONE transaction. The snapshot is a FULL-SNAPSHOT
+    /// REPLACE — clears `sei_prior_index` and inserts every entry, so stale rows
+    /// from the prior run are removed (despite the `Upsert` name, this part is a
+    /// whole-table replace). `plugin_markers` are upserted per `plugin_id`, so a
+    /// run only advances the markers of the plugins it actually dispatched.
+    /// Bundling both in one transaction keeps the marker from ever advancing
+    /// without the snapshot it describes (see [`replace_prior_index_and_markers`]).
     /// Query-time write: it runs after `CommitRun` (no active run transaction),
     /// best-effort, and never gates the run's own outcome. `recorded_at` is the
     /// run-completion timestamp stamped onto every row.
+    ///
+    /// [`replace_prior_index_and_markers`]: crate::replace_prior_index_and_markers
     UpsertPriorIndex {
         entries: Vec<PriorIndexEntry>,
+        plugin_markers: Vec<PluginIndexMarker>,
         recorded_at: String,
         ack: Ack<()>,
     },

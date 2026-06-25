@@ -71,6 +71,12 @@ const DEAD_CODE_ROOT_TAGS: &[&str] = &[
     // a module *with* `__all__` emits no `public-surface`, so well-declared
     // modules are byte-identical to before.
     "public-surface",
+    // `allow-dead-code` (ADR-054): the Rust plugin emits this for an item
+    // carrying `#[allow(dead_code)]` / `#[expect(dead_code)]` — an explicit
+    // author "keep this" assertion that suppresses rustc's own dead-code lint.
+    // The lowest-confidence root class (an explicit local suppression, not a
+    // structural surface), but fail-toward-live and consistent with rustc.
+    "allow-dead-code",
     "wardline:external_boundary",
     "wardline:trusted",
 ];
@@ -92,6 +98,19 @@ const DEAD_CODE_EXCLUDED_TAGS: &[&str] = &["framework-handler", "plugin-hook"];
 /// subsystems (groupings, not code), and guidance sheets. Exclusion is by
 /// kind, not plugin, so a plugin-emitted non-code kind is covered too.
 const DEAD_CODE_NON_CODE_KINDS: &[&str] = &["file", "project", "subsystem", "guidance"];
+
+/// Code-adjacent CONTAINER kinds that are never dead-code candidates (ADR-054).
+/// A `module` (and a Rust `impl` block) is the containment spine rooted at the
+/// always-live crate root: reachability-by-containment reaches every container by
+/// construction, so it is never "dead" in any actionable sense — you remove its
+/// contents (which ARE surveyed individually), not the namespace/block.
+/// Reachability proper runs over call+import edges only, and the Rust plugin
+/// emits no module/impl-targeting `imports` edges (its import edges target
+/// items), so without this exclusion every Rust module and `impl` would read as
+/// dead and dominate the candidate set. Kept distinct from
+/// [`DEAD_CODE_NON_CODE_KINDS`] (these are code, not non-code anchors) and
+/// disclosed separately.
+const DEAD_CODE_CONTAINER_KINDS: &[&str] = &["module", "impl"];
 
 /// Runtime import predicate used by graph shortcuts. Missing or malformed
 /// properties fail toward inclusion; explicit `type_only=true` or
@@ -349,8 +368,10 @@ impl ServerState {
             .with_reader(move |conn| {
                 let filter = scope.resolve(conn)?;
                 let (in_scope, scope_truncated) = filter.in_scope_ids(conn, &project_root)?;
+                // The languages present localise every advisory lever (ADR-054).
+                let langs = plugins_present(conn)?;
                 let Some(reachability) = dead_code_reachability(conn, app_only)? else {
-                    return Ok(dead_code_no_roots_envelope(&page, scope_truncated));
+                    return Ok(dead_code_no_roots_envelope(&page, scope_truncated, &langs));
                 };
                 let DeadCodeReachability {
                     app_excluded,
@@ -428,6 +449,7 @@ impl ServerState {
                         unresolved_call_site_suppressed,
                         withheld_count,
                         roots_mode,
+                        &langs,
                     ),
                     "app_only": app_only,
                     "dead_code": dead_code,
@@ -443,6 +465,7 @@ impl ServerState {
                     },
                     "excluded": {
                         "non_code_kinds": DEAD_CODE_NON_CODE_KINDS,
+                        "container_kinds": DEAD_CODE_CONTAINER_KINDS,
                         "plugins_without_roots": plugins_without_roots_json(excluded_by_plugin),
                     },
                     // Aggregate-level actionability without identity
@@ -477,11 +500,65 @@ const SHORTCUT_PAGE_DEFAULT: usize = 50;
 const SHORTCUT_PAGE_MAX: usize = 200;
 const CHURN_SCAN_CAP: usize = 50_000;
 
+/// The distinct plugin ids that own at least one entity in this index — the
+/// languages whose source-level levers a dead-code advisory should name
+/// (ADR-054: a Rust corpus must never be handed Python-only `__all__` advice).
+fn plugins_present(conn: &rusqlite::Connection) -> loomweave_storage::Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT plugin_id FROM entities")?;
+    let mut rows = stmt.query([])?;
+    let mut out = BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        out.insert(row.get::<_, String>(0)?);
+    }
+    Ok(out)
+}
+
+/// The source-level levers that emit reachability roots, phrased per language
+/// from the plugin ids actually present (ADR-054 / ADR-053). Sorted-set input →
+/// deterministic ordering; an unknown/empty plugin set yields a generic phrase.
+fn root_tag_levers(plugin_ids: &BTreeSet<String>) -> String {
+    let phrases: Vec<&'static str> = plugin_ids
+        .iter()
+        .filter_map(|p| match p.as_str() {
+            "python" => Some(
+                "for Python, declare `__all__` to mark a module's public surface \
+                 (with no `__all__`, public module-level defs/classes are auto-tagged \
+                 `public-surface`) and add entry-point / cli-command / http-route \
+                 decorators to externally-invoked functions",
+            ),
+            "rust" => Some(
+                "for Rust, make an item `pub` (exported API), add a `fn main` / \
+                 `[[bin]]` or a `#[tokio::main]` entry point, and mark tests with \
+                 `#[test]` / `#[cfg(test)]`",
+            ),
+            _ => None,
+        })
+        .collect();
+    if phrases.is_empty() {
+        return "the levers are source-level: emit reachability-root tags (exported \
+                API, entry points, tests) for the analysed languages"
+            .to_owned();
+    }
+    format!("the levers are source-level — {}", phrases.join("; "))
+}
+
 /// The honest signal-unavailable envelope for `find_dead_code` when no
 /// reachability root tags exist — zero candidates, never a whole-corpus false
 /// positive. Identical in both `explicit` and `auto` modes: `auto` cannot
-/// fabricate roots from an empty tag set.
-fn dead_code_no_roots_envelope(page: &Page, scope_truncated: bool) -> Value {
+/// fabricate roots from an empty tag set. `plugin_ids` localises the lever copy
+/// to the languages present (ADR-054).
+fn dead_code_no_roots_envelope(
+    page: &Page,
+    scope_truncated: bool,
+    plugin_ids: &BTreeSet<String>,
+) -> Value {
+    let levers = root_tag_levers(plugin_ids);
+    let signal_msg = format!(
+        "this index has no reachability root tags (entry-point / http-route / test / \
+         data-model / cli-command / exported-api / public-surface / allow-dead-code), \
+         so dead code cannot be determined — this is NOT a guarantee there is no dead \
+         code. {levers}"
+    );
     success_envelope(json!({
         "dead_code": [],
         "page": {
@@ -490,16 +567,7 @@ fn dead_code_no_roots_envelope(page: &Page, scope_truncated: bool) -> Value {
         },
         "scope_truncated": scope_truncated,
         "scan_truncated": false,
-        "signal": missing_signal(
-            "entity_tags",
-            "this index has no reachability root tags (entry-point / http-route / \
-             test / data-model / cli-command / exported-api / public-surface), so \
-             dead code cannot be determined — this is NOT a guarantee there is no \
-             dead code. The levers are source-level: declare `__all__` (or, with \
-             no `__all__`, public module-level defs/classes are auto-tagged \
-             `public-surface`) and add entry-point / cli-command / http-route \
-             decorators to public entry functions",
-        ),
+        "signal": missing_signal("entity_tags", &signal_msg),
     }))
 }
 
@@ -517,6 +585,7 @@ fn dead_code_summary(
     shielded_by_unresolved_calls: usize,
     withheld_secret: usize,
     roots_mode: RootsMode,
+    plugin_ids: &BTreeSet<String>,
 ) -> Value {
     let analysed = reachable.saturating_add(dead_candidates);
     let dead_pct = dead_candidates
@@ -525,16 +594,14 @@ fn dead_code_summary(
         .unwrap_or(0);
     let low_confidence = dead_pct > 25;
     let advisory = low_confidence.then(|| {
+        let levers = root_tag_levers(plugin_ids);
         format!(
             "{dead_pct}% of analysed entities ({dead_candidates}/{analysed}) are unreachable \
              from the reachability roots — implausibly high, so the roots likely do not cover \
              this corpus (e.g. code reached through framework dispatch, dependency injection, a \
              CLI, or tests that static analysis cannot follow). Treat these candidates as LOW \
-             CONFIDENCE. There is no roots config knob; the levers are source-level: declare \
-             `__all__` to mark a module's public surface (non-underscore module-level \
-             defs/classes are auto-tagged `public-surface` roots when a module declares no \
-             `__all__`), and add entry-point / cli-command / http-route decorators to \
-             externally-invoked entry points, before relying on dead-code detection."
+             CONFIDENCE. There is no roots config knob; {levers}, before relying on dead-code \
+             detection."
         )
     });
     json!({
@@ -1033,6 +1100,7 @@ fn dead_code_candidate_set(
     let mut candidates: Vec<String> = all_rows
         .into_iter()
         .filter(|row| !DEAD_CODE_NON_CODE_KINDS.contains(&row.kind.as_str()))
+        .filter(|row| !DEAD_CODE_CONTAINER_KINDS.contains(&row.kind.as_str()))
         .filter(|row| match &plugins_with_roots {
             None => true,
             Some(plugins_with_roots) => {
@@ -1397,12 +1465,17 @@ fn strongly_connected_cycles(adjacency: &HashMap<String, Vec<String>>) -> Vec<Ve
 mod tests {
     use super::*;
 
+    fn plugin_set(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     #[test]
     fn dead_code_summary_flags_low_confidence_when_unreachable_share_is_high() {
         // The lacuna shape: 141 candidates of ~391 analysed (36%) — implausibly
         // high, so the roots don't cover the corpus. Confidence must read LOW and
         // recruit the operator, not present 141 as a confident headline.
-        let s = dead_code_summary(141, 250, 1, 3, 5, RootsMode::Explicit);
+        let py = plugin_set(&["python"]);
+        let s = dead_code_summary(141, 250, 1, 3, 5, RootsMode::Explicit, &py);
         assert_eq!(s["confidence"], "low");
         assert!(s["advisory"].as_str().unwrap().contains("LOW CONFIDENCE"));
         assert_eq!(s["dead_candidates"], 141);
@@ -1415,17 +1488,17 @@ mod tests {
 
         // A plausible dead share (a few orphans in a well-rooted corpus) reads
         // MODERATE with no advisory — the breakdown still leads, but no alarm.
-        let s = dead_code_summary(5, 400, 0, 0, 0, RootsMode::Explicit);
+        let s = dead_code_summary(5, 400, 0, 0, 0, RootsMode::Explicit, &py);
         assert_eq!(s["confidence"], "moderate");
         assert!(s["advisory"].is_null());
 
         // Degenerate: nothing analysed → no division panic, no false alarm.
-        let s = dead_code_summary(0, 0, 0, 0, 0, RootsMode::Explicit);
+        let s = dead_code_summary(0, 0, 0, 0, 0, RootsMode::Explicit, &py);
         assert_eq!(s["confidence"], "moderate");
         assert!(s["advisory"].is_null());
 
         // Auto mode declares the derived-confidence roots.
-        let s = dead_code_summary(5, 400, 0, 0, 0, RootsMode::Auto);
+        let s = dead_code_summary(5, 400, 0, 0, 0, RootsMode::Auto, &py);
         assert_eq!(s["roots_mode"], "auto");
         assert_eq!(s["roots_confidence"], "derived");
     }
@@ -1435,8 +1508,16 @@ mod tests {
         // clarion-4ec50f3d92: the LOW-confidence advisory must recruit the
         // *actual* levers — declaring `__all__`, adding entry-point/cli/http
         // decorators — never a "configure roots" knob that loomweave.yaml does
-        // not have.
-        let s = dead_code_summary(141, 250, 1, 3, 5, RootsMode::Explicit);
+        // not have. (Python corpus.)
+        let s = dead_code_summary(
+            141,
+            250,
+            1,
+            3,
+            5,
+            RootsMode::Explicit,
+            &plugin_set(&["python"]),
+        );
         let advisory = s["advisory"]
             .as_str()
             .expect("low-confidence advisory present");
@@ -1456,14 +1537,41 @@ mod tests {
     }
 
     #[test]
+    fn dead_code_advisory_is_language_aware_for_rust() {
+        // ADR-054: a Rust corpus must be handed Rust levers (`pub` / `#[test]` /
+        // an entry point), NEVER Python-only `__all__` advice.
+        let s = dead_code_summary(
+            141,
+            250,
+            0,
+            0,
+            0,
+            RootsMode::Explicit,
+            &plugin_set(&["rust"]),
+        );
+        let advisory = s["advisory"]
+            .as_str()
+            .expect("low-confidence advisory present");
+        assert!(advisory.contains("LOW CONFIDENCE"));
+        assert!(
+            advisory.contains("#[test]"),
+            "advisory names a Rust lever: {advisory}"
+        );
+        assert!(
+            !advisory.contains("__all__"),
+            "no Python-only advice for a Rust corpus: {advisory}"
+        );
+    }
+
+    #[test]
     fn dead_code_no_roots_envelope_recruits_real_levers() {
         // clarion-4ec50f3d92: the signal-unavailable envelope must point at the
-        // source-level levers, not imply a config knob.
+        // source-level levers, not imply a config knob. (Python corpus.)
         let page = Page {
             limit: 50,
             offset: 0,
         };
-        let envelope = dead_code_no_roots_envelope(&page, false);
+        let envelope = dead_code_no_roots_envelope(&page, false, &plugin_set(&["python"]));
         let rendered = serde_json::to_string(&envelope).expect("serialise envelope");
         assert!(
             rendered.contains("__all__"),
@@ -1472,6 +1580,25 @@ mod tests {
         assert!(
             !rendered.contains("configure"),
             "envelope must not imply a config knob: {rendered}"
+        );
+    }
+
+    #[test]
+    fn dead_code_no_roots_envelope_is_language_aware_for_rust() {
+        // ADR-054: a Rust-only no-roots corpus gets Rust levers, not `__all__`.
+        let page = Page {
+            limit: 50,
+            offset: 0,
+        };
+        let envelope = dead_code_no_roots_envelope(&page, false, &plugin_set(&["rust"]));
+        let rendered = serde_json::to_string(&envelope).expect("serialise envelope");
+        assert!(
+            rendered.contains("#[test]"),
+            "envelope names a Rust lever: {rendered}"
+        );
+        assert!(
+            !rendered.contains("__all__"),
+            "no Python-only advice for a Rust corpus: {rendered}"
         );
     }
 

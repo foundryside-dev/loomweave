@@ -42,6 +42,7 @@ use crate::references::{
     fields_reference_sites, signature_reference_sites, type_reference_sites,
 };
 use crate::resolve::{Resolution, Resolver};
+use crate::root_tags::{TagCtx, has_macro_export, is_unrestricted_pub, root_tags};
 use crate::signature::{function_signature, impl_signature, struct_signature};
 use crate::spans::{SourceRange, source_range_of};
 
@@ -176,6 +177,7 @@ fn extract_file_on_pinned_stack(
         &module_id,
         file_path,
         resolution,
+        TagCtx::for_file(module_path),
         &mut entities,
         &mut edges,
         &mut acc,
@@ -392,12 +394,16 @@ fn degraded_module_tuple(
 // near-identical dispatch arm over the item enum. Splitting it would obscure the
 // one-arm-per-syn-Item structure the reader relies on.
 #[allow(clippy::too_many_lines)]
+// The walk threads file context (path/module/resolver) + the two output sinks +
+// the ADR-054 tag context; bundling would only hide the data flow.
+#[allow(clippy::too_many_arguments)]
 fn walk_items(
     items: &[Item],
     module_path: &str,
     parent_id: &str,
     file_path: &str,
     resolution: Option<(&str, &Resolver)>,
+    ctx: TagCtx,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
     acc: &mut Phase2Acc,
@@ -502,7 +508,11 @@ fn walk_items(
     for item in items {
         match item {
             Item::Fn(ItemFn {
-                sig, attrs, block, ..
+                vis,
+                sig,
+                attrs,
+                block,
+                ..
             }) => {
                 let name = sig.ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
@@ -511,7 +521,7 @@ fn walk_items(
                 {
                     q.push_str(&disc);
                 }
-                let child = entity(
+                let mut child = entity(
                     "function",
                     &q,
                     file_path,
@@ -519,6 +529,10 @@ fn walk_items(
                     Some(parent_id),
                     Some(function_signature(sig)),
                 )?;
+                attach_tags(
+                    &mut child,
+                    root_tags(&name, is_unrestricted_pub(vis), true, attrs, ctx),
+                );
                 let fn_id = build_id("function", &q)?;
                 push_with_contains(parent_id, child, out, edges);
                 // Phase 2: walk the body for call sites, ONLY with a resolver
@@ -543,6 +557,7 @@ fn walk_items(
                 }
             }
             Item::Struct(ItemStruct {
+                vis,
                 ident,
                 fields,
                 attrs,
@@ -555,7 +570,7 @@ fn walk_items(
                 {
                     q.push_str(&disc);
                 }
-                let child = entity(
+                let mut child = entity(
                     "struct",
                     &q,
                     file_path,
@@ -563,6 +578,10 @@ fn walk_items(
                     Some(parent_id),
                     Some(struct_signature(fields)),
                 )?;
+                attach_tags(
+                    &mut child,
+                    root_tags(&name, is_unrestricted_pub(vis), false, attrs, ctx),
+                );
                 push_with_contains(parent_id, child, out, edges);
                 // Phase 2: anchored `derives` edges, ONLY with a resolver (the
                 // edges-aware entry point) — parity with `imports`/`implements`.
@@ -586,12 +605,14 @@ fn walk_items(
                     &method_is_cfg_twin,
                     &mut seen_impl_ids,
                     resolution,
+                    ctx,
                     out,
                     edges,
                     acc,
                 )?;
             }
             Item::Mod(ItemMod {
+                vis,
                 ident,
                 content: Some((_, inner)),
                 attrs,
@@ -615,8 +636,18 @@ fn walk_items(
                     None,
                 )?);
                 let nested_id = build_id("module", &nested)?;
+                // ADR-054: the pub-chain and cfg(test) ancestry descend with the
+                // module nesting; `in_bin_target` is fixed per file.
                 walk_items(
-                    inner, &nested, &nested_id, file_path, resolution, out, edges, acc,
+                    inner,
+                    &nested,
+                    &nested_id,
+                    file_path,
+                    resolution,
+                    ctx.descend_into_mod(vis, attrs),
+                    out,
+                    edges,
+                    acc,
                 )?;
             }
             // Phase 1b leaf kinds: free items riding the same qualname + entity +
@@ -624,6 +655,7 @@ fn walk_items(
             // signature builder yet — trait/impl SEI signatures are a later task).
             // Trait *bodies* are deliberately NOT walked here (matching 1a).
             Item::Enum(ItemEnum {
+                vis,
                 ident,
                 attrs,
                 variants,
@@ -636,7 +668,7 @@ fn walk_items(
                 {
                     q.push_str(&disc);
                 }
-                let child = entity(
+                let mut child = entity(
                     "enum",
                     &q,
                     file_path,
@@ -644,6 +676,10 @@ fn walk_items(
                     Some(parent_id),
                     None,
                 )?;
+                attach_tags(
+                    &mut child,
+                    root_tags(&name, is_unrestricted_pub(vis), false, attrs, ctx),
+                );
                 push_with_contains(parent_id, child, out, edges);
                 // Phase 2: `derives` edges for enums too (structs + enums are
                 // the only derive targets in the walk — no `Item::Union` arm).
@@ -660,7 +696,9 @@ fn walk_items(
                     emit_reference_edges(&ref_sites, &enum_id, from_crate, resolver, acc, edges);
                 }
             }
-            Item::Trait(ItemTrait { ident, attrs, .. }) => {
+            Item::Trait(ItemTrait {
+                vis, ident, attrs, ..
+            }) => {
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
                 if is_cfg_twin("trait", &name)
@@ -668,7 +706,7 @@ fn walk_items(
                 {
                     q.push_str(&disc);
                 }
-                let child = entity(
+                let mut child = entity(
                     "trait",
                     &q,
                     file_path,
@@ -676,10 +714,18 @@ fn walk_items(
                     Some(parent_id),
                     None,
                 )?;
+                attach_tags(
+                    &mut child,
+                    root_tags(&name, is_unrestricted_pub(vis), false, attrs, ctx),
+                );
                 push_with_contains(parent_id, child, out, edges);
             }
             Item::Type(ItemType {
-                ident, attrs, ty, ..
+                vis,
+                ident,
+                attrs,
+                ty,
+                ..
             }) => {
                 let name = ident.to_string();
                 let mut q = free_item_qualname(module_path, &name);
@@ -688,7 +734,7 @@ fn walk_items(
                 {
                     q.push_str(&disc);
                 }
-                let child = entity(
+                let mut child = entity(
                     "type_alias",
                     &q,
                     file_path,
@@ -696,6 +742,10 @@ fn walk_items(
                     Some(parent_id),
                     None,
                 )?;
+                attach_tags(
+                    &mut child,
+                    root_tags(&name, is_unrestricted_pub(vis), false, attrs, ctx),
+                );
                 push_with_contains(parent_id, child, out, edges);
                 // Phase 2: the alias RHS is a type position — `references`
                 // sites from the type_alias entity (D3), resolver-gated.
@@ -707,6 +757,7 @@ fn walk_items(
                 }
             }
             Item::Const(ItemConst {
+                vis,
                 ident,
                 attrs,
                 ty,
@@ -734,7 +785,7 @@ fn walk_items(
                 {
                     q.push_str(&disc);
                 }
-                let child = entity(
+                let mut child = entity(
                     "const",
                     &q,
                     file_path,
@@ -742,6 +793,10 @@ fn walk_items(
                     Some(parent_id),
                     None,
                 )?;
+                attach_tags(
+                    &mut child,
+                    root_tags(&name, is_unrestricted_pub(vis), false, attrs, ctx),
+                );
                 push_with_contains(parent_id, child, out, edges);
                 // Phase 2: declared type (type position) + initializer
                 // (expression position) both mint `references` sites from the
@@ -755,6 +810,7 @@ fn walk_items(
                 }
             }
             Item::Static(ItemStatic {
+                vis,
                 ident,
                 attrs,
                 ty,
@@ -768,7 +824,7 @@ fn walk_items(
                 {
                     q.push_str(&disc);
                 }
-                let child = entity(
+                let mut child = entity(
                     "static",
                     &q,
                     file_path,
@@ -776,6 +832,10 @@ fn walk_items(
                     Some(parent_id),
                     None,
                 )?;
+                attach_tags(
+                    &mut child,
+                    root_tags(&name, is_unrestricted_pub(vis), false, attrs, ctx),
+                );
                 push_with_contains(parent_id, child, out, edges);
                 // Phase 2: same channel as `const` — declared type +
                 // initializer, from the static entity (D3), resolver-gated.
@@ -801,7 +861,7 @@ fn walk_items(
                 {
                     q.push_str(&disc);
                 }
-                let child = entity(
+                let mut child = entity(
                     "macro",
                     &q,
                     file_path,
@@ -809,6 +869,20 @@ fn walk_items(
                     Some(parent_id),
                     None,
                 )?;
+                // `macro_rules!` has no `Visibility`; `#[macro_export]` is its
+                // external-surface marker (ADR-054 §1). It is CHAIN-INDEPENDENT —
+                // a `#[macro_export]` in a private mod is still crate-root API —
+                // so the pub-chain gate is waived for an exported macro.
+                let exported_macro = has_macro_export(attrs);
+                let macro_ctx = if exported_macro {
+                    ctx.with_export_chain_satisfied()
+                } else {
+                    ctx
+                };
+                attach_tags(
+                    &mut child,
+                    root_tags(&name, exported_macro, false, attrs, macro_ctx),
+                );
                 push_with_contains(parent_id, child, out, edges);
             }
             // `use` items resolve to anchored `imports` edges (Phase 1b, Task 7)
@@ -1133,6 +1207,7 @@ fn emit_impl(
     method_is_cfg_twin: &dyn Fn(&str, &str) -> bool,
     seen_impl_ids: &mut std::collections::BTreeSet<String>,
     resolution: Option<(&str, &Resolver)>,
+    ctx: TagCtx,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
     acc: &mut Phase2Acc,
@@ -1204,7 +1279,7 @@ fn emit_impl(
             {
                 q.push_str(&disc);
             }
-            let child = entity(
+            let mut child = entity(
                 "function",
                 &q,
                 file_path,
@@ -1212,6 +1287,22 @@ fn emit_impl(
                 Some(&impl_id),
                 Some(function_signature(&m.sig)),
             )?;
+            // ADR-054 increment 2: a `pub` method of a `pub` type is external API
+            // (`exported-api`). Trait-impl methods carry inherited visibility (no
+            // `pub`), so the pub rule leaves them unrooted — a deferred follow-up.
+            // The pub-chain + cfg(test) gating is inherited from the enclosing
+            // module via `ctx`; `at_file_top` is cleared so a method named `main`
+            // is not an entry point.
+            attach_tags(
+                &mut child,
+                root_tags(
+                    &m.sig.ident.to_string(),
+                    is_unrestricted_pub(&m.vis),
+                    true,
+                    &m.attrs,
+                    ctx.descend_into_impl(),
+                ),
+            );
             let method_id = build_id("function", &q)?;
             push_with_contains(&impl_id, child, out, edges); // impl -> method
             // Phase 2: walk the method body for call sites, ONLY with a resolver.
@@ -1335,6 +1426,15 @@ fn push_with_contains(from_id: &str, child: Value, out: &mut Vec<Value>, edges: 
         edges.push(contains_edge(from_id, to_id));
     }
     out.push(child);
+}
+
+/// Attach ADR-054 reachability-root `tags` to an entity, omitting the key when
+/// the item carries none (default-empty keeps the wire addition non-breaking,
+/// parity with the Python plugin's `_attach_optional_entity_metadata`).
+fn attach_tags(child: &mut Value, tags: Vec<String>) {
+    if !tags.is_empty() {
+        child["tags"] = Value::from(tags);
+    }
 }
 
 /// A structural `contains` edge. Per ADR-026 decision 3 a structural edge

@@ -69,5 +69,6 @@ The agent **escalates before**:
   Wardline/Weft-hub repos — note the existing standing authorization covers
   *tool use*, not outward-facing publication)
 
-Last reviewed: 2026-06-11. Review cadence: every 30 days or at each
+Last reviewed: 2026-06-24 (confirmed unchanged by owner at `/own-product`
+resume; first reviewed 2026-06-11). Review cadence: every 30 days or at each
 `/own-product` resume, whichever comes first.

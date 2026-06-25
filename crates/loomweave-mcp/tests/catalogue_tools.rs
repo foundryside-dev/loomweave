@@ -201,6 +201,14 @@ fn insert_tag(conn: &Connection, entity_id: &str, tag: &str) {
     .expect("insert tag");
 }
 
+fn insert_tag_with_plugin(conn: &Connection, entity_id: &str, plugin_id: &str, tag: &str) {
+    conn.execute(
+        "INSERT INTO entity_tags (entity_id, plugin_id, tag) VALUES (?1, ?2, ?3)",
+        params![entity_id, plugin_id, tag],
+    )
+    .expect("insert tag");
+}
+
 fn insert_contains_edge(conn: &Connection, parent: &str, child: &str) {
     conn.execute(
         "INSERT INTO edges (kind, from_id, to_id, confidence) VALUES ('contains', ?1, ?2, 'resolved')",
@@ -3636,15 +3644,17 @@ async fn find_dead_code_excludes_non_code_entities() {
     );
 }
 
-/// B2(2) failing-first: entities owned by a plugin that emitted NO reachability
-/// root tags (the Rust plugin today — binary/lib roots unsupported, PDR-0012
-/// keeps the Rust line out of the launch envelope) must be EXCLUDED with an
-/// in-band marker, never false-flagged dead. A wrong answer is worse than an
-/// honest scope statement.
+/// B2(2): entities owned by a plugin that emitted NO reachability root tags must
+/// be EXCLUDED with an in-band marker, never false-flagged dead. A wrong answer
+/// is worse than an honest scope statement. (Since ADR-054 the Rust plugin DOES
+/// emit roots — see `find_dead_code_surveys_rust_once_it_emits_roots` — so the
+/// untagged `rust` entity here stands in for any hypothetical rootless plugin;
+/// the exclusion mechanism is plugin-name-agnostic, keyed on emitted tags.)
 #[tokio::test]
 async fn find_dead_code_excludes_plugins_without_root_coverage_with_marker() {
     let (project, db, conn) = open_project();
-    // Python emits roots; rust emits none (true to the live plugins).
+    // One plugin emits roots (python); the other emits none — its entities are
+    // withheld rather than false-flagged dead.
     insert_entity(
         &conn,
         "python:function:main",
@@ -4176,6 +4186,170 @@ async fn find_dead_code_public_surface_root_rescues_library_api_in_app_only() {
     // band (threshold > 25%).
     assert_eq!(env["result"]["summary"]["confidence"], "moderate", "{env}");
     assert!(env["result"]["summary"]["advisory"].is_null(), "{env}");
+}
+
+/// ADR-054 acceptance: once the Rust plugin emits reachability roots, a Rust-only
+/// index is SURVEYED (not withheld by the no-roots exclusion); a genuinely-unused
+/// private fn is flagged dead; and a `pub` lib fn reached only via a test stays
+/// live through its `exported-api` root even in `app_only` (where tests are
+/// excluded). The exclusion lift is automatic — `plugins_without_roots` drops to
+/// zero the moment Rust owns a root-tagged entity.
+#[tokio::test]
+async fn find_dead_code_surveys_rust_once_it_emits_roots() {
+    let (project, db, conn) = open_project();
+    // A pub lib fn → `exported-api` root.
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:lib.public_api",
+        "rust",
+        "function",
+        "src/lib.rs",
+        "{}",
+    );
+    insert_tag_with_plugin(
+        &conn,
+        "rust:function:lib.public_api",
+        "rust",
+        "exported-api",
+    );
+    // A private internal reached only from the public API — kept live transitively.
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:lib.internal_used",
+        "rust",
+        "function",
+        "src/lib.rs",
+        "{}",
+    );
+    insert_calls_edge(
+        &conn,
+        "rust:function:lib.public_api",
+        "rust:function:lib.internal_used",
+        "resolved",
+    );
+    // A pub lib fn whose ONLY caller is a test — its `exported-api` root must keep
+    // it live in app_only, where the test root is excluded.
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:lib.tested_only",
+        "rust",
+        "function",
+        "src/lib.rs",
+        "{}",
+    );
+    insert_tag_with_plugin(
+        &conn,
+        "rust:function:lib.tested_only",
+        "rust",
+        "exported-api",
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:tests.it_works",
+        "rust",
+        "function",
+        "src/lib.rs",
+        "{}",
+    );
+    insert_tag_with_plugin(&conn, "rust:function:tests.it_works", "rust", "test");
+    insert_calls_edge(
+        &conn,
+        "rust:function:tests.it_works",
+        "rust:function:lib.tested_only",
+        "resolved",
+    );
+    // Genuinely dead: a private fn nothing calls.
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:lib.dead_helper",
+        "rust",
+        "function",
+        "src/lib.rs",
+        "{}",
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    for app_only in [false, true] {
+        let env = call_tool(&state, "find_dead_code", json!({ "app_only": app_only })).await;
+        assert_eq!(env["ok"], true, "{env}");
+        let dead: Vec<String> = env["result"]["dead_code"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            dead,
+            vec!["rust:function:lib.dead_helper".to_owned()],
+            "only the genuine orphan is dead (app_only={app_only}); the exported-api root \
+             keeps the test-only-reached pub fn live: {env}"
+        );
+        // The exclusion has lifted: Rust is surveyed, not withheld.
+        assert_eq!(
+            env["result"]["summary"]["not_analysed"]["plugins_without_roots"], 0,
+            "rust emits roots → no plugin is withheld (app_only={app_only}): {env}"
+        );
+    }
+}
+
+/// ADR-054: `module` and `impl` are containment-spine containers rooted at the
+/// always-live crate root, not removable code — so they are never dead-code
+/// candidates, even with no inbound call/import edge. (Rust modules/impls
+/// systematically lack module-targeting import edges; without this exclusion
+/// every Rust module and impl block would read as dead and dominate the
+/// candidate set.)
+#[tokio::test]
+async fn find_dead_code_excludes_module_containers() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:main",
+        "function",
+        "app.py",
+        Some((1, 5)),
+    );
+    insert_tag(&conn, "python:function:main", "entry-point");
+    // Container entities with no inbound call/import edge — never "dead code".
+    insert_entity(
+        &conn,
+        "python:module:orphan_mod",
+        "module",
+        "orphan.py",
+        Some((1, 10)),
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "rust:impl:orphan.Widget.impl#<>",
+        "rust",
+        "impl",
+        "src/orphan.rs",
+        "{}",
+    );
+    // A genuinely dead function — the only legitimate candidate.
+    insert_entity(
+        &conn,
+        "python:function:dead",
+        "function",
+        "app.py",
+        Some((6, 9)),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["python:function:dead".to_owned()],
+        "module / impl containers are never dead-code candidates: {env}"
+    );
 }
 
 /// `app_only: true` on coupling excludes test-tagged callers from the ranking so

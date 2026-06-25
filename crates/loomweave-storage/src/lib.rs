@@ -46,8 +46,9 @@ pub use guidance::{
     list_guidance_sheets, rule_match, slugify_guidance_name, upsert_guidance_sheet,
 };
 pub use prior_index::{
-    PriorIndexEntry, clear_prior_index, load_prior_index, previously_analyzed_files,
-    prior_locators_by_file, replace_prior_index, upsert_prior_index_entry,
+    PluginIndexMarker, PriorIndexEntry, clear_prior_index, load_plugin_index_markers,
+    load_prior_index, previously_analyzed_files, prior_locators_by_file, replace_prior_index,
+    replace_prior_index_and_markers, upsert_plugin_index_marker, upsert_prior_index_entry,
 };
 pub use query::{
     CallEdgeMatch, CanonicalProjectPath, ContainedEntities, EntityRow, EntitySubsystem,

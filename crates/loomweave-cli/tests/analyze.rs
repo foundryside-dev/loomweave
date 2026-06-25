@@ -3962,6 +3962,123 @@ fn analyze_no_incremental_forces_full_reanalysis() {
     );
 }
 
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_ontology_bump_forces_full_reanalysis() {
+    // clarion-e12d424f1d: the incremental skip keys ONLY on a file's byte
+    // content (`file_needs_reanalysis` → whole-file hash), with no plugin
+    // tag-schema component. After a plugin upgrade that changes the emitted
+    // vocabulary (e.g. ADR-053/054 reachability-root tags), every UNCHANGED
+    // file keeps its pre-upgrade `entity_tags` rows — which carry no root tags —
+    // because the file is byte-identical and so silently skipped. The dead-code
+    // survey then false-flags the unchanged public surface as dead. The fix
+    // persists a per-plugin (version, ontology_version) marker and forces a full
+    // re-dispatch of that plugin's files when the marker moves, even WITHOUT
+    // --no-incremental.
+    //
+    // Here we bump ONLY the manifest's `ontology_version` between two
+    // byte-identical runs and assert the second (plain incremental) run
+    // re-analyses everything (skipped_files == 0) rather than skipping on the
+    // stale hash. Before the fix the second run skips both files.
+    let (project_dir, plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("bump_a.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("bump_b.p3"), b"module\n").unwrap();
+
+    // Run 1: the PHASE3 manifest ships ontology_version 0.6.0.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "first run has no prior index, so it skips nothing"
+    );
+
+    // Sanity: a plain incremental re-run with the SAME manifest skips both
+    // unchanged files — proving the skip is live and the next assertion is not
+    // vacuously true.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2),
+        "an unchanged incremental re-run with an unchanged manifest skips both files"
+    );
+
+    // Upgrade the plugin in place: bump ONLY ontology_version, leave both source
+    // files byte-identical.
+    let bumped = PHASE3_PLUGIN_MANIFEST.replace(
+        "ontology_version = \"0.6.0\"",
+        "ontology_version = \"0.7.0\"",
+    );
+    assert_ne!(
+        bumped, PHASE3_PLUGIN_MANIFEST,
+        "the manifest bump must actually change the ontology_version line"
+    );
+    std::fs::write(plugin_dir.path().join("plugin.toml"), &bumped).unwrap();
+
+    // Run 3: plain incremental (NO --no-incremental). The tag-schema marker
+    // moved, so every file must re-dispatch to refresh its entity_tags.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "an ontology_version bump must force a full re-analyse despite byte-identical \
+         source — otherwise unchanged files keep stale (rootless) entity_tags and the \
+         dead-code survey false-flags the unchanged public surface (clarion-e12d424f1d)"
+    );
+
+    // Run 4: same (bumped) manifest, byte-identical source. The marker was
+    // persisted by run 3, so it now MATCHES and the skip re-engages — proving
+    // the force-full fires once per upgrade, not forever (which would silently
+    // disable incremental analysis after any upgrade).
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2),
+        "once the marker is persisted, an unchanged re-run skips again — the force-full \
+         is a one-shot per marker change, not a permanent full-reanalyse"
+    );
+
+    // Run 5: bump the plugin `version` (ontology unchanged). The marker keys on
+    // BOTH components, so a version-only move must also force a full re-dispatch.
+    let bumped_version = bumped.replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+    assert_ne!(
+        bumped_version, bumped,
+        "the version bump must actually change the version line"
+    );
+    std::fs::write(plugin_dir.path().join("plugin.toml"), &bumped_version).unwrap();
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "a plugin version bump must also force a full re-analyse (the marker keys on the \
+         (version, ontology_version) pair)"
+    );
+}
+
 // ── REQ-ANALYZE-06: parse-failure findings are persisted, not just logged ────
 
 /// Mirrors the real Python plugin: every file yields one `module` entity, and a
