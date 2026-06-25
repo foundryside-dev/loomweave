@@ -825,7 +825,7 @@ fn serve_http_files_storage_failure_returns_closed_error_without_raw_detail() {
 
 /// The `GET /api/v1/_capabilities` federation golden, embedded BYTE-IDENTICAL
 /// from the on-disk normative fixture. `include_str!` captures the exact bytes
-/// (meta + shape_decl + examples), so this const IS the wire authority the
+/// (meta + `shape_decl` + examples), so this const IS the wire authority the
 /// producer-recheck tests (`serve_http_responses_match_federation_fixture_contracts`
 /// and `serve_http_capabilities_and_mcp_stdio_coexist`) compare the live
 /// `get_capabilities` handler against.

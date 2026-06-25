@@ -187,8 +187,8 @@ fn real_parser_routes_issue_id_into_id_via_the_weft_rename() {
         "golden body must NOT carry the classic id key (it is renamed to issue_id)"
     );
 
-    let parsed: IssueDetail = parse_issue_detail_response(&body_value.to_string())
-        .expect("golden 200 body must parse");
+    let parsed: IssueDetail =
+        parse_issue_detail_response(&body_value.to_string()).expect("golden 200 body must parse");
     assert_eq!(
         parsed.id, "genp-0123456789",
         "id deserializes from the route's issue_id field (weft-4a46553503)"

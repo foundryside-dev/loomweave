@@ -274,7 +274,9 @@ def test_consumer_version_gate_rejects_skew_copy(tmp_path: Path) -> None:
     # proving the gate keys on version, not on a parse failure.
     assert state.vocabulary is not None
     assert state.vocabulary.confidence_basis == "descriptor_version_skew"
-    assert tuple(sorted(state.vocabulary.entries_by_name)) == tuple(sorted(EXPECTED_CANONICAL_NAMES))
+    assert tuple(sorted(state.vocabulary.entries_by_name)) == tuple(
+        sorted(EXPECTED_CANONICAL_NAMES)
+    )
 
 
 # ── Layer 2 — drift recheck vs the Wardline source of truth ──────────────────

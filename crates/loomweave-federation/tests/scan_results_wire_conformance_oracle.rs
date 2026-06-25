@@ -161,7 +161,8 @@ fn produced_batch() -> PreparedBatch {
 /// HTTP client serializes it (`reqwest .json()` → `serde_json::to_*` over the same
 /// `Serialize` impl).
 fn produced_wire_value() -> Value {
-    serde_json::to_value(&produced_batch().request).expect("serialize produced scan-results request")
+    serde_json::to_value(&produced_batch().request)
+        .expect("serialize produced scan-results request")
 }
 
 fn golden_value() -> Value {
@@ -232,7 +233,11 @@ fn producer_emits_the_loomweave_positive_contract() {
     assert_eq!(wire["complete_scan_run"], Value::Bool(true));
 
     let findings = wire["findings"].as_array().expect("findings array");
-    assert_eq!(findings.len(), 3, "all three fixed rows emit (none skipped)");
+    assert_eq!(
+        findings.len(),
+        3,
+        "all three fixed rows emit (none skipped)"
+    );
 
     // Row 0 — defect: WARN→medium, real path + lines, nested loomweave.* round-trip.
     let defect = &findings[0];
@@ -243,7 +248,10 @@ fn producer_emits_the_loomweave_positive_contract() {
     assert_eq!(defect["line_end"], Value::from(20));
     assert_eq!(defect["metadata"]["kind"], Value::from("defect"));
     assert_eq!(defect["metadata"]["confidence"], Value::from(0.95));
-    assert_eq!(defect["metadata"]["confidence_basis"], Value::from("ast_match"));
+    assert_eq!(
+        defect["metadata"]["confidence_basis"],
+        Value::from("ast_match")
+    );
     let lw = &defect["metadata"]["loomweave"];
     assert_eq!(
         lw["entity_id"],

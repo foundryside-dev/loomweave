@@ -118,9 +118,9 @@ fn golden_response_body(example_name: &str) -> String {
         .get("examples")
         .and_then(Value::as_array)
         .and_then(|examples| {
-            examples.iter().find(|example| {
-                example.get("name").and_then(Value::as_str) == Some(example_name)
-            })
+            examples
+                .iter()
+                .find(|example| example.get("name").and_then(Value::as_str) == Some(example_name))
         })
         .and_then(|example| example.pointer("/response/body"))
         .unwrap_or_else(|| panic!("missing fixture example body {example_name}"))
