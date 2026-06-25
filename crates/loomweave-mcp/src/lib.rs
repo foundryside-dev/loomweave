@@ -38,10 +38,10 @@ use loomweave_storage::{
     InferredEdgeWriteStats, ReaderPool, ReferenceDirection, ReferenceEdgeMatch,
     RolledUpReferenceEdge, StorageError, SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRow,
     WriterCmd, call_edges_from, call_edges_targeting, containing_module_id,
-    entity_briefing_block_reason, entity_by_id, import_edges_for_entity,
-    inferred_edge_cache_key_id, module_reference_rollup, reference_edges_for_entity,
-    relation_edges_for_entity, resolve_entity_ref, sei_for_locator, tags_for_entity,
-    unresolved_call_sites_for_caller, unresolved_caller_count_for_target,
+    duplicate_locator_collision, entity_briefing_block_reason, entity_by_id,
+    import_edges_for_entity, inferred_edge_cache_key_id, module_reference_rollup,
+    reference_edges_for_entity, relation_edges_for_entity, resolve_entity_ref, sei_for_locator,
+    tags_for_entity, unresolved_call_sites_for_caller, unresolved_caller_count_for_target,
     unresolved_callers_for_target,
 };
 
@@ -4312,8 +4312,40 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
             "tags".to_owned(),
             json!(tags_for_entity(conn, &entity.id).unwrap_or_default()),
         );
+        // Disclose a same-locator collision the store absorbed as last-write-wins
+        // (clarion-48af930f2a): this id's row may be a chimera of two source
+        // declarations, so a consumer must not read it (or its edges) as a clean
+        // single declaration. Only present when a collision exists; absence means
+        // none. Graceful-degrade to absent on any lookup error — the disclosure
+        // is enrichment and must never fail the structural read (same posture as
+        // the SEI/tags joins above).
+        if let Some(collision) = collision_json(conn, &entity.id) {
+            object.insert("collision".to_owned(), collision);
+        }
     }
     value
+}
+
+/// Build the `collision` disclosure object for `entity_id`, or `None` when the
+/// id carries no `LMWV-DUPLICATE-LOCATOR` finding. Read regardless of finding
+/// status, so a suppressed finding still discloses the chimera. The note states
+/// the honest ceiling: this is disclosure, not recovery — the shadowed
+/// declaration's edges were collapsed at analyze and are not recoverable.
+fn collision_json(conn: &rusqlite::Connection, entity_id: &str) -> Option<Value> {
+    let collision = duplicate_locator_collision(conn, entity_id)
+        .ok()
+        .flatten()?;
+    Some(json!({
+        "shadowed": true,
+        "declarations": collision.declarations,
+        "shape": collision.shape,
+        "note": "This id resolves to more than one source declaration; the store \
+                 keeps one row per id (last-write-wins), so this row is a chimera \
+                 and one declaration is shadowed. Edges, relations, and \
+                 associations bound to the shadowed declaration were collapsed \
+                 during analyze and are NOT recoverable — treat this row's graph \
+                 neighborhood as unreliable. Detection: LMWV-DUPLICATE-LOCATOR.",
+    }))
 }
 
 /// Shannon entropy (bits/byte) of a string, used by the briefing-block guard to
@@ -8084,6 +8116,98 @@ mod tests {
         assert!(
             !out.to_string().contains("super-secret-value"),
             "leaked briefing-blocked bytes via file anchor: {out}"
+        );
+    }
+
+    #[test]
+    fn entity_json_discloses_locator_collision() {
+        // clarion-48af930f2a: the single entity read choke point must disclose a
+        // same-locator collision so a consumer reading the shadowed id sees the
+        // chimera instead of a clean-looking row. Proven at the read surface,
+        // and with a SUPPRESSED finding — the data-loss fact outlives a status
+        // flip, so suppression must not hide the disclosure.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("loomweave.db");
+        let mut conn = Connection::open(&db_path).expect("open sqlite");
+        pragma::apply_write_pragmas(&conn).expect("write pragmas");
+        schema::apply_migrations(&mut conn).expect("apply migrations");
+
+        let id = "python:class:specimen.colliding.ShelfMark";
+        conn.execute(
+            "INSERT INTO entities (
+                id, plugin_id, kind, name, short_name, source_file_path, properties,
+                content_hash, created_at, updated_at
+             ) VALUES (
+                ?1, 'python', 'class', 'ShelfMark', 'ShelfMark',
+                '/specimen/colliding/__init__.py', '{}', 'h', 't', 't'
+             )",
+            rusqlite::params![id],
+        )
+        .expect("seed colliding entity");
+
+        // Before any finding: a clean row carries no `collision` field.
+        let entity = entity_row(id, "ShelfMark", Some("h"));
+        let clean = super::entity_json(&conn, &entity);
+        assert!(
+            clean.get("collision").is_none(),
+            "an entity with no duplicate-locator finding must not be flagged: {clean}"
+        );
+
+        // Seed a SUPPRESSED duplicate-locator finding anchored to the colliding
+        // entity (the post-clarion-48af930f2a anchor).
+        conn.execute(
+            "INSERT OR IGNORE INTO runs (id, started_at, config, stats, status) \
+             VALUES ('run-1', 't', '{}', '{}', 'completed')",
+            [],
+        )
+        .unwrap();
+        let evidence = serde_json::json!({
+            "plugin_id": "python",
+            "metadata": {
+                "entity_id": id,
+                "anchor_entity_id": id,
+                "first_source_file_path": "/specimen/colliding/__init__.py",
+                "colliding_source_file_path": "/specimen/colliding.py",
+                "shape": "in_run_cross_file",
+            }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO findings (
+                id, tool, tool_version, run_id, rule_id, kind, severity,
+                entity_id, related_entities, message, evidence, properties,
+                supports, supported_by, status, created_at, updated_at
+             ) VALUES (
+                'core:finding:infra:dup', 'loomweave', '0', 'run-1', ?1, 'defect', 'ERROR',
+                ?2, '[]', 'm', ?3, '{}',
+                '[]', '[]', 'suppressed', 't', 't'
+             )",
+            rusqlite::params![loomweave_core::DUPLICATE_LOCATOR_RULE_ID, id, evidence],
+        )
+        .expect("seed suppressed collision finding");
+
+        let flagged = super::entity_json(&conn, &entity);
+        let collision = flagged
+            .get("collision")
+            .expect("the chimera must be disclosed even when the finding is suppressed");
+        assert_eq!(collision["shadowed"], serde_json::json!(true));
+        assert_eq!(collision["shape"], "in_run_cross_file");
+        let declarations = collision["declarations"]
+            .as_array()
+            .expect("declarations array");
+        assert_eq!(declarations.len(), 2, "both declarations: {collision}");
+        assert!(
+            declarations.iter().any(|d| d == "/specimen/colliding.py")
+                && declarations
+                    .iter()
+                    .any(|d| d == "/specimen/colliding/__init__.py"),
+            "both colliding paths must be disclosed: {collision}"
+        );
+        assert!(
+            collision["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("NOT recoverable")),
+            "the note must state the disclosure-not-recovery ceiling: {collision}"
         );
     }
 

@@ -30,6 +30,7 @@ pub use host::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, BriefingBlockReason, HostError, HostFinding,
     PluginHost, RawEdge, RawEntity,
 };
+pub use host_findings::DUPLICATE_LOCATOR_RULE_ID;
 pub use jail::{JailError, jail, jail_to_string};
 pub use limits::{
     BreakerState, CapExceeded, ContentLengthCeiling, DEFAULT_MAX_NOFILE, DEFAULT_MAX_NPROC,
