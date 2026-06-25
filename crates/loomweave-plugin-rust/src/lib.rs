@@ -10,6 +10,7 @@ pub mod parse_guard;
 pub mod qualname;
 pub mod references;
 pub mod resolve;
+pub mod root_tags;
 pub mod scope;
 pub mod serve;
 pub mod signature;

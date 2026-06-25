@@ -224,7 +224,7 @@ fn analyze_e2e_stored_rust_entity_set_excludes_out_of_src_files() {
         "rust:impl:e2e_crate.Widget.impl[Display]".to_owned(),
         "rust:function:e2e_crate.Widget.impl[Display].fmt".to_owned(),
         // Task 11 (exit gate): the remaining leaf kinds, so the analyzed crate
-        // exercises EVERY entity kind in the 0.5.0 ontology. (`module`, `struct`,
+        // exercises EVERY entity kind in the ontology. (`module`, `struct`,
         // `function`, `trait`, `impl` above; `enum`/`type_alias`/`const`/`static`/
         // `macro` here.) Enum VARIANTS do not emit as separate entities.
         "rust:enum:e2e_crate.Color".to_owned(),
