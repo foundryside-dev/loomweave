@@ -1,0 +1,85 @@
+[
+  {
+    "content_hash_at_compute": "beb500c7a64f99d4cfb1e96b5f003b05c35326f2b1d73d7b2bf6225ab1307875",
+    "qualname": "svc.read_raw",
+    "wardline_json": {
+      "content_hash_at_compute": "beb500c7a64f99d4cfb1e96b5f003b05c35326f2b1d73d7b2bf6225ab1307875",
+      "dead_code_root": {
+        "is_root": true,
+        "reason": "Wardline trust-decorated entity is externally reachable or trust-significant.",
+        "source": "wardline_trust_decorator",
+        "tags": [
+          "entry-point"
+        ]
+      },
+      "findings": [],
+      "qualname": "svc.read_raw",
+      "schema_version": "wardline-taint-1",
+      "taint": {
+        "actual_return": "EXTERNAL_RAW",
+        "contributing_callee_qualname": null,
+        "declared_return": "EXTERNAL_RAW",
+        "resolved_call_count": 0,
+        "source": "anchored",
+        "unresolved_call_count": 0
+      }
+    }
+  },
+  {
+    "content_hash_at_compute": "beb500c7a64f99d4cfb1e96b5f003b05c35326f2b1d73d7b2bf6225ab1307875",
+    "qualname": "svc.helper",
+    "wardline_json": {
+      "content_hash_at_compute": "beb500c7a64f99d4cfb1e96b5f003b05c35326f2b1d73d7b2bf6225ab1307875",
+      "dead_code_root": {
+        "is_root": false,
+        "reason": null,
+        "source": null,
+        "tags": []
+      },
+      "findings": [],
+      "qualname": "svc.helper",
+      "schema_version": "wardline-taint-1",
+      "taint": {
+        "actual_return": "UNKNOWN_RAW",
+        "contributing_callee_qualname": null,
+        "declared_return": "UNKNOWN_RAW",
+        "resolved_call_count": 0,
+        "source": "fallback",
+        "unresolved_call_count": 0
+      }
+    }
+  },
+  {
+    "content_hash_at_compute": "beb500c7a64f99d4cfb1e96b5f003b05c35326f2b1d73d7b2bf6225ab1307875",
+    "qualname": "svc.leaky",
+    "wardline_json": {
+      "content_hash_at_compute": "beb500c7a64f99d4cfb1e96b5f003b05c35326f2b1d73d7b2bf6225ab1307875",
+      "dead_code_root": {
+        "is_root": true,
+        "reason": "Wardline trust-decorated entity is externally reachable or trust-significant.",
+        "source": "wardline_trust_decorator",
+        "tags": [
+          "entry-point"
+        ]
+      },
+      "findings": [
+        {
+          "fingerprint": "9a291cac4a30b2cd8353f89eb428e184b01cb3919563ebeffd672745bf9cc665",
+          "line_start": 14,
+          "path": "svc.py",
+          "rule_id": "PY-WL-101"
+        }
+      ],
+      "qualname": "svc.leaky",
+      "schema_version": "wardline-taint-1",
+      "taint": {
+        "actual_return": "EXTERNAL_RAW",
+        "contributing_callee_qualname": "svc.read_raw",
+        "declared_return": "INTEGRAL",
+        "resolved_call_count": 1,
+        "source": "anchored",
+        "unresolved_call_count": 0
+      }
+    }
+  }
+]

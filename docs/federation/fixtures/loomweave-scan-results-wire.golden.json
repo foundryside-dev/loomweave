@@ -1,0 +1,73 @@
+{
+  "scan_source": "loomweave",
+  "scan_run_id": "run-conformance-1",
+  "mark_unseen": true,
+  "create_observations": false,
+  "complete_scan_run": true,
+  "findings": [
+    {
+      "line_end": 20,
+      "line_start": 12,
+      "message": "Circular import detected",
+      "metadata": {
+        "confidence": 0.95,
+        "confidence_basis": "ast_match",
+        "kind": "defect",
+        "loomweave": {
+          "entity_id": "python:class:auth.tokens::TokenManager",
+          "internal_severity": "WARN",
+          "internal_status": "open",
+          "related_entities": [
+            "python:class:auth.sessions::SessionStore"
+          ],
+          "supported_by": [],
+          "supports": [
+            "python:function:auth.tokens::mint"
+          ]
+        }
+      },
+      "path": "src/auth/tokens.py",
+      "rule_id": "LMWV-PY-STRUCTURE-001",
+      "severity": "medium"
+    },
+    {
+      "line_end": 58,
+      "line_start": 42,
+      "message": "HTTP route entry point",
+      "metadata": {
+        "kind": "fact",
+        "loomweave": {
+          "entity_id": "python:function:api.routes::handle_request",
+          "internal_severity": "NONE",
+          "internal_status": "open",
+          "related_entities": [],
+          "supported_by": [],
+          "supports": []
+        }
+      },
+      "path": "src/api/routes.py",
+      "rule_id": "LMWV-PY-FACT-ENTRYPOINT",
+      "severity": "info"
+    },
+    {
+      "message": "Subsystem exhibits weak modularity",
+      "metadata": {
+        "confidence": 0.5,
+        "confidence_basis": "coupling_metric",
+        "kind": "defect",
+        "loomweave": {
+          "entity_id": "core:subsystem:abcd1234",
+          "internal_severity": "ERROR",
+          "internal_status": "open",
+          "related_entities": [],
+          "supported_by": [],
+          "supports": [],
+          "synthetic_anchor": true
+        }
+      },
+      "path": "/repo/root",
+      "rule_id": "LMWV-SUBSYSTEM-COHESION",
+      "severity": "high"
+    }
+  ]
+}
