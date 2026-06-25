@@ -185,6 +185,65 @@ fn non_exported_macro_has_no_tags() {
     assert!(tags(&m, "rust:macro:k.m.mac").is_empty());
 }
 
+#[test]
+fn macro_export_in_private_mod_is_still_exported_api() {
+    // `#[macro_export]` lifts a macro to the crate root regardless of module
+    // privacy — chain-INDEPENDENT, unlike `pub` visibility. The common idiom is
+    // `mod macros { #[macro_export] macro_rules! ... }`; without this the macro
+    // (real external API) reads as dead — the under-rooting failure ADR-054 fights.
+    let m = tags_by_id(
+        "k",
+        "k.m",
+        "mod internal { #[macro_export] macro_rules! mac { () => {}; } }\n",
+    );
+    let id = m
+        .keys()
+        .find(|k| k.starts_with("rust:macro:"))
+        .expect("macro emitted")
+        .clone();
+    assert_eq!(
+        tags(&m, &id),
+        ["exported-api"],
+        "#[macro_export] is chain-independent"
+    );
+}
+
+// ---- entry-point: export_name FFI (distinct from no_mangle) ----------------
+
+#[test]
+fn export_name_ffi_export_is_entry_point() {
+    let m = tags_by_id(
+        "k",
+        "k.m",
+        "#[export_name = \"my_export\"]\npub extern \"C\" fn exported() {}\n",
+    );
+    assert_eq!(
+        tags(&m, "rust:function:k.m.exported"),
+        ["entry-point", "exported-api"]
+    );
+}
+
+// ---- regression guard: serde/typetag must NOT be mistaken for a root -------
+
+#[test]
+fn serde_attribute_is_not_a_root() {
+    // The typetag::serde catastrophe class: a bare last-segment match on `serde`
+    // would tag every `#[serde(...)]`. This pins that a real serde attribute (and
+    // a non-framework derive) produces NO reachability-root tag.
+    let serded = tags_by_id(
+        "k",
+        "k.m",
+        "#[serde(rename_all = \"camelCase\")]\nstruct P { v: i32 }\n",
+    );
+    let derived = tags_by_id(
+        "k",
+        "k.m",
+        "#[derive(Clone, Debug, Serialize)]\nstruct Q { v: i32 }\n",
+    );
+    assert!(tags(&serded, "rust:struct:k.m.P").is_empty());
+    assert!(tags(&derived, "rust:struct:k.m.Q").is_empty());
+}
+
 // ---- impl-method rooting (increment 2: pub methods of pub types) -----------
 
 /// Find the single emitted method entity whose id ends in `.<name>` (robust to

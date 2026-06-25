@@ -87,6 +87,19 @@ impl TagCtx {
             ..self
         }
     }
+
+    /// The export chain is satisfied independently of the lexical `pub` chain.
+    /// `#[macro_export]` lifts a macro to the crate root regardless of how deeply
+    /// it is nested in private modules, so its `exported-api` status must not be
+    /// gated by `ancestors_all_pub` (the standard `mod macros { #[macro_export]
+    /// … }` idiom would otherwise read as dead — under-rooting).
+    #[must_use]
+    pub fn with_export_chain_satisfied(self) -> Self {
+        Self {
+            ancestors_all_pub: true,
+            ..self
+        }
+    }
 }
 
 /// Reachability-root tags for a walked item, sorted + deduplicated (ADR-054).

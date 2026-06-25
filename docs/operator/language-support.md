@@ -42,8 +42,9 @@ a declared `exported-api` (ADR-053 / clarion-4ec50f3d92), so a Python codebase i
 not over-reported as dead just because it does not exhaustively declare `__all__`.
 
 **Rust emits** (ADR-054, clarion-05fdd0490e): `exported-api`, `entry-point`,
-`test`, and `allow-dead-code`, derived from Rust's explicit semantics rather than
-inferred — so `entity_dead_list` now **works** on a pure-Rust index.
+`test`, `allow-dead-code`, `http-route`, and `cli-command` (the last two with a
+`framework-handler` companion), derived from Rust's explicit semantics rather
+than inferred — so `entity_dead_list` now **works** on a pure-Rust index.
 
 - `exported-api` — an unrestricted `pub` value/type item whose whole enclosing
   module chain is `pub` (the visibility chain reaches the crate's external
@@ -68,7 +69,8 @@ inferred — so `entity_dead_list` now **works** on a pure-Rust index.
   `#[pyclass]` / `#[pymodule]`) and proc-macro entry points (`#[proc_macro]` /
   `#[proc_macro_derive]` / `#[proc_macro_attribute]`) — items reached from a
   non-Rust host or the compiler.
-- `pub` methods of `pub` types (inherent `impl` blocks) are `exported-api`.
+- `pub` methods of `pub` types in **library** targets (inherent `impl` blocks)
+  are `exported-api` (same lib/bin and pub-chain gating as regular `pub` items).
 
 Not yet emitted by Rust (tracked second-pass extensions): `pub use` re-export
 resolution (a `pub(crate)` item re-exported `pub` is under-rooted — a narrow,

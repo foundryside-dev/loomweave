@@ -870,10 +870,18 @@ fn walk_items(
                     None,
                 )?;
                 // `macro_rules!` has no `Visibility`; `#[macro_export]` is its
-                // external-surface marker (ADR-054 §1).
+                // external-surface marker (ADR-054 §1). It is CHAIN-INDEPENDENT —
+                // a `#[macro_export]` in a private mod is still crate-root API —
+                // so the pub-chain gate is waived for an exported macro.
+                let exported_macro = has_macro_export(attrs);
+                let macro_ctx = if exported_macro {
+                    ctx.with_export_chain_satisfied()
+                } else {
+                    ctx
+                };
                 attach_tags(
                     &mut child,
-                    root_tags(&name, has_macro_export(attrs), false, attrs, ctx),
+                    root_tags(&name, exported_macro, false, attrs, macro_ctx),
                 );
                 push_with_contains(parent_id, child, out, edges);
             }
