@@ -225,6 +225,30 @@ This is a further additive ontology change: Rust plugin `ontology_version`
   parse-only (`syn`) extractor cannot detect them — a permanent limitation, not a
   deferral.
 
+## Empirical result (dogfood, the loomweave workspace itself)
+
+Analysed a copy of the loomweave Rust workspace (181 files, **4231 entities**,
+5755 edges) with the increment-1+2 plugin (acceptance criterion AC#6):
+
+- `entity_dead_list` is **available and plausible**: **357 dead / 2384 analysed
+  ≈ 15%** → **moderate** confidence (well inside the plausible band; nowhere near
+  the >25% "implausible" band ADR-053 fought for Python). The no-roots exclusion
+  lifts; `find_entry_points` / `find_http_routes` light up for Rust.
+- **Trait-impl-method rooting deferral is vindicated by the data:** of the 357
+  candidates only **8** are `impl` methods. Trait-heavy real Rust does *not*
+  pathologically inflate the dead share, so deferring trait-method rooting was
+  the right call, not a hidden weakness.
+- The candidate set is dominated by **private value items** — `const` (124),
+  `struct` (113), `enum` (25) — reached through *value references* (a const read
+  in an expression, a struct used as a field type) that the Rust plugin does not
+  yet emit as reachability edges, AND the dead-code adjacency counts only
+  call+import (not `references`). So these read as dead though they are used: a
+  **pre-existing reference-extraction + reachability-coverage gap surfaced (not
+  caused) by making Rust analysable.** It is the natural next accuracy lever
+  (the Rust analogue of ADR-053's method-rooting follow-up) and is tracked
+  separately; it does not block this model, whose headline number is already
+  honest and plausible.
+
 ## Alternatives considered
 
 ### Alternative 1: reuse `exported-api` for the `#[allow(dead_code)]` keep-signal
