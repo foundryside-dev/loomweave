@@ -12,6 +12,19 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Changed
+
+- **SEI git-rename consumer re-pointed to `legis`'s `/git/rename-feed`.**
+  `LegisGitRenameSource` now reads the committed leg of `legis`'s additive
+  superset endpoint `GET /git/rename-feed?base=…&head=HEAD` instead of the legacy
+  `GET /git/renames?rev_range=…`. `legis` pins each `committed[]` entry
+  byte-identical to the old `/git/renames` array with a contract-lock test, so
+  committed renames resolve unchanged; the `working_tree` leg is not consumed
+  (committed-window semantics preserved — the shell source remains the sole
+  working-tree authority). Enrich-only and fail-soft as before; the wire-drift
+  guard now warns on a legacy flat-array body or a `committed`-less envelope.
+  (Federation ledger B3.)
+
 ## [1.3.1] — 2026-06-22
 
 Patch release on top of `1.3.0`. (Cargo SemVer `1.3.1`; Python wheels `1.3.1`.)
