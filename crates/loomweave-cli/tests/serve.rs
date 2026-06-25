@@ -823,6 +823,52 @@ fn serve_http_files_storage_failure_returns_closed_error_without_raw_detail() {
     assert!(!body.contains(&dir.path().display().to_string()));
 }
 
+/// The `GET /api/v1/_capabilities` federation golden, embedded BYTE-IDENTICAL
+/// from the on-disk normative fixture. `include_str!` captures the exact bytes
+/// (meta + `shape_decl` + examples), so this const IS the wire authority the
+/// producer-recheck tests (`serve_http_responses_match_federation_fixture_contracts`
+/// and `serve_http_capabilities_and_mcp_stdio_coexist`) compare the live
+/// `get_capabilities` handler against.
+const CAPABILITIES_GOLDEN: &str =
+    include_str!("../../../docs/federation/fixtures/get-api-v1-capabilities.json");
+
+/// Layer-1 byte-pin: lowercase-hex `blake3` over the EXACT bytes of the
+/// capabilities golden. Pins the whole fixture file so a silent reformat,
+/// field reorder, or re-vendor reds here even when the semantic shape the
+/// producer-recheck validates is unchanged.
+///
+/// Tamper proof: perturbing one byte of the fixture (or one hex char of this
+/// const) makes `capabilities_golden_bytes_match_layer1_pin` fail with a
+/// `left != right` mismatch; `capabilities_golden_byte_pin_rejects_a_mutated_byte`
+/// additionally proves a single flipped input byte yields a DIFFERENT digest.
+const CAPABILITIES_GOLDEN_BLAKE3: &str =
+    "74d5fd1230a62f7a279e54d2a798ce85b3ae8b962f593d1d6bd8c0e2db70dbf7";
+
+#[test]
+fn capabilities_golden_bytes_match_layer1_pin() {
+    let actual = blake3::hash(CAPABILITIES_GOLDEN.as_bytes())
+        .to_hex()
+        .to_string();
+    assert_eq!(
+        actual, CAPABILITIES_GOLDEN_BLAKE3,
+        "vendored get-api-v1-capabilities golden drifted from its byte-pin; \
+         re-vendor BYTE-IDENTICAL and update CAPABILITIES_GOLDEN_BLAKE3"
+    );
+}
+
+#[test]
+fn capabilities_golden_byte_pin_rejects_a_mutated_byte() {
+    // Tamper proof: flipping one byte of the golden produces a digest that
+    // does NOT match the pin, demonstrating the byte-pin is load-bearing.
+    let mut tampered = CAPABILITIES_GOLDEN.as_bytes().to_vec();
+    tampered[0] ^= 0x01;
+    let mutated = blake3::hash(&tampered).to_hex().to_string();
+    assert_ne!(
+        mutated, CAPABILITIES_GOLDEN_BLAKE3,
+        "a single mutated byte must NOT collide with the pinned digest"
+    );
+}
+
 #[test]
 fn serve_http_capabilities_and_mcp_stdio_coexist() {
     let dir = tempfile::tempdir().expect("temp project");

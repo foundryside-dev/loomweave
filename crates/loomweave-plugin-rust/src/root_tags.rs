@@ -192,12 +192,32 @@ fn attr_last_seg_in(attrs: &[Attribute], names: &[&str]) -> bool {
     })
 }
 
-/// Any attribute that is the bare single ident `name` (no path) for one of
-/// `names` — used where the attribute is never path-qualified (`#[proc_macro]`).
+/// Any attribute whose path ident — after peeling a single edition-2024
+/// `#[unsafe(<inner>)]` wrapper — is one of `names`. Covers both a bare
+/// single-ident attribute (`#[proc_macro]`, never path-qualified) and the
+/// unsafe-wrapped FFI exports: edition 2024 makes bare `#[no_mangle]` /
+/// `#[export_name = "…"]` a hard error, so real code writes
+/// `#[unsafe(no_mangle)]` / `#[unsafe(export_name = "…")]`, which syn parses as
+/// `Meta::List { path: "unsafe", tokens: <inner attr> }` — the export ident
+/// lives one level in. The inner may be a bare path (`no_mangle`) or a
+/// name-value (`export_name = "…"`), so it is parsed as a full [`Meta`]. Missing
+/// the wrapped form would under-root every edition-2024 FFI export (read dead).
 fn attr_is_ident_in(attrs: &[Attribute], names: &[&str]) -> bool {
-    attrs
-        .iter()
-        .any(|a| names.iter().any(|n| a.path().is_ident(n)))
+    attrs.iter().any(|a| {
+        if names.iter().any(|n| a.path().is_ident(n)) {
+            return true;
+        }
+        let Meta::List(list) = &a.meta else {
+            return false;
+        };
+        if !list.path.is_ident("unsafe") {
+            return false;
+        }
+        let Ok(inner) = syn::parse2::<Meta>(list.tokens.clone()) else {
+            return false;
+        };
+        names.iter().any(|n| inner.path().is_ident(n))
+    })
 }
 
 /// Any `#[derive(...)]` whose derive list contains a path with a final segment

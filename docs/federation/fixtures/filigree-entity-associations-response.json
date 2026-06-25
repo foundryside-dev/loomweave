@@ -2,7 +2,7 @@
   "_meta": {
     "contract": "filigree-entity-associations-response",
     "endpoint": "GET /api/entity-associations?entity_id={entity_id}",
-    "fixture_version": 1,
+    "fixture_version": 3,
     "stability": "normative",
     "authority": "Weft G15 / ADR-029 EntityAssociation producer-consumer conformance",
     "producer": "Filigree dashboard_routes.entities.api_list_associations_by_entity",
@@ -12,8 +12,8 @@
       "loomweave/docs/federation/fixtures/filigree-entity-associations-response.json"
     ],
     "verification": "Filigree: uv run pytest tests/api/test_entity_associations.py -q; Loomweave: cargo test -p loomweave-federation filigree::tests::parses_canonical_filigree_entity_association_fixture",
-    "updated": "2026-06-13",
-    "description": "Canonical live Filigree reverse-lookup response for EntityAssociation rows. The producer test emits this body through Filigree's HTTP route; the consumer test deserializes the same body in Loomweave."
+    "updated": "2026-06-24",
+    "description": "Canonical live Filigree reverse-lookup response for EntityAssociation rows. The producer test emits this body through Filigree's HTTP route; the consumer test deserializes the same body in Loomweave. v2 (warpline seam): each row carries the bound issue's lifecycle facts (claimed_at, closed_at, status, status_category) for warpline's 'changed since claimed/closed' correlation; all four are null for an orphaned binding. v3 (warpline commit-anchor seam, contract B): each row also carries the opaque per-issue commit anchors (claim_commit, close_commit) — the caller-supplied branch@sha the issue was claimed/closed at, stored verbatim and never parsed by Filigree; null for an orphaned binding or when no commit was supplied (warpline then falls back to the timestamp). Additive — Loomweave's consumer ignores unknown fields (no serde deny_unknown_fields), so a v1/v2 consumer still parses v3. The loomweave repo-local copy should be synced for documentation parity (non-breaking)."
   },
   "shape_decl": {
     "kind": "filigree-entity-associations-fixture-shapes",
@@ -54,7 +54,13 @@
               "freshness_status": "unknown",
               "signature": null,
               "signoff_seq": null,
-              "signed_content_hash": null
+              "signed_content_hash": null,
+              "claimed_at": null,
+              "closed_at": null,
+              "claim_commit": null,
+              "close_commit": null,
+              "status": "open",
+              "status_category": "open"
             }
           ]
         }

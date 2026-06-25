@@ -1,0 +1,85 @@
+{
+  "_meta": {
+    "contract": "filigree-weft",
+    "stability": "Frozen for the weft-generation lifetime per ADR-002. Shape additions that preserve wire compatibility (new optional response fields) are allowed; breaking changes require a new generation.",
+    "authority": [
+      "docs/architecture/decisions/ADR-002-api-generations-and-federation-posture.md",
+      "docs/plans/2026-04-24-2.0-federation-work-package.md"
+    ],
+    "pinning_discipline": "shape reference; see docs/federation/contracts.md",
+    "updated": "2026-04-26",
+    "endpoint": "GET /api/weft/issues/{issue_id}",
+    "status": "live as of Phase C3.",
+    "relation_to_classic": "Classic GET /api/issue/{id} returns EnrichedIssueDetail (IssueDict + dep_details + events + comments). Weft returns the simpler IssueWeft (or IssueWeftWithFiles when include_files=true). Federation consumers do not need dashboard-UI enrichment; weft mirrors MCP get_issue's projection."
+  },
+  "shape_decl": {
+    "request_type": "GET (no body); query param include_files (default false in weft)",
+    "response_type": "IssueWeft | IssueWeftWithFiles",
+    "rationale": "issue_id replaces id at the entity primary-key level; reference fields (parent_id, blocks, blocked_by, children) keep their existing names. include_files defaults to false for weft (federation consumers usually want the bare projection); classic does not expose include_files at all and continues returning EnrichedIssueDetail."
+  },
+  "examples": [
+    {
+      "name": "live_v_issue_detail_200",
+      "note": "Open, un-claimed task issue → 200 with the full 25-field IssueWeft projection. The entity's own primary key is named issue_id (the id→issue_id weft rename); reference fields keep their names. status_category derives from status; is_ready is computed from blockers; the four lifecycle/commit anchors are null for an open, un-claimed, un-closed issue.",
+      "request": {
+        "method": "GET",
+        "path": "/api/weft/issues/genp-0123456789",
+        "headers": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "issue_id": "genp-0123456789",
+          "title": "golden issue detail",
+          "status": "open",
+          "status_category": "open",
+          "priority": 2,
+          "type": "task",
+          "parent_id": null,
+          "assignee": "",
+          "claimed_at": null,
+          "last_heartbeat_at": null,
+          "claim_expires_at": null,
+          "created_at": "2026-01-02T03:04:05+00:00",
+          "updated_at": "2026-01-02T03:04:05+00:00",
+          "closed_at": null,
+          "claim_commit": null,
+          "close_commit": null,
+          "description": "",
+          "notes": "",
+          "fields": {},
+          "labels": [],
+          "blocks": [],
+          "blocked_by": [],
+          "is_ready": true,
+          "children": [],
+          "data_warnings": []
+        }
+      }
+    },
+    {
+      "name": "error_not_found",
+      "note": "Missing issue id \u2192 404 NOT_FOUND with the standard ErrorResponse envelope.",
+      "request": {
+        "method": "GET",
+        "path": "/api/weft/issues/genp-deadbeef00",
+        "headers": {},
+        "body": null
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "error": "Issue not found: genp-deadbeef00",
+          "code": "NOT_FOUND"
+        }
+      }
+    }
+  ]
+}
