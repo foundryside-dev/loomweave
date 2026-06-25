@@ -161,27 +161,69 @@ Additive tag-vocabulary change: Rust plugin `ontology_version` **0.5.0 →
 `scripts/check-rust-plugin-manifest-lockstep.py`), `serve.rs`'s `initialize`
 response, and the `docs/operator/language-support.md` table.
 
-## Deferred to increment 2 (noted here, like ADR-053's Alternative 3)
+## Increment 2 (implemented): framework handlers + `pub`-method rooting
 
-These are real follow-ups, deferred because each either needs cross-file
-resolution or would only *narrow* the root set:
+A focused framework-attribute survey (a 6-agent taxonomy sweep across the Rust
+web / CLI / FFI / RPC / test ecosystems) produced a precision-first, collision-
+aware detection set. The Rust plugin now also emits:
 
-- **Framework-attribute handlers** — `http-route` (axum/actix/rocket route
-  attribute macros, e.g. `#[get("/…")]`), `cli-command` (clap/structopt derives
-  and `#[command]`), `framework-handler` (proc-macro registration attrs). Rust's
-  web frameworks are heterogeneous (many use the builder pattern, not
-  attributes), so this is best-effort attribute detection with a documented
-  coverage limit — breadth research, deferred to a focused increment.
+- **`http-route`** (+ `framework-handler` companion) — actix-web / ntex / rocket
+  route attribute macros, matched on the attribute's last path segment (`get`,
+  `post`, `put`, `patch`, `delete`, `head`, `options`, `trace`, `connect`,
+  `route`). Cross-crate last-segment collisions are benign (every match means a
+  route) and over-rooting is fail-toward-live.
+- **`cli-command`** (+ `framework-handler`) — clap / structopt CLI derives,
+  matched on the `#[derive(...)]` list (`Parser`, `Subcommand`, `Args`,
+  `ValueEnum`, `StructOpt`).
+- **`entry-point`** also from pyo3 FFI host exports (`#[pyfunction]` / `#[pyfn]`
+  / `#[pyclass]` / `#[pymodule]`) and proc-macro entry points (`#[proc_macro]` /
+  `#[proc_macro_derive]` / `#[proc_macro_attribute]`) — items reached from a
+  non-Rust host or the compiler.
+- **`test`** also from the std-replacement runners `#[rstest]` / `#[test_case]`
+  / `#[quickcheck]`.
+- **`pub`-method rooting** — a `pub` method of an inherent `impl` whose enclosing
+  module chain is `pub` (lib target) is `exported-api`. Trait-impl methods carry
+  inherited visibility (no `pub`) so the rule leaves them unrooted (see the
+  residual below). The pub-chain + cfg(test) gating is inherited from the
+  enclosing module; a method named `main` is never an entry point.
+
+**Critical tag-semantics fact (verified against `shortcuts.rs`):**
+`framework-handler` is in `DEAD_CODE_EXCLUDED_TAGS`, **not** `DEAD_CODE_ROOT_TAGS`
+— it excludes the *tagged entity itself* from dead-code candidacy but does NOT
+root its callees. So `http-route` / `cli-command` (the real roots) carry
+`framework-handler` only as the self-exclusion companion, exactly as the Python
+plugin does. FFI host exports map to `entry-point` (a real root) precisely so
+their callees ARE traversed.
+
+The collision survey's one **catastrophic** finding is honoured: a bare
+last-segment match on `serde` (from `typetag::serde`) would match every
+`#[serde(...)]`, so no such match exists; CLI detection is derive-gated and the
+deferred FFI frameworks that need it use full-path matching.
+
+This is a further additive ontology change: Rust plugin `ontology_version`
+**0.6.0 → 0.7.0**.
+
+## Still deferred (second-pass extensions)
+
 - **`pub use` re-export resolution** — a privately-defined item re-exported
   `pub` is part of the API surface. Resolving the re-export target needs the
   cross-file symbol table (the resolver). The common facade case (`pub use
   internal::Thing` where `Thing` is itself `pub`) is **already covered** by
   `Thing`'s own `exported-api` tag at its definition; only a `pub(crate)` item
-  re-exported `pub` is under-rooted, a narrow residual. Deferred.
-- **`pub`-method rooting** — a `pub` method of a `pub` type (an `impl` item) is
-  external API, but reachability traverses call+import edges only, so rooting
-  the type does not root its methods. This is the Rust analog of the Python
-  follow-up clarion-961a1acb2c; deferred with it.
+  re-exported `pub` is under-rooted, a narrow residual.
+- **Trait-impl-method rooting** — a method reached only via trait dispatch
+  (the Rust framework-dispatch case) has no inbound call edge; the pub rule does
+  not root it (inherited visibility). `framework-handler` on a `#[handler]` would
+  exclude the handler but not its private callees — the documented under-rooting
+  residual this model's error-cost asymmetry otherwise fights. Left as an open
+  follow-up rather than silently promoting handlers to `entry-point`.
+- **Lower-prevalence frameworks** — wasm-bindgen / napi / uniffi / cxx FFI,
+  poem/salvo `#[handler]`, rocket `#[catch]`, tarpc / jsonrpsee, argh / gumdrop /
+  bpaf. Several need full-path matching to stay collision-safe; deferred to a
+  second pass. Builder-pattern frameworks (axum `Router::route`, warp filters,
+  tonic codegen) register routes via runtime calls, not attributes, so a
+  parse-only (`syn`) extractor cannot detect them — a permanent limitation, not a
+  deferral.
 
 ## Alternatives considered
 

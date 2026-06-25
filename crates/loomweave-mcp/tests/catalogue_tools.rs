@@ -4293,11 +4293,12 @@ async fn find_dead_code_surveys_rust_once_it_emits_roots() {
     }
 }
 
-/// ADR-054: a `module` is the containment spine rooted at the always-live crate
-/// root, not removable code — so a module entity is never a dead-code candidate,
-/// even with no inbound call/import edge. (Rust modules systematically lack
-/// module-targeting import edges; without this exclusion every Rust module would
-/// read as dead and dominate the candidate set.)
+/// ADR-054: `module` and `impl` are containment-spine containers rooted at the
+/// always-live crate root, not removable code — so they are never dead-code
+/// candidates, even with no inbound call/import edge. (Rust modules/impls
+/// systematically lack module-targeting import edges; without this exclusion
+/// every Rust module and impl block would read as dead and dominate the
+/// candidate set.)
 #[tokio::test]
 async fn find_dead_code_excludes_module_containers() {
     let (project, db, conn) = open_project();
@@ -4309,13 +4310,21 @@ async fn find_dead_code_excludes_module_containers() {
         Some((1, 5)),
     );
     insert_tag(&conn, "python:function:main", "entry-point");
-    // A module with no inbound call/import edge — a container, never "dead code".
+    // Container entities with no inbound call/import edge — never "dead code".
     insert_entity(
         &conn,
         "python:module:orphan_mod",
         "module",
         "orphan.py",
         Some((1, 10)),
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "rust:impl:orphan.Widget.impl#<>",
+        "rust",
+        "impl",
+        "src/orphan.rs",
+        "{}",
     );
     // A genuinely dead function — the only legitimate candidate.
     insert_entity(
@@ -4339,7 +4348,7 @@ async fn find_dead_code_excludes_module_containers() {
     assert_eq!(
         dead,
         vec!["python:function:dead".to_owned()],
-        "a module container is never a dead-code candidate: {env}"
+        "module / impl containers are never dead-code candidates: {env}"
     );
 }
 

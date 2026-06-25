@@ -100,15 +100,17 @@ const DEAD_CODE_EXCLUDED_TAGS: &[&str] = &["framework-handler", "plugin-hook"];
 const DEAD_CODE_NON_CODE_KINDS: &[&str] = &["file", "project", "subsystem", "guidance"];
 
 /// Code-adjacent CONTAINER kinds that are never dead-code candidates (ADR-054).
-/// A `module` is the containment spine rooted at the always-live crate root:
-/// reachability-by-containment reaches every module by construction, so a module
-/// is never "dead" in any actionable sense — you remove its contents, not the
-/// namespace. Reachability proper runs over call+import edges only, and the Rust
-/// plugin emits no module-targeting `imports` edges (its import edges target
-/// items), so without this exclusion every Rust module would read as dead and
-/// dominate the candidate set. Kept distinct from [`DEAD_CODE_NON_CODE_KINDS`]
-/// (modules are code, not non-code anchors) and disclosed separately.
-const DEAD_CODE_CONTAINER_KINDS: &[&str] = &["module"];
+/// A `module` (and a Rust `impl` block) is the containment spine rooted at the
+/// always-live crate root: reachability-by-containment reaches every container by
+/// construction, so it is never "dead" in any actionable sense — you remove its
+/// contents (which ARE surveyed individually), not the namespace/block.
+/// Reachability proper runs over call+import edges only, and the Rust plugin
+/// emits no module/impl-targeting `imports` edges (its import edges target
+/// items), so without this exclusion every Rust module and `impl` would read as
+/// dead and dominate the candidate set. Kept distinct from
+/// [`DEAD_CODE_NON_CODE_KINDS`] (these are code, not non-code anchors) and
+/// disclosed separately.
+const DEAD_CODE_CONTAINER_KINDS: &[&str] = &["module", "impl"];
 
 /// Runtime import predicate used by graph shortcuts. Missing or malformed
 /// properties fail toward inclusion; explicit `type_only=true` or

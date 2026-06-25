@@ -605,6 +605,7 @@ fn walk_items(
                     &method_is_cfg_twin,
                     &mut seen_impl_ids,
                     resolution,
+                    ctx,
                     out,
                     edges,
                     acc,
@@ -1198,6 +1199,7 @@ fn emit_impl(
     method_is_cfg_twin: &dyn Fn(&str, &str) -> bool,
     seen_impl_ids: &mut std::collections::BTreeSet<String>,
     resolution: Option<(&str, &Resolver)>,
+    ctx: TagCtx,
     out: &mut Vec<Value>,
     edges: &mut Vec<Value>,
     acc: &mut Phase2Acc,
@@ -1269,7 +1271,7 @@ fn emit_impl(
             {
                 q.push_str(&disc);
             }
-            let child = entity(
+            let mut child = entity(
                 "function",
                 &q,
                 file_path,
@@ -1277,6 +1279,22 @@ fn emit_impl(
                 Some(&impl_id),
                 Some(function_signature(&m.sig)),
             )?;
+            // ADR-054 increment 2: a `pub` method of a `pub` type is external API
+            // (`exported-api`). Trait-impl methods carry inherited visibility (no
+            // `pub`), so the pub rule leaves them unrooted — a deferred follow-up.
+            // The pub-chain + cfg(test) gating is inherited from the enclosing
+            // module via `ctx`; `at_file_top` is cleared so a method named `main`
+            // is not an entry point.
+            attach_tags(
+                &mut child,
+                root_tags(
+                    &m.sig.ident.to_string(),
+                    is_unrestricted_pub(&m.vis),
+                    true,
+                    &m.attrs,
+                    ctx.descend_into_impl(),
+                ),
+            );
             let method_id = build_id("function", &q)?;
             push_with_contains(&impl_id, child, out, edges); // impl -> method
             // Phase 2: walk the method body for call sites, ONLY with a resolver.

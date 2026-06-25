@@ -17,7 +17,7 @@ produced an entity. The differences below are entirely in what the plugins
 |---|---|---|
 | Status | first-party, v1.0 | first-party, 1.x |
 | Source backend | `pyright` (type-resolved) | `syn` (parse-only, in-project symbol table) |
-| Ontology version | 0.9.0 | 0.6.0 |
+| Ontology version | 0.9.0 | 0.7.0 |
 | Wardline-aware | **yes** (`wardline:*` trust tags) | no |
 | **Entity kinds** | `function`, `class`, `module` | `module`, `struct`, `enum`, `trait`, `function`, `impl`, `type_alias`, `const`, `static`, `macro` |
 | **Structural edges** | `contains`, `calls`, `references`, `imports` | `contains`, `calls`, `references`, `imports` |
@@ -55,19 +55,34 @@ inferred — so `entity_dead_list` now **works** on a pure-Rust index.
 - `entry-point` — `fn main`; a runtime-entry attribute (`#[tokio::main]` /
   `#[actix_web::main]` / `#[async_std::main]`); an FFI export (`#[no_mangle]` /
   `#[export_name]`).
-- `test` — `#[test]` / `#[bench]`, or any item under a `#[cfg(test)]` module.
+- `test` — `#[test]` / `#[bench]`, the std-replacement runners (`#[rstest]`,
+  `#[test_case]`, `#[quickcheck]`), or any item under a `#[cfg(test)]` module.
 - `allow-dead-code` — an item carrying `#[allow(dead_code)]` /
   `#[expect(dead_code)]` (an explicit author keep-signal; the lowest-confidence
   root class).
+- `http-route` (+ `framework-handler`) — actix-web / ntex / rocket route
+  attribute macros (`#[get("/")]`, `#[post]`, …, `#[route]`).
+- `cli-command` (+ `framework-handler`) — clap / structopt CLI derives
+  (`#[derive(Parser)]` / `Subcommand` / `Args` / `ValueEnum` / `StructOpt`).
+- `entry-point` also covers pyo3 FFI host exports (`#[pyfunction]` /
+  `#[pyclass]` / `#[pymodule]`) and proc-macro entry points (`#[proc_macro]` /
+  `#[proc_macro_derive]` / `#[proc_macro_attribute]`) — items reached from a
+  non-Rust host or the compiler.
+- `pub` methods of `pub` types (inherent `impl` blocks) are `exported-api`.
 
-Not yet emitted by Rust (tracked, increment 2): framework-attribute handlers
-(`http-route` / `cli-command` / `framework-handler` from axum/actix/rocket/clap
-attributes), `pub use` re-export resolution, and `pub`-method rooting of `pub`
-types. A `pub(crate)` item re-exported `pub` is therefore under-rooted today (a
-narrow, fail-toward-live residual). The structural tools (`entity_find`,
-`entity_callers_list`, `entity_neighborhood_get`, the edge surfaces) are
-unaffected. See [rust-known-limitations.md](./rust-known-limitations.md) for the
-full list of what Rust analysis does and does not resolve.
+Not yet emitted by Rust (tracked second-pass extensions): `pub use` re-export
+resolution (a `pub(crate)` item re-exported `pub` is under-rooted — a narrow,
+fail-toward-live residual); trait-impl-method rooting (a method reached only via
+trait dispatch — `framework-handler` excludes the *handler* but not its private
+callees, the documented under-rooting residual); and the lower-prevalence
+frameworks (wasm-bindgen / napi / uniffi / cxx FFI, poem/salvo `#[handler]`,
+rocket `#[catch]`, tarpc/jsonrpsee, argh/gumdrop). Builder-pattern frameworks
+(axum `Router::route`, warp filters, tonic codegen) register routes via runtime
+calls, not attributes, so a parse-only extractor cannot detect them. The
+structural tools (`entity_find`, `entity_callers_list`,
+`entity_neighborhood_get`, the edge surfaces) are unaffected. See
+[rust-known-limitations.md](./rust-known-limitations.md) for the full list of
+what Rust analysis does and does not resolve.
 
 ## Mixed-language repositories
 

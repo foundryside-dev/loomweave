@@ -13,6 +13,26 @@ use std::collections::BTreeSet;
 
 use syn::{Attribute, Meta, Visibility};
 
+/// actix-web / ntex / rocket route attribute macros (last-segment match). All
+/// cross-crate collisions are benign — every match means an HTTP route — and
+/// over-rooting is fail-toward-live, so a generic last-segment match is safe.
+const HTTP_ROUTE_ATTRS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "trace", "connect", "route",
+];
+/// clap (v3/v4) + structopt CLI command/arg derive macros (derive-list match).
+/// Distinctive, derive-position-unambiguous names (collision-safe per the
+/// framework-taxonomy survey, ADR-054 increment 2).
+const CLI_COMMAND_DERIVES: &[&str] = &["Parser", "Subcommand", "Args", "ValueEnum", "StructOpt"];
+/// pyo3 FFI host-export attributes (last-segment) — callable from a Python host,
+/// so a genuine entry point from outside the Rust call graph. pyo3-unique names,
+/// zero collision.
+const PYO3_ENTRY_ATTRS: &[&str] = &["pyfunction", "pyfn", "pyclass", "pymodule"];
+/// proc-macro entry points (bare single ident, never path-qualified) —
+/// compiler-invoked, so reachability roots.
+const PROC_MACRO_ATTRS: &[&str] = &["proc_macro", "proc_macro_derive", "proc_macro_attribute"];
+/// std-replacement test runners beyond `#[test]`/`#[bench]` (last-segment).
+const TEST_RUNNER_ATTRS: &[&str] = &["rstest", "test_case", "quickcheck"];
+
 /// Module context threaded down the recursive item walk for tag derivation.
 /// Four independent lexical facts about the current position — a context bag,
 /// not a state machine; two-variant enums would obscure rather than clarify.
@@ -55,6 +75,18 @@ impl TagCtx {
             at_file_top: false,
         }
     }
+
+    /// The context for an `impl` block's methods. The pub-chain and cfg(test)
+    /// ancestry are inherited from the enclosing module unchanged (an `impl`
+    /// adds no visibility of its own); only `at_file_top` clears, so a method
+    /// named `main` is never mistaken for the program entry (ADR-054 increment 2).
+    #[must_use]
+    pub fn descend_into_impl(self) -> Self {
+        Self {
+            at_file_top: false,
+            ..self
+        }
+    }
 }
 
 /// Reachability-root tags for a walked item, sorted + deduplicated (ADR-054).
@@ -79,8 +111,22 @@ pub fn root_tags(
     if ctx.under_cfg_test || has_test_attr(attrs) {
         tags.insert("test");
     }
-    if is_fn && is_entry_point(name, attrs, ctx) {
+    // entry-point: a bare module-level `fn main` (fns only), OR an entry
+    // attribute (runtime entry / FFI host export / proc-macro) on any item.
+    if (is_fn && ctx.at_file_top && name == "main") || has_entry_attr(attrs) {
         tags.insert("entry-point");
+    }
+    // Framework-dispatched handlers — reached by the framework, not by a static
+    // caller, so roots regardless of visibility/crate-type. `framework-handler`
+    // rides as the excluded-tag companion (mirroring the Python plugin); the
+    // ROOT is `http-route` / `cli-command` (ADR-054 increment 2).
+    if attr_last_seg_in(attrs, HTTP_ROUTE_ATTRS) {
+        tags.insert("http-route");
+        tags.insert("framework-handler");
+    }
+    if derive_last_seg_in(attrs, CLI_COMMAND_DERIVES) {
+        tags.insert("cli-command");
+        tags.insert("framework-handler");
     }
     if has_allow_dead_code(attrs) {
         tags.insert("allow-dead-code");
@@ -102,23 +148,62 @@ pub fn has_macro_export(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| a.path().is_ident("macro_export"))
 }
 
-/// `#[test]` / `#[bench]`, including last-segment variants like `#[tokio::test]`.
+/// `#[test]` / `#[bench]` (incl. last-segment variants like `#[tokio::test]`),
+/// and the std-replacement test-runner attributes (`#[rstest]`, etc.).
 fn has_test_attr(attrs: &[Attribute]) -> bool {
     attrs
         .iter()
         .any(|a| last_segment_is(a, "test") || last_segment_is(a, "bench"))
+        || attr_last_seg_in(attrs, TEST_RUNNER_ATTRS)
 }
 
-/// A module-level `fn main`, an async-runtime entry attribute (`#[tokio::main]`
-/// / `#[actix_web::main]` / `#[async_std::main]`, matched on the `main` last
-/// segment), or an FFI export (`#[no_mangle]` / `#[export_name]`).
-fn is_entry_point(name: &str, attrs: &[Attribute], ctx: TagCtx) -> bool {
-    (ctx.at_file_top && name == "main")
-        || attrs.iter().any(|a| {
-            last_segment_is(a, "main")
-                || a.path().is_ident("no_mangle")
-                || a.path().is_ident("export_name")
-        })
+/// An attribute that reaches an item from OUTSIDE the Rust call graph: an
+/// async-runtime entry (`#[tokio::main]` / `#[actix_web::main]`, matched on the
+/// `main` last segment), an FFI host export (pyo3, `#[no_mangle]` /
+/// `#[export_name]`), or a compiler-invoked proc-macro entry point.
+fn has_entry_attr(attrs: &[Attribute]) -> bool {
+    attr_last_seg_in(attrs, &["main"])
+        || attr_last_seg_in(attrs, PYO3_ENTRY_ATTRS)
+        || attr_is_ident_in(attrs, &["no_mangle", "export_name"])
+        || attr_is_ident_in(attrs, PROC_MACRO_ATTRS)
+}
+
+/// Any attribute whose final path segment is one of `names` (so `#[get]` and
+/// `#[actix_web::get]` both match `"get"`).
+fn attr_last_seg_in(attrs: &[Attribute], names: &[&str]) -> bool {
+    attrs.iter().any(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| names.iter().any(|n| s.ident == n))
+    })
+}
+
+/// Any attribute that is the bare single ident `name` (no path) for one of
+/// `names` — used where the attribute is never path-qualified (`#[proc_macro]`).
+fn attr_is_ident_in(attrs: &[Attribute], names: &[&str]) -> bool {
+    attrs
+        .iter()
+        .any(|a| names.iter().any(|n| a.path().is_ident(n)))
+}
+
+/// Any `#[derive(...)]` whose derive list contains a path with a final segment
+/// (or any segment) in `names` — catches `#[derive(Parser)]` and
+/// `#[derive(clap::Parser)]`. The `names` are distinctive enough that a
+/// path-prefix token can never be one of them.
+fn derive_last_seg_in(attrs: &[Attribute], names: &[&str]) -> bool {
+    attrs.iter().any(|a| {
+        if let Meta::List(list) = &a.meta {
+            list.path.is_ident("derive")
+                && list
+                    .tokens
+                    .to_string()
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|t| names.contains(&t))
+        } else {
+            false
+        }
+    })
 }
 
 /// `#[allow(dead_code)]` or `#[expect(dead_code)]` — an explicit author keep
