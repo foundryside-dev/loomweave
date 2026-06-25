@@ -752,6 +752,26 @@ fn insert_entity(
             entity.updated_at,
         ],
     )?;
+    // ADR-026 dual-encoding self-heal (clarion-abda98c869). `parent_id` is the
+    // authoritative parent; a `contains` edge into this entity from any OTHER
+    // node is a stale claim left when the claiming file moved — a file_scope
+    // module/package dual-claim whose claimer flipped between runs, or a
+    // relocated entity whose old file's contains edge outlived the move. Such an
+    // edge contradicts `parent_id` and trips `parent_contains_mismatch` at
+    // flush/commit, aborting the whole run. Prune it here, in the same
+    // transaction as the parent write, so parent_id and its single contains edge
+    // stay consistent regardless of intra-run file order — and an already
+    // corrupted index self-heals on the next analysis that re-emits the entity.
+    // The claiming file's own contains edge (from_id == parent_id) is never
+    // touched, so this only removes contradictions, never the matching edge; an
+    // entity with no parent_id (a root) is left entirely alone.
+    if let Some(parent_id) = entity.parent_id.as_deref() {
+        conn.execute(
+            "DELETE FROM edges \
+              WHERE kind = 'contains' AND to_id = ?1 AND from_id != ?2",
+            params![entity.id, parent_id],
+        )?;
+    }
     conn.execute(
         "DELETE FROM entity_tags WHERE entity_id = ?1 AND plugin_id = ?2",
         params![entity.id, entity.plugin_id],

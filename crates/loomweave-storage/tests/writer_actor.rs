@@ -2698,6 +2698,119 @@ async fn parent_id_without_matching_contains_edge_rejects_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaiming_entity_under_a_new_parent_prunes_the_stale_contains_edge() {
+    // clarion-abda98c869: when a file_scope entity's claim moves between files
+    // across runs (a module/package dual-claim flip, or a genuine move), the
+    // PREVIOUS claimer's `contains` edge must not linger and contradict the new
+    // `parent_id`. Re-inserting the entity with a new parent prunes any stale
+    // contains edge into it, keeping the ADR-026 dual encoding consistent — so
+    // the run commits instead of aborting with LMWV-INFRA-PARENT-CONTAINS-MISMATCH.
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    // Run 1: file A claims module m (parent=A, contains A->m). Consistent.
+    begin_demo_run(&tx, "run-1").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_file_entity_named("core:file:a.py", "a.py")),
+        ack,
+    })
+    .await
+    .unwrap();
+    let mut module_a = make_module_entity("python:module:m");
+    module_a.parent_id = Some("core:file:a.py".to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(module_a),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_contains_edge("core:file:a.py", "python:module:m")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-1".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .expect("run 1 is internally consistent");
+
+    // Run 2: file B re-claims module m (parent=B, contains B->m). The A->m edge
+    // from run 1 is stale and would trip the parent-contains validation; the
+    // re-claim must prune it rather than abort the run.
+    begin_demo_run(&tx, "run-2").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_file_entity_named("core:file:b.py", "b.py")),
+        ack,
+    })
+    .await
+    .unwrap();
+    let mut module_b = make_module_entity("python:module:m");
+    module_b.parent_id = Some("core:file:b.py".to_owned());
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(module_b),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_contains_edge("core:file:b.py", "python:module:m")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-2".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .expect("re-claim must prune the stale contains edge and commit, not abort");
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    // The graph reflects the new claimer only: exactly one contains edge, from B,
+    // matching the module's parent_id.
+    let pool = ReaderPool::open(&path, 1).unwrap();
+    let (froms, parent): (Vec<String>, Option<String>) = pool
+        .with_reader(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT from_id FROM edges \
+                  WHERE kind = 'contains' AND to_id = 'python:module:m' \
+                  ORDER BY from_id",
+            )?;
+            let froms = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let parent = conn.query_row(
+                "SELECT parent_id FROM entities WHERE id = 'python:module:m'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            Ok((froms, parent))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        froms,
+        ["core:file:b.py"],
+        "the stale A->m contains edge must be pruned; only B->m survives"
+    );
+    assert_eq!(parent.as_deref(), Some("core:file:b.py"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn orphan_contains_edge_with_no_matching_parent_id_rejects_run() {
     // Inverse direction of parent-id consistency: a contains edge exists but
     // the child entity's parent_id does not match (or is NULL).
