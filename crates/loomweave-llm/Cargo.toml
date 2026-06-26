@@ -1,0 +1,23 @@
+[package]
+name = "loomweave-llm"
+description = "Loomweave LLM + embedding provider traits, concrete providers (OpenRouter / Codex CLI / Claude CLI), and the outbound HTTP/CLI transport for summaries and embeddings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+fs2.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+which.workspace = true
