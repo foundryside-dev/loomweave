@@ -77,6 +77,24 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Trust-surface — loomweave-core must not link an HTTP client
+        # PRD-0001 / clarion-141e9c08c8: the plugin-supervisor + SEI crate must
+        # not carry an outbound HTTP client; provider HTTP lives in loomweave-llm.
+        # `--prefix none` flattens the tree so the anchor matches an indented dep
+        # (a plain `^reqwest` against the tree output never matches and would pass
+        # vacuously). `reqwest` stays legitimate in federation/cli — this is a
+        # per-crate ban cargo-deny's [bans] cannot express.
+        run: |
+          set -euo pipefail
+          # Capture first so a `cargo tree` failure exits the step (under `set -e`)
+          # instead of being swallowed by the pipe and read as "no reqwest".
+          deps="$(cargo tree -p loomweave-core --edges normal --prefix none)"
+          if grep -qE '^reqwest v' <<<"$deps"; then
+            echo "::error::loomweave-core links reqwest; the provider HTTP must stay in loomweave-llm (PRD-0001)"
+            exit 1
+          fi
+          echo "OK: loomweave-core has no reqwest in its dependency tree"
+
       - name: install cargo-nextest
         uses: taiki-e/install-action@e310bff3ef77234d477d6bb655da153a5c49d1db
 
