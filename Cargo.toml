@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/loomweave-analysis",
     "crates/loomweave-core",
+    "crates/loomweave-llm",
     "crates/loomweave-federation",
     "crates/loomweave-storage",
     "crates/loomweave-cli",

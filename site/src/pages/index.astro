@@ -117,7 +117,7 @@ const quickStart =
           <EnrichmentChip client:visible state="present" peer="wardline" />
           <EnrichmentChip client:visible state="present" peer="warpline" />
           <EnrichmentChip client:visible state="absent" peer="legis" />
-          <EnrichmentChip client:visible state="unavailable" peer="charter" />
+          <EnrichmentChip client:visible state="unavailable" peer="plainweave" />
         </div>
       </div>
     </div>
@@ -336,6 +336,14 @@ const quickStart =
             to <code>live</code>.
           </li>
         </ul>
+      </Banner>
+
+      <Banner client:visible tone="danger" title="Not a security scanner — SEI is identity, not authorization.">
+        Loomweave maps structure and mints identity; it does not scan for
+        vulnerabilities, render a SAST verdict, or decide who may touch what. The
+        <code>SEI</code> is a stable coordinate, not a credential — keying a fact on it
+        grants no authority. Loomweave is deconfliction-first, not security; never treat
+        its structural graph or its identities as an access-control or compliance boundary.
       </Banner>
 
       <ul class="spine__notes">

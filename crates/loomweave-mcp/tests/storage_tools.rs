@@ -8,18 +8,18 @@ use std::{
     },
 };
 
-use loomweave_core::{
-    CachingModel, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
-    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
-    LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig, Recording,
-    RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
-};
 use loomweave_federation::{
     loomweave_port::publish_port,
     loomweave_url::{
         SOURCE_EPHEMERAL_PORT as LOOMWEAVE_SOURCE_EPHEMERAL_PORT,
         SOURCE_NONE as LOOMWEAVE_SOURCE_NONE,
     },
+};
+use loomweave_llm::{
+    CachingModel, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
+    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmProvider, LlmProviderError,
+    LlmPurpose, LlmRequest, LlmResponse, OpenRouterProvider, OpenRouterProviderConfig, Recording,
+    RecordingProvider, build_inferred_calls_prompt, build_leaf_summary_prompt,
 };
 use loomweave_mcp::{
     DiagnosticsContext, LlmDiagnostics, McpToolPolicy, ServerState,

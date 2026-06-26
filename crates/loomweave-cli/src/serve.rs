@@ -6,17 +6,17 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use loomweave_core::{
-    ApiEmbeddingProvider, ApiEmbeddingProviderConfig, ClaudeCliProvider, ClaudeCliProviderConfig,
-    CodexCliProvider, CodexCliProviderConfig, EmbeddingProvider, EmbeddingProviderError,
-    LlmProvider, OpenRouterProvider, OpenRouterProviderConfig, Recording, RecordingProvider,
-    TrafficLoggingProvider,
-};
 use loomweave_federation::config::{
     LlmConfig, McpConfig, ProviderSelection, SemanticProviderKind, SemanticSearchConfig,
     select_provider_with_env,
 };
 use loomweave_federation::filigree::FiligreeHttpClient;
+use loomweave_llm::{
+    ApiEmbeddingProvider, ApiEmbeddingProviderConfig, ClaudeCliProvider, ClaudeCliProviderConfig,
+    CodexCliProvider, CodexCliProviderConfig, EmbeddingProvider, EmbeddingProviderError,
+    LlmProvider, OpenRouterProvider, OpenRouterProviderConfig, Recording, RecordingProvider,
+    TrafficLoggingProvider,
+};
 use loomweave_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
 
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
