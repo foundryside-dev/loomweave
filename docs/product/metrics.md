@@ -1,6 +1,6 @@
 # Loomweave — Metrics
 
-> Bootstrapped 2026-06-11. **Updated 2026-06-24** (checkpoint). Baselines are
+> Bootstrapped 2026-06-11. **Updated 2026-06-26** (checkpoint). Baselines are
 > real observed readings; targets are falsifiable (a number/boolean and a date).
 
 ## North star
@@ -14,9 +14,16 @@ found by the adversarial 4-corpus QA sweep.
 - `READING (2026-06-24): 0 open families` — **TARGET MET.** All four fixed
   (ADR-049 Amendments 6–9; PDR-0004). The original `0 by 2026-06-30` target is
   achieved ahead of its date.
-- **OPEN QUESTION (owner):** the north-star target is now met and needs a fresh
-  falsifiable successor. Candidate: fabricated-edge / dropped-file defect count
-  on the same sweep stays 0 across the 1.3.x line — but the owner should set the
+- `READING (2026-06-26): 0 open collision families` — holds. Supporting signal:
+  the broader graph-correctness frontier is being actively defended — three
+  graph-correctness bugs closed in the drift-window since the last checkpoint
+  (clarion-abda98c869 parent-contains-mismatch, clarion-48af930f2a same-locator
+  shadowing, clarion-e12d424f1d incremental dead-code false-positive). This is
+  live evidence the candidate successor below is the right shape.
+- **OPEN QUESTION (owner, carried):** the collision-family target is met and needs
+  a fresh falsifiable successor. Candidate: fabricated-edge / dropped-file /
+  collision defect count on the adversarial sweep stays 0 across the 1.3.x line
+  (now partially evidenced — three such bugs closed). The owner should ratify the
   real next target rather than have it invented here.
 
 ## Guardrails
@@ -27,15 +34,25 @@ found by the adversarial 4-corpus QA sweep.
    carry HTTP. *(Scope: `loomweave-core`-specific — `reqwest` is legitimate in
    `loomweave-federation` and `loomweave-cli`; this is not a workspace-wide ban.)*
    - `BASELINE (2026-06-24): yes` — `loomweave-core` links `reqwest` directly.
-   - `TARGET: no` — verified by `cargo tree -p loomweave-core` resolving no
-     `reqwest`; becomes met when PRD-0001 lands. **Currently: yes (bet open).**
+   - `READING (2026-06-26): no` — **TARGET MET.** PRD-0001 landed (PDR-0005, PR
+     #76 → `main` `b346328`). `cargo tree -p loomweave-core --edges normal`
+     resolves no `reqwest`; now enforced as a standing CI gate in `verify.yml`
+     (fails the build if `reqwest` re-enters core's tree).
+   - `TARGET: no — now MET and standing (CI-enforced).`
 2. **CI floor stays green** (ADR-023): fmt, clippy `-D warnings`, build, nextest,
    doc, deny, ruff, ruff-format, mypy --strict, pytest, e2e scripts.
    - `BASELINE (2026-06-11): green, ~1450 nextest tests`
    - `READING (2026-06-24): presumed green` — five releases (1.2.0–1.3.1) cut
-     since, each implying a green floor; **not independently re-verified this
-     session.** One security event handled: msgpack GHSA-6v7p-g79w-8964 bumped
-     (1.3.1).
+     since, each implying a green floor; not independently re-verified that session.
+   - `READING (2026-06-26): GREEN — independently verified.` On the loomweave-llm
+     merge commit `b346328` (PR #76): Rust + Rust(aarch64) + Python + e2e all
+     pass; locally nextest 1948 / pytest 220 green under CI-equivalent conditions.
+     **Caveat (CI blind spot):** the `wardline_taint_fact_conformance_oracle`
+     reads the live `~/wardline` sibling repo and *skip-cleans* when absent — so a
+     vendored-golden drift from that sibling turns the **local** floor red while
+     **CI stays green** (no sibling on the runner). Filed as clarion-72e1c1a07d
+     (pre-existing, not from this bet). Promote to a real guardrail if the
+     CI-invisibility recurs.
    - `TARGET: green on every release/merge — standing, no end date`
 3. **MCP context tax under budget**: `tools/list` payload has a CI-enforced
    22,000-byte budget.

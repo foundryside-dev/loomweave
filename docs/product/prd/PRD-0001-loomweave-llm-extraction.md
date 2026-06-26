@@ -1,5 +1,5 @@
-# PRD-0001 — Extract `loomweave-llm` crate from `loomweave-core`     Status: ready-for-planning
-Decision: PDR-0003 (pending — confirmed in-session 2026-06-24, written at next /product-checkpoint)
+# PRD-0001 — Extract `loomweave-llm` crate from `loomweave-core`     Status: SHIPPED (2026-06-26)
+Decision: PDR-0003 (selection) → PDR-0005 (accepted; all 6 criteria met; PR #76 → main b346328)
 Bet (roadmap.md): Now (promoted from Next this session)   Target metric (metrics.md): Trust-surface — does `loomweave-core` (plugin-host/SEI crate) link outbound HTTP (NEW)
 
 ## Problem

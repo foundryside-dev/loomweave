@@ -1,57 +1,66 @@
 # Loomweave — Current State (resume brief)
 
-> Refreshed at checkpoint **2026-06-24**. Next session: start here, then
+> Refreshed at checkpoint **2026-06-26**. Next session: start here, then
 > `vision.md` (grant), `roadmap.md` + `metrics.md`, then reconcile the tracker
 > IDs below against Filigree.
 
 ## The bet right now
 
-**Extract `loomweave-llm` from `loomweave-core`** (clarion-141e9c08c8, PDR-0003)
-— pay the head-of-critical-path architecture debt and remove outbound HTTP from
-the plugin-supervisor + SEI crate. **Dispatched, not yet executed:**
-- PRD: `docs/product/prd/PRD-0001-loomweave-llm-extraction.md` (ready-for-planning).
-- Boundary ratified by a solution-architect pass (pure-leaf crate, no cycle).
-- Implementation plan: `docs/plans/2026-06-24-loomweave-llm-extraction.md`.
-- **Next action:** `/review-plan` that plan, then execute (subagent-driven or a
-  fresh `executing-plans` session). Metric it moves: trust-surface
-  `loomweave-core links reqwest: yes → no`.
+**Now horizon is turning over.** The recorded Now bet — the `loomweave-llm`
+extraction (clarion-141e9c08c8) — is **accepted and merged** this session
+(PDR-0005, PR #76 → `main` `b346328`). `loomweave-core` no longer links `reqwest`;
+a standing trust-surface CI gate enforces it. **The next session's DECIDE picks
+the new Now.** Candidates (intent only — roadmap.md):
+
+1. **Incremental-analyze correctness cluster** — defends the north-star directly;
+   already shrinking (3 graph-correctness bugs closed in the drift-window). Still
+   open: clarion-feab311907, clarion-14398b2536, clarion-a65cb18b02 (all confirmed).
+2. **Per-provider split** (clarion-4328c5c757) — now **unblocked** by the extraction.
+3. **B.4\* analyze 24× perf regression** (clarion-c20593d0d8, triage).
 
 ## In flight (tracker authoritative for status)
 
-- Nothing claimed/in-progress. The Now bet's tracker item (clarion-141e9c08c8)
-  is dispatched (PRD + plan) but not started — no code changed this session.
-- Active defect cluster (Now/Next): clarion-feab311907, clarion-14398b2536,
-  clarion-a65cb18b02 (all confirmed); clarion-abda98c869, clarion-c20593d0d8
-  (triage).
+- **clarion-05fdd0490e** (ADR-054 Rust reachability-root tags) — `building`,
+  assignee `claude` (**a concurrent actor**, not this owner-session; increments
+  1+2 already shipped). Do not grab it.
+- Nothing else claimed by this session.
 
-## Decided this session (2026-06-24)
+## Decided this session (2026-06-26)
 
-- **Authority grant CONFIRMED as-is** by owner; `Last reviewed` stamped
-  2026-06-24 (content unchanged).
-- **PDR-0003** — Now bet = `loomweave-llm` extraction.
-- **PDR-0004** — accepted the 1.1.0 / Rust-plugin-gold bet as **complete**
-  (PDR-0002 gate satisfied; all 4 collision families fixed; now v1.3.1).
+- **PDR-0005** — accepted the `loomweave-llm` extraction bet as complete (all 6
+  PRD-0001 criteria met on the merge commit). Closed clarion-141e9c08c8;
+  unblocked clarion-4328c5c757.
+- **Authority grant re-confirmed as-is** by owner; `Last reviewed` stamped 2026-06-26.
+- **Owner steer:** execute loomweave-llm this session (vs. reconcile-first or
+  steer-to-cluster) — done.
+- Filed **clarion-72e1c1a07d** (pre-existing wardline conformance drift; not from this bet).
 
 ## Metric signals
 
-- North star (open collision families) **4 → 0, TARGET MET** — needs a fresh
-  successor target (owner). See `metrics.md`.
-- New guardrail: trust-surface (`loomweave-core` HTTP) — currently `yes`, target
-  `no`, met when the Now bet lands.
-- **Re-check needed:** `tools/list` 22 KB budget (MCP surface grew; margin was 13
-  bytes — reading unknown). CI floor presumed green at 1.3.1, not re-verified.
+- **Trust-surface guardrail — TARGET MET** (`yes → no`): `loomweave-core` links no
+  `reqwest`; CI-enforced. See `metrics.md`.
+- **North star** (open collision families) — still **0**; needs a fresh successor
+  target (owner). The graph-correctness cluster shrinking is live support for the
+  candidate ("fabricated-edge / dropped-file / collision count stays 0").
+- **CI floor — GREEN, independently verified** on `b346328`. Caveat: the
+  wardline-taint conformance oracle makes the *local* floor red / *CI* green when
+  the `~/wardline` sibling drifts (clarion-72e1c1a07d) — a CI blind spot.
+- **`tools/list` 22 KB budget** — still UNKNOWN, carried from 2026-06-24; not re-measured.
 
 ## Open questions / awaiting owner
 
-1. **Fresh north-star target** now that the collision-family target is met.
-2. **`tools/list` byte budget** — re-measure; may be breached.
-3. **Adoption metric** — still undecided; telemetry is escalation-gated (local-first).
-4. **ESCALATION (carried forward):** the Wardline Amendments 4–9 corpus
-   re-vendor handoff is **prepared but not pushed** — outward-facing, gated. Do
-   not push without owner sign-off.
+1. **New Now bet** — DECIDE from the candidates above (the horizon turned over).
+2. **Fresh north-star successor target** (collision target met; candidate identified).
+3. **`tools/list` byte budget** — re-measure; may be breached.
+4. **Adoption metric** — still undecided; telemetry is escalation-gated (local-first).
+5. **ESCALATION (carried forward):** Wardline Amendments 4–9 corpus re-vendor
+   handoff — prepared, not pushed, **outward-facing, gated.** Do not push without
+   owner sign-off.
+6. **Cleanup (minor):** remote branch `origin/feat/loomweave-llm-extraction` is
+   merged but still on origin — awaiting owner OK to delete (per standing rule).
 
 ## Where the next session starts
 
-1. `/review-plan docs/plans/2026-06-24-loomweave-llm-extraction.md`, then execute
-   the `loomweave-llm` extraction (the recorded Now bet). On completion, run the
-   PRD-0001 acceptance gate and bank the trust-surface metric flip.
+1. **DECIDE the new Now** from the three candidates (cluster / per-provider split /
+   B.4\* perf), and set the north-star successor target. Then DISPATCH (PRD +
+   plan) as usual.
