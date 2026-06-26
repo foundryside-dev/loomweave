@@ -1081,6 +1081,7 @@ dependencies = [
  "loomweave-analysis",
  "loomweave-core",
  "loomweave-federation",
+ "loomweave-llm",
  "loomweave-mcp",
  "loomweave-plugin-fixture",
  "loomweave-scanner",
@@ -1108,10 +1109,7 @@ dependencies = [
 name = "loomweave-core"
 version = "1.3.1"
 dependencies = [
- "async-trait",
- "fs2",
  "nix",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1137,6 +1135,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "loomweave-llm"
+version = "1.3.1"
+dependencies = [
+ "async-trait",
+ "fs2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "which",
+]
+
+[[package]]
 name = "loomweave-mcp"
 version = "1.3.1"
 dependencies = [
@@ -1144,6 +1158,7 @@ dependencies = [
  "blake3",
  "loomweave-core",
  "loomweave-federation",
+ "loomweave-llm",
  "loomweave-storage",
  "nix",
  "reqwest",

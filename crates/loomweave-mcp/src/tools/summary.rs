@@ -8,10 +8,11 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use loomweave_core::{
-    EdgeConfidence, INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput,
-    LEAF_SUMMARY_PROMPT_TEMPLATE_ID, LeafSummaryPromptInput, LlmPurpose, LlmRequest, McpErrorCode,
-    build_inferred_calls_prompt, build_leaf_summary_prompt,
+use loomweave_core::{EdgeConfidence, McpErrorCode};
+use loomweave_llm::{
+    INFERRED_CALLS_PROMPT_VERSION, InferredCallsPromptInput, LEAF_SUMMARY_PROMPT_TEMPLATE_ID,
+    LeafSummaryPromptInput, LlmPurpose, LlmRequest, build_inferred_calls_prompt,
+    build_leaf_summary_prompt,
 };
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};

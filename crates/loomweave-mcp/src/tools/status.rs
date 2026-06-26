@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 
-use loomweave_core::{LeafSummaryPromptInput, McpErrorCode, build_leaf_summary_prompt};
+use loomweave_core::McpErrorCode;
+use loomweave_llm::{LeafSummaryPromptInput, build_leaf_summary_prompt};
 use serde_json::{Value, json};
 
 use loomweave_storage::{

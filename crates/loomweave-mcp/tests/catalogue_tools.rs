@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use loomweave_core::{EmbeddingRecording, RecordingEmbeddingProvider};
+use loomweave_llm::{EmbeddingRecording, RecordingEmbeddingProvider};
 use loomweave_mcp::config::SemanticSearchConfig;
 use loomweave_mcp::filigree::{
     EntityAssociationsResponse, FiligreeClientError, FiligreeLookup, WardlineFinding,

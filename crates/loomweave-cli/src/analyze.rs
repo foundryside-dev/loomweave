@@ -25,9 +25,10 @@ use uuid::Uuid;
 use loomweave_core::plugin::host::FINDING_PLUGIN_ABORTED;
 use loomweave_core::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, CrashLoopBreaker, CrashLoopState,
-    DiscoveredPlugin, EmbeddingProvider, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding,
-    UnresolvedCallSite, discover,
+    DiscoveredPlugin, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding, UnresolvedCallSite,
+    discover,
 };
+use loomweave_llm::EmbeddingProvider;
 use loomweave_storage::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, EmbeddingKey, EmbeddingStore, GitRename,
     NewEntityDescriptor, PriorIndexEntry, SeiBindingRecord, SeiDecision, SeiLineageEntry,
@@ -8061,8 +8062,8 @@ mod tests {
     async fn semantic_embedding_population_skips_fresh_sidecar_rows() {
         use std::sync::Arc;
 
-        use loomweave_core::{EmbeddingProvider, EmbeddingRecording, RecordingEmbeddingProvider};
         use loomweave_federation::config::SemanticSearchConfig;
+        use loomweave_llm::{EmbeddingProvider, EmbeddingRecording, RecordingEmbeddingProvider};
         use loomweave_storage::{EmbeddingKey, EmbeddingStore, pragma, schema};
 
         let project = tempfile::tempdir().unwrap();
@@ -8130,8 +8131,8 @@ mod tests {
     async fn semantic_embedding_population_skips_briefing_blocked_entities() {
         use std::sync::Arc;
 
-        use loomweave_core::{EmbeddingProvider, EmbeddingRecording, RecordingEmbeddingProvider};
         use loomweave_federation::config::SemanticSearchConfig;
+        use loomweave_llm::{EmbeddingProvider, EmbeddingRecording, RecordingEmbeddingProvider};
         use loomweave_storage::{pragma, schema};
 
         let project = tempfile::tempdir().unwrap();

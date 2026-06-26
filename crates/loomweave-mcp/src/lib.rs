@@ -15,10 +15,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use loomweave_core::{
-    EdgeConfidence, EmbeddingProvider, LlmProvider, LlmProviderError, LlmRequest, LlmResponse,
-    McpErrorCode,
-};
+use loomweave_core::{EdgeConfidence, McpErrorCode};
+use loomweave_llm::{EmbeddingProvider, LlmProvider, LlmProviderError, LlmRequest, LlmResponse};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
@@ -6128,7 +6126,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use loomweave_core::{CachingModel, LlmProvider, LlmProviderError, LlmRequest, LlmResponse};
+    use loomweave_llm::{CachingModel, LlmProvider, LlmProviderError, LlmRequest, LlmResponse};
     use loomweave_storage::{
         EntityRow, InferredEdgeCacheKey, ReaderPool, UnresolvedCallSiteRow, pragma, schema,
     };

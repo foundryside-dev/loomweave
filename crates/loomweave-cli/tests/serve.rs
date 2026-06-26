@@ -10,10 +10,8 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use hmac::{Hmac, Mac};
-use loomweave_core::{
-    LEAF_SUMMARY_PROMPT_TEMPLATE_ID,
-    plugin::{ContentLengthCeiling, Frame, read_frame, write_frame},
-};
+use loomweave_core::plugin::{ContentLengthCeiling, Frame, read_frame, write_frame};
+use loomweave_llm::LEAF_SUMMARY_PROMPT_TEMPLATE_ID;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::Value;
