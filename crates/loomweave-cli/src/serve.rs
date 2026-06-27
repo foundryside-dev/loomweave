@@ -11,6 +11,7 @@ use loomweave_federation::config::{
     select_provider_with_env,
 };
 use loomweave_federation::filigree::FiligreeHttpClient;
+use loomweave_federation::warpline::WarplineMcpClient;
 use loomweave_llm::{
     ApiEmbeddingProvider, ApiEmbeddingProviderConfig, ClaudeCliProvider, ClaudeCliProviderConfig,
     CodexCliProvider, CodexCliProviderConfig, EmbeddingProvider, EmbeddingProviderError,
@@ -91,6 +92,12 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     )
     .context("build Filigree HTTP client")?;
 
+    // Read-only Warpline churn consumer for the high-churn / recently-changed
+    // surfaces. `None` when disabled (the default) — the surfaces degrade
+    // honestly. Enrich-only, dependency-sink: nothing flows loomweave→warpline.
+    let warpline_client =
+        WarplineMcpClient::from_config(&config.integrations.warpline, Some(&project_root));
+
     let diagnostics = loomweave_mcp::DiagnosticsContext {
         llm: llm_diagnostics,
         filigree: filigree_resolution,
@@ -127,6 +134,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         llm_provider,
         semantic_search_state(&config.semantic_search, embedding_provider),
         filigree_client,
+        warpline_client,
         diagnostics,
         loomweave_mcp::McpToolPolicy {
             enable_write_tools: config.serve.mcp.enable_write_tools,
@@ -199,6 +207,7 @@ fn spawn_mcp_stdio(
     llm_provider: Option<Arc<dyn LlmProvider>>,
     semantic_search: Option<SemanticSearchState>,
     filigree_client: Option<FiligreeHttpClient>,
+    warpline_client: Option<WarplineMcpClient>,
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
@@ -215,6 +224,7 @@ fn spawn_mcp_stdio(
                 llm_provider,
                 semantic_search,
                 filigree_client,
+                warpline_client,
                 diagnostics,
                 tool_policy,
                 analyze_config_path,
@@ -234,6 +244,7 @@ fn run_mcp_stdio(
     llm_provider: Option<Arc<dyn LlmProvider>>,
     semantic_search: Option<SemanticSearchState>,
     filigree_client: Option<FiligreeHttpClient>,
+    warpline_client: Option<WarplineMcpClient>,
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
@@ -270,6 +281,9 @@ fn run_mcp_stdio(
     }
     if let Some(client) = filigree_client {
         state = state.with_filigree_client(Arc::new(client));
+    }
+    if let Some(client) = warpline_client {
+        state = state.with_warpline_client(Arc::new(client));
     }
     state = state.with_diagnostics(diagnostics);
 

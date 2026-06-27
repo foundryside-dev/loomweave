@@ -10,6 +10,7 @@ pub mod scan_results;
 pub mod snapshot;
 mod tools;
 pub mod wardline_reconcile;
+pub mod warpline;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -711,12 +712,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_high_churn_list",
-            description: "Entities ranked by git churn, optional `scope`. v1.0 does not populate churn, so this is honest-empty in practice. Bounded.",
+            description: "Entities ranked by change count (desc), optional `scope`. Counts (churn_count/last_changed_at/last_actor) from Warpline at read time; Warpline off/unreachable → honest-empty (warpline signal). Bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_recent_change_list",
-            description: "Entities changed since `since`, optional `scope`. v1.0 indexes no per-entity change time, so this is an honest no-op with a note pointing at index_diff_get. Never fabricates.",
+            description: "Entities changed since `since` (optional), most-recent first, optional `scope`. Change facts from Warpline at read time; Warpline off/unreachable → honest-empty (warpline signal).",
             input_schema: scope_page_schema(true),
         },
         ToolDefinition {
@@ -1210,6 +1211,13 @@ pub struct ServerState {
     budget: Arc<Mutex<BudgetLedger>>,
     inferred_inflight: InferredInflight,
     filigree_client: Option<Arc<dyn FiligreeLookup>>,
+    /// Read-only consumer of Warpline's FROZEN churn read, injected by `serve`
+    /// when the warpline integration is enabled. `None` is the honest-degrade
+    /// default: the churn surfaces stay honest-empty (with a missing-signal note
+    /// naming warpline) rather than fabricating a ranking. Enrich-only,
+    /// dependency-sink — loomweave reads warpline's churn count and retains
+    /// nothing (the loomweave↔warpline HARD RULE).
+    warpline_client: Option<Arc<dyn crate::warpline::WarplineLookup>>,
     diagnostics: Option<DiagnosticsContext>,
     tool_policy: McpToolPolicy,
     /// Supervised `loomweave analyze` runs launched via `analyze_start`.
@@ -1241,6 +1249,7 @@ impl ServerState {
             budget: Arc::new(Mutex::new(BudgetLedger::default())),
             inferred_inflight: Arc::new(AsyncMutex::new(HashMap::new())),
             filigree_client: None,
+            warpline_client: None,
             diagnostics: None,
             tool_policy: McpToolPolicy::default(),
             analyze_runs: Arc::new(Mutex::new(HashMap::new())),
@@ -1339,6 +1348,18 @@ impl ServerState {
     #[must_use]
     pub fn with_filigree_client(mut self, client: Arc<dyn FiligreeLookup>) -> Self {
         self.filigree_client = Some(client);
+        self
+    }
+
+    /// Inject the read-only Warpline churn consumer used by the high-churn /
+    /// recently-changed surfaces. Absent → those surfaces degrade honestly
+    /// (honest-empty with a missing-signal note). Enrich-only, dependency-sink.
+    #[must_use]
+    pub fn with_warpline_client(
+        mut self,
+        client: Arc<dyn crate::warpline::WarplineLookup>,
+    ) -> Self {
+        self.warpline_client = Some(client);
         self
     }
 

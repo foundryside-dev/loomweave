@@ -550,6 +550,14 @@ impl ClaudePermissionMode {
 #[serde(default, deny_unknown_fields)]
 pub struct IntegrationsConfig {
     pub filigree: FiligreeConfig,
+    /// Warpline (the federation's temporal/change authority) churn-count read,
+    /// consumed at read time by `entity_high_churn_list` /
+    /// `entity_recent_change_list`. Read-only, enrich-only, dependency-sink:
+    /// loomweave never stores a warpline fact (the seam's HARD RULE — loomweave
+    /// retains no cross-run history; see the 2026-06-13 warpline interface lock
+    /// §1, §5). Default disabled — the churn surfaces stay honest-empty with a
+    /// missing-signal note until an operator opts in.
+    pub warpline: WarplineConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -750,6 +758,44 @@ impl Default for FiligreeConfig {
             timeout_seconds: 5,
             emit_findings: false,
             prune_unseen_days: 30,
+        }
+    }
+}
+
+/// Read-time consumption of Warpline's FROZEN churn-count read
+/// (`warpline_entity_churn_count_get`, `warpline.entity_churn_count.v1`). This
+/// is a *read-only* seam: loomweave asks warpline for per-entity change counts
+/// to rank `entity_high_churn_list` / `entity_recent_change_list`, joins them at
+/// read time, and retains NOTHING (the loomweave↔warpline HARD RULE — loomweave
+/// holds no cross-run history). There is deliberately NO write/emit flag here:
+/// unlike the Filigree seam, nothing flows loomweave→warpline.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WarplineConfig {
+    /// Whether the churn surfaces consult warpline. Default `false`: the
+    /// surfaces stay honest-empty (with a missing-signal note naming warpline)
+    /// until an operator opts in. A missing/unreachable warpline with this
+    /// `true` degrades the same way — never an error, never empty-as-clean.
+    pub enabled: bool,
+    /// Actor identity carried on the warpline call. Warpline is an MCP-stdio
+    /// member (no HTTP read API), so it is launched as a subprocess and driven
+    /// over its MCP stdio transport — the same mechanism the Filigree MCP-tool
+    /// calls use. The command is resolved at call time (env override
+    /// `LOOMWEAVE_WARPLINE_MCP_COMMAND`, else the `warpline mcp` shim).
+    ///
+    /// There is deliberately NO `timeout_seconds` knob: warpline has no HTTP
+    /// path, the subprocess round-trip is short-lived, and a per-call timeout is
+    /// not yet wired — advertising one would promise a guarantee not delivered
+    /// (input-affordances-are-promises). Subprocess-hang handling is a tracked
+    /// follow-up.
+    pub actor: String,
+}
+
+impl Default for WarplineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            actor: "loomweave-mcp".to_owned(),
         }
     }
 }
