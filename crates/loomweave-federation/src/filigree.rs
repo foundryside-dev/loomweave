@@ -1,11 +1,11 @@
 //! Filigree HTTP/MCP contract helpers for Loomweave MCP.
 
-use std::io::{BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
-use loomweave_core::plugin::{ContentLengthCeiling, Frame, read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -522,109 +522,153 @@ impl FiligreeHttpClient {
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, FiligreeClientError> {
         let (program, args) = resolve_filigree_mcp_command(self.project_root.as_deref());
-        let mut child = Command::new(&program)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .current_dir(
-                self.project_root
-                    .as_deref()
-                    .unwrap_or_else(|| Path::new(".")),
+        run_mcp_tool_over_command(
+            &program,
+            &args,
+            self.project_root.as_deref(),
+            FILIGREE_MCP_TIMEOUT,
+            tool,
+            arguments,
+        )
+    }
+}
+
+/// Per-call timeout for the filigree MCP subprocess round-trip. filigree-mcp is
+/// launched as a subprocess and driven over newline-delimited MCP JSON-RPC; a
+/// child that accepts the connection and never answers would otherwise block the
+/// observation write. 10s covers a cold filigree-mcp (Python import + DB open);
+/// past it the call errors so the caller degrades instead of hanging.
+const FILIGREE_MCP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Drive one filigree MCP tool call over the **newline-delimited** JSON-RPC
+/// transport `filigree-mcp` (the MCP Python SDK's `stdio_server`) speaks — NOT
+/// Content-Length framing, which it rejects as an internal error. The whole
+/// handshake+call runs on a worker thread bounded by `timeout`: a hung child is
+/// killed and the call errors rather than blocking forever. Returns the parsed
+/// tool envelope (`result.content[0].text`). The resolved launch command is a
+/// parameter so this is unit-testable with an injected fake server.
+fn run_mcp_tool_over_command(
+    program: &str,
+    args: &[String],
+    project_root: Option<&Path>,
+    timeout: Duration,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value, FiligreeClientError> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // stderr discarded: we never drain it, so a large filigree traceback that
+        // filled a piped stderr (64 KiB) would block the child mid-write.
+        .stderr(Stdio::null())
+        .current_dir(project_root.unwrap_or_else(|| Path::new(".")))
+        .spawn()
+        .map_err(|err| mcp_tool_error(tool, &format!("spawn {program}: {err}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| mcp_tool_error(tool, "child stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| mcp_tool_error(tool, "child stdout unavailable"))?;
+
+    let init = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "loomweave-init",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "loomweave", "version": env!("CARGO_PKG_VERSION") }
+        }
+    });
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+    });
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "loomweave-call",
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments }
+    });
+
+    // Drive the blocking write+read on a worker thread so it is bounded by
+    // recv_timeout; on timeout we kill the child (closing its pipes, unblocking
+    // the worker). The handshake responses are tiny, so filigree never blocks on
+    // stdout-write while we are still writing stdin — no write/read deadlock.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tool_owned = tool.to_owned();
+    let worker = std::thread::spawn(move || {
+        let outcome = (|| -> Result<serde_json::Value, FiligreeClientError> {
+            write_mcp_json(&mut stdin, &init, &tool_owned)?;
+            write_mcp_json(&mut stdin, &initialized, &tool_owned)?;
+            write_mcp_json(&mut stdin, &call, &tool_owned)?;
+            stdin
+                .flush()
+                .map_err(|err| mcp_tool_error(&tool_owned, &format!("flush stdin: {err}")))?;
+            drop(stdin); // EOF ends filigree-mcp's read loop so it exits cleanly.
+            let mut reader = BufReader::new(stdout);
+            read_mcp_json(&mut reader, "loomweave-call", &tool_owned)
+        })();
+        let _ = tx.send(outcome);
+    });
+
+    let response = match rx.recv_timeout(timeout) {
+        Ok(outcome) => {
+            let _ = child.wait();
+            let _ = worker.join();
+            outcome?
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = worker.join();
+            return Err(mcp_tool_error(
+                tool,
+                &format!("filigree did not respond within {}s", timeout.as_secs()),
+            ));
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(mcp_tool_error(
+                tool,
+                "filigree worker thread disconnected before responding",
+            ));
+        }
+    };
+
+    if let Some(error) = response.get("error").filter(|err| !err.is_null()) {
+        return Err(mcp_tool_error(tool, &error.to_string()));
+    }
+    let text = response
+        .get("result")
+        .and_then(|result| result.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            mcp_tool_error(
+                tool,
+                &format!("missing result.content[0].text in response {response}"),
             )
-            .spawn()
-            .map_err(|err| FiligreeClientError::McpTool {
-                tool: tool.to_owned(),
-                message: format!("spawn {program}: {err}"),
-            })?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| FiligreeClientError::McpTool {
-                tool: tool.to_owned(),
-                message: "child stdin unavailable".to_owned(),
-            })?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| FiligreeClientError::McpTool {
-                tool: tool.to_owned(),
-                message: "child stdout unavailable".to_owned(),
-            })?;
-        let mut stdout = BufReader::new(stdout);
+        })?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).map_err(FiligreeClientError::InvalidObservationResponse)?;
+    if parsed.get("error").is_some() {
+        return Err(mcp_tool_error(tool, &parsed.to_string()));
+    }
+    Ok(parsed)
+}
 
-        write_mcp_json(
-            &mut stdin,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "loomweave-init",
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "loomweave",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }
-            }),
-            tool,
-        )?;
-        let _ = read_mcp_json(&mut stdout, "loomweave-init", tool)?;
-
-        write_mcp_json(
-            &mut stdin,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {}
-            }),
-            tool,
-        )?;
-
-        write_mcp_json(
-            &mut stdin,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "loomweave-call",
-                "method": "tools/call",
-                "params": {
-                    "name": tool,
-                    "arguments": arguments,
-                }
-            }),
-            tool,
-        )?;
-        drop(stdin);
-
-        let response = read_mcp_json(&mut stdout, "loomweave-call", tool)?;
-        let _ = child.wait();
-        if let Some(error) = response.get("error") {
-            return Err(FiligreeClientError::McpTool {
-                tool: tool.to_owned(),
-                message: error.to_string(),
-            });
-        }
-        let text = response
-            .get("result")
-            .and_then(|result| result.get("content"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|content| content.first())
-            .and_then(|item| item.get("text"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| FiligreeClientError::McpTool {
-                tool: tool.to_owned(),
-                message: format!("missing result.content[0].text in response {response}"),
-            })?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(text).map_err(FiligreeClientError::InvalidObservationResponse)?;
-        if parsed.get("error").is_some() {
-            return Err(FiligreeClientError::McpTool {
-                tool: tool.to_owned(),
-                message: parsed.to_string(),
-            });
-        }
-        Ok(parsed)
+/// Build a transport-level [`FiligreeClientError::McpTool`].
+fn mcp_tool_error(tool: &str, message: &str) -> FiligreeClientError {
+    FiligreeClientError::McpTool {
+        tool: tool.to_owned(),
+        message: message.to_owned(),
     }
 }
 
@@ -793,45 +837,51 @@ pub fn weft_observations_url(base_url: &str, limit: u64, offset: u64) -> String 
     )
 }
 
+/// Write one newline-delimited JSON-RPC message: compact JSON (no embedded
+/// newlines) + `\n`, the framing `filigree-mcp` reads line-by-line.
 fn write_mcp_json(
     writer: &mut impl Write,
     value: &serde_json::Value,
     tool: &str,
 ) -> Result<(), FiligreeClientError> {
-    let body = serde_json::to_vec(value).map_err(|err| FiligreeClientError::McpTool {
-        tool: tool.to_owned(),
-        message: format!("serialize MCP request: {err}"),
-    })?;
-    write_frame(writer, &Frame { body }).map_err(|err| FiligreeClientError::McpTool {
-        tool: tool.to_owned(),
-        message: format!("write MCP frame: {err}"),
-    })
+    let mut body = serde_json::to_vec(value)
+        .map_err(|err| mcp_tool_error(tool, &format!("serialize MCP request: {err}")))?;
+    body.push(b'\n');
+    writer
+        .write_all(&body)
+        .map_err(|err| mcp_tool_error(tool, &format!("write MCP request: {err}")))
 }
 
+/// Read newline-delimited JSON-RPC responses until one carries `expected_id`,
+/// skipping the init result and the notification's `id: null` error. EOF before
+/// a match is a transport fault (surfaced so the caller degrades).
 fn read_mcp_json(
-    reader: &mut impl std::io::BufRead,
+    reader: &mut impl BufRead,
     expected_id: &str,
     tool: &str,
 ) -> Result<serde_json::Value, FiligreeClientError> {
+    let mut line = String::new();
     loop {
-        let frame = read_frame(reader, ContentLengthCeiling::DEFAULT).map_err(|err| {
-            FiligreeClientError::McpTool {
-                tool: tool.to_owned(),
-                message: format!("read MCP frame: {err}"),
-            }
-        })?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&frame.body).map_err(|err| FiligreeClientError::McpTool {
-                tool: tool.to_owned(),
-                message: format!("parse MCP response: {err}"),
-            })?;
-        if value
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| id == expected_id)
-        {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|err| mcp_tool_error(tool, &format!("read MCP response: {err}")))?;
+        if read == 0 {
+            return Err(mcp_tool_error(
+                tool,
+                "filigree closed its output before answering the call",
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|err| mcp_tool_error(tool, &format!("parse MCP response line: {err}")))?;
+        if value.get("id").and_then(serde_json::Value::as_str) == Some(expected_id) {
             return Ok(value);
         }
+        // Non-matching id (init result, notification id:null error) → keep reading.
     }
 }
 
@@ -868,7 +918,15 @@ fn resolve_filigree_mcp_command(project_root: Option<&Path>) -> (String, Vec<Str
         return (python.to_owned(), args);
     }
 
-    ("filigree".to_owned(), vec!["mcp".to_owned()])
+    filigree_mcp_fallback_command()
+}
+
+/// Last-resort launcher when the env override is unset and `filigree mcp-status`
+/// could not name a python executable: the standalone `filigree-mcp` binary.
+/// NOT `filigree mcp` — that is not a valid filigree subcommand (it exits with a
+/// usage error → broken pipe), the defect the Warpline consumer hit.
+fn filigree_mcp_fallback_command() -> (String, Vec<String>) {
+    ("filigree-mcp".to_owned(), Vec::new())
 }
 
 fn replace_project_placeholder(raw: &str, project_root: Option<&Path>) -> String {
@@ -1752,5 +1810,174 @@ mod tests {
         FiligreeHttpClient::from_config(&config, |_| None)
             .expect("build client")
             .expect("enabled client")
+    }
+
+    // --- MCP stdio transport (newline-delimited JSON-RPC) ---------------------
+
+    /// `write_mcp_json` must emit ONE newline-delimited JSON line — the framing
+    /// the MCP Python SDK's stdio transport (`mcp.server.stdio`) reads — NOT a
+    /// Content-Length frame (which filigree-mcp rejects as an internal error).
+    #[test]
+    fn write_mcp_json_emits_newline_delimited_line_not_content_length() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_mcp_json(
+            &mut buf,
+            &serde_json::json!({"jsonrpc": "2.0", "id": "x", "method": "ping"}),
+            "ping",
+        )
+        .expect("write");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(
+            !text.contains("Content-Length"),
+            "must NOT use Content-Length framing: {text:?}"
+        );
+        assert!(text.ends_with('\n'), "must be newline-terminated: {text:?}");
+        assert_eq!(text.matches('\n').count(), 1, "exactly one line: {text:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(text.trim_end()).expect("the line is the JSON body");
+        assert_eq!(parsed["id"], serde_json::json!("x"));
+    }
+
+    /// `read_mcp_json` must read newline-delimited responses, skipping lines whose
+    /// id does not match (the init result, the notification's id:null error) until
+    /// the awaited id.
+    #[test]
+    fn read_mcp_json_reads_newline_lines_and_skips_non_matching_ids() {
+        let stream = "\
+{\"jsonrpc\":\"2.0\",\"id\":\"loomweave-init\",\"result\":{}}\n\
+{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32601}}\n\
+{\"jsonrpc\":\"2.0\",\"id\":\"loomweave-call\",\"result\":{\"ok\":true}}\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(stream.as_bytes()));
+        let value = read_mcp_json(&mut reader, "loomweave-call", "observation_create")
+            .expect("reads the matching-id line");
+        assert_eq!(value["result"]["ok"], serde_json::json!(true));
+    }
+
+    /// EOF before the awaited id is a transport fault, surfaced as an error (never
+    /// a silent success) so the caller degrades.
+    #[test]
+    fn read_mcp_json_errors_on_eof_before_match() {
+        let stream = "{\"jsonrpc\":\"2.0\",\"id\":\"loomweave-init\",\"result\":{}}\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(stream.as_bytes()));
+        let err = read_mcp_json(&mut reader, "loomweave-call", "observation_create")
+            .expect_err("EOF before the call response must error");
+        assert!(matches!(err, FiligreeClientError::McpTool { .. }), "{err}");
+    }
+
+    /// The last-resort launcher fallback is the standalone `filigree-mcp` binary,
+    /// NOT `filigree mcp` (which is not a valid filigree subcommand and would exit
+    /// with a usage error → broken pipe, the same defect the Warpline consumer
+    /// hit). The happy path resolves `python -m filigree.mcp_server` via
+    /// `filigree mcp-status`; this guards only the fallback constant.
+    #[test]
+    fn fallback_command_is_filigree_mcp_binary_not_subcommand() {
+        let (program, args) = filigree_mcp_fallback_command();
+        assert_eq!(program, "filigree-mcp");
+        assert!(
+            args.is_empty(),
+            "the MCP server takes no subcommand: {args:?}"
+        );
+    }
+
+    /// A fake `filigree-mcp`: a newline-delimited JSON-RPC server (the transport
+    /// the real one speaks). `argv[1]` selects a mode; `argv[2]` (optional) is a
+    /// sidecar the tool-call arguments are dumped to. `tools/call` replies with a
+    /// `result.content[0].text` envelope — exactly what `run_mcp_tool` extracts.
+    const FAKE_FILIGREE_MCP_PY: &str = r#"
+import sys, json, time
+mode = sys.argv[1] if len(sys.argv) > 1 else "ok"
+sidecar = sys.argv[2] if len(sys.argv) > 2 else None
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method, rid = req.get("method"), req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-11-25",
+            "serverInfo": {"name": "fake-filigree", "version": "0"},
+            "capabilities": {"tools": {}}}})
+    elif method == "tools/call":
+        args = (req.get("params") or {}).get("arguments") or {}
+        if sidecar:
+            with open(sidecar, "w") as f:
+                json.dump(args, f)
+        if mode == "hang":
+            time.sleep(60); continue
+        env = {"ok": True, "observation_id": "filigree-obs-1", "summary": args.get("summary")}
+        send({"jsonrpc": "2.0", "id": rid,
+              "result": {"content": [{"type": "text", "text": json.dumps(env)}]}})
+    elif rid is not None:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown"}})
+    else:
+        send({"jsonrpc": "2.0", "id": None, "error": {"code": -32601, "message": "unknown"}})
+"#;
+
+    fn write_fake_filigree(dir: &Path) -> PathBuf {
+        let script = dir.join("fake_filigree_mcp.py");
+        std::fs::write(&script, FAKE_FILIGREE_MCP_PY).expect("write fake filigree mcp");
+        script
+    }
+
+    /// The transport regression: over the REAL newline-delimited subprocess
+    /// transport, an `observation_create` call completes and the envelope parses.
+    /// (The bug: Content-Length framing made filigree-mcp error and the read hang.)
+    #[test]
+    fn real_transport_completes_observation_call_over_newline_jsonrpc() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = write_fake_filigree(dir.path());
+        let sidecar = dir.path().join("args.json");
+        let value = run_mcp_tool_over_command(
+            "python3",
+            &[
+                script.display().to_string(),
+                "ok".to_owned(),
+                sidecar.display().to_string(),
+            ],
+            Some(dir.path()),
+            Duration::from_secs(10),
+            "observation_create",
+            &serde_json::json!({"summary": "hello", "priority": 3}),
+        )
+        .expect("observation_create completes over the newline transport");
+        assert_eq!(value["ok"], serde_json::json!(true));
+        assert_eq!(value["observation_id"], serde_json::json!("filigree-obs-1"));
+
+        let args: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).expect("sidecar"))
+                .expect("sidecar JSON");
+        assert_eq!(args["summary"], serde_json::json!("hello"));
+    }
+
+    /// A filigree-mcp that completes the handshake then never answers the call
+    /// must DEGRADE via the bounded timeout, not hang forever.
+    #[test]
+    fn real_transport_times_out_instead_of_hanging() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = write_fake_filigree(dir.path());
+        let start = std::time::Instant::now();
+        let err = run_mcp_tool_over_command(
+            "python3",
+            &[script.display().to_string(), "hang".to_owned()],
+            Some(dir.path()),
+            Duration::from_secs(1),
+            "observation_create",
+            &serde_json::json!({"summary": "hello"}),
+        )
+        .expect_err("a hung filigree-mcp must error, not hang");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "must return promptly via the timeout"
+        );
+        assert!(matches!(err, FiligreeClientError::McpTool { .. }), "{err}");
+        assert!(
+            err.to_string().contains("did not respond"),
+            "the timeout reason is surfaced: {err}"
+        );
     }
 }
