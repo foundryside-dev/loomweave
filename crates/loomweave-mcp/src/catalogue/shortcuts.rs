@@ -1059,8 +1059,60 @@ fn rank_and_finalize_churn(
     // Provenance + honest-empty note. A genuinely empty answer (warpline present,
     // no in-scope entity carried a recorded change) is honest-empty, never clean.
     let is_empty = response_json["page"]["total"] == json!(0);
+    // Warpline truncation disclosure: when warpline bounded the read to an in-band
+    // lead (more candidates than its overflow cap), the entities ranked below the
+    // lead are absent from the join and graft `churn_count: 0` — a TRUNCATION, not
+    // a never-observed 0. Disclose it so the two kinds of 0 are not conflated
+    // (this is the honesty floor; reading warpline's overflow dump for complete
+    // coverage of an over-cap scope is a tracked follow-up — narrow `scope` for
+    // exact counts meanwhile). Bites `recently_changed` hardest: a recent but
+    // low-total-churn entity ranked outside the lead is dropped as count-0.
+    let partial = response.overflow_partial();
+    // Keying-miss disclosure, symmetric with `churn_truncated`: warpline returns
+    // `churn_count: 0` with a null locator for a ref it could not key-match (an
+    // SEI loomweave holds but warpline has not recorded, or a divergent locator
+    // dialect). That 0 is "real churn unknown", NOT a never-observed 0 — without
+    // this a scoped query over key-missed entities reads as "this code never
+    // changes" (the absence-as-clean failure this module exists to prevent). Only
+    // SEI-keyed misses are detectable (see `unresolved_ref_count`).
+    let unresolved = response.unresolved_ref_count();
     if let Some(object) = response_json.as_object_mut() {
         mode.tag(object);
+        if unresolved > 0 {
+            object.insert(
+                "churn_unresolved".to_owned(),
+                json!({
+                    "count": unresolved,
+                    "reason": format!(
+                        "warpline could not key-match {unresolved} in-scope candidate(s) \
+                         (loomweave sent an SEI warpline has not recorded, or the locator \
+                         dialect differs); they are shown with churn_count 0 here but their real \
+                         churn is UNKNOWN, not zero — a federation keying gap, not a \
+                         never-observed 0. (recently_changed drops them entirely.)"
+                    ),
+                }),
+            );
+        }
+        if let Some((total, counted)) = partial {
+            let uncounted = total.saturating_sub(counted).max(0);
+            object.insert(
+                "churn_truncated".to_owned(),
+                json!({
+                    "truncated": true,
+                    "counted": counted,
+                    "total_candidates": total,
+                    "uncounted": uncounted,
+                    "reason": format!(
+                        "warpline truncated the churn read to its top {counted} entities by \
+                         churn_count; {uncounted} in-scope candidate(s) ranked below that are \
+                         shown with churn_count 0 here and may be undercounted — a truncation, \
+                         NOT a never-observed 0. Narrow `scope` for exact counts; complete \
+                         over-cap coverage (reading warpline's overflow dump) is a tracked \
+                         follow-up."
+                    ),
+                }),
+            );
+        }
         if is_empty {
             object.insert(
                 "signal".to_owned(),

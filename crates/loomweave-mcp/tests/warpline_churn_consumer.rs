@@ -105,6 +105,74 @@ impl WarplineLookup for UnreachableWarplineClient {
     }
 }
 
+/// A warpline client whose envelope carries an overflow `reason_class: "partial"`
+/// — warpline truncated the read to an in-band lead. Echoes a real count for
+/// alpha only; beta + gamma are absent from `items` (the truncated tail), so the
+/// consumer grafts 0 onto them. The consumer must DISCLOSE this truncation
+/// (`churn_truncated`) rather than letting those 0s read as never-observed.
+struct PartialOverflowWarplineClient;
+
+impl WarplineLookup for PartialOverflowWarplineClient {
+    fn entity_churn_counts(
+        &self,
+        _entity_refs: &[WarplineEntityRef],
+        _window: Option<&Value>,
+    ) -> Result<ChurnCountResponse, WarplineClientError> {
+        // total 3 candidates, only 1 returned in-band (the lead); reason partial.
+        let envelope = format!(
+            r#"{{
+              "schema": "warpline.entity_churn_count.v1", "ok": true,
+              "data": {{
+                "items": [
+                  {{"entity": {{"sei": "{SEI_ALPHA}", "locator": "{LOC_ALPHA}"}},
+                   "churn_count": 7, "last_changed_at": "2026-06-13T00:00:00Z",
+                   "last_actor": "agent:codex"}}
+                ],
+                "overflow": {{"total": 3, "returned": 1,
+                             "dumped_to": "/abs/.weft/warpline/overflow/churn.json",
+                             "reason_class": "partial",
+                             "cause": "3 items exceeded the in-band cap",
+                             "fix": "read the dump"}}
+              }}
+            }}"#
+        );
+        parse_churn_count_response(&envelope).map_err(WarplineClientError::Contract)
+    }
+}
+
+/// A warpline client modelling a KEYING MISS: loomweave sends SEI refs warpline
+/// has not recorded, so warpline echoes each ref with `churn_count: 0` and a
+/// NULL locator. The consumer must DISCLOSE this (`churn_unresolved`) rather than
+/// let the zeros read as "this code never changes" — the lacuna failure mode
+/// (warpline keys by path-locator with null sei; loomweave sends dotted-locator
+/// SEIs that miss).
+struct UnresolvedKeyWarplineClient;
+
+impl WarplineLookup for UnresolvedKeyWarplineClient {
+    fn entity_churn_counts(
+        &self,
+        entity_refs: &[WarplineEntityRef],
+        _window: Option<&Value>,
+    ) -> Result<ChurnCountResponse, WarplineClientError> {
+        // One item per ref, each a miss: sei echoed, locator null, count 0.
+        let items: Vec<String> = entity_refs
+            .iter()
+            .map(|r| {
+                format!(
+                    r#"{{"entity": {{"sei": "{}", "locator": null}}, "churn_count": 0}}"#,
+                    r.value
+                )
+            })
+            .collect();
+        let envelope = format!(
+            r#"{{"schema": "warpline.entity_churn_count.v1", "ok": true,
+                 "data": {{"items": [{}]}}}}"#,
+            items.join(", ")
+        );
+        parse_churn_count_response(&envelope).map_err(WarplineClientError::Contract)
+    }
+}
+
 fn open_project() -> (tempfile::TempDir, std::path::PathBuf, Connection) {
     let project = tempfile::tempdir().expect("temp project");
     let dir = project.path().join(".weft/loomweave");
@@ -349,4 +417,77 @@ async fn high_churn_degrades_honestly_when_warpline_unreachable() {
             .contains("peer_unavailable"),
         "the warpline error reason is surfaced, not swallowed"
     );
+}
+
+/// Honest-truncation — warpline answered but bounded the read to an in-band lead
+/// (overflow `reason_class: "partial"`). The truncated-out entities graft
+/// `churn_count: 0`, but the surface must DISCLOSE the truncation
+/// (`churn_truncated`) so those 0s are not conflated with never-observed 0s. This
+/// is the honesty floor for an over-cap scope (complete coverage via the overflow
+/// dump is a tracked follow-up).
+#[tokio::test]
+async fn high_churn_discloses_warpline_overflow_truncation() {
+    let (project, db, conn) = open_project();
+    seed_three_entities(&conn);
+    let state = state_with_warpline(project.path(), &db, Arc::new(PartialOverflowWarplineClient));
+
+    let envelope = call_tool(&state, "entity_high_churn_list", json!({})).await;
+    let result = ok_payload(&envelope);
+
+    // Not a hard error; the in-band entity carries its real count.
+    assert_eq!(result["churn_source"], json!("warpline"));
+    let alpha = result["entities"]
+        .as_array()
+        .expect("entities")
+        .iter()
+        .find(|e| e["id"] == json!(LOC_ALPHA))
+        .expect("alpha present");
+    assert_eq!(alpha["churn_count"], json!(7));
+
+    // The truncation is disclosed with warpline's own counts — NOT silently
+    // swallowed into all-plausible zeros.
+    let truncated = &result["churn_truncated"];
+    assert_eq!(truncated["truncated"], json!(true));
+    assert_eq!(truncated["total_candidates"], json!(3));
+    assert_eq!(truncated["counted"], json!(1));
+    assert_eq!(truncated["uncounted"], json!(2));
+    assert!(
+        truncated["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("truncat"),
+        "the disclosure must name the truncation: {truncated}"
+    );
+}
+
+/// Honest keying-miss — warpline answered but could not key-match the refs (null
+/// locator, count 0). A non-empty all-zero result must DISCLOSE the keying gap
+/// (`churn_unresolved`) so the zeros are not read as "never changes" — the
+/// scoped-all-zeros failure the overflow disclosure's twin must also cover.
+#[tokio::test]
+async fn high_churn_discloses_warpline_keying_miss() {
+    let (project, db, conn) = open_project();
+    seed_three_entities(&conn);
+    let state = state_with_warpline(project.path(), &db, Arc::new(UnresolvedKeyWarplineClient));
+
+    let envelope = call_tool(&state, "entity_high_churn_list", json!({})).await;
+    let result = ok_payload(&envelope);
+
+    // Non-empty (3 candidates ranked) but every count is 0 — and that is DISCLOSED
+    // as a keying miss, not silently shipped as a clean all-zero answer.
+    assert_eq!(result["page"]["total"], json!(3));
+    assert_eq!(result["churn_source"], json!("warpline"));
+    assert_eq!(result["churn_unresolved"]["count"], json!(3));
+    assert!(
+        result["churn_unresolved"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("key"),
+        "the disclosure must name the keying gap: {}",
+        result["churn_unresolved"]
+    );
+    // A genuine all-zero (resolved, never-observed) must NOT trip this — covered by
+    // the GV-LW-2 fixture where every item has a non-null locator (unresolved 0).
 }

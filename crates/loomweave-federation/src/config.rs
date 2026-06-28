@@ -777,18 +777,21 @@ pub struct WarplineConfig {
     /// until an operator opts in. A missing/unreachable warpline with this
     /// `true` degrades the same way — never an error, never empty-as-clean.
     pub enabled: bool,
-    /// Actor identity carried on the warpline call. Warpline is an MCP-stdio
-    /// member (no HTTP read API), so it is launched as a subprocess and driven
-    /// over its MCP stdio transport — the same mechanism the Filigree MCP-tool
-    /// calls use. The command is resolved at call time (env override
-    /// `LOOMWEAVE_WARPLINE_MCP_COMMAND`, else the `warpline mcp` shim).
-    ///
-    /// There is deliberately NO `timeout_seconds` knob: warpline has no HTTP
-    /// path, the subprocess round-trip is short-lived, and a per-call timeout is
-    /// not yet wired — advertising one would promise a guarantee not delivered
-    /// (input-affordances-are-promises). Subprocess-hang handling is a tracked
-    /// follow-up.
+    /// Operator-configured actor identity. **Reserved, not sent on the wire:**
+    /// `actor` is not in warpline's FROZEN `warpline_entity_churn_count_get`
+    /// schema (`additionalProperties: false`), so the churn read carries none.
+    /// The field is retained (rather than removed) so an existing `loomweave.yaml`
+    /// that sets `integrations.warpline.actor` still parses under
+    /// `deny_unknown_fields` — warpline's own dogfood config sets it.
     pub actor: String,
+    /// Per-call timeout (seconds) for the warpline churn subprocess round-trip.
+    /// Warpline is an MCP-stdio member (no HTTP read API), launched as a
+    /// subprocess and driven over **newline-delimited** MCP JSON-RPC (the
+    /// transport `warpline-mcp` actually speaks). A warpline child that accepts
+    /// the connection and never answers would otherwise hang the read; this
+    /// bound makes a transport fault degrade to the honest `warpline-unreachable`
+    /// response instead. Default 10s; a `0` is floored to 1s by the client.
+    pub timeout_seconds: u64,
 }
 
 impl Default for WarplineConfig {
@@ -796,6 +799,7 @@ impl Default for WarplineConfig {
         Self {
             enabled: false,
             actor: "loomweave-mcp".to_owned(),
+            timeout_seconds: 10,
         }
     }
 }
