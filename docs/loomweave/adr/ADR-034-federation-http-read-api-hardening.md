@@ -1,6 +1,6 @@
 # ADR-034: Federation HTTP Read API Hardening — Identity Auth, Batch Resolution, `BRIEFING_BLOCKED`, Instance ID
 
-**Status**: Accepted; HMAC freshness amended by [ADR-042](./ADR-042-hmac-freshness-and-replay-window.md)
+**Status**: Accepted; HMAC freshness amended by [ADR-042](./ADR-042-hmac-freshness-and-replay-window.md); briefing-blocked SEI exposure on the MCP read surface amended 2026-06-29 (see Amendment below)
 **Date**: 2026-05-19
 **Deciders**: qacona@gmail.com
 **Context**: Sprint 3 Weft federation hardening (see [`docs/implementation/sprint-3/2026-05-19-weft-federation-hardening-tasking.md`](../../implementation/sprint-3/2026-05-19-weft-federation-hardening-tasking.md)); extends ADR-014's read-API §"Security Posture" and §"Error Envelope"
@@ -148,6 +148,55 @@ The Sprint 3 tasking doc originally proposed pinning these decisions into ADR-01
 
 - `api_version` remains `1`. The additions are non-breaking augmentations of the v1 wire contract — every pre-Sprint-3 client request shape is still accepted, just with the added option to authenticate, batch, and discriminate on the wider error set. An incompatible change to the read API will be the trigger for `api_version: 2`, not the introduction of these hardenings.
 - The Sprint-3 tasking-doc items C1, C2, C5, C7, C8, C9, C10, C11 are not addressed by this ADR — they cover storage correctness and runtime supervision rather than wire-contract decisions. They land directly in the implementation without an ADR change because they implement, rather than amend, ADR-014's existing contract.
+
+## Amendment (2026-06-29) — briefing-blocked entities carry their SEI on the MCP read surface
+
+**Decider**: john@pgpl.net (owner-ratified — this reverses a deliberate secret-handling posture). **Tracker**: clarion-obs-30c0ef3b0a (warpline churn keying gap).
+
+### What changed
+
+The **MCP** entity read/resolve surface now carries a briefing-blocked entity's
+**SEI** binding key (when it has an alive binding) instead of forcing it to JSON
+`null`. The projection functions `blocked_entity_stub`, `stack_entity_json`, and
+`compact_blocked_node_json` (loomweave-mcp) route the SEI through a new
+`blocked_sei` helper: the SEI rides along like the already-exposed locator,
+EXCEPT when the entity `id` is itself secret-like (the rare high-entropy generated
+symbol the A3 entropy guard withholds), in which case the SEI is withheld with it
+(a durable key is never exposed when its locator is not).
+
+This is scoped to the **MCP** surface. §3's HTTP `403 BRIEFING_BLOCKED` /
+batch-`briefing_blocked`-partition behaviour is **unchanged**: that surface still
+omits `entity_id`, `content_hash`, `canonical_path`, and `language` entirely.
+
+### Why
+
+The prior posture (briefing-blocked rows are "navigable by locator, not bound
+across siblings", so the SEI stays null) was layered onto the A3 projection
+(clarion-719e7320f5) — but A3 itself ("redact secret CONTENT, not entity
+IDENTITY") restored `id`/`name`/`path`/`content_hash` and is silent on the SEI.
+Withholding the SEI broke every SEI-keyed federation join through a secret-bearing
+file — concretely, Warpline's churn backfill (`reresolve-sei`) resolves the
+qualname but receives `sei: null`, so `entity_keys.sei` stays NULL and
+`entity_high_churn_list` / `entity_recent_change_list` undercount those files to
+`0` (the keying gap, disclosed by `churn_unresolved` but not closed).
+
+The SEI is a content-free identity hash (`loomweave:eid:<hex>`, ADR-038), strictly
+less revealing than the locator + `content_hash` this surface already exposes per
+A3, and REQ-C-04/ADR-038 already require every surface returning an `id` to carry
+its SEI. The narrow residual the prior posture defended — a sibling *durably*
+binding a secret-bearing entity by a rename-surviving key — was accepted at the
+authority gate: the correctness cost (permanent churn undercount on secret files)
+outweighs it, and loomweave already emits that SEI *ephemerally* on the churn-query
+seam (`sei_for_locator`, no briefing-block check) regardless.
+
+### Bounds & residual
+
+- The secret **content** (summary/source/docstring) is still never projected.
+- Re-running Warpline's `reresolve-sei` sweep is required to heal already-minted
+  NULL `entity_keys.sei` rows; the size of the recovered set is an empirical
+  question (a large share of warpline's NULL keys are non-secret entities whose
+  sweep simply has not run to convergence, and historical/deleted locators
+  loomweave no longer indexes — neither is closed by this amendment).
 
 ## Related Decisions
 

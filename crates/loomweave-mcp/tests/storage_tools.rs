@@ -3840,6 +3840,32 @@ async fn entity_at_redacts_briefing_blocked_match_and_context() {
 }
 
 #[tokio::test]
+async fn entity_at_blocked_match_carries_bound_sei_in_stack() {
+    // A blocked entity WITH an alive SEI binding carries that SEI in the
+    // containing stack (stack_entity_json via blocked_sei): the federation
+    // binding key rides along even through the block (REQ-C-04/ADR-038 + the
+    // ADR-034 2026-06-29 amendment); only the secret CONTENT stays hidden. The
+    // unbound case (null sei) is covered by the test above.
+    let (project, db_path) = open_project();
+    mark_blocked(&db_path, "python:function:demo.mid", "secret_present");
+    seed_alive_sei_binding(&db_path, "loomweave:eid:midsei", "python:function:demo.mid");
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 4})).await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let stack = resp["result"]["entity_context"]["containing_stack"]
+        .as_array()
+        .unwrap();
+    let matched_node = stack.last().expect("matched node present");
+    assert_eq!(matched_node["briefing_blocked"], "secret_present", "{resp}");
+    assert_eq!(matched_node["id"], "python:function:demo.mid", "{resp}");
+    assert_eq!(
+        matched_node["sei"], "loomweave:eid:midsei",
+        "blocked matched node must carry its bound SEI for federation keying: {resp}"
+    );
+}
+
+#[tokio::test]
 async fn entity_at_redacts_blocked_alternative() {
     let (project, db_path) = open_project();
     // demo.target and demo.alt_target both span lines 7-8 (same-granularity
@@ -4027,6 +4053,42 @@ async fn orientation_keeps_blocked_node_navigable_in_execution_paths() {
     assert!(
         !has_sentinel,
         "no sentinel for a navigable blocked node: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn orientation_blocked_node_carries_bound_sei_in_execution_paths() {
+    // A blocked execution-path node WITH an alive SEI binding carries that SEI
+    // (compact_blocked_node_json via blocked_sei) so federation siblings can key
+    // on it through the block (ADR-034 2026-06-29 amendment). The unbound case
+    // (null sei) is covered by the test above.
+    let (project, db_path) = open_project();
+    mark_blocked(&db_path, "python:function:demo.target", "secret_present");
+    seed_alive_sei_binding(
+        &db_path,
+        "loomweave:eid:targetsei",
+        "python:function:demo.target",
+    );
+    let state = state_for(project.path(), &db_path);
+
+    let resp = call_tool(
+        &state,
+        "orientation_pack",
+        json!({"entity": "python:function:demo.entry"}),
+    )
+    .await;
+    assert_eq!(resp["ok"], true, "{resp}");
+    let nodes = resp["result"]["execution_paths"]["nodes"]
+        .as_array()
+        .unwrap();
+    let blocked_node = nodes
+        .iter()
+        .find(|n| n["id"] == "python:function:demo.target")
+        .expect("blocked node present with identity");
+    assert_eq!(blocked_node["briefing_blocked"], "secret_present", "{resp}");
+    assert_eq!(
+        blocked_node["sei"], "loomweave:eid:targetsei",
+        "blocked execution-path node must carry its bound SEI for federation keying: {resp}"
     );
 }
 

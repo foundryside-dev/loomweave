@@ -4314,7 +4314,8 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
     // caller-named entity's identity + remediation — builds identity via
     // `entity_identity_json` instead, bypassing this gate.
     if let Some(reason) = briefing_block_reason(entity) {
-        return blocked_entity_stub(entity, &reason);
+        let sei = sei_for_locator(conn, &entity.id).ok().flatten();
+        return blocked_entity_stub(entity, &reason, sei.as_deref());
     }
     let mut value = entity_identity_json(entity);
     if let Some(object) = value.as_object_mut() {
@@ -4431,6 +4432,26 @@ pub(crate) fn redact_secretlike(value: &str) -> Value {
     }
 }
 
+/// The cross-tool `sei` binding key for a briefing-blocked row. Per
+/// REQ-C-04/ADR-038 every surface returning an entity `id` must also carry its
+/// SEI — the SEI is a content-free identity hash (`loomweave:eid:<hex>`), never
+/// the secret, so it rides along like the (already-exposed) locator and lets
+/// federation siblings key on a blocked entity (the ADR-034 amendment that
+/// reversed the prior "sei stays null" posture — withholding it only broke
+/// federation joins, e.g. warpline churn). It is *not* run through
+/// [`redact_secretlike`] (a deterministic hash never trips the entropy guard).
+///
+/// Contrapositive guard: when the entity `id` is *itself* secret-like (the rare
+/// high-entropy generated symbol that A3 withholds), there is no navigable
+/// locator to bind, so the durable key is withheld with it — a withheld locator
+/// must never leak a durable cross-tool handle.
+fn blocked_sei(entity_id: &str, sei: Option<&str>) -> Value {
+    match sei {
+        Some(sei) if !name_value_is_secretlike(entity_id) => json!(sei),
+        _ => Value::Null,
+    }
+}
+
 /// The projection of a briefing-blocked entity (ADR-013 secret scan).
 ///
 /// Per clarion-719e7320f5 (A3) the briefing-block flag rides ALONGSIDE a real,
@@ -4439,16 +4460,19 @@ pub(crate) fn redact_secretlike(value: &str) -> Value {
 /// entity's structural identity (`project_finding_list` already prints those same
 /// paths), so only the secret-bearing content (summary/source/docstring) is
 /// withheld — and those are never part of this projection to begin with. The
-/// cross-tool `sei` binding key stays null (ADR-034): a blocked row is navigable
-/// by locator but not bound across siblings.
+/// cross-tool `sei` binding key now rides along too (via [`blocked_sei`],
+/// REQ-C-04/ADR-038 + the ADR-034 amendment) so federation siblings can key on a
+/// blocked entity; the prior "sei stays null" posture only broke federation joins
+/// (warpline churn) without protecting the secret content.
 ///
 /// Guard: in the rare case where a `name`/`short_name`/`id` is *itself*
 /// high-entropy (a generated symbol embedding a secret), that single field is
-/// re-withheld — the rest of the identity still rides along.
-fn blocked_entity_stub(entity: &EntityRow, reason: &str) -> Value {
+/// re-withheld — the rest of the identity still rides along, and the `sei` is
+/// withheld with a secret-like `id` (see [`blocked_sei`]).
+fn blocked_entity_stub(entity: &EntityRow, reason: &str, sei: Option<&str>) -> Value {
     json!({
         "id": redact_secretlike(&entity.id),
-        "sei": Value::Null,
+        "sei": blocked_sei(&entity.id, sei),
         "kind": entity.kind,
         "name": redact_secretlike(&entity.name),
         "short_name": redact_secretlike(&entity.short_name),
@@ -4570,13 +4594,15 @@ fn stack_entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
     // A blocked entity in the containing stack (the matched node, or a blocked
     // ancestor module) keeps its navigable identity but rides the briefing-block
     // flag (clarion-719e7320f5, A3): the secret is the file content, not the
-    // structural identity. The `sei` cross-tool binding key stays null. The
-    // high-entropy-name guard re-withholds id/name/short_name only when the
-    // value is itself secret-like.
+    // structural identity. The `sei` cross-tool binding key rides along too
+    // (REQ-C-04/ADR-038 + the ADR-034 amendment) via `blocked_sei`. The
+    // high-entropy-name guard re-withholds id/name/short_name (and, with a
+    // secret-like id, the sei) only when the value is itself secret-like.
     if let Some(reason) = briefing_block_reason(entity) {
+        let sei = sei_for_locator(conn, &entity.id).ok().flatten();
         return json!({
             "id": redact_secretlike(&entity.id),
-            "sei": Value::Null,
+            "sei": blocked_sei(&entity.id, sei.as_deref()),
             "kind": entity.kind,
             "short_name": redact_secretlike(&entity.short_name),
             "name": redact_secretlike(&entity.name),
@@ -5880,7 +5906,7 @@ fn compact_execution_paths(
                 if name_value_is_secretlike(&entity.id) {
                     secret_id.insert(id.clone());
                 } else {
-                    nodes.push(compact_blocked_node_json(&entity, &reason));
+                    nodes.push(compact_blocked_node_json(conn, &entity, &reason));
                 }
             } else {
                 nodes.push(compact_node_json(conn, &entity));
@@ -5937,13 +5963,20 @@ fn compact_node_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
 
 /// A path node for a briefing-blocked entity (clarion-719e7320f5, A3): the same
 /// navigable shape as [`compact_node_json`] plus the `briefing_blocked` flag.
-/// The `sei` cross-tool binding key stays null (no read-time join — and a blocked
-/// row is navigable by locator, not bound across siblings). The `short_name`
-/// guard re-withholds only the one field if it is itself high-entropy.
-fn compact_blocked_node_json(entity: &EntityRow, reason: &str) -> Value {
+/// The `sei` cross-tool binding key rides along (REQ-C-04/ADR-038 + the ADR-034
+/// amendment) via `blocked_sei` so federation siblings can key on the node; the
+/// caller already routes secret-like ids to the sentinel, and `blocked_sei`
+/// re-guards it. The `short_name` guard re-withholds only the one field if it is
+/// itself high-entropy.
+fn compact_blocked_node_json(
+    conn: &rusqlite::Connection,
+    entity: &EntityRow,
+    reason: &str,
+) -> Value {
+    let sei = sei_for_locator(conn, &entity.id).ok().flatten();
     json!({
         "id": redact_secretlike(&entity.id),
-        "sei": Value::Null,
+        "sei": blocked_sei(&entity.id, sei.as_deref()),
         "kind": entity.kind,
         "short_name": redact_secretlike(&entity.short_name),
         "source_file_path": entity.source_file_path,
@@ -7948,17 +7981,24 @@ mod tests {
     }
 
     #[test]
-    fn blocked_entity_stub_preserves_navigable_identity() {
-        // clarion-719e7320f5 (A3): the briefing-block projection keeps the
-        // navigable identity (id/kind/name/short_name/path/lines/hash) and rides
-        // the `briefing_blocked` flag; only the cross-tool `sei` stays null.
+    fn blocked_entity_stub_carries_bound_sei_alongside_navigable_identity() {
+        // clarion-719e7320f5 (A3) + REQ-C-04/ADR-038: the briefing-block projection
+        // keeps the navigable identity (id/kind/name/short_name/path/lines/hash)
+        // AND, per the federation SEI-exposure decision (owner-ratified — see
+        // ADR-034 amendment), carries the durable cross-tool `sei` binding key when
+        // the entity has one. The SEI is a content-free identity hash, never the
+        // secret; withholding it only broke federation joins (warpline churn).
         let mut entity = entity_row("python:function:app.login", "app.login", Some("abc123"));
         entity.short_name = "login".to_owned();
         entity.source_file_path = Some("app.py".to_owned());
         entity.source_line_start = Some(10);
         entity.source_line_end = Some(20);
 
-        let projection = super::blocked_entity_stub(&entity, "secret_present");
+        let projection = super::blocked_entity_stub(
+            &entity,
+            "secret_present",
+            Some("loomweave:eid:a82891aadb3647009ddba4a6733f1677"),
+        );
         assert_eq!(projection["id"], "python:function:app.login");
         assert_eq!(projection["kind"], "function");
         assert_eq!(projection["name"], "app.login");
@@ -7968,9 +8008,9 @@ mod tests {
         assert_eq!(projection["source_line_end"], 20);
         assert_eq!(projection["content_hash"], "abc123");
         assert_eq!(projection["briefing_blocked"], "secret_present");
-        assert!(
-            projection["sei"].is_null(),
-            "SEI must stay null: {projection}"
+        assert_eq!(
+            projection["sei"], "loomweave:eid:a82891aadb3647009ddba4a6733f1677",
+            "bound SEI must ride along so federation siblings can key on it: {projection}"
         );
         // The secret-bearing content is never part of this projection.
         for content in ["summary", "source", "docstring"] {
@@ -7982,22 +8022,47 @@ mod tests {
     }
 
     #[test]
-    fn blocked_entity_stub_re_withholds_high_entropy_name_only() {
-        // The guard: a high-entropy name/id is itself secret-like, so that one
-        // field is re-withheld while the rest of the identity still rides along.
+    fn blocked_entity_stub_withholds_sei_when_unbound() {
+        // Graceful-degrade: a pre-SEI DB or an orphaned/unbound locator resolves to
+        // no SEI; the projection carries `null` (never fabricates one).
+        let mut entity = entity_row("python:function:app.login", "app.login", Some("abc123"));
+        entity.source_file_path = Some("app.py".to_owned());
+
+        let projection = super::blocked_entity_stub(&entity, "secret_present", None);
+        assert_eq!(projection["id"], "python:function:app.login");
+        assert!(
+            projection["sei"].is_null(),
+            "an unbound blocked entity carries null sei, not a fabricated one: {projection}"
+        );
+    }
+
+    #[test]
+    fn blocked_entity_stub_re_withholds_high_entropy_name_and_sei() {
+        // The guard: a high-entropy name/id is itself secret-like, so that field is
+        // re-withheld. The SEI is withheld WITH it — REQ-C-04's contrapositive: a
+        // durable binding key is only exposed when the navigable locator it binds
+        // is, so a secret-like (withheld) id never leaks a durable handle.
         let secret = "fn_aGVsbG8gd29ybGQgc2VjcmV0IGtleSBhYmMxMjP8x9z";
         let id = format!("python:function:{secret}");
         let mut entity = entity_row(&id, secret, Some("abc123"));
         entity.short_name = secret.to_owned();
         entity.source_file_path = Some("g.py".to_owned());
 
-        let projection = super::blocked_entity_stub(&entity, "secret_present");
+        let projection = super::blocked_entity_stub(
+            &entity,
+            "secret_present",
+            Some("loomweave:eid:a82891aadb3647009ddba4a6733f1677"),
+        );
         assert!(
             projection["id"].is_null(),
             "high-entropy id must be withheld"
         );
         assert!(projection["name"].is_null());
         assert!(projection["short_name"].is_null());
+        assert!(
+            projection["sei"].is_null(),
+            "sei must be withheld when its locator is itself secret-like: {projection}"
+        );
         // Non-secret structural identity still rides along.
         assert_eq!(projection["kind"], "function");
         assert_eq!(projection["source_file_path"], "g.py");
