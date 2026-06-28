@@ -4,9 +4,12 @@
 > horizon, and why. Sequencing, WSJF scoring, and dated forecasts are produced
 > by `/axiom-program-management`, never here. No dates, no commitments.
 >
-> Bootstrapped 2026-06-11. **Updated: 2026-06-26 (PDR-0005)** — the
-> `loomweave-llm` extraction shipped (PR #76 → `main` `b346328`); the Now horizon
-> turns over again. Prior: 2026-06-24 (PDR-0003/0004). Tracker IDs are Filigree issues.
+> Bootstrapped 2026-06-11. **Updated: 2026-06-28 (PDR-0006)** — a federation
+> MCP-transport reliability cycle (warpline churn-fill + filigree-mcp seam) ran
+> ahead of the open Now DECIDE; the filigree fix shipped (PR #78 → `main`
+> `b5aabe8`), the warpline churn-fill is in flight (PR #77). The three Now
+> candidates remain on deck, untouched. Prior: 2026-06-26 (PDR-0005). Tracker IDs
+> are Filigree issues.
 
 ## Now — turning over (the `loomweave-llm` extraction shipped)
 
@@ -33,6 +36,17 @@ each with the metric it moves:
 - **B.4\* analyze wall-time 24× regression** on elspeth_mini (clarion-c20593d0d8,
   triage) — bears on the "graph fast enough to prefer over grep" north-star.
 
+## In flight (this session — federation-transport reliability, PDR-0006)
+
+- **Warpline churn-fill** (PR #77, open vs `main`; branch `feat/warpline-churn-consumer`)
+  — lights up the dead-by-design `entity_high_churn_list` /
+  `entity_recent_change_list` surfaces by consuming Warpline's frozen churn read.
+  NO-GO transport bug fixed + honesty disclosures (`churn_truncated`,
+  `churn_unresolved`) added; validated live. **Not yet accepted** — accept/merge +
+  the locator-dialect/NULL-sei keying gap (clarion-obs-30c0ef3b0a, undercounts
+  churn at the real operating point) are next-session calls. → moves federation
+  enrichment fidelity / "federation degrades cleanly."
+
 ## In flight (other actors — not this session's work)
 
 - **ADR-054 Rust reachability-root tags** (clarion-05fdd0490e, `building`,
@@ -43,6 +57,11 @@ each with the metric it moves:
 
 ## Shipped since 2026-06-11 (banked, no longer open bets)
 
+- **filigree-mcp newline-transport fix** (clarion-a5bfcf5ef9, PDR-0006) — PR #78 →
+  `main` `b5aabe8`. Repaired the broken stdio observation-write seam
+  (Content-Length → newline JSON-RPC) + bounded timeout + fallback launcher. Last
+  of the two Content-Length stdio clients in `loomweave-federation` — bug class
+  closed.
 - **`loomweave-llm` extraction** (clarion-141e9c08c8, PDR-0005) — PR #76 → `main`
   `b346328`. `loomweave-core` no longer links `reqwest`; providers live in a new
   pure-leaf crate; standing trust-surface CI gate added. Unblocks

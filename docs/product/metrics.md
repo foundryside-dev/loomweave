@@ -1,6 +1,6 @@
 # Loomweave — Metrics
 
-> Bootstrapped 2026-06-11. **Updated 2026-06-26** (checkpoint). Baselines are
+> Bootstrapped 2026-06-11. **Updated 2026-06-28** (checkpoint). Baselines are
 > real observed readings; targets are falsifiable (a number/boolean and a date).
 
 ## North star
@@ -20,6 +20,9 @@ found by the adversarial 4-corpus QA sweep.
   (clarion-abda98c869 parent-contains-mismatch, clarion-48af930f2a same-locator
   shadowing, clarion-e12d424f1d incremental dead-code false-positive). This is
   live evidence the candidate successor below is the right shape.
+- `READING (2026-06-28): 0 open collision families` — **not re-swept this
+  session** (the cycle was federation transport, not graph correctness — PDR-0006).
+  Carried forward unchanged; no identity/extraction code touched.
 - **OPEN QUESTION (owner, carried):** the collision-family target is met and needs
   a fresh falsifiable successor. Candidate: fabricated-edge / dropped-file /
   collision defect count on the adversarial sweep stays 0 across the 1.3.x line
@@ -53,6 +56,11 @@ found by the adversarial 4-corpus QA sweep.
      **CI stays green** (no sibling on the runner). Filed as clarion-72e1c1a07d
      (pre-existing, not from this bet). Promote to a real guardrail if the
      CI-invisibility recurs.
+   - `READING (2026-06-28): GREEN on PR #78` — the filigree transport fix merged to
+     `main` `b5aabe8` with all CI checks passing (Rust + Rust aarch64 + Python + e2e
+     walking-skeleton). 131 loomweave-federation tests green locally; fmt + clippy
+     (-D warnings, federation/mcp/cli) + cargo doc clean. (Scoped verification — the
+     federation crate + downstream; not a full-workspace nextest this session.)
    - `TARGET: green on every release/merge — standing, no end date`
 3. **MCP context tax under budget**: `tools/list` payload has a CI-enforced
    22,000-byte budget.
@@ -69,6 +77,16 @@ found by the adversarial 4-corpus QA sweep.
 
 ## Watchlist (not yet a target)
 
+- **Federation MCP-transport correctness** — count of stdio clients in
+  `loomweave-federation` that mis-frame against their newline-JSON-RPC sibling
+  servers (Content-Length instead of newline). `READING (2026-06-28): 0` — both
+  clients (warpline, filigree) now newline-framed; grep over
+  `crates/loomweave-federation/src/` for `write_frame|read_frame|ContentLengthCeiling`
+  returns none (PDR-0006). Falsifiable re-emergence guard: stays 0 as new
+  federation seams are added. Promote to a guardrail if a third seam reintroduces
+  it. Caveat: `resolve_filigree_mcp_command`'s `filigree mcp-status` spawn is a
+  blocking `.output()` outside the new timeout — a residual hang vector, disclosed
+  in PR #78, not yet bounded.
 - **Subsystem-count drift** on unchanged re-analyze (clustering instability,
   clarion-14398b2536, confirmed). Promote to a guardrail when the fix lands.
 - **B.4* analyze wall-time 24× regression** on elspeth_mini (3.99s → 96.99s;
