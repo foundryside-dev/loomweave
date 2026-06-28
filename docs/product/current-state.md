@@ -1,16 +1,16 @@
 # Loomweave — Current State (resume brief)
 
-> Refreshed at checkpoint **2026-06-28**. Next session: start here, then
+> Refreshed at checkpoint **2026-06-29**. Next session: start here, then
 > `vision.md` (grant), `roadmap.md` + `metrics.md`, then reconcile the tracker
 > IDs below against Filigree.
 
 ## The bet right now
 
-**The Now horizon is still open — DECIDE has not run.** This session did not pick
-a new Now bet. Instead, a federation MCP-transport reliability cycle (PDR-0006,
-owner-directed) ran *ahead* of the DECIDE: the warpline churn-fill NO-GO and the
-filigree-mcp seam bug. **The three recorded Now candidates remain on deck,
-untouched** (roadmap.md):
+**The Now horizon is still open — DECIDE has not run.** No new Now bet was picked.
+The session segments since 2026-06-26 spent on (a) a federation MCP-transport
+reliability cycle (PDR-0006) and (b) repo-hygiene cleanup (PDR-0007) — both ahead
+of / beside the DECIDE, not consuming it. **The three recorded Now candidates
+remain on deck, untouched** (roadmap.md):
 
 1. **Incremental-analyze correctness cluster** — defends the north-star directly.
    Open: clarion-feab311907, clarion-14398b2536, clarion-a65cb18b02 (all confirmed).
@@ -26,28 +26,29 @@ untouched** (roadmap.md):
   Lights up the dead `entity_high_churn_list` / `entity_recent_change_list`
   surfaces via Warpline's churn read. NO-GO transport bug fixed; honesty
   disclosures (`churn_truncated`, `churn_unresolved`) added; validated live on
-  lacuna. **Not accepted** — no PRD, no tracker issue (emergent branch). Merging it
-  is within grant (internal delivery).
+  lacuna. **Not yet accepted** — accept/merge + the keying gap are next-session calls.
 - **ADR-054 Rust reachability-root tags** (clarion-05fdd0490e, `building`,
   assignee `claude`, **a concurrent actor** — not this owner-session). Do not grab it.
 
-## Decided this session (2026-06-28)
+## Decided this session (2026-06-29)
 
-- **PDR-0006** — spent the open Now cycle on federation-transport reliability
-  ahead of the three candidates (owner-directed). filigree-mcp newline-transport
-  fix **shipped** (clarion-a5bfcf5ef9 closed; PR #78 → `main` `b5aabe8`, CI green
-  incl. aarch64). warpline churn-fill driven to a validated fix (PR #77, open).
-  Content-Length-vs-newline bug class **closed** (both federation stdio clients).
+- **PDR-0007** — disposed of the stale `weft/legis-conformance` branch (orphaned,
+  no PR; tested the deleted `parse_legis_rename_json` against the pre-#73
+  `/git/renames` shape → won't compile). Deleted it (owner-authorized); carried its
+  intent forward as **clarion-0715faa9d6** (rewrite the shared rename-feed
+  conformance golden against the new shape). Obsolete commit `9c30ce0` preserved in
+  the issue.
+- **Repo hygiene:** 7 merged remote branches deleted (PRs #53/#54/#74/#75/#76/#78
+  + the stale legis branch); only `feat/warpline-churn-consumer` (open PR #77) plus
+  historical (`rc4`, `rename/clarion-to-loomweave`) and auto-managed
+  (`dependabot/*`) branches remain. Resolves the prior checkpoint's open-question #7.
 
 ## Metric signals
 
-- **CI floor — GREEN on PR #78** (Rust + aarch64 + Python + e2e); 131 federation
-  tests + fmt/clippy/doc clean. Scoped verification (federation + downstream), not
-  a full-workspace nextest. See `metrics.md`.
-- **Federation MCP-transport correctness — 0** mis-framed stdio clients
-  (grep-verified). New watchlist reading.
-- **North star** (open collision families) — still **0**; **not re-swept** (this
-  was transport, not graph correctness). Still needs a fresh successor target (owner).
+- **No new readings this session** (cleanup + investigation only — no CI runs or
+  sweeps). Carried unchanged from 2026-06-28: CI floor GREEN on PR #78;
+  federation MCP-transport correctness = 0 mis-framed stdio clients; north-star
+  (open collision families) = 0, not re-swept. See `metrics.md`.
 - **`tools/list` 22 KB budget** — still UNKNOWN, carried from 2026-06-24; not re-measured.
 
 ## Open questions / awaiting owner
@@ -65,12 +66,12 @@ untouched** (roadmap.md):
 5. **Adoption metric** — still undecided; telemetry is escalation-gated (local-first).
 6. **ESCALATION (carried, outward-facing, gated):** Wardline Amendments 4–9 corpus
    re-vendor handoff — prepared, not pushed. Do not push without owner sign-off.
-7. **Cleanup (awaiting owner OK to delete remote branches):**
-   `origin/fix/filigree-mcp-newline-transport` (merged via #78) and
-   `origin/feat/loomweave-llm-extraction` (merged via #76, carried). **Keep**
-   `origin/feat/warpline-churn-consumer` — PR #77 is still open.
+7. **Legis conformance golden (clarion-0715faa9d6, PDR-0007)** — when picked up, the
+   cross-member "agreed vector home" step (legis vendoring the byte-identical
+   golden + pinning the same sha) is **outward-facing → escalates**. The loomweave
+   consumer half is in-grant; the legis push is not.
 8. **Residual (disclosed in PR #78, not bounded):** `resolve_filigree_mcp_command`
-   runs `filigree mcp-status --json` via a blocking `.output()` *before* the new
+   runs `filigree mcp-status --json` via a blocking `.output()` *before* the
    timeout-bounded section — a hung mcp-status is an unbounded wait. Short-lived;
    bounding it is a follow-up.
 

@@ -4,12 +4,12 @@
 > horizon, and why. Sequencing, WSJF scoring, and dated forecasts are produced
 > by `/axiom-program-management`, never here. No dates, no commitments.
 >
-> Bootstrapped 2026-06-11. **Updated: 2026-06-28 (PDR-0006)** — a federation
-> MCP-transport reliability cycle (warpline churn-fill + filigree-mcp seam) ran
-> ahead of the open Now DECIDE; the filigree fix shipped (PR #78 → `main`
-> `b5aabe8`), the warpline churn-fill is in flight (PR #77). The three Now
-> candidates remain on deck, untouched. Prior: 2026-06-26 (PDR-0005). Tracker IDs
-> are Filigree issues.
+> Bootstrapped 2026-06-11. **Updated: 2026-06-29 (PDR-0007)** — repo-hygiene
+> cleanup; the stale `weft/legis-conformance` branch disposed of and its intent
+> carried forward as clarion-0715faa9d6 (concrete G16 consumer golden) under Next.
+> No horizon moved. Prior: 2026-06-28 (PDR-0006) — federation MCP-transport
+> reliability cycle (filigree #78 shipped, warpline #77 in flight). Tracker IDs are
+> Filigree issues.
 
 ## Now — turning over (the `loomweave-llm` extraction shipped)
 
@@ -86,6 +86,11 @@ each with the metric it moves:
 - Federation-audit G-series gaps (G2 historical-locator resolve
   clarion-3c47f53e99, G10 project selector clarion-c37e1714fd, G14 canonical-JSON
   SEI oracle clarion-9d0e82513c, G16 rename-parser vectors clarion-73dff1d2d1).
+  The shared byte-pinned legis↔loomweave rename-feed conformance golden — the
+  concrete consumer-side realization of G16 — is now tracked as **clarion-0715faa9d6**
+  (PDR-0007; revives the deleted stale `weft/legis-conformance` against the new
+  `/git/rename-feed` shape; the cross-member "vector home" coordination with legis
+  is owner-gated/outward-facing).
 - Shared `weft.toml` key-layout proposal for the hub to bless (clarion-00abdf2fcb).
 - Wardline handoff for Amendments 4–9 corpus re-vendor (prepared, not pushed;
   **escalation-gated — outward-facing**, see `current-state.md`).
