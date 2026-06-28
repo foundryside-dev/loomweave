@@ -1319,6 +1319,25 @@ pub fn entities_by_churn(
     Ok((out, truncated))
 }
 
+/// Candidate universe for the warpline-backed churn surfaces
+/// (`entity_high_churn_list` / `entity_recent_change_list`). Unlike
+/// [`entities_by_churn`], this does NOT filter on `git_churn_count` (loomweave
+/// does not populate it in v1.0, so that scan is empty). Loomweave owns the
+/// entity *catalogue*; warpline owns the change *counts*. The read layer sends
+/// these rows' SEIs/locators to warpline and ranks by the returned counts. Rows
+/// are ordered by id (a stable, content-free order — warpline supplies the
+/// ranking) and materialised up to `scan_cap`. Returns `(rows, scan_truncated)`.
+pub fn entities_for_churn_candidates(
+    conn: &Connection,
+    scan_cap: usize,
+) -> Result<(Vec<EntityRow>, bool)> {
+    let limit = i64::try_from(scan_cap.saturating_add(1)).unwrap_or(i64::MAX);
+    let sql = format!("SELECT {ENTITY_COLUMNS} FROM entities ORDER BY id LIMIT ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![limit], map_entity_row)?;
+    collect_capped(rows, scan_cap)
+}
+
 pub fn call_edges_targeting(
     conn: &Connection,
     target_id: &str,

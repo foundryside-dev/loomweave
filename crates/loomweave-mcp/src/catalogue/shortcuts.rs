@@ -16,13 +16,14 @@ use serde_json::{Value, json};
 
 use loomweave_core::{EdgeConfidence, McpErrorCode};
 use loomweave_storage::{
-    call_edges_targeting, entities_by_churn, entities_targeted_by_unresolved_call_sites,
-    entity_by_id, resolve_entity_ref,
+    call_edges_targeting, entities_for_churn_candidates,
+    entities_targeted_by_unresolved_call_sites, entity_by_id, resolve_entity_ref, sei_for_locator,
 };
 
 use crate::ParamError;
 use crate::ServerState;
-use crate::catalogue::{Page, RawScope, finalize_entity_page, missing_signal};
+use crate::catalogue::{Page, RawScope, ScopeFilter, finalize_entity_page, missing_signal};
+use crate::warpline::{ChurnCountResponse, WarplineEntityRef};
 use crate::{
     entity_json, flatten_storage_envelope_result, optional_bool, optional_confidence,
     optional_non_empty_string, required_str, success_envelope, tool_error_envelope,
@@ -800,101 +801,395 @@ impl ServerState {
         Ok(flatten_storage_envelope_result(result))
     }
 
-    /// `high_churn(limit?, scope?)` — entities ranked by `git_churn_count`
-    /// descending. The analyze pipeline does not populate churn in v1.0, so this
-    /// is honest-empty in practice (the missing signal is surfaced); the query is
-    /// real, so it lights up if churn is ever populated. Bounded, SEI-carrying.
+    /// `high_churn(limit?, scope?)` — entities ranked by change count, **descending**.
+    ///
+    /// Loomweave does not populate `git_churn_count` in v1.0 and, by the seam's
+    /// HARD RULE, retains no cross-run history — so the count comes from Warpline
+    /// (the federation's temporal authority) at read time. Loomweave owns the
+    /// entity catalogue (the candidate universe); Warpline owns the counts. The
+    /// flow: gather candidates → filter to scope → one bounded, SEI-keyed
+    /// `warpline_entity_churn_count_get` call → rank the scoped set by the
+    /// returned counts → page → graft the count onto each entity. Read-only,
+    /// enrich-only, dependency-sink: nothing is stored, nothing flows from
+    /// loomweave to warpline.
+    ///
+    /// Honest-degrade (lock §1C): warpline absent / disabled / unreachable →
+    /// honest-empty with a missing-signal note that NAMES warpline as the source
+    /// — never empty-as-clean, never a hard error breaking the core flow.
+    /// Bounded, SEI-carrying.
     pub(crate) async fn tool_high_churn(
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let scope = RawScope::parse(arguments)?;
-        let page = Page::parse(arguments, SHORTCUT_PAGE_DEFAULT, SHORTCUT_PAGE_MAX)?;
-        let project_root = self.project_root.clone();
-        let result = self
-            .readers
-            .with_reader(move |conn| {
-                let filter = scope.resolve(conn)?;
-                let (rows, scan_truncated) = entities_by_churn(conn, CHURN_SCAN_CAP)?;
-                // Keep churn alongside; finalize over the entity rows, then graft
-                // the churn count onto each returned entity.
-                let churn_by_id: std::collections::HashMap<String, i64> =
-                    rows.iter().map(|(e, c)| (e.id.clone(), *c)).collect();
-                let entities: Vec<_> = rows.into_iter().map(|(e, _)| e).collect();
-                let mut response = finalize_entity_page(
-                    conn,
-                    &project_root,
-                    entities,
-                    &filter,
-                    page,
-                    scan_truncated,
-                );
-                if let Some(list) = response["entities"].as_array() {
-                    let grafted: Vec<Value> = list
-                        .iter()
-                        .map(|entity| {
-                            let mut entity = entity.clone();
-                            if let Some(object) = entity.as_object_mut()
-                                && let Some(id) = object.get("id").and_then(Value::as_str)
-                                && let Some(churn) = churn_by_id.get(id)
-                            {
-                                object.insert("git_churn_count".to_owned(), json!(churn));
-                            }
-                            entity
-                        })
-                        .collect();
-                    if let Some(object) = response.as_object_mut() {
-                        object.insert("entities".to_owned(), Value::Array(grafted));
-                    }
-                }
-                if response["page"]["total"] == json!(0)
-                    && let Some(object) = response.as_object_mut()
-                {
-                    object.insert(
-                        "signal".to_owned(),
-                        missing_signal(
-                            "git_churn_count",
-                            "no entity carries git churn; the analyze pipeline does not populate \
-                             git_churn_count in v1.0",
-                        ),
-                    );
-                }
-                Ok(success_envelope(response))
-            })
-            .await;
-        Ok(flatten_storage_envelope_result(result))
+        self.churn_ranked_surface(arguments, ChurnMode::HighChurn)
+            .await
     }
 
-    /// `recently_changed(since?, scope?)` — entities changed since a timestamp.
-    /// Loomweave does not index a per-entity git change timestamp in v1.0, so this
-    /// is an honest no-op: it returns an empty set with a missing-signal note
-    /// pointing at `index_diff` for repo-level freshness. The args are accepted
-    /// for forward-compatibility. Never fabricates a change set.
-    // Honest no-op: no storage read, but kept `async` for the uniform tool
-    // dispatch interface (every `tool_*` is awaited in `handle_tool_call`).
-    #[allow(clippy::unused_async)]
+    /// `recently_changed(since?, scope?)` — entities with a recorded change
+    /// (`churn_count >= 1`) over the window `[since, now)`, ordered by
+    /// `last_changed_at` descending.
+    ///
+    /// Same Warpline-backed read as [`Self::tool_high_churn`] — loomweave has no
+    /// per-entity git change timestamp in v1.0, so warpline supplies both the
+    /// count and the `last_changed_at`. `since` is passed through as the warpline
+    /// `window.since`; entities with no recorded change in the window are
+    /// filtered out. Honest-degrade is identical to `high_churn` (warpline absent
+    /// → honest-empty + warpline-named missing-signal note, never empty-as-clean).
     pub(crate) async fn tool_recently_changed(
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        // Validate args so a malformed call still errors honestly.
-        let _ = RawScope::parse(arguments)?;
         let since = match arguments.get("since") {
             None | Some(Value::Null) => None,
             Some(Value::String(value)) => Some(value.clone()),
             Some(_) => return Err(ParamError::new("since must be an ISO-8601 string or null")),
         };
-        Ok(success_envelope(json!({
-            "entities": [],
-            "since": since,
-            "page": { "total": 0, "offset": 0, "limit": 0, "returned": 0, "truncated": false },
-            "signal": missing_signal(
-                "git_change_time",
-                "Loomweave does not index a per-entity git change timestamp in v1.0; use index_diff \
-                 for repo-level freshness (HEAD vs last analyze)"
-            ),
-        })))
+        self.churn_ranked_surface(arguments, ChurnMode::RecentlyChanged { since })
+            .await
     }
+
+    /// Shared body for the two Warpline-backed churn surfaces. `mode` selects
+    /// `high_churn` (rank all candidates by count desc) vs `recently_changed`
+    /// (window `since`, keep `churn_count >= 1`, order by `last_changed_at` desc).
+    async fn churn_ranked_surface(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+        mode: ChurnMode,
+    ) -> std::result::Result<Value, ParamError> {
+        let scope = RawScope::parse(arguments)?;
+        let page = Page::parse(arguments, SHORTCUT_PAGE_DEFAULT, SHORTCUT_PAGE_MAX)?;
+        let project_root = self.project_root.clone();
+        let warpline_client = self.warpline_client.clone();
+        let result = self
+            .readers
+            .with_reader(move |conn| {
+                let filter = scope.resolve(conn)?;
+                // 1. Candidate universe = the entity catalogue (capped), NOT the
+                //    empty `git_churn_count` scan. Warpline holds the counts.
+                let (candidates, scan_truncated) =
+                    entities_for_churn_candidates(conn, CHURN_SCAN_CAP)?;
+                // 2. Scope-filter BEFORE asking warpline, so a scoped query keeps
+                //    its in-scope high-churners regardless of the global ranking
+                //    (the representative-fixture trap: scope-after-rank loses
+                //    in-scope rows that fell below the global top-N).
+                let in_scope: Vec<loomweave_storage::EntityRow> = candidates
+                    .into_iter()
+                    .filter(|e| {
+                        filter.contains(&e.id, e.source_file_path.as_deref(), &project_root)
+                    })
+                    .collect();
+
+                // Honest-degrade: no warpline client wired → the surface cannot
+                // rank. Honest-empty with a warpline-named missing-signal note.
+                let Some(client) = warpline_client.as_ref() else {
+                    return Ok(success_envelope(churn_unavailable(
+                        &filter,
+                        scan_truncated,
+                        &mode,
+                        "warpline-disabled",
+                        "Warpline churn integration is disabled \
+                         (integrations.warpline.enabled: false); enable it to rank by change count",
+                    )));
+                };
+
+                // 3. Build SEI-keyed refs (locator fallback when unresolved) and
+                //    make ONE bounded warpline call (lock: one aggregation read,
+                //    join, discard — not N timeline calls).
+                let refs: Vec<WarplineEntityRef> = in_scope
+                    .iter()
+                    .map(|e| {
+                        let sei = sei_for_locator(conn, &e.id).ok().flatten();
+                        WarplineEntityRef::for_entity(&e.id, sei.as_deref())
+                    })
+                    .collect();
+                let response = match client.entity_churn_counts(&refs, mode.window().as_ref()) {
+                    Ok(response) => response,
+                    Err(err) => {
+                        // Transport / warpline-error / unparseable → honest
+                        // unavailable, NOT an empty (clean) ranking.
+                        return Ok(success_envelope(churn_unavailable(
+                            &filter,
+                            scan_truncated,
+                            &mode,
+                            "warpline-unreachable",
+                            &err.to_string(),
+                        )));
+                    }
+                };
+
+                // 4-5. Rank the scoped set by the returned counts, page, finalize,
+                //      and graft the warpline facts back on.
+                Ok(success_envelope(rank_and_finalize_churn(
+                    conn,
+                    &project_root,
+                    in_scope,
+                    &filter,
+                    page,
+                    scan_truncated,
+                    &mode,
+                    &response,
+                )))
+            })
+            .await;
+        Ok(flatten_storage_envelope_result(result))
+    }
+}
+
+/// Which of the two Warpline-backed churn surfaces is being served.
+#[derive(Debug, Clone)]
+enum ChurnMode {
+    /// `high_churn`: rank every candidate by count (desc); keep count-0 rows.
+    HighChurn,
+    /// `recently_changed`: window by `since`, drop count-0 rows, order by
+    /// `last_changed_at` (desc).
+    RecentlyChanged { since: Option<String> },
+}
+
+impl ChurnMode {
+    /// The frozen warpline `window` object for this mode (`None` for
+    /// `high_churn`: all-time count).
+    fn window(&self) -> Option<Value> {
+        match self {
+            ChurnMode::HighChurn => None,
+            ChurnMode::RecentlyChanged { since } => Some(json!({
+                "since": since, "until": Value::Null, "rev_range": Value::Null
+            })),
+        }
+    }
+
+    fn is_recency(&self) -> bool {
+        matches!(self, ChurnMode::RecentlyChanged { .. })
+    }
+
+    /// Tag the response with `churn_source` provenance and (for recency) echo the
+    /// `since` argument. Applied to every answer, available or degraded.
+    fn tag(&self, object: &mut serde_json::Map<String, Value>) {
+        object.insert("churn_source".to_owned(), json!("warpline"));
+        if let ChurnMode::RecentlyChanged { since } = self {
+            object.insert("since".to_owned(), json!(since));
+        }
+    }
+}
+
+/// Rank the scoped candidates by warpline's returned counts, page + finalize,
+/// and graft the churn facts onto each returned entity. `finalize_entity_page`
+/// preserves input order (and re-applies scope idempotently), so passing the
+/// already-ranked rows yields a ranked page.
+#[allow(clippy::too_many_arguments)]
+fn rank_and_finalize_churn(
+    conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
+    in_scope: Vec<loomweave_storage::EntityRow>,
+    filter: &ScopeFilter,
+    page: Page,
+    scan_truncated: bool,
+    mode: &ChurnMode,
+    response: &ChurnCountResponse,
+) -> Value {
+    // Index counts by key (SEI or locator), then rank the scoped set.
+    let by_key = response.index_by_key();
+    let is_recency = mode.is_recency();
+    let mut ranked: Vec<(loomweave_storage::EntityRow, ChurnFacts)> = in_scope
+        .into_iter()
+        .filter_map(|entity| {
+            let sei = sei_for_locator(conn, &entity.id).ok().flatten();
+            let key_sei = sei.as_deref().filter(|s| !s.is_empty());
+            // Look up the count under whichever key warpline echoed.
+            let item = key_sei
+                .and_then(|s| by_key.get(s))
+                .or_else(|| by_key.get(entity.id.as_str()));
+            let facts = ChurnFacts::from_item(item.copied());
+            // recently_changed keeps only entities with a recorded change;
+            // high_churn keeps every candidate (count 0 included).
+            if is_recency && facts.churn_count < 1 {
+                None
+            } else {
+                Some((entity, facts))
+            }
+        })
+        .collect();
+    if is_recency {
+        // Most-recently-changed first. `last_changed_at` is ISO-8601, so lexical
+        // desc == chronological desc; tie-break on id for determinism.
+        ranked.sort_by(|a, b| {
+            b.1.last_changed_at
+                .cmp(&a.1.last_changed_at)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+    } else {
+        ranked.sort_by(|a, b| {
+            b.1.churn_count
+                .cmp(&a.1.churn_count)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+    }
+
+    let facts_by_id: std::collections::HashMap<String, ChurnFacts> = ranked
+        .iter()
+        .map(|(e, f)| (e.id.clone(), f.clone()))
+        .collect();
+    let ranked_entities: Vec<loomweave_storage::EntityRow> =
+        ranked.into_iter().map(|(e, _)| e).collect();
+    let mut response_json = finalize_entity_page(
+        conn,
+        project_root,
+        ranked_entities,
+        filter,
+        page,
+        scan_truncated,
+    );
+    if let Some(list) = response_json["entities"].as_array() {
+        let grafted: Vec<Value> = list
+            .iter()
+            .map(|entity| {
+                let mut entity = entity.clone();
+                if let Some(object) = entity.as_object_mut()
+                    && let Some(id) = object.get("id").and_then(Value::as_str)
+                    && let Some(facts) = facts_by_id.get(id)
+                {
+                    facts.graft_onto(object);
+                }
+                entity
+            })
+            .collect();
+        if let Some(object) = response_json.as_object_mut() {
+            object.insert("entities".to_owned(), Value::Array(grafted));
+        }
+    }
+    // Provenance + honest-empty note. A genuinely empty answer (warpline present,
+    // no in-scope entity carried a recorded change) is honest-empty, never clean.
+    let is_empty = response_json["page"]["total"] == json!(0);
+    // Warpline truncation disclosure: when warpline bounded the read to an in-band
+    // lead (more candidates than its overflow cap), the entities ranked below the
+    // lead are absent from the join and graft `churn_count: 0` — a TRUNCATION, not
+    // a never-observed 0. Disclose it so the two kinds of 0 are not conflated
+    // (this is the honesty floor; reading warpline's overflow dump for complete
+    // coverage of an over-cap scope is a tracked follow-up — narrow `scope` for
+    // exact counts meanwhile). Bites `recently_changed` hardest: a recent but
+    // low-total-churn entity ranked outside the lead is dropped as count-0.
+    let partial = response.overflow_partial();
+    // Keying-miss disclosure, symmetric with `churn_truncated`: warpline returns
+    // `churn_count: 0` with a null locator for a ref it could not key-match (an
+    // SEI loomweave holds but warpline has not recorded, or a divergent locator
+    // dialect). That 0 is "real churn unknown", NOT a never-observed 0 — without
+    // this a scoped query over key-missed entities reads as "this code never
+    // changes" (the absence-as-clean failure this module exists to prevent). Only
+    // SEI-keyed misses are detectable (see `unresolved_ref_count`).
+    let unresolved = response.unresolved_ref_count();
+    if let Some(object) = response_json.as_object_mut() {
+        mode.tag(object);
+        if unresolved > 0 {
+            object.insert(
+                "churn_unresolved".to_owned(),
+                json!({
+                    "count": unresolved,
+                    "reason": format!(
+                        "warpline could not key-match {unresolved} in-scope candidate(s) \
+                         (loomweave sent an SEI warpline has not recorded, or the locator \
+                         dialect differs); they are shown with churn_count 0 here but their real \
+                         churn is UNKNOWN, not zero — a federation keying gap, not a \
+                         never-observed 0. (recently_changed drops them entirely.)"
+                    ),
+                }),
+            );
+        }
+        if let Some((total, counted)) = partial {
+            let uncounted = total.saturating_sub(counted).max(0);
+            object.insert(
+                "churn_truncated".to_owned(),
+                json!({
+                    "truncated": true,
+                    "counted": counted,
+                    "total_candidates": total,
+                    "uncounted": uncounted,
+                    "reason": format!(
+                        "warpline truncated the churn read to its top {counted} entities by \
+                         churn_count; {uncounted} in-scope candidate(s) ranked below that are \
+                         shown with churn_count 0 here and may be undercounted — a truncation, \
+                         NOT a never-observed 0. Narrow `scope` for exact counts; complete \
+                         over-cap coverage (reading warpline's overflow dump) is a tracked \
+                         follow-up."
+                    ),
+                }),
+            );
+        }
+        if is_empty {
+            object.insert(
+                "signal".to_owned(),
+                missing_signal(
+                    "warpline_churn",
+                    "warpline reported no recorded change for any in-scope entity \
+                     (a complete answer, not an absence of code)",
+                ),
+            );
+        }
+    }
+    response_json
+}
+
+/// Warpline churn facts grafted onto an entity in the churn surfaces. A
+/// candidate with no warpline row (never-observed) carries `churn_count: 0` and
+/// null timestamps — a real, complete answer, not a missing fact.
+#[derive(Debug, Clone)]
+struct ChurnFacts {
+    churn_count: i64,
+    first_changed_at: Option<String>,
+    last_changed_at: Option<String>,
+    last_actor: Option<String>,
+}
+
+impl ChurnFacts {
+    fn from_item(item: Option<&crate::warpline::ChurnItem>) -> Self {
+        match item {
+            Some(item) => Self {
+                churn_count: item.churn_count,
+                first_changed_at: item.first_changed_at.clone(),
+                last_changed_at: item.last_changed_at.clone(),
+                last_actor: item.last_actor.clone(),
+            },
+            None => Self {
+                churn_count: 0,
+                first_changed_at: None,
+                last_changed_at: None,
+                last_actor: None,
+            },
+        }
+    }
+
+    fn graft_onto(&self, object: &mut serde_json::Map<String, Value>) {
+        object.insert("churn_count".to_owned(), json!(self.churn_count));
+        object.insert("first_changed_at".to_owned(), json!(self.first_changed_at));
+        object.insert("last_changed_at".to_owned(), json!(self.last_changed_at));
+        object.insert("last_actor".to_owned(), json!(self.last_actor));
+    }
+}
+
+/// The honest-degrade envelope for the churn surfaces when warpline cannot
+/// answer (disabled / unreachable / error). An empty entity set, a
+/// missing-signal note that NAMES warpline + the reason, and `churn_source:
+/// warpline` provenance. Never empty-as-clean, never a hard error. Mirrors the
+/// `scope_truncated`/`scan_truncated`/`page` shape of a normal answer so the
+/// wire shape is stable across the available/unavailable paths.
+fn churn_unavailable(
+    filter: &ScopeFilter,
+    scan_truncated: bool,
+    mode: &ChurnMode,
+    reason: &str,
+    message: &str,
+) -> Value {
+    let mut response = json!({
+        "entities": [],
+        "page": { "total": 0, "offset": 0, "limit": 0, "returned": 0, "truncated": false },
+        "scope_truncated": filter.scope_truncated(),
+        "scan_truncated": scan_truncated,
+        "signal": missing_signal("warpline_churn", message),
+        "reason": reason,
+    });
+    if let Some(object) = response.as_object_mut() {
+        // `churn_source: warpline` provenance + (for recency) the echoed `since`.
+        mode.tag(object);
+    }
+    response
 }
 
 /// Of the given entity ids, those carrying the `test` categorisation tag.

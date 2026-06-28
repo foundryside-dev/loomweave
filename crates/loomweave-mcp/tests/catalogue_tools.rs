@@ -1639,13 +1639,35 @@ async fn categorisation_shortcuts_are_honest_empty() {
         "find_tests",
         "find_deprecations",
         "find_todos",
-        "high_churn",
     ] {
         let env = call_tool(&state, tool, json!({})).await;
         assert_eq!(env["ok"], true, "{tool}: {env}");
         assert_eq!(env["result"]["page"]["total"], 0, "{tool}: {env}");
         assert_eq!(env["result"]["signal"]["available"], false, "{tool}: {env}");
     }
+}
+
+#[tokio::test]
+async fn high_churn_degrades_honestly_without_warpline() {
+    // `high_churn` now ranks by Warpline's change count at read time. With no
+    // warpline client wired (the default), it degrades to honest-empty with a
+    // warpline-named signal — never empty-as-clean, never a hard error.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "high_churn", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(
+        env["error"],
+        serde_json::Value::Null,
+        "no hard error: {env}"
+    );
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert_eq!(env["result"]["signal"]["signal"], "warpline_churn", "{env}");
+    assert_eq!(env["result"]["churn_source"], "warpline", "{env}");
+    assert_eq!(env["result"]["reason"], "warpline-disabled", "{env}");
 }
 
 #[tokio::test]
@@ -1749,7 +1771,11 @@ async fn what_tests_this_returns_test_tagged_callers() {
 }
 
 #[tokio::test]
-async fn recently_changed_is_honest_noop() {
+async fn recently_changed_degrades_honestly_without_warpline() {
+    // `recently_changed` is no longer a no-op: it ranks by Warpline's change
+    // facts at read time. With no warpline client wired (the default), it
+    // degrades to honest-empty with a warpline-named signal (never the old
+    // `git_change_time` no-op note, never empty-as-clean, never a hard error).
     let (project, db, conn) = open_project();
     insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
     drop(conn);
@@ -1761,8 +1787,17 @@ async fn recently_changed_is_honest_noop() {
     )
     .await;
     assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(
+        env["error"],
+        serde_json::Value::Null,
+        "no hard error: {env}"
+    );
     assert_eq!(env["result"]["page"]["total"], 0);
-    assert_eq!(env["result"]["signal"]["signal"], "git_change_time");
+    assert_eq!(env["result"]["signal"]["signal"], "warpline_churn", "{env}");
+    assert_eq!(env["result"]["churn_source"], "warpline", "{env}");
+    assert_eq!(env["result"]["reason"], "warpline-disabled", "{env}");
+    // The `since` argument is echoed back even on the degrade path.
+    assert_eq!(env["result"]["since"], "2026-01-01T00:00:00Z", "{env}");
 }
 
 #[tokio::test]
