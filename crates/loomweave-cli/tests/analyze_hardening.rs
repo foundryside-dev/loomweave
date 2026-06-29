@@ -156,6 +156,24 @@ fn finding_evidence(conn: &Connection, rule_id: &str) -> String {
     .expect("query finding evidence")
 }
 
+/// The `entity_id` anchor column of the single `rule_id` finding.
+fn finding_entity_id(conn: &Connection, rule_id: &str) -> String {
+    conn.query_row(
+        "SELECT entity_id FROM findings WHERE rule_id = ?1",
+        [rule_id],
+        |row| row.get(0),
+    )
+    .expect("query finding entity_id")
+}
+
+/// Count of `entities` rows with the given id (FK-satisfaction probe).
+fn entity_row_count(conn: &Connection, id: &str) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM entities WHERE id = ?1", [id], |row| {
+        row.get(0)
+    })
+    .expect("query entity row count")
+}
+
 /// Assert no live process carries `marker` ("KEY=VALUE") in its environment.
 ///
 /// The marker is set on the spawned `loomweave analyze` process only; the
@@ -506,6 +524,74 @@ fn abort_at_analyze_classified_and_terminal() {
         finding_count(&conn, "LMWV-INFRA-PLUGIN-OOM-KILLED"),
         0,
         "SIGABRT must not be classified as an OOM kill"
+    );
+
+    assert_no_leaked_child(&marker_pair);
+}
+
+/// Trust boundary (review follow-up to clarion-48af930f2a): a plugin-reported
+/// finding must NOT be able to set the host-reserved `anchor_entity_id`
+/// metadata key. The host's `host_finding_anchor_id` takes that key verbatim as
+/// `findings.entity_id` (FK-enforced at insert), so a forged value naming a
+/// nonexistent entity would hard-fail the WHOLE analyze run on the findings FK
+/// (and an existing one would silently mis-anchor the finding). The fix strips
+/// the key at the plugin boundary (`validate_plugin_finding`); this test proves
+/// the end-to-end consequence: the run COMPLETES and the finding falls back to
+/// a real (file/project) anchor instead of the forged id.
+#[test]
+fn plugin_forged_anchor_entity_id_does_not_win_or_fail_the_run() {
+    const FORGED: &str = "fixture:gadget:forged.ghost.nonexistent";
+    const FORGED_RULE: &str = "LMWV-FIXTURE-FORGED-ANCHOR";
+
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    let (marker_key, marker_value, marker_pair) = unique_marker("forged-anchor");
+
+    // The forged-anchor switch makes the plugin emit a finding whose metadata
+    // carries `anchor_entity_id = FORGED`. With the boundary strip in place the
+    // run must SUCCEED — pre-fix it hard-failed on the findings FK.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env(&marker_key, &marker_value)
+        .env("LOOMWEAVE_FIXTURE_FINDING_FORGED_ANCHOR", "1")
+        .timeout(ANALYZE_BACKSTOP)
+        .assert()
+        .success();
+
+    let conn = open_db(&project_dir);
+
+    // The run committed cleanly — the forged FK did not abort it.
+    let (run_count, run_status, _failure_reason) = run_record(&conn);
+    assert_eq!(run_count, 1, "exactly one run row");
+    assert_eq!(
+        run_status, "completed",
+        "a forged plugin anchor must not fail the run"
+    );
+
+    // The finding survived (the strip drops only the reserved key, not the
+    // diagnostic) and anchored to a REAL entity that is not the forged id.
+    assert_eq!(
+        finding_count(&conn, FORGED_RULE),
+        1,
+        "the plugin finding is persisted, not dropped"
+    );
+    let anchor = finding_entity_id(&conn, FORGED_RULE);
+    assert_ne!(
+        anchor, FORGED,
+        "the forged anchor_entity_id must NOT become the finding's entity_id"
+    );
+    assert_eq!(
+        entity_row_count(&conn, FORGED),
+        0,
+        "the forged id must never have been inserted as an entity"
+    );
+    assert_eq!(
+        entity_row_count(&conn, &anchor),
+        1,
+        "the finding must anchor to a real (file/project) entity; got {anchor}"
     );
 
     assert_no_leaked_child(&marker_pair);

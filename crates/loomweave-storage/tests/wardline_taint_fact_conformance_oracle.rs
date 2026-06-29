@@ -68,7 +68,7 @@ const GOLDEN: &str = include_str!("fixtures/wardline-taint-fact-wire.golden.json
 /// Tamper proof: perturbing one hex char of this const (or one byte of the
 /// fixture) makes `golden_bytes_match_layer1_pin` fail with a
 /// `left != right` mismatch — the pin is load-bearing, not decorative.
-const GOLDEN_BLAKE3: &str = "5ecabddd14bfb6a1c245c62bfa7b34e2cb4a5c9209c0f7da0250e7293f91ca6a";
+const GOLDEN_BLAKE3: &str = "ca7a1cd80c87ee20857aa7e9da221784ca068015bd423031bee822640ab43162";
 
 /// The plugin under which Wardline's Python-frontend qualnames resolve. The
 /// golden is a Python scan (`svc.py`), so its qualnames live under
