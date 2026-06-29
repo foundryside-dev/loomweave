@@ -16,6 +16,7 @@
 //!   twice in one file, or shared across files) without extra env knobs
 //!   (clarion-b19fe90c3e).
 
+use std::collections::BTreeMap;
 use std::io::{BufReader, Write};
 
 /// True when the named environment variable is set to exactly `"1"`.
@@ -38,8 +39,8 @@ fn hang_forever() -> ! {
 use loomweave_core::plugin::limits::ContentLengthCeiling;
 use loomweave_core::plugin::transport::{Frame, read_frame, write_frame};
 use loomweave_core::plugin::{
-    AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, InitializeResult, JsonRpcVersion,
-    ProtocolError, ResponseEnvelope, ResponsePayload, ShutdownResult,
+    AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, InitializeResult,
+    JsonRpcVersion, ProtocolError, ResponseEnvelope, ResponsePayload, ShutdownResult,
 };
 use serde_json::Value;
 
@@ -176,7 +177,7 @@ fn main() {
                     entities,
                     edges: vec![],
                     stats: AnalyzeFileStats::default(),
-                    findings: vec![],
+                    findings: forged_anchor_findings(),
                 };
                 send_result(&mut writer, id, serde_json::to_value(result).unwrap());
             }
@@ -193,6 +194,29 @@ fn main() {
             _ => std::process::exit(1),
         }
     }
+}
+
+/// Opt-in trust-boundary probe: when `LOOMWEAVE_FIXTURE_FINDING_FORGED_ANCHOR`
+/// is set, emit one plugin finding whose metadata carries a FORGED
+/// host-reserved `anchor_entity_id` naming an entity that does not exist. The
+/// host MUST strip this key at the plugin boundary (`validate_plugin_finding`)
+/// so it cannot override the trusted file anchor; otherwise the finding's
+/// `entity_id` FK insert hard-fails the whole analyze run. Inert in normal runs.
+fn forged_anchor_findings() -> Vec<AnalyzeFileFinding> {
+    if !env_flag("LOOMWEAVE_FIXTURE_FINDING_FORGED_ANCHOR") {
+        return Vec::new();
+    }
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "anchor_entity_id".to_owned(),
+        Value::String("fixture:gadget:forged.ghost.nonexistent".to_owned()),
+    );
+    vec![AnalyzeFileFinding {
+        subcode: "LMWV-FIXTURE-FORGED-ANCHOR".to_owned(),
+        severity: Some("warning".to_owned()),
+        message: "fixture emitted a finding with a forged anchor_entity_id".to_owned(),
+        metadata,
+    }]
 }
 
 /// Parse `gadget <name>` lines out of the analysed file and build one

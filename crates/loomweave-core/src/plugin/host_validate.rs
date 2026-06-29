@@ -169,6 +169,16 @@ fn stringify_finding_metadata_value(value: serde_json::Value) -> Result<String, 
     }
 }
 
+/// Metadata key the HOST reserves for its own finding-anchor precedence. The
+/// cli's `host_finding_anchor_id` takes this value verbatim as
+/// `findings.entity_id` (FK-enforced at insert), so it overrides the trusted
+/// file anchor. A plugin-reported finding must NOT be able to set it across the
+/// trust boundary: a nonexistent id would hard-fail the whole analyze run on
+/// the findings FK, and an existing id would silently mis-associate the
+/// finding. Validation strips it (the legitimate producer — the host's
+/// duplicate-locator finding — bypasses this path entirely).
+const HOST_RESERVED_ANCHOR_ENTITY_ID_KEY: &str = "anchor_entity_id";
+
 pub(crate) fn validate_plugin_finding(
     raw: AnalyzeFileFinding,
     rule_id_prefix: &str,
@@ -217,6 +227,11 @@ pub(crate) fn validate_plugin_finding(
     for (key, value) in raw.metadata {
         if key.is_empty() {
             return Err("metadata key is empty".to_owned());
+        }
+        if key == HOST_RESERVED_ANCHOR_ENTITY_ID_KEY {
+            // Host-reserved anchor-precedence key — drop any plugin-supplied
+            // value so it cannot override the trusted file anchor below.
+            continue;
         }
         if key.len() > MAX_ENTITY_FIELD_BYTES {
             return Err(format!(
@@ -281,6 +296,44 @@ mod tests {
             ok.metadata.get("anchor_file_path").map(String::as_str),
             Some("pkg/a.py"),
             "the analyzed path is recorded as anchor_file_path"
+        );
+    }
+
+    #[test]
+    fn validate_plugin_finding_strips_host_reserved_anchor_entity_id() {
+        // `anchor_entity_id` is a HOST-reserved precedence key consumed by the
+        // cli's `host_finding_anchor_id`: it overrides the trusted file anchor
+        // and is taken verbatim as `findings.entity_id` (FK-enforced at insert).
+        // A plugin must NOT be able to set it across the trust boundary — a
+        // nonexistent id would hard-fail the whole analyze run on the findings
+        // FK, and an existing id would silently mis-associate the finding.
+        // Validation strips it (symmetric with the host-overwritten
+        // `anchor_file_path`); other plugin metadata is preserved.
+        let mut raw = finding("PY-CODE", "m");
+        raw.metadata.insert(
+            "anchor_entity_id".to_owned(),
+            serde_json::Value::String("python:function:evil.injected".to_owned()),
+        );
+        raw.metadata.insert(
+            "detail".to_owned(),
+            serde_json::Value::String("kept".to_owned()),
+        );
+        let ok = validate_plugin_finding(raw, "PY-", Path::new("pkg/a.py"))
+            .expect("a well-formed finding validates");
+        assert_eq!(
+            ok.metadata.get("anchor_entity_id"),
+            None,
+            "a plugin-supplied anchor_entity_id must be stripped (host-reserved key)"
+        );
+        assert_eq!(
+            ok.metadata.get("anchor_file_path").map(String::as_str),
+            Some("pkg/a.py"),
+            "the trusted analyzed path is still recorded as anchor_file_path"
+        );
+        assert_eq!(
+            ok.metadata.get("detail").map(String::as_str),
+            Some("kept"),
+            "non-reserved plugin metadata is preserved"
         );
     }
 
