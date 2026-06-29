@@ -1639,13 +1639,35 @@ async fn categorisation_shortcuts_are_honest_empty() {
         "find_tests",
         "find_deprecations",
         "find_todos",
-        "high_churn",
     ] {
         let env = call_tool(&state, tool, json!({})).await;
         assert_eq!(env["ok"], true, "{tool}: {env}");
         assert_eq!(env["result"]["page"]["total"], 0, "{tool}: {env}");
         assert_eq!(env["result"]["signal"]["available"], false, "{tool}: {env}");
     }
+}
+
+#[tokio::test]
+async fn high_churn_degrades_honestly_without_warpline() {
+    // `high_churn` now ranks by Warpline's change count at read time. With no
+    // warpline client wired (the default), it degrades to honest-empty with a
+    // warpline-named signal — never empty-as-clean, never a hard error.
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    drop(conn);
+    let state = state_for(project.path(), &db);
+    let env = call_tool(&state, "high_churn", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(
+        env["error"],
+        serde_json::Value::Null,
+        "no hard error: {env}"
+    );
+    assert_eq!(env["result"]["page"]["total"], 0, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert_eq!(env["result"]["signal"]["signal"], "warpline_churn", "{env}");
+    assert_eq!(env["result"]["churn_source"], "warpline", "{env}");
+    assert_eq!(env["result"]["reason"], "warpline-disabled", "{env}");
 }
 
 #[tokio::test]
@@ -1749,7 +1771,11 @@ async fn what_tests_this_returns_test_tagged_callers() {
 }
 
 #[tokio::test]
-async fn recently_changed_is_honest_noop() {
+async fn recently_changed_degrades_honestly_without_warpline() {
+    // `recently_changed` is no longer a no-op: it ranks by Warpline's change
+    // facts at read time. With no warpline client wired (the default), it
+    // degrades to honest-empty with a warpline-named signal (never the old
+    // `git_change_time` no-op note, never empty-as-clean, never a hard error).
     let (project, db, conn) = open_project();
     insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
     drop(conn);
@@ -1761,8 +1787,17 @@ async fn recently_changed_is_honest_noop() {
     )
     .await;
     assert_eq!(env["ok"], true, "{env}");
+    assert_eq!(
+        env["error"],
+        serde_json::Value::Null,
+        "no hard error: {env}"
+    );
     assert_eq!(env["result"]["page"]["total"], 0);
-    assert_eq!(env["result"]["signal"]["signal"], "git_change_time");
+    assert_eq!(env["result"]["signal"]["signal"], "warpline_churn", "{env}");
+    assert_eq!(env["result"]["churn_source"], "warpline", "{env}");
+    assert_eq!(env["result"]["reason"], "warpline-disabled", "{env}");
+    // The `since` argument is echoed back even on the degrade path.
+    assert_eq!(env["result"]["since"], "2026-01-01T00:00:00Z", "{env}");
 }
 
 #[tokio::test]
@@ -2322,9 +2357,15 @@ fn insert_blocked_entity(
 /// (clarion-719e7320f5, A3): `id`, `kind`, `name`, `short_name`,
 /// `source_file_path`, the line span and `content_hash` are PRESENT alongside
 /// the `briefing_blocked` flag, so the entity stays navigable; only the secret
-/// content is withheld, and the cross-tool SEI binding key stays null. The id is
-/// the qualname-bearing locator the caller pasted, so it appears verbatim.
-fn assert_blocked_identity_present(entity: &Value, reason: &str) {
+/// *content* is withheld. The id is the qualname-bearing locator the caller
+/// pasted, so it appears verbatim.
+///
+/// `expected_sei` pins the cross-tool SEI posture (the ADR-034 amendment that
+/// reversed "sei stays null" — see [`blocked_sei`] in loomweave-mcp): `Some(sei)`
+/// when the blocked entity has an alive binding (the SEI rides along, content-free,
+/// so federation siblings can key on it), `None` when it is unbound (graceful-
+/// degrade null, never fabricated).
+fn assert_blocked_identity_present(entity: &Value, reason: &str, expected_sei: Option<&str>) {
     assert_eq!(entity["briefing_blocked"], reason, "block reason: {entity}");
     for field in [
         "id",
@@ -2341,10 +2382,17 @@ fn assert_blocked_identity_present(entity: &Value, reason: &str) {
             "identity field `{field}` must be PRESENT for a blocked entity: {entity}"
         );
     }
-    assert!(
-        entity["sei"].is_null(),
-        "SEI must stay null for a blocked entity (ADR-034): {entity}"
-    );
+    match expected_sei {
+        Some(sei) => assert_eq!(
+            entity["sei"], sei,
+            "bound SEI must ride along for a blocked entity so federation siblings \
+             can key on it (REQ-C-04/ADR-038 + ADR-034 amendment): {entity}"
+        ),
+        None => assert!(
+            entity["sei"].is_null(),
+            "an unbound blocked entity carries null sei, never a fabricated one: {entity}"
+        ),
+    }
     // The secret *content* never appears in the entity projection.
     for leaked in ["summary", "source", "docstring"] {
         assert!(
@@ -2385,7 +2433,7 @@ async fn find_by_kind_redacts_briefing_blocked_identity() {
         .iter()
         .find(|e| e["briefing_blocked"] == "secret_present")
         .expect("blocked entity stub present");
-    assert_blocked_identity_present(blocked, "secret_present");
+    assert_blocked_identity_present(blocked, "secret_present", None);
     // The navigable locator IS exposed now (A3): the identity is not the secret.
     assert_eq!(blocked["id"], "python:function:leaky", "{env}");
 }
@@ -2440,7 +2488,7 @@ async fn search_semantic_redacts_briefing_blocked_identity() {
     assert_eq!(env["ok"], true, "{env}");
     let results = env["result"]["results"].as_array().unwrap();
     assert_eq!(results.len(), 1, "{env}");
-    assert_blocked_identity_present(&results[0]["entity"], "secret_present");
+    assert_blocked_identity_present(&results[0]["entity"], "secret_present", None);
     assert_eq!(results[0]["entity"]["id"], "python:function:login", "{env}");
 }
 
@@ -2473,7 +2521,7 @@ async fn find_by_wardline_redacts_blocked_entity_and_withholds_blob() {
         .iter()
         .find(|e| e["briefing_blocked"] == "secret_present")
         .expect("blocked entity stub present");
-    assert_blocked_identity_present(blocked, "secret_present");
+    assert_blocked_identity_present(blocked, "secret_present", None);
     // The entity's own navigable locator IS exposed now (A3).
     assert_eq!(blocked["id"], "python:function:tainted", "{env}");
     // …but the Wardline taint blob is source-derived *content*, so it stays
@@ -2529,7 +2577,7 @@ async fn coupling_hotspots_blocked_entity_keeps_navigable_identity() {
         .map(|h| &h["entity"])
         .find(|e| e["briefing_blocked"] == "secret_present")
         .expect("blocked hotspot present with identity");
-    assert_blocked_identity_present(blocked, "secret_present");
+    assert_blocked_identity_present(blocked, "secret_present", None);
     assert_eq!(blocked["id"], "python:function:hub", "{env}");
     assert_eq!(blocked["source_file_path"], "hub.py", "{env}");
     assert_eq!(blocked["source_line_start"], 3, "{env}");
@@ -2904,12 +2952,14 @@ async fn entity_resolve_collapses_briefing_blocked_candidate_to_stub() {
     let results = env["result"]["results"].as_array().expect("results array");
     assert_eq!(results[0]["result_kind"], "resolved");
     let candidate = &results[0]["candidates"][0];
-    assert_blocked_identity_present(candidate, "secret_in_source");
-    // The navigable locator IS exposed now (A3); the cross-tool SEI stays null.
+    assert_blocked_identity_present(candidate, "secret_in_source", Some("loomweave:eid:secret"));
+    // The navigable locator AND the content-free cross-tool SEI ride along now
+    // (A3 + ADR-034 amendment) so federation siblings can key on the blocked
+    // entity; only the secret CONTENT stays withheld.
     assert_eq!(candidate["id"], "python:function:secret.handler", "{env}");
-    assert!(
-        !env.to_string().contains("loomweave:eid:secret"),
-        "blocked SEI leaked via entity_resolve: {env}"
+    assert_eq!(
+        candidate["sei"], "loomweave:eid:secret",
+        "blocked entity's SEI must ride along for federation keying: {env}"
     );
 }
 
@@ -3038,15 +3088,20 @@ async fn entity_resolve_collapses_briefing_blocked_rust_candidate_to_stub() {
     let results = env["result"]["results"].as_array().expect("results array");
     assert_eq!(results[0]["result_kind"], "resolved");
     let candidate = &results[0]["candidates"][0];
-    assert_blocked_identity_present(candidate, "secret_in_source");
-    // The navigable locator IS exposed now (A3); the cross-tool SEI stays null.
+    assert_blocked_identity_present(
+        candidate,
+        "secret_in_source",
+        Some("loomweave:eid:rust-secret"),
+    );
+    // The navigable locator AND the content-free cross-tool SEI ride along now
+    // (A3 + ADR-034 amendment); only the secret CONTENT stays withheld.
     assert_eq!(
         candidate["id"], "rust:function:secret.rust_handler",
         "{env}"
     );
-    assert!(
-        !env.to_string().contains("loomweave:eid:rust-secret"),
-        "blocked SEI leaked via entity_resolve: {env}"
+    assert_eq!(
+        candidate["sei"], "loomweave:eid:rust-secret",
+        "blocked entity's SEI must ride along for federation keying: {env}"
     );
 }
 
@@ -3394,13 +3449,14 @@ async fn entity_resolve_blocked_sei_entry_collapses_to_stub() {
     let results = env["result"]["results"].as_array().expect("results array");
     assert_eq!(results[0]["result_kind"], "resolved");
     let candidate = &results[0]["candidates"][0];
-    assert_blocked_identity_present(candidate, "secret_in_source");
-    // The navigable locator IS exposed now (A3); the resolving SEI was the
-    // caller's own input, so it may echo, but the candidate row's SEI is null.
+    assert_blocked_identity_present(candidate, "secret_in_source", Some("loomweave:eid:secret"));
+    // The navigable locator AND the cross-tool SEI ride along now (A3 + ADR-034
+    // amendment); here the candidate's own bound SEI equals the one the caller
+    // resolved by, confirming the durable key round-trips even through the block.
     assert_eq!(candidate["id"], "python:function:secret.handler", "{env}");
-    assert!(
-        candidate["sei"].is_null(),
-        "candidate SEI must be null: {env}"
+    assert_eq!(
+        candidate["sei"], "loomweave:eid:secret",
+        "blocked entity resolved by SEI carries that SEI back: {env}"
     );
 }
 
@@ -3495,11 +3551,15 @@ async fn entity_resolve_ambiguous_with_blocked_candidate_redacts_only_that_candi
     // Sorted python < rust: the python candidate comes first, identity intact…
     assert_eq!(candidates[0]["id"], "python:function:dual.secret");
     // …and the rust one keeps its navigable identity but stays content-redacted.
-    assert_blocked_identity_present(&candidates[1], "secret_in_source");
+    assert_blocked_identity_present(
+        &candidates[1],
+        "secret_in_source",
+        Some("loomweave:eid:dual-secret"),
+    );
     assert_eq!(candidates[1]["id"], "rust:function:dual.secret", "{env}");
-    assert!(
-        !env.to_string().contains("loomweave:eid:dual-secret"),
-        "blocked SEI leaked via ambiguous entity_resolve: {env}"
+    assert_eq!(
+        candidates[1]["sei"], "loomweave:eid:dual-secret",
+        "the blocked ambiguous candidate carries its SEI for federation keying: {env}"
     );
 }
 

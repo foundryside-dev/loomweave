@@ -4,12 +4,13 @@
 > horizon, and why. Sequencing, WSJF scoring, and dated forecasts are produced
 > by `/axiom-program-management`, never here. No dates, no commitments.
 >
-> Bootstrapped 2026-06-11. **Updated: 2026-06-28 (PDR-0006)** — a federation
-> MCP-transport reliability cycle (warpline churn-fill + filigree-mcp seam) ran
-> ahead of the open Now DECIDE; the filigree fix shipped (PR #78 → `main`
-> `b5aabe8`), the warpline churn-fill is in flight (PR #77). The three Now
-> candidates remain on deck, untouched. Prior: 2026-06-26 (PDR-0005). Tracker IDs
-> are Filigree issues.
+> Bootstrapped 2026-06-11. **Updated: 2026-06-29 (PDR-0008)** — the warpline churn
+> keying gap root-caused + fixed loomweave-side (briefing-blocked entities' SEI now
+> rides the read surface; owner-ratified posture reversal; clarion-4b3061b1ac,
+> ADR-034 amendment) → moved to Shipped. Prior same-day: PDR-0007 (stale
+> `weft/legis-conformance` branch disposed → clarion-0715faa9d6); PDR-0006
+> (federation MCP-transport reliability cycle: filigree #78 shipped, warpline #77 in
+> flight). No Now horizon moved. Tracker IDs are Filigree issues.
 
 ## Now — turning over (the `loomweave-llm` extraction shipped)
 
@@ -38,14 +39,14 @@ each with the metric it moves:
 
 ## In flight (this session — federation-transport reliability, PDR-0006)
 
-- **Warpline churn-fill** (PR #77, open vs `main`; branch `feat/warpline-churn-consumer`)
+- **Warpline churn-fill TRANSPORT** (PR #77, open vs `main`; branch `feat/warpline-churn-consumer`)
   — lights up the dead-by-design `entity_high_churn_list` /
   `entity_recent_change_list` surfaces by consuming Warpline's frozen churn read.
   NO-GO transport bug fixed + honesty disclosures (`churn_truncated`,
-  `churn_unresolved`) added; validated live. **Not yet accepted** — accept/merge +
-  the locator-dialect/NULL-sei keying gap (clarion-obs-30c0ef3b0a, undercounts
-  churn at the real operating point) are next-session calls. → moves federation
-  enrichment fidelity / "federation degrades cleanly."
+  `churn_unresolved`) added; validated live. **Still open / not yet accepted** —
+  the transport PR is the remaining in-flight piece. (The keying gap that PR #77
+  disclosed is now FIXED separately — see Shipped.) → moves federation enrichment
+  fidelity / "federation degrades cleanly."
 
 ## In flight (other actors — not this session's work)
 
@@ -57,6 +58,15 @@ each with the metric it moves:
 
 ## Shipped since 2026-06-11 (banked, no longer open bets)
 
+- **Warpline churn keying gap — loomweave-side fix** (clarion-4b3061b1ac, PDR-0008)
+  — branch `fix/briefing-blocked-sei-federation-key` → `main`. loomweave nulled
+  briefing-blocked (secret-bearing) entities' SEI on its MCP read surface, so
+  warpline's `reresolve-sei` couldn't backfill and churn read `0` for those files.
+  Now the content-free SEI rides the blocked-entity projections (owner-ratified
+  posture reversal, ADR-034 2026-06-29 amendment); secret content still withheld;
+  live-proven on lacuna. Deep-pagination half split to clarion-obs-acffc4e8a1
+  (still open). NB: warpline must re-run `reresolve-sei` to heal already-minted
+  NULL rows (warpline-side operational follow-up).
 - **filigree-mcp newline-transport fix** (clarion-a5bfcf5ef9, PDR-0006) — PR #78 →
   `main` `b5aabe8`. Repaired the broken stdio observation-write seam
   (Content-Length → newline JSON-RPC) + bounded timeout + fallback launcher. Last
@@ -86,6 +96,11 @@ each with the metric it moves:
 - Federation-audit G-series gaps (G2 historical-locator resolve
   clarion-3c47f53e99, G10 project selector clarion-c37e1714fd, G14 canonical-JSON
   SEI oracle clarion-9d0e82513c, G16 rename-parser vectors clarion-73dff1d2d1).
+  The shared byte-pinned legis↔loomweave rename-feed conformance golden — the
+  concrete consumer-side realization of G16 — is now tracked as **clarion-0715faa9d6**
+  (PDR-0007; revives the deleted stale `weft/legis-conformance` against the new
+  `/git/rename-feed` shape; the cross-member "vector home" coordination with legis
+  is owner-gated/outward-facing).
 - Shared `weft.toml` key-layout proposal for the hub to bless (clarion-00abdf2fcb).
 - Wardline handoff for Amendments 4–9 corpus re-vendor (prepared, not pushed;
   **escalation-gated — outward-facing**, see `current-state.md`).
