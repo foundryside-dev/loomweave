@@ -1,8 +1,8 @@
 # Loomweave — Current State (resume brief)
 
-> Refreshed at checkpoint **2026-06-29**. Next session: start here, then
-> `vision.md` (grant), `roadmap.md` + `metrics.md`, then reconcile the tracker
-> IDs below against Filigree.
+> Refreshed **2026-06-29** (PDR-0008 — warpline keying-gap fix shipped). Next
+> session: start here, then `vision.md` (grant), `roadmap.md` + `metrics.md`, then
+> reconcile the tracker IDs below against Filigree.
 
 ## The bet right now
 
@@ -22,16 +22,27 @@ remain on deck, untouched** (roadmap.md):
 
 ## In flight (tracker authoritative for status)
 
-- **Warpline churn-fill — PR #77, OPEN vs `main`** (branch `feat/warpline-churn-consumer`).
+- **Warpline churn-fill TRANSPORT — PR #77, OPEN vs `main`** (branch `feat/warpline-churn-consumer`).
   Lights up the dead `entity_high_churn_list` / `entity_recent_change_list`
   surfaces via Warpline's churn read. NO-GO transport bug fixed; honesty
   disclosures (`churn_truncated`, `churn_unresolved`) added; validated live on
-  lacuna. **Not yet accepted** — accept/merge + the keying gap are next-session calls.
+  lacuna. **Not yet accepted** — accept/merge is the remaining call. (The keying
+  gap it disclosed is now FIXED + merged — see "Decided/shipped" below.)
 - **ADR-054 Rust reachability-root tags** (clarion-05fdd0490e, `building`,
   assignee `claude`, **a concurrent actor** — not this owner-session). Do not grab it.
 
 ## Decided this session (2026-06-29)
 
+- **PDR-0008** — **warpline churn keying gap root-caused + FIXED** (merged to `main`).
+  Root cause was loomweave nulling briefing-blocked (secret-bearing) entities' SEI
+  on its MCP read surface (NOT the dialect mismatch the observation guessed), which
+  defeated warpline's `reresolve-sei` backfill → churn `0` for those files. Fix:
+  the content-free SEI now rides the blocked-entity projections via a `blocked_sei`
+  helper (owner-ratified secret-handling posture reversal; ADR-034 2026-06-29
+  amendment); secret content still withheld; live-proven on lacuna. Issue
+  clarion-4b3061b1ac (closed by merge); deep-pagination half split to
+  clarion-obs-acffc4e8a1. **Warpline-side follow-up:** re-run `reresolve-sei` to
+  heal already-minted NULL `entity_keys.sei` rows.
 - **PDR-0007** — disposed of the stale `weft/legis-conformance` branch (orphaned,
   no PR; tested the deleted `parse_legis_rename_json` against the pre-#73
   `/git/renames` shape → won't compile). Deleted it (owner-authorized); carried its
@@ -57,11 +68,11 @@ remain on deck, untouched** (roadmap.md):
    its keying gap, **or** DECIDE a new Now from the three candidates. (DECIDE has
    not run since 2026-06-26.)
 2. **Fresh north-star successor target** (collision target met; candidate identified).
-3. **Warpline keying gap** (clarion-obs-30c0ef3b0a) — loomweave↔warpline
-   locator-dialect + NULL-sei mismatch undercounts churn at the real operating
-   point (disclosed via `churn_unresolved`, not silent). **Observation expires
-   ~2026-07-12** — promote to a tracked issue or dismiss before then. Closing it
-   likely needs a cross-product (warpline-side) change → would escalate.
+3. ~~Warpline keying gap (clarion-obs-30c0ef3b0a)~~ — **RESOLVED 2026-06-29
+   (PDR-0008).** Root cause was loomweave-side (briefing-blocked SEI nulled), fixed
+   + merged (clarion-4b3061b1ac). Remaining: (a) **warpline-side** — re-run
+   `reresolve-sei` to heal already-minted NULL rows (operational, cross-product);
+   (b) deep-pagination half now tracked as clarion-obs-acffc4e8a1 (open).
 4. **`tools/list` byte budget** — re-measure; may be breached.
 5. **Adoption metric** — still undecided; telemetry is escalation-gated (local-first).
 6. **ESCALATION (carried, outward-facing, gated):** Wardline Amendments 4–9 corpus
