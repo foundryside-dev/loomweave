@@ -1,7 +1,8 @@
 # Loomweave — Metrics
 
-> Bootstrapped 2026-06-11. **Updated 2026-06-28** (checkpoint). Baselines are
-> real observed readings; targets are falsifiable (a number/boolean and a date).
+> Bootstrapped 2026-06-11. **Updated 2026-06-29** (checkpoint — PR #79 CI-floor
+> reading; wardline-drift CI blind spot recurred). Baselines are real observed
+> readings; targets are falsifiable (a number/boolean and a date).
 
 ## North star
 
@@ -61,6 +62,16 @@ found by the adversarial 4-corpus QA sweep.
      walking-skeleton). 131 loomweave-federation tests green locally; fmt + clippy
      (-D warnings, federation/mcp/cli) + cargo doc clean. (Scoped verification — the
      federation crate + downstream; not a full-workspace nextest this session.)
+   - `READING (2026-06-29): GREEN on PR #79` — the briefing-blocked SEI fix
+     (PDR-0008) merged to `main` `a980ef2`; all 4 CI checks pass (Rust + Rust
+     aarch64 + Python + Sprint-1 e2e). Locally: fmt + workspace clippy (-D warnings)
+     + cargo doc (-D warnings) clean; nextest **1972/1973**. **The CI blind-spot
+     caveat above FIRED this session:** the lone local failure was
+     `wardline_taint_fact_conformance_oracle` (vendored golden drifted from the live
+     `~/wardline` sibling — a taint-fingerprint diff), exactly the
+     local-red / CI-green divergence flagged 2026-06-26. It has now **recurred** →
+     per that reading's own trigger, promote clarion-72e1c1a07d to a real guardrail
+     (the vendored-golden drift needs a CI-visible check or a re-vendor cadence).
    - `TARGET: green on every release/merge — standing, no end date`
 3. **MCP context tax under budget**: `tools/list` payload has a CI-enforced
    22,000-byte budget.

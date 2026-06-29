@@ -46,17 +46,28 @@ The warpline churn-fill (transport **and** keying gap) has now shipped — see
   intent forward as **clarion-0715faa9d6** (rewrite the shared rename-feed
   conformance golden against the new shape). Obsolete commit `9c30ce0` preserved in
   the issue.
-- **Repo hygiene:** 7 merged remote branches deleted (PRs #53/#54/#74/#75/#76/#78
-  + the stale legis branch); only `feat/warpline-churn-consumer` (open PR #77) plus
-  historical (`rc4`, `rename/clarion-to-loomweave`) and auto-managed
-  (`dependabot/*`) branches remain. Resolves the prior checkpoint's open-question #7.
+- **This-session housekeeping (execution of PDR-0008, not new decisions):**
+  PR #77 (warpline transport) merged to `main` `1d2b4fa` by the owner/Bid-1 flow,
+  concurrent with the keying-gap work; the merged `feat/warpline-churn-consumer`
+  (#77) + `fix/briefing-blocked-sei-federation-key` (#79) remote branches deleted +
+  local refs pruned (incl. the disposed `weft/legis-conformance` leftover); stale
+  "#77 open" product docs corrected on `main` `a138d9a`; the fixed `loomweave`
+  binary rebuilt from `main` and atomically installed into the local uv tool
+  (hash `bc4f162b`), live-verified to expose the blocked-entity SEI. Remote now:
+  `main` + historical (`rc4`, `rename/clarion-to-loomweave`) + auto-managed
+  `dependabot/*` only.
 
 ## Metric signals
 
-- **No new readings this session** (cleanup + investigation only — no CI runs or
-  sweeps). Carried unchanged from 2026-06-28: CI floor GREEN on PR #78;
-  federation MCP-transport correctness = 0 mis-framed stdio clients; north-star
-  (open collision families) = 0, not re-swept. See `metrics.md`.
+- **CI floor GREEN on PR #79** (`a980ef2`): all 4 CI checks (Rust + aarch64 +
+  Python + Sprint-1 e2e); locally fmt + workspace clippy (-D warnings) + doc clean,
+  nextest **1972/1973**. See `metrics.md`.
+- **CI blind spot RECURRED:** the lone local nextest failure was
+  `wardline_taint_fact_conformance_oracle` (vendored golden drifted from live
+  `~/wardline`) — the local-red/CI-green divergence flagged 2026-06-26, now
+  recurred → **promote clarion-72e1c1a07d to a guardrail** (new open question).
+- North-star (open collision families) = 0, **not re-swept** (this was federation
+  correctness, not graph identity — no identity/extraction code touched).
 - **`tools/list` 22 KB budget** — still UNKNOWN, carried from 2026-06-24; not re-measured.
 
 ## Open questions / awaiting owner
@@ -71,6 +82,11 @@ The warpline churn-fill (transport **and** keying gap) has now shipped — see
    `reresolve-sei` to heal already-minted NULL rows (operational, cross-product);
    (b) deep-pagination half now tracked as clarion-obs-acffc4e8a1 (open).
 4. **`tools/list` byte budget** — re-measure; may be breached.
+4b. **Promote clarion-72e1c1a07d to a guardrail (NEW, 2026-06-29).** The
+   `wardline_taint_fact_conformance_oracle` local-red/CI-green divergence (vendored
+   golden drifts from live `~/wardline`) has now recurred (flagged 2026-06-26, fired
+   2026-06-29) — its own trigger says promote on recurrence. Needs a CI-visible
+   check or a re-vendor cadence so a sibling drift can't pass CI.
 5. **Adoption metric** — still undecided; telemetry is escalation-gated (local-first).
 6. **ESCALATION (carried, outward-facing, gated):** Wardline Amendments 4–9 corpus
    re-vendor handoff — prepared, not pushed. Do not push without owner sign-off.
@@ -85,6 +101,8 @@ The warpline churn-fill (transport **and** keying gap) has now shipped — see
 
 ## Where the next session starts
 
-1. **DECIDE:** resolve open question 1 — either accept/merge warpline #77 (+ plan
-   the keying-gap fix) or pick a new Now from the three candidates. Then set the
-   north-star successor target, and DISPATCH (PRD + plan) as usual.
+1. **DECIDE a new Now** (the warpline work is fully shipped, so the field is the
+   three recorded candidates: incremental-analyze correctness cluster /
+   per-provider split / B.4\* perf). Set the north-star successor target, then
+   DISPATCH (PRD + plan). The wardline-drift guardrail (open question 4b) is a
+   cheap, in-grant pickup if a smaller bite is wanted first.
