@@ -1,7 +1,7 @@
 [plugin]
 name = "loomweave-plugin-rust"
 plugin_id = "rust"
-version = "1.3.1"
+version = "1.4.0"
 protocol_version = "1.0"
 # Bare basename per ADR-021 — the host refuses any path component. This is the
 # DISCOVERY name; the cargo artifact is `loomweave-rust-plugin` (off-glob).
