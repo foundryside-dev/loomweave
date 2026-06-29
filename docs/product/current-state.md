@@ -17,17 +17,14 @@ remain on deck, untouched** (roadmap.md):
 2. **Per-provider split** (clarion-4328c5c757) — unblocked by the loomweave-llm extraction.
 3. **B.4\* analyze 24× perf regression** (clarion-c20593d0d8, triage).
 
-…OR the next DECIDE may instead **accept/merge the in-flight warpline churn-fill**
-(PR #77) and close its keying gap. That choice is the first open question below.
+The warpline churn-fill (transport **and** keying gap) has now shipped — see
+"Decided/shipped" below — so it is no longer a DECIDE candidate.
 
 ## In flight (tracker authoritative for status)
 
-- **Warpline churn-fill TRANSPORT — PR #77, OPEN vs `main`** (branch `feat/warpline-churn-consumer`).
-  Lights up the dead `entity_high_churn_list` / `entity_recent_change_list`
-  surfaces via Warpline's churn read. NO-GO transport bug fixed; honesty
-  disclosures (`churn_truncated`, `churn_unresolved`) added; validated live on
-  lacuna. **Not yet accepted** — accept/merge is the remaining call. (The keying
-  gap it disclosed is now FIXED + merged — see "Decided/shipped" below.)
+- **(none of this owner-session's)** — both warpline pieces merged (PR #77 transport
+  `1d2b4fa`; PR #79 keying-gap fix `a980ef2`). The federation-transport cycle
+  (PDR-0006) and its keying-gap follow-up (PDR-0008) are fully banked.
 - **ADR-054 Rust reachability-root tags** (clarion-05fdd0490e, `building`,
   assignee `claude`, **a concurrent actor** — not this owner-session). Do not grab it.
 
@@ -64,9 +61,9 @@ remain on deck, untouched** (roadmap.md):
 
 ## Open questions / awaiting owner
 
-1. **Next Now:** accept/merge the in-flight warpline churn-fill (PR #77) and close
-   its keying gap, **or** DECIDE a new Now from the three candidates. (DECIDE has
-   not run since 2026-06-26.)
+1. **Next Now:** DECIDE a new Now from the three candidates (warpline churn-fill +
+   its keying gap have now SHIPPED, so they are no longer a candidate). DECIDE has
+   not run since 2026-06-26.
 2. **Fresh north-star successor target** (collision target met; candidate identified).
 3. ~~Warpline keying gap (clarion-obs-30c0ef3b0a)~~ — **RESOLVED 2026-06-29
    (PDR-0008).** Root cause was loomweave-side (briefing-blocked SEI nulled), fixed

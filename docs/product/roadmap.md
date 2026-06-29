@@ -37,17 +37,6 @@ each with the metric it moves:
 - **B.4\* analyze wall-time 24× regression** on elspeth_mini (clarion-c20593d0d8,
   triage) — bears on the "graph fast enough to prefer over grep" north-star.
 
-## In flight (this session — federation-transport reliability, PDR-0006)
-
-- **Warpline churn-fill TRANSPORT** (PR #77, open vs `main`; branch `feat/warpline-churn-consumer`)
-  — lights up the dead-by-design `entity_high_churn_list` /
-  `entity_recent_change_list` surfaces by consuming Warpline's frozen churn read.
-  NO-GO transport bug fixed + honesty disclosures (`churn_truncated`,
-  `churn_unresolved`) added; validated live. **Still open / not yet accepted** —
-  the transport PR is the remaining in-flight piece. (The keying gap that PR #77
-  disclosed is now FIXED separately — see Shipped.) → moves federation enrichment
-  fidelity / "federation degrades cleanly."
-
 ## In flight (other actors — not this session's work)
 
 - **ADR-054 Rust reachability-root tags** (clarion-05fdd0490e, `building`,
@@ -58,6 +47,12 @@ each with the metric it moves:
 
 ## Shipped since 2026-06-11 (banked, no longer open bets)
 
+- **Warpline churn-fill TRANSPORT** (PR #77, PDR-0006) — merged to `main` `1d2b4fa`
+  (2026-06-29). Lights up the dead-by-design `entity_high_churn_list` /
+  `entity_recent_change_list` surfaces by consuming Warpline's frozen churn read:
+  newline JSON-RPC + `warpline-mcp` launcher + bounded timeout + honesty
+  disclosures (`churn_truncated`, `churn_unresolved`). → federation enrichment
+  fidelity. (Merged by the owner/Bid-1 flow concurrent with the keying-gap work.)
 - **Warpline churn keying gap — loomweave-side fix** (clarion-4b3061b1ac, PDR-0008)
   — branch `fix/briefing-blocked-sei-federation-key` → `main`. loomweave nulled
   briefing-blocked (secret-bearing) entities' SEI on its MCP read surface, so
