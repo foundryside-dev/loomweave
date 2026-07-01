@@ -44,7 +44,7 @@ jobs:
         # Pin the Pages source to GitHub Actions (build_type=workflow); enables
         # Pages if needed. Without this, deploy-pages fails when the repo is
         # still set to "Deploy from a branch".
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
         with:
           enablement: true
 
