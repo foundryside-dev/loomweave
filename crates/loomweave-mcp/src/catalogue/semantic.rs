@@ -9,7 +9,7 @@
 //! considered, so stale vectors never surface (freshness, like the summary
 //! cache).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Value, json};
 
@@ -17,7 +17,7 @@ use loomweave_storage::{EmbeddingStore, embeddings_db_path, entity_by_id};
 
 use crate::ParamError;
 use crate::ServerState;
-use crate::catalogue::{Page, RawScope, missing_signal};
+use crate::catalogue::{Page, RawScope, catalogue_summary, missing_signal};
 use crate::{
     entity_json, flatten_storage_envelope_result, required_str, success_envelope,
     tool_error_envelope,
@@ -47,10 +47,20 @@ impl ServerState {
             .as_ref()
             .filter(|state| state.config.enabled)
         else {
+            let summary = catalogue_summary(
+                0,
+                0,
+                false,
+                "low",
+                json!({"by_kind": {}, "semantic_vectors": 0}),
+                Some("semantic search is not enabled"),
+                Some("configure semantic search provider or use structural filters"),
+            );
             return Ok(success_envelope(json!({
                 "result_kind": "not_enabled",
                 "results": [],
                 "page": { "total": 0, "offset": 0, "limit": 0, "returned": 0, "truncated": false },
+                "summary": summary,
                 "signal": missing_signal(
                     "semantic_search",
                     "semantic search is not enabled (semantic_search.enabled=false) or no embedding \
@@ -159,6 +169,12 @@ fn rank_semantic(
     });
 
     let total = scored.len();
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    for (id, _) in &scored {
+        if let Some(entity) = entity_by_id(conn, id)? {
+            *by_kind.entry(entity.kind).or_insert(0) += 1;
+        }
+    }
     let returned: Vec<(String, f32)> = scored
         .into_iter()
         .skip(page.offset)
@@ -177,6 +193,29 @@ fn rank_semantic(
             json!({ "entity": entity, "score": score })
         })
         .collect();
+    let confidence = format!("semantic:model:{model_id}");
+    let summary = catalogue_summary(
+        total,
+        returned_count,
+        truncated,
+        &confidence,
+        json!({
+            "by_kind": by_kind,
+            "semantic_vectors": total,
+        }),
+        if scan_truncated {
+            Some("semantic vector scan truncated")
+        } else if scope_truncated {
+            Some("scope resolution truncated")
+        } else {
+            None
+        },
+        if scan_truncated || scope_truncated {
+            Some("rerun analyze or narrow the semantic search scope")
+        } else {
+            None
+        },
+    );
 
     Ok(success_envelope(json!({
         "result_kind": "ranked",
@@ -189,6 +228,7 @@ fn rank_semantic(
             "returned": returned_count,
             "truncated": truncated,
         },
+        "summary": summary,
         "scope_truncated": scope_truncated,
         "scan_truncated": scan_truncated,
     })))

@@ -28,7 +28,7 @@ mod inspection;
 mod semantic;
 mod shortcuts;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::{Value, json};
 
@@ -86,6 +86,39 @@ pub(crate) fn paginate<T: Clone>(rows: &[T], page: Page) -> (Vec<T>, Value) {
     (slice, meta)
 }
 
+/// Build the C-16 lead summary block shared by catalogue list tools.
+pub(crate) fn catalogue_summary(
+    total: usize,
+    returned: usize,
+    truncated: bool,
+    confidence: &str,
+    counts: Value,
+    partial_reason: Option<&str>,
+    recovery_action: Option<&str>,
+) -> Value {
+    let advisory = if let Some(reason) = partial_reason {
+        json!({
+            "reason": reason,
+            "action": recovery_action.unwrap_or("narrow the query or refresh the relevant source signal"),
+        })
+    } else if truncated {
+        json!({
+            "reason": "page truncated",
+            "action": recovery_action.unwrap_or("request the next page with offset + returned or narrow filters"),
+        })
+    } else {
+        Value::Null
+    };
+    json!({
+        "total": total,
+        "returned": returned,
+        "completeness": if truncated || partial_reason.is_some() { "partial" } else { "complete" },
+        "confidence": confidence,
+        "counts": counts,
+        "advisory": advisory,
+    })
+}
+
 /// Filter materialised `candidates` by `scope`, paginate, and render
 /// SEI-bearing entity rows (via [`crate::entity_json`]) with bounded-response
 /// metadata (`page.total`/`returned`/`truncated`, plus `scope_truncated` and
@@ -104,6 +137,14 @@ pub(crate) fn finalize_entity_page(
         .filter(|e| scope.contains(&e.id, e.source_file_path.as_deref(), project_root))
         .collect();
     let total = in_scope.len();
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    let mut withheld = 0usize;
+    for entity in &in_scope {
+        *by_kind.entry(entity.kind.clone()).or_insert(0) += 1;
+        if crate::briefing_block_reason(entity).is_some() {
+            withheld += 1;
+        }
+    }
     let returned: Vec<loomweave_storage::EntityRow> = in_scope
         .into_iter()
         .skip(page.offset)
@@ -115,6 +156,40 @@ pub(crate) fn finalize_entity_page(
         .iter()
         .map(|e| crate::entity_json(conn, e))
         .collect();
+    let scope_truncated = scope.scope_truncated();
+    let counts = json!({
+        "by_kind": by_kind,
+        "withheld": withheld,
+    });
+    let partial_reason = if scan_truncated {
+        Some("scan truncated")
+    } else if scope_truncated {
+        Some("scope resolution truncated")
+    } else if withheld > 0 {
+        Some("briefing context withheld content for one or more result(s)")
+    } else {
+        None
+    };
+    let recovery_action = if withheld > 0 {
+        Some("request an authorized briefing context or narrow the query to visible scopes")
+    } else if scan_truncated || scope_truncated {
+        Some("rerun analysis with narrower scope or refresh the index")
+    } else {
+        None
+    };
+    let summary = catalogue_summary(
+        total,
+        returned_count,
+        truncated,
+        if scan_truncated || scope_truncated {
+            "low"
+        } else {
+            "moderate"
+        },
+        counts,
+        partial_reason,
+        recovery_action,
+    );
     json!({
         "entities": entities,
         "page": {
@@ -124,7 +199,8 @@ pub(crate) fn finalize_entity_page(
             "returned": returned_count,
             "truncated": truncated,
         },
-        "scope_truncated": scope.scope_truncated(),
+        "summary": summary,
+        "scope_truncated": scope_truncated,
         "scan_truncated": scan_truncated,
     })
 }
@@ -540,5 +616,64 @@ mod tests {
         assert_eq!(slice, vec![8, 9]);
         assert_eq!(meta["truncated"], false);
         assert_eq!(meta["returned"], 2);
+    }
+
+    #[test]
+    fn catalogue_summary_reports_complete_page_without_advisory() {
+        let summary = catalogue_summary(
+            3,
+            3,
+            false,
+            "high",
+            json!({"by_kind": {"function": 3}}),
+            None,
+            None,
+        );
+
+        assert_eq!(summary["total"], 3);
+        assert_eq!(summary["returned"], 3);
+        assert_eq!(summary["completeness"], "complete");
+        assert_eq!(summary["confidence"], "high");
+        assert_eq!(summary["counts"]["by_kind"]["function"], 3);
+        assert!(summary["advisory"].is_null());
+    }
+
+    #[test]
+    fn catalogue_summary_reports_truncated_page_with_offset_action() {
+        let summary = catalogue_summary(10, 3, true, "moderate", json!({}), None, None);
+
+        assert_eq!(summary["completeness"], "partial");
+        assert_eq!(summary["advisory"]["reason"], "page truncated");
+        assert!(
+            summary["advisory"]["action"]
+                .as_str()
+                .expect("advisory action")
+                .contains("offset")
+        );
+    }
+
+    #[test]
+    fn catalogue_summary_reports_recovery_for_low_confidence_or_withheld() {
+        let summary = catalogue_summary(
+            5,
+            5,
+            false,
+            "low",
+            json!({"withheld": 2}),
+            Some("briefing context withheld 2 result(s)"),
+            Some("request an authorized briefing context or narrow the query to visible scopes"),
+        );
+
+        assert_eq!(summary["completeness"], "partial");
+        assert_eq!(
+            summary["advisory"]["reason"],
+            "briefing context withheld 2 result(s)"
+        );
+        assert!(
+            summary["advisory"]["action"]
+                .as_str()
+                .expect("advisory action")
+                .contains("briefing context")
+        );
     }
 }

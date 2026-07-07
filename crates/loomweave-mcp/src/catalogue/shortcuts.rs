@@ -22,7 +22,9 @@ use loomweave_storage::{
 
 use crate::ParamError;
 use crate::ServerState;
-use crate::catalogue::{Page, RawScope, ScopeFilter, finalize_entity_page, missing_signal};
+use crate::catalogue::{
+    Page, RawScope, ScopeFilter, catalogue_summary, finalize_entity_page, missing_signal,
+};
 use crate::warpline::{ChurnCountResponse, WarplineEntityRef};
 use crate::{
     entity_json, flatten_storage_envelope_result, optional_bool, optional_confidence,
@@ -204,6 +206,11 @@ impl ServerState {
 
                 let cycles = strongly_connected_cycles(&adjacency);
                 let total = cycles.len();
+                let modules_in_cycles = cycles
+                    .iter()
+                    .flat_map(|members| members.iter())
+                    .collect::<HashSet<_>>()
+                    .len();
                 let returned: Vec<Vec<String>> = cycles
                     .into_iter()
                     .skip(page.offset)
@@ -225,6 +232,28 @@ impl ServerState {
                         json!({ "length": members.len(), "members": entities })
                     })
                     .collect();
+                let summary = catalogue_summary(
+                    total,
+                    returned_count,
+                    truncated,
+                    confidence.as_str(),
+                    json!({
+                        "cycles": total,
+                        "modules_in_cycles": modules_in_cycles,
+                    }),
+                    if scan_truncated {
+                        Some("scan truncated")
+                    } else if scope_truncated {
+                        Some("scope resolution truncated")
+                    } else {
+                        None
+                    },
+                    if scan_truncated || scope_truncated {
+                        Some("rerun analysis with narrower scope or refresh the index")
+                    } else {
+                        None
+                    },
+                );
 
                 Ok(success_envelope(json!({
                     "cycles": cycles_json,
@@ -236,6 +265,7 @@ impl ServerState {
                         "returned": returned_count,
                         "truncated": truncated,
                     },
+                    "summary": summary,
                     "scope_truncated": scope_truncated,
                     "scan_truncated": scan_truncated,
                 })))
@@ -283,6 +313,16 @@ impl ServerState {
                 ranked.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
 
                 let total = ranked.len();
+                let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+                let mut withheld = 0usize;
+                for (id, _, _) in &ranked {
+                    if let Some(entity) = entity_by_id(conn, id)? {
+                        *by_kind.entry(entity.kind.clone()).or_insert(0) += 1;
+                        if crate::briefing_block_reason(&entity).is_some() {
+                            withheld += 1;
+                        }
+                    }
+                }
                 let returned: Vec<(String, i64, i64)> = ranked
                     .into_iter()
                     .skip(page.offset)
@@ -306,6 +346,32 @@ impl ServerState {
                         })
                     })
                     .collect();
+                let summary = catalogue_summary(
+                    total,
+                    returned_count,
+                    truncated,
+                    confidence.as_str(),
+                    json!({
+                        "ranked": total,
+                        "returned": returned_count,
+                        "by_kind": by_kind,
+                        "withheld": withheld,
+                    }),
+                    if scope_truncated {
+                        Some("scope resolution truncated")
+                    } else if withheld > 0 {
+                        Some("briefing context withheld content for one or more result(s)")
+                    } else {
+                        None
+                    },
+                    if scope_truncated {
+                        Some("rerun analysis with narrower scope or refresh the index")
+                    } else if withheld > 0 {
+                        Some("request an authorized briefing context or narrow the query to visible scopes")
+                    } else {
+                        None
+                    },
+                );
 
                 Ok(success_envelope(json!({
                     "hotspots": hotspots,
@@ -318,6 +384,7 @@ impl ServerState {
                         "returned": returned_count,
                         "truncated": truncated,
                     },
+                    "summary": summary,
                     "scope_truncated": scope_truncated,
                 })))
             })
@@ -1118,6 +1185,17 @@ fn rank_and_finalize_churn(
         }
         if let Some((total, counted)) = partial {
             let uncounted = total.saturating_sub(counted).max(0);
+            if let Some(summary) = object.get_mut("summary").and_then(Value::as_object_mut) {
+                summary.insert("completeness".to_owned(), json!("partial"));
+                summary.insert("confidence".to_owned(), json!("low"));
+                summary.insert(
+                    "advisory".to_owned(),
+                    json!({
+                        "reason": "warpline churn read truncated",
+                        "action": "narrow `scope` for exact counts; complete over-cap coverage requires the Warpline overflow artifact",
+                    }),
+                );
+            }
             object.insert(
                 "churn_truncated".to_owned(),
                 json!({

@@ -537,6 +537,17 @@ async fn findings_for_paginates_with_total_and_truncated() {
     assert_eq!(env["result"]["page"]["total"], 5, "{env}");
     assert_eq!(env["result"]["page"]["returned"], 2);
     assert_eq!(env["result"]["page"]["truncated"], true);
+    assert_eq!(env["result"]["summary"]["total"], 5);
+    assert_eq!(env["result"]["summary"]["returned"], 2);
+    assert_eq!(env["result"]["summary"]["completeness"], "partial");
+    assert_eq!(env["result"]["summary"]["counts"]["by_kind"]["defect"], 5);
+    assert_eq!(env["result"]["summary"]["counts"]["by_status"]["open"], 5);
+    assert!(
+        env["result"]["summary"]["advisory"]["action"]
+            .as_str()
+            .unwrap()
+            .contains("offset")
+    );
     assert_eq!(env["result"]["findings"].as_array().unwrap().len(), 2);
 }
 
@@ -860,6 +871,23 @@ async fn project_finding_list_filters_and_paginates() {
     assert_eq!(env["result"]["page"]["total"], 6, "{env}");
     assert_eq!(env["result"]["page"]["returned"], 2, "{env}");
     assert_eq!(env["result"]["page"]["truncated"], true, "{env}");
+    assert_eq!(env["result"]["summary"]["total"], 6, "{env}");
+    assert_eq!(env["result"]["summary"]["returned"], 2, "{env}");
+    assert_eq!(env["result"]["summary"]["completeness"], "partial", "{env}");
+    assert_eq!(
+        env["result"]["summary"]["counts"]["by_kind"]["defect"], 6,
+        "{env}"
+    );
+    assert_eq!(
+        env["result"]["summary"]["counts"]["by_status"]["open"], 6,
+        "{env}"
+    );
+    assert!(
+        env["result"]["summary"]["advisory"]["action"]
+            .as_str()
+            .unwrap()
+            .contains("offset")
+    );
 }
 
 // ---- guidance_for -------------------------------------------------------
@@ -1105,6 +1133,15 @@ async fn find_by_kind_paginates_with_total_and_truncated() {
     assert_eq!(env["result"]["page"]["total"], 5, "{env}");
     assert_eq!(env["result"]["page"]["returned"], 2);
     assert_eq!(env["result"]["page"]["truncated"], true);
+    assert_eq!(
+        env["result"]["summary"]["total"],
+        env["result"]["page"]["total"]
+    );
+    assert_eq!(
+        env["result"]["summary"]["counts"]["by_kind"]["function"],
+        env["result"]["page"]["total"]
+    );
+    assert_eq!(env["result"]["summary"]["completeness"], "partial");
 }
 
 #[tokio::test]
@@ -1981,14 +2018,46 @@ async fn find_circular_imports_detects_a_cycle() {
         "python:module:c",
         "resolved",
     );
+    insert_entity(&conn, "python:module:d", "module", "d.py", Some((1, 5)));
+    insert_entity(&conn, "python:module:e", "module", "e.py", Some((1, 5)));
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:d",
+        "python:module:e",
+        "resolved",
+    );
+    insert_edge(
+        &conn,
+        "imports",
+        "python:module:e",
+        "python:module:d",
+        "resolved",
+    );
     drop(conn);
     let state = state_for(project.path(), &db);
 
-    let env = call_tool(&state, "find_circular_imports", json!({})).await;
+    let env = call_tool(&state, "find_circular_imports", json!({"limit": 1})).await;
     assert_eq!(env["ok"], true, "{env}");
-    assert_eq!(env["result"]["page"]["total"], 1, "{env}");
+    assert_eq!(env["result"]["page"]["total"], 2, "{env}");
+    assert_eq!(env["result"]["page"]["returned"], 1, "{env}");
+    assert_eq!(env["result"]["page"]["truncated"], true, "{env}");
     assert_eq!(env["result"]["cycles"][0]["length"], 2);
     assert_eq!(env["result"]["confidence"], "resolved");
+    assert_eq!(env["result"]["summary"]["total"], 2, "{env}");
+    assert_eq!(env["result"]["summary"]["returned"], 1, "{env}");
+    assert_eq!(env["result"]["summary"]["counts"]["cycles"], 2, "{env}");
+    assert_eq!(
+        env["result"]["summary"]["counts"]["modules_in_cycles"], 4,
+        "{env}"
+    );
+    assert_eq!(env["result"]["summary"]["completeness"], "partial", "{env}");
+    assert!(
+        env["result"]["summary"]["advisory"]["action"]
+            .as_str()
+            .unwrap()
+            .contains("offset")
+    );
     // members carry sei
     assert!(
         env["result"]["cycles"][0]["members"][0]
@@ -2141,13 +2210,25 @@ async fn find_coupling_hotspots_ranks_by_fan_in_plus_out() {
     drop(conn);
     let state = state_for(project.path(), &db);
 
-    let env = call_tool(&state, "find_coupling_hotspots", json!({})).await;
+    let env = call_tool(&state, "find_coupling_hotspots", json!({"limit": 1})).await;
     assert_eq!(env["ok"], true, "{env}");
     let top = &env["result"]["hotspots"][0];
     assert_eq!(top["entity"]["id"], "python:function:hub", "{env}");
     assert_eq!(top["fan_in"], 3);
     assert_eq!(top["fan_out"], 1);
     assert_eq!(top["coupling"], 4);
+    assert_eq!(env["result"]["page"]["returned"], 1, "{env}");
+    assert_eq!(env["result"]["page"]["truncated"], true, "{env}");
+    assert_eq!(
+        env["result"]["summary"]["total"], env["result"]["page"]["total"],
+        "{env}"
+    );
+    assert_eq!(env["result"]["summary"]["returned"], 1, "{env}");
+    assert_eq!(
+        env["result"]["summary"]["counts"]["ranked"], env["result"]["page"]["total"],
+        "{env}"
+    );
+    assert_eq!(env["result"]["summary"]["completeness"], "partial", "{env}");
     assert!(top["entity"].get("sei").is_some());
 }
 
@@ -2722,6 +2803,16 @@ async fn find_dead_code_flags_unreachable_and_spares_live() {
         candidate["entity"]["sei"].is_null() || candidate["entity"]["sei"].is_string(),
         "candidate carries an sei field: {env}"
     );
+    assert!(
+        env["result"]["summary"]["dead_candidates"].is_number(),
+        "{env}"
+    );
+    assert!(env["result"]["summary"]["confidence"].is_string(), "{env}");
+    assert!(
+        env["result"]["summary"]["advisory"].is_string()
+            || env["result"]["summary"]["advisory"].is_null(),
+        "{env}"
+    );
 }
 
 // clarion-bf496d55d1 §4.2: a Wardline-derived trust-boundary tag
@@ -2835,6 +2926,10 @@ async fn search_semantic_disabled_returns_not_enabled() {
     assert_eq!(env["ok"], true, "{env}");
     assert_eq!(env["result"]["result_kind"], "not_enabled", "{env}");
     assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+    assert_eq!(env["result"]["summary"]["total"], 0, "{env}");
+    assert_eq!(env["result"]["summary"]["returned"], 0, "{env}");
+    assert_eq!(env["result"]["summary"]["completeness"], "partial", "{env}");
+    assert_eq!(env["result"]["summary"]["confidence"], "low", "{env}");
     assert!(
         env["result"]["results"].as_array().unwrap().is_empty(),
         "{env}"
@@ -2928,6 +3023,16 @@ async fn search_semantic_ranks_by_cosine_similarity() {
     let results = env["result"]["results"].as_array().unwrap();
     // stale (content_hash mismatch) is excluded; login + add remain.
     assert_eq!(results.len(), 2, "{env}");
+    assert_eq!(env["result"]["summary"]["total"], 2, "{env}");
+    assert_eq!(env["result"]["summary"]["returned"], 2, "{env}");
+    assert_eq!(
+        env["result"]["summary"]["completeness"], "complete",
+        "{env}"
+    );
+    assert_eq!(
+        env["result"]["summary"]["confidence"], "semantic:model:rec-model",
+        "{env}"
+    );
     assert_eq!(results[0]["entity"]["id"], "python:function:login", "{env}");
     assert!(
         results[0]["score"].as_f64().unwrap() > results[1]["score"].as_f64().unwrap(),
@@ -3233,6 +3338,13 @@ async fn briefing_blocked_high_entropy_name_field_is_re_withheld() {
     assert_eq!(blocked["kind"], "function", "{env}");
     assert_eq!(blocked["source_file_path"], "g.py", "{env}");
     assert_eq!(blocked["source_line_start"], 1, "{env}");
+    assert_eq!(env["result"]["summary"]["counts"]["withheld"], 1, "{env}");
+    assert!(
+        env["result"]["summary"]["advisory"]["action"]
+            .as_str()
+            .unwrap()
+            .contains("briefing context")
+    );
     // The secret-bearing qualname must not leak anywhere.
     assert!(
         !env.to_string().contains(secret_name),
