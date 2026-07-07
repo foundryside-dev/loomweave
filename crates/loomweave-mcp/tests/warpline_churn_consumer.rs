@@ -1,4 +1,4 @@
-//! GV-LW-2 conformance + honest-degrade for the Warpline churn consumer.
+//! GV-LW-2 consumer behaviour + honest-degrade for the Warpline churn seam.
 //!
 //! The dead `entity_high_churn_list` / `entity_recent_change_list` surfaces are
 //! lit up by consuming Warpline's FROZEN `warpline_entity_churn_count_get`
@@ -23,47 +23,20 @@ use loomweave_storage::{ReaderPool, pragma, schema};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
-// The three SEIs of the GV-LW-2 vector. alpha + beta are observed by warpline;
-// gamma is never-observed.
-const SEI_ALPHA: &str = "loomweave:eid:0000000000000000000000000000000a";
-const SEI_BETA: &str = "loomweave:eid:0000000000000000000000000000000b";
-const SEI_GAMMA: &str = "loomweave:eid:0000000000000000000000000000000c";
+// The three SEIs of the GV-LW-2 vector. alpha + beta are observed by Warpline;
+// the third SEI is echoed with `churn_count: 0`, not omitted or hard-failed.
+const SEI_ALPHA: &str = "loomweave:eid:aaaa";
+const SEI_BETA: &str = "loomweave:eid:bbbb";
+const SEI_GAMMA: &str = "loomweave:eid:never-observed";
 
-const LOC_ALPHA: &str = "python:function:src/pkg/mod.py::alpha";
-const LOC_BETA: &str = "python:function:src/pkg/mod.py::beta";
-const LOC_GAMMA: &str = "python:function:src/pkg/mod.py::gamma";
+const LOC_ALPHA: &str = "python:function:m.py::a";
+const LOC_BETA: &str = "python:function:m.py::b";
+const LOC_GAMMA: &str = "python:function:m.py::never_observed";
 
-/// The recorded FROZEN `warpline.entity_churn_count.v1` envelope — the GV-LW-2
-/// producer fixture (full envelope, not a convenient subset). alpha=7, beta=2,
-/// gamma=0 (present, not omitted).
-const GV_LW_2_ENVELOPE: &str = r#"{
-  "schema": "warpline.entity_churn_count.v1",
-  "ok": true,
-  "query": {"repo": "/abs/path", "tool": "warpline_entity_churn_count_get",
-            "arguments": {}, "filters": {}, "sort": {"by": "churn_count", "order": "desc"},
-            "page": {"limit": 100, "cursor": null}},
-  "data": {
-    "items": [
-      {"entity": {"sei": "loomweave:eid:0000000000000000000000000000000a",
-                  "locator": "python:function:src/pkg/mod.py::alpha"},
-       "churn_count": 7, "first_changed_at": "2026-05-01T00:00:00Z",
-       "last_changed_at": "2026-06-13T00:00:00Z", "last_actor": "agent:codex"},
-      {"entity": {"sei": "loomweave:eid:0000000000000000000000000000000b",
-                  "locator": "python:function:src/pkg/mod.py::beta"},
-       "churn_count": 2, "first_changed_at": "2026-05-10T00:00:00Z",
-       "last_changed_at": "2026-06-01T00:00:00Z", "last_actor": "agent:fable"},
-      {"entity": {"sei": "loomweave:eid:0000000000000000000000000000000c",
-                  "locator": "python:function:src/pkg/mod.py::gamma"},
-       "churn_count": 0, "first_changed_at": null, "last_changed_at": null, "last_actor": null}
-    ],
-    "window": {"since": null, "until": null, "rev_range": null},
-    "page": {"limit": 100, "next_cursor": null, "has_more": false}
-  },
-  "warnings": [], "next_actions": {},
-  "enrichment": {"sei": "present"},
-  "meta": {"producer": {"tool": "warpline", "version": "0.1.0"},
-           "local_only": true, "peer_side_effects": []}
-}"#;
+/// The producer-generated `warpline.entity_churn_count.v1` GV-LW-2 envelope.
+/// It is byte-pinned and source-rechecked by `warpline_churn_conformance_oracle`.
+const GV_LW_2_ENVELOPE: &str =
+    include_str!("../../../docs/federation/fixtures/warpline-gv-lw-2-churn-envelope.json");
 
 /// A fake warpline client that replays the recorded frozen envelope through the
 /// REAL parse path (`parse_churn_count_response`) — exactly what the live MCP
@@ -288,11 +261,11 @@ async fn gv_lw_2_high_churn_ranks_three_entities() {
     assert_eq!(result["page"]["total"], json!(3));
     assert_eq!(result["churn_source"], json!("warpline"));
 
-    // Ranked by count descending: alpha(7), beta(2), gamma(0).
+    // Ranked by count descending: alpha(2), beta(1), gamma(0).
     assert_eq!(entities[0]["id"], json!(LOC_ALPHA));
-    assert_eq!(entities[0]["churn_count"], json!(7));
+    assert_eq!(entities[0]["churn_count"], json!(2));
     assert_eq!(entities[1]["id"], json!(LOC_BETA));
-    assert_eq!(entities[1]["churn_count"], json!(2));
+    assert_eq!(entities[1]["churn_count"], json!(1));
     assert_eq!(entities[2]["id"], json!(LOC_GAMMA));
     assert_eq!(
         entities[2]["churn_count"],
@@ -313,6 +286,11 @@ async fn gv_lw_2_high_churn_ranks_three_entities() {
         json!("2026-06-13T00:00:00Z")
     );
     assert_eq!(entities[0]["last_actor"], json!("agent:codex"));
+    assert_eq!(
+        result["churn_unresolved"]["count"],
+        json!(1),
+        "the producer-generated zero SEI has no locator, so Loomweave discloses the keying gap"
+    );
 
     // Loomweave sent SEI-keyed refs (one per candidate) — the keying contract.
     let refs = fake.seen_refs.lock().unwrap();
@@ -488,6 +466,7 @@ async fn high_churn_discloses_warpline_keying_miss() {
         "the disclosure must name the keying gap: {}",
         result["churn_unresolved"]
     );
-    // A genuine all-zero (resolved, never-observed) must NOT trip this — covered by
-    // the GV-LW-2 fixture where every item has a non-null locator (unresolved 0).
+    // A resolved all-zero fixture must NOT trip this; the producer-generated
+    // GV-LW-2 vector deliberately carries a null locator on its zero row, so it is
+    // covered by the disclosure path rather than the no-disclosure path.
 }

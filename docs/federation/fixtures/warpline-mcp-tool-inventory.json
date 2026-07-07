@@ -1,0 +1,257 @@
+{
+  "schema": "warpline.mcp_tool_inventory.v1",
+  "status": "admitted-frozen",
+  "frozen_at": "2026-06-13",
+  "tools": [
+    {
+      "name": "blast_radius",
+      "endorsed_name": "warpline_impact_radius_get",
+      "shim": "blast_radius",
+      "schema": "warpline.impact_radius.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [
+        "loomweave snapshot optional"
+      ],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Traverses warpline's dated snapshots; does not answer current graph truth."
+    },
+    {
+      "name": "capture_snapshot",
+      "endorsed_name": "warpline_edge_snapshot_capture",
+      "shim": "capture_snapshot",
+      "schema": "warpline.edge_snapshot.v1",
+      "mutates": true,
+      "read_only": false,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [
+        "loomweave"
+      ],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Captures dated edge snapshots into .weft/warpline only; never mutates sibling repos."
+    },
+    {
+      "name": "changed",
+      "endorsed_name": "warpline_change_list",
+      "shim": "changed",
+      "schema": "warpline.change_list.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Returns temporal change facts from git/warpline store."
+    },
+    {
+      "name": "churn",
+      "endorsed_name": "warpline_entity_churn_count_get",
+      "shim": "churn",
+      "schema": "warpline.entity_churn_count.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Aggregates change-event counts; a never-observed entity is churn_count 0, not an error."
+    },
+    {
+      "name": "reverify",
+      "endorsed_name": "warpline_reverify_worklist_get",
+      "shim": "reverify",
+      "schema": "warpline.reverify_worklist.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [
+        "loomweave snapshot optional"
+      ],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Returns reverify worklists; does not file work or govern changes."
+    },
+    {
+      "name": "timeline",
+      "endorsed_name": "warpline_entity_timeline_get",
+      "shim": "timeline",
+      "schema": "warpline.entity_timeline.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Returns per-entity change timeline; reports sei_resolution only, never lineage."
+    },
+    {
+      "name": "verify_record",
+      "endorsed_name": "warpline_verification_record",
+      "shim": "verify_record",
+      "schema": "warpline.verification_record.v1",
+      "mutates": true,
+      "read_only": false,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Records verification gate-pass events into .weft/warpline only; never mutates sibling repos. Advisory; warpline never gates."
+    },
+    {
+      "name": "warpline_change_list",
+      "endorsed_name": "warpline_change_list",
+      "shim": "changed",
+      "schema": "warpline.change_list.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Returns temporal change facts from git/warpline store."
+    },
+    {
+      "name": "warpline_edge_snapshot_capture",
+      "endorsed_name": "warpline_edge_snapshot_capture",
+      "shim": "capture_snapshot",
+      "schema": "warpline.edge_snapshot.v1",
+      "mutates": true,
+      "read_only": false,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [
+        "loomweave"
+      ],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Captures dated edge snapshots into .weft/warpline only; never mutates sibling repos."
+    },
+    {
+      "name": "warpline_entity_churn_count_get",
+      "endorsed_name": "warpline_entity_churn_count_get",
+      "shim": "churn",
+      "schema": "warpline.entity_churn_count.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Aggregates change-event counts; a never-observed entity is churn_count 0, not an error."
+    },
+    {
+      "name": "warpline_entity_timeline_get",
+      "endorsed_name": "warpline_entity_timeline_get",
+      "shim": "timeline",
+      "schema": "warpline.entity_timeline.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Returns per-entity change timeline; reports sei_resolution only, never lineage."
+    },
+    {
+      "name": "warpline_impact_radius_get",
+      "endorsed_name": "warpline_impact_radius_get",
+      "shim": "blast_radius",
+      "schema": "warpline.impact_radius.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [
+        "loomweave snapshot optional"
+      ],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Traverses warpline's dated snapshots; does not answer current graph truth."
+    },
+    {
+      "name": "warpline_reverify_worklist_get",
+      "endorsed_name": "warpline_reverify_worklist_get",
+      "shim": "reverify",
+      "schema": "warpline.reverify_worklist.v1",
+      "mutates": false,
+      "read_only": true,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [
+        "loomweave snapshot optional"
+      ],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Returns reverify worklists; does not file work or govern changes."
+    },
+    {
+      "name": "warpline_verification_record",
+      "endorsed_name": "warpline_verification_record",
+      "shim": "verify_record",
+      "schema": "warpline.verification_record.v1",
+      "mutates": true,
+      "read_only": false,
+      "writes_local_state": true,
+      "idempotent": true,
+      "mutates_paths": [
+        ".weft/warpline/"
+      ],
+      "federation_dependencies": [],
+      "local_only": true,
+      "peer_side_effects": [],
+      "authority_boundary": "Records verification gate-pass events into .weft/warpline only; never mutates sibling repos. Advisory; warpline never gates."
+    }
+  ]
+}

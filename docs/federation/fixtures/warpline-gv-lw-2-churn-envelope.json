@@ -1,0 +1,117 @@
+{
+  "schema": "warpline.entity_churn_count.v1",
+  "ok": true,
+  "query": {
+    "repo": "/abs/path",
+    "tool": "warpline_entity_churn_count_get",
+    "arguments": {
+      "entity_refs": [
+        {
+          "kind": "sei",
+          "value": "loomweave:eid:aaaa"
+        },
+        {
+          "kind": "sei",
+          "value": "loomweave:eid:bbbb"
+        },
+        {
+          "kind": "sei",
+          "value": "loomweave:eid:never-observed"
+        }
+      ],
+      "window": {
+        "since": null,
+        "until": null,
+        "rev_range": null
+      }
+    },
+    "filters": {},
+    "sort": {
+      "by": "churn_count",
+      "order": "desc"
+    },
+    "page": {
+      "limit": 100,
+      "cursor": null
+    }
+  },
+  "data": {
+    "items": [
+      {
+        "entity": {
+          "sei": "loomweave:eid:aaaa",
+          "locator": "python:function:m.py::a"
+        },
+        "churn_count": 2,
+        "first_changed_at": "2026-06-13T00:00:00Z",
+        "last_changed_at": "2026-06-13T00:00:00Z",
+        "last_actor": "agent:codex"
+      },
+      {
+        "entity": {
+          "sei": "loomweave:eid:bbbb",
+          "locator": "python:function:m.py::b"
+        },
+        "churn_count": 1,
+        "first_changed_at": "2026-06-13T00:00:00Z",
+        "last_changed_at": "2026-06-13T00:00:00Z",
+        "last_actor": "agent:codex"
+      },
+      {
+        "entity": {
+          "sei": "loomweave:eid:never-observed",
+          "locator": null
+        },
+        "churn_count": 0,
+        "first_changed_at": null,
+        "last_changed_at": null,
+        "last_actor": null
+      }
+    ],
+    "window": {
+      "since": null,
+      "until": null,
+      "rev_range": null
+    },
+    "overflow": {
+      "total": 3,
+      "returned": 3,
+      "dumped_to": null,
+      "reason_class": "clean"
+    },
+    "page": {
+      "limit": 100,
+      "next_cursor": null,
+      "has_more": false,
+      "reason_class": "clean"
+    }
+  },
+  "warnings": [],
+  "next_actions": {},
+  "enrichment": {
+    "sei": "present",
+    "edges": "absent",
+    "work": "unavailable",
+    "risk": "unavailable",
+    "governance": "unavailable",
+    "requirements": "unavailable"
+  },
+  "enrichment_reasons": {
+    "requirements": {
+      "reason_class": "disabled",
+      "cause": "the requirements dimension is reserved in the frozen enrichment vocab but no requirements-trace transport is wired in warpline yet",
+      "fix": "wire a requirements-trace consumer (e.g. a legis/requirements read keyed on the SEI) and populate enrichment.requirements; until then it is honestly reserved, not an earned-empty"
+    },
+    "sei": {
+      "reason_class": "clean"
+    }
+  },
+  "meta": {
+    "producer": {
+      "tool": "warpline",
+      "version": "1.3.0"
+    },
+    "local_only": true,
+    "peer_side_effects": []
+  }
+}
