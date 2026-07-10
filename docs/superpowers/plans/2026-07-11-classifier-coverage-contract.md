@@ -16,16 +16,25 @@ The planning workspace contains unrelated concurrent changes in `CHANGELOG.md`, 
 
 - [ ] **Step 1: Create an isolated worktree from the design commit**
 
-Use the `superpowers:using-git-worktrees` skill, then run:
+Use the `superpowers:using-git-worktrees` skill. Record the parent branch before
+creating the feature branch so closeout can integrate into the exact branch the
+work came from:
 
 ```bash
 cd /home/john/loomweave
-git worktree add .worktrees/classifier-coverage -b fix/classifier-coverage-contract de3e734
+PARENT_BRANCH=$(git branch --show-current)
+test -n "$PARENT_BRANCH"
+git worktree add .worktrees/classifier-coverage -b fix/classifier-coverage-contract "$PARENT_BRANCH"
 cd /home/john/loomweave/.worktrees/classifier-coverage
+PARENT_META=$(git rev-parse --git-path loomweave-parent-branch)
+printf '%s\n' "$PARENT_BRANCH" > "$PARENT_META"
 git status --short --branch
 ```
 
-Expected: branch `fix/classifier-coverage-contract` with a clean worktree.
+Expected: branch `fix/classifier-coverage-contract` with a clean worktree and
+the path printed by `git rev-parse --git-path loomweave-parent-branch`
+containing `main`. The metadata file lives under the worktree's Git
+administrative directory and is not committed.
 
 - [ ] **Step 2: Pin the tracker and baseline**
 
@@ -53,6 +62,8 @@ Expected: the issue is `fixing`; the focused crate suites pass before new tests 
 - Modify: `crates/loomweave-core/src/plugin/manifest.rs`
 - Modify: `plugins/python/plugin.toml`
 - Modify: `crates/loomweave-plugin-rust/plugin.toml`
+- Modify: `crates/loomweave-plugin-rust/src/serve.rs`
+- Modify: `packaging/rust-plugin-dist/wheel-data/data/share/loomweave/plugins/rust/plugin.toml`
 - Test: `crates/loomweave-core/src/plugin/manifest.rs`
 - Test: `plugins/python/tests/test_package.py`
 - Test: `crates/loomweave-plugin-rust/src/lib.rs`
@@ -103,7 +114,12 @@ assert manifest["ontology"]["classifier_tags"] == [
 assert manifest["ontology"]["ontology_version"] == "0.12.0"
 ```
 
-Update the Rust manifest test to pin the sorted set `allow-dead-code`, `cli-command`, `entry-point`, `exported-api`, `framework-handler`, `http-route`, `test` and ontology `0.9.0`.
+Update the Rust manifest test to pin the sorted set `allow-dead-code`, `cli-command`, `entry-point`, `exported-api`, `framework-handler`, `http-route`, `test` and ontology `0.9.0`. Update the handshake ontology constant in `crates/loomweave-plugin-rust/src/serve.rs` to `0.9.0`, then copy the canonical manifest byte-for-byte into the distribution wheel path:
+
+```bash
+cp crates/loomweave-plugin-rust/plugin.toml packaging/rust-plugin-dist/wheel-data/data/share/loomweave/plugins/rust/plugin.toml
+python scripts/check-rust-plugin-manifest-lockstep.py
+```
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -203,7 +219,7 @@ Add the exact sorted Python/Rust sets from Step 1, bump their ontology versions,
 cargo test -p loomweave-core plugin::manifest -- --nocapture
 cargo test -p loomweave-plugin-rust manifest_parses -- --nocapture
 uv run --project plugins/python pytest --no-cov plugins/python/tests/test_package.py -q
-git add crates/loomweave-core/src/classifier_coverage.rs crates/loomweave-core/src/lib.rs crates/loomweave-core/src/plugin/manifest.rs plugins/python/plugin.toml plugins/python/tests/test_package.py crates/loomweave-plugin-rust/plugin.toml crates/loomweave-plugin-rust/src/lib.rs
+git add crates/loomweave-core/src/classifier_coverage.rs crates/loomweave-core/src/lib.rs crates/loomweave-core/src/plugin/manifest.rs plugins/python/plugin.toml plugins/python/tests/test_package.py crates/loomweave-plugin-rust/plugin.toml crates/loomweave-plugin-rust/src/lib.rs crates/loomweave-plugin-rust/src/serve.rs packaging/rust-plugin-dist/wheel-data/data/share/loomweave/plugins/rust/plugin.toml
 git commit -m "feat: declare plugin classifier capabilities"
 ```
 
@@ -612,16 +628,136 @@ source_walk_complete=true, python degraded_files=0
 
 If source changed, report actual counts and judge the contract fields rather than historical cardinality.
 
-- [ ] **Step 7: Record compatibility and close only after fresh evidence**
+### Task 6: Integrate into the parent branch and reinstall uv tools
+
+**Files:**
+- No source changes. This task integrates the verified commits and installs the built wheels.
+
+- [ ] **Step 1: Rebase onto the recorded parent and re-run the gates**
+
+Use `superpowers:finishing-a-development-branch`. From the feature worktree:
+
+```bash
+PARENT_META=$(git rev-parse --git-path loomweave-parent-branch)
+PARENT_BRANCH=$(cat "$PARENT_META")
+test "$PARENT_BRANCH" = "main"
+git rebase "$PARENT_BRANCH"
+git status --short --branch
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo build --workspace --bins
+cargo nextest run --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+cargo deny check
+plugins/python/.venv/bin/ruff check plugins/python
+plugins/python/.venv/bin/ruff format --check plugins/python
+plugins/python/.venv/bin/mypy --strict plugins/python
+plugins/python/.venv/bin/pytest plugins/python
+bash tests/e2e/sprint_1_walking_skeleton.sh
+bash tests/e2e/sprint_2_mcp_surface.sh
+bash tests/e2e/phase3_subsystems.sh
+wardline scan . --fail-on ERROR
+```
+
+Expected: the rebase is clean and every gate exits zero against the current parent. If the parent moves again after this verification, repeat the rebase and this exact gate block before merging.
+
+- [ ] **Step 2: Fast-forward the verified feature branch into its parent**
+
+Do not stash, reset, or overwrite the parent worktree's concurrent edits. The merge is allowed only when the parent worktree is clean:
+
+```bash
+PARENT_WORKTREE=/home/john/loomweave
+test -z "$(git -C "$PARENT_WORKTREE" status --porcelain)"
+FEATURE_HEAD=$(git rev-parse HEAD)
+git -C "$PARENT_WORKTREE" switch "$PARENT_BRANCH"
+git -C "$PARENT_WORKTREE" merge --ff-only fix/classifier-coverage-contract
+test "$(git -C "$PARENT_WORKTREE" rev-parse HEAD)" = "$FEATURE_HEAD"
+git -C "$PARENT_WORKTREE" status --short --branch
+```
+
+Expected: the parent branch now points at the exact verified feature SHA and remains clean. If the cleanliness check fails, stop and report the modified paths; do not create a stash on the owner's behalf. If `--ff-only` fails because the parent advanced, return to Step 1.
+
+- [ ] **Step 3: Build all three wheels from the merged parent**
+
+Build from `/home/john/loomweave`, not from the soon-to-be-removed feature worktree:
+
+```bash
+cd /home/john/loomweave
+INSTALL_DIST=$(mktemp -d)
+uv build --wheel --out-dir "$INSTALL_DIST" crates/loomweave-cli
+uv build --wheel --out-dir "$INSTALL_DIST" plugins/python
+uv build --wheel --out-dir "$INSTALL_DIST" packaging/rust-plugin-dist
+CLI_WHEEL=$(find "$INSTALL_DIST" -maxdepth 1 -type f -name 'loomweave-*.whl' ! -name 'loomweave_plugin_*' -print -quit)
+PYTHON_WHEEL=$(find "$INSTALL_DIST" -maxdepth 1 -type f -name 'loomweave_plugin_python-*.whl' -print -quit)
+RUST_WHEEL=$(find "$INSTALL_DIST" -maxdepth 1 -type f -name 'loomweave_plugin_rust-*.whl' -print -quit)
+test -f "$CLI_WHEEL"
+test -f "$PYTHON_WHEEL"
+test -f "$RUST_WHEEL"
+```
+
+Expected: one local wheel for `loomweave`, `loomweave-plugin-python`, and `loomweave-plugin-rust`. Do not install a registry artifact with the same version number; the exact local wheel paths are the installation authority.
+
+- [ ] **Step 4: Force-reinstall the local wheels into uv**
+
+Install the plugin tools independently so their executables and neighboring shared-data manifests resolve from their own uv environments. Install the CLI with both local wheels supplied so its exact-version dependencies cannot resolve back to an older registry build:
+
+```bash
+uv tool install --force --reinstall "$PYTHON_WHEEL"
+uv tool install --force --reinstall "$RUST_WHEEL"
+uv tool install --force --reinstall "$CLI_WHEEL" --with "$PYTHON_WHEEL" --with "$RUST_WHEEL"
+hash -r
+uv tool list
+```
+
+Expected: `uv tool list` contains all three local packages at the workspace version. `--force --reinstall` replaces the existing managed executables and refreshes cached package data.
+
+- [ ] **Step 5: Verify installed executables and packaged manifests**
+
+```bash
+UV_BIN=$(uv tool dir --bin)
+UV_ROOT=$(uv tool dir)
+test "$(dirname "$(command -v loomweave)")" = "$UV_BIN"
+test "$(dirname "$(command -v loomweave-plugin-python)")" = "$UV_BIN"
+test "$(dirname "$(command -v loomweave-plugin-rust)")" = "$UV_BIN"
+loomweave --version
+PYTHON_MANIFESTS=$(find "$UV_ROOT" -path '*/share/loomweave/plugins/python/plugin.toml' -type f)
+RUST_MANIFESTS=$(find "$UV_ROOT" -path '*/share/loomweave/plugins/rust/plugin.toml' -type f)
+test -n "$PYTHON_MANIFESTS"
+test -n "$RUST_MANIFESTS"
+while IFS= read -r manifest; do cmp plugins/python/plugin.toml "$manifest"; done <<< "$PYTHON_MANIFESTS"
+while IFS= read -r manifest; do cmp crates/loomweave-plugin-rust/plugin.toml "$manifest"; done <<< "$RUST_MANIFESTS"
+loomweave doctor
+```
+
+Expected: every executable is linked from uv's bin directory, every installed manifest is byte-identical to the merged parent source, and `loomweave doctor` discovers both plugins without a schema/version error.
+
+- [ ] **Step 6: Prove the uv-installed build on Scrappack**
+
+Clear the worktree-specific `PATH` override from Task 5 before this proof:
+
+```bash
+export PATH="$UV_BIN:$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '/classifier-coverage/' | paste -sd ':' -)"
+test "$(command -v loomweave)" = "$UV_BIN/loomweave"
+git -C /home/john/scrappack status --short
+loomweave analyze /home/john/scrappack
+git -C /home/john/scrappack status --short
+```
+
+Expected: Scrappack's tracked status is identical before/after, the analysis log discovers the uv-installed Python plugin with the new ontology, and the resulting HTTP-route/exported-API responses remain supported-complete with zero matches. Capture the installed executable paths, `uv tool list`, plugin discovery lines, run coverage JSON, and MCP classification blocks in the Filigree comment.
+
+- [ ] **Step 7: Record compatibility, close the issue, and remove the worktree**
 
 Plainweave 1.2.1 is expected to remain `denominator_complete=false` until the consumer prompt at `docs/implementation/handoffs/2026-07-11-plainweave-classifier-coverage-prompt.md` is implemented. Include the exact latest `runs.stats.classifier_coverage` and MCP `classification` objects in the handoff.
 
 ```bash
-git status --short
-git log --oneline de3e734..HEAD
-git diff --check de3e734..HEAD
-filigree add-comment clarion-b5c50abb19 "Implemented classifier declarations, per-run coverage, and authoritative MCP classification; verified supported-zero on Scrappack and recorded Plainweave migration evidence."
-filigree close clarion-b5c50abb19 --reason="Loomweave now distinguishes supported-zero, unsupported or unavailable, degraded, and truncated classifier enumeration; canonical gates passed."
+cd /home/john/loomweave
+git status --short --branch
+git log --oneline 9d60b59..HEAD
+git diff --check 9d60b59..HEAD
+filigree add-comment clarion-b5c50abb19 "Implemented classifier declarations, per-run coverage, and authoritative MCP classification; full gates passed; merged the verified feature SHA onto main; force-reinstalled local CLI/Python/Rust wheels through uv; verified the uv-installed build on Scrappack; recorded Plainweave migration evidence."
+filigree close clarion-b5c50abb19 --reason="Loomweave now distinguishes supported-zero, unsupported or unavailable, degraded, and truncated classifier enumeration; verified commits are on main and the exact local wheels are active in uv."
+git worktree remove .worktrees/classifier-coverage
+git branch -d fix/classifier-coverage-contract
 ```
 
-Do not close if any canonical gate fails, Scrappack cannot prove supported-zero, or the final diff includes unrelated changes.
+Do not close or remove the worktree if any canonical gate fails, the parent merge is incomplete, uv still resolves an older artifact, Scrappack cannot prove supported-zero through the uv-installed build, or the final diff includes unrelated changes.
