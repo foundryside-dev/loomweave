@@ -246,7 +246,7 @@ analyze-time precompute):
 |------|----------|
 | `module_circular_import_list` | import cycles (SCCs over `imports` edges) |
 | `entity_coupling_hotspot_list` | entities ranked by fan-in + fan-out |
-| `entity_entry_point_list` / `entity_http_route_list` / `entity_data_model_list` / `entity_test_list` | entities by categorisation tag |
+| `entity_entry_point_list` / `entity_http_route_list` / `entity_exported_api_list` / `entity_cli_command_list` / `entity_data_model_list` / `entity_test_list` | entities by categorisation tag |
 | `entity_deprecation_list` / `entity_todo_list` | deprecated / TODO-tagged entities |
 | `entity_test_caller_list` | test-tagged callers of an entity |
 | `entity_high_churn_list` | entities ranked by git churn |

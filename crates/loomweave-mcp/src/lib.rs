@@ -99,16 +99,15 @@ LLM spend; reconnect after changes."
         "Loomweave is a code-archaeology server: this project is pre-extracted into \
 a queryable map of entities (functions, classes, modules, files), the call / \
 reference / import edges between them, relation edges (inherits_from / decorates \
-/ implements / derives), and subsystem clusters. Ask Loomweave instead of \
-re-reading or grepping the tree.{write_tools_note}
+/ implements / derives), and subsystems. Ask Loomweave instead of \
+grepping the tree.{write_tools_note}
 
 Entity IDs are `{{plugin}}:{{kind}}:{{qualified_name}}`; subsystems are \
 `core:subsystem:{{hash}}`. Get an id from `entity_find` or `entity_at` and copy \
 it verbatim; `entity_resolve` maps pasted qualnames, Rust `::` paths, and SEI \
 tokens to identity rows — never hand-construct an id.
 
-Deep dive: the `loomweave-workflow` skill/prompt. Live counts: the \
-`loomweave://context` resource.
+Deep dive: `loomweave-workflow`; live counts: `loomweave://context`.
 
 Tools: {tool_names}."
     )
@@ -148,6 +147,8 @@ pub const RENAME_MAP: &[(&str, &str)] = &[
     ("find_coupling_hotspots", "entity_coupling_hotspot_list"),
     ("find_entry_points", "entity_entry_point_list"),
     ("find_http_routes", "entity_http_route_list"),
+    ("find_exported_apis", "entity_exported_api_list"),
+    ("find_cli_commands", "entity_cli_command_list"),
     ("find_data_models", "entity_data_model_list"),
     ("find_tests", "entity_test_list"),
     ("find_deprecations", "entity_deprecation_list"),
@@ -653,7 +654,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_coupling_hotspot_list",
-            description: "Entities ranked by coupling (distinct fan-in + fan-out), most-coupled first. `confidence` is a ceiling (default resolved). `app_only:true` drops test-tagged/non-first-party. Optional `scope`. Bounded (limit default 20).",
+            description: "Rank by coupling; optional `scope`, `confidence`, `app_only`; bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -668,37 +669,47 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_entry_point_list",
-            description: "Entities tagged `entry-point`, optional `scope`. HONEST-EMPTY when the tag is not emitted — absence of signal, not absence of entry points. Bounded.",
+            description: "Tagged `entry-point`; optional `scope`; honest-empty signal; bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_http_route_list",
-            description: "Entities tagged `http-route`, optional `scope`. Honest-empty when route categorisation is not emitted. Bounded.",
+            description: "Tagged `http-route`; optional `scope`; honest-empty signal; bounded.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "entity_exported_api_list",
+            description: "Tagged `exported-api`; optional `scope`; honest-empty signal; bounded.",
+            input_schema: scope_page_schema(false),
+        },
+        ToolDefinition {
+            name: "entity_cli_command_list",
+            description: "Tagged `cli-command`; optional `scope`; honest-empty signal; bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_data_model_list",
-            description: "Entities tagged `data-model`, optional `scope`. Honest-empty when data-model categorisation is not emitted. Bounded.",
+            description: "Tagged `data-model`; optional `scope`; honest-empty signal; bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_test_list",
-            description: "Entities tagged `test`, optional `scope`. Honest-empty when test categorisation is not emitted. Bounded.",
+            description: "Tagged `test`; optional `scope`; honest-empty signal; bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_deprecation_list",
-            description: "Entities tagged `deprecated`, optional `scope`. Honest-empty when deprecation categorisation is not emitted. Bounded.",
+            description: "Tagged `deprecated`; optional `scope`; honest-empty signal; bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_todo_list",
-            description: "Entities carrying a TODO/FIXME marker, optional `scope`. Honest-empty when TODO extraction is not emitted. Bounded.",
+            description: "TODO/FIXME-tagged entities; optional `scope`; honest-empty signal; bounded.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_test_caller_list",
-            description: "The test-tagged callers of an entity. Honest-empty when test categorisation is not emitted — NOT a guarantee the entity is untested. Bounded.",
+            description: "Test-tagged callers of `id`; honest-empty is not proof untested; bounded.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -712,17 +723,17 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_high_churn_list",
-            description: "Entities ranked by change count (desc), optional `scope`. Counts (churn_count/last_changed_at/last_actor) from Warpline at read time; Warpline off/unreachable → honest-empty (warpline signal). Bounded.",
+            description: "Rank by Warpline change count; optional `scope`; honest-empty if unavailable.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_recent_change_list",
-            description: "Entities changed since `since` (optional), most-recent first, optional `scope`. Change facts from Warpline at read time; Warpline off/unreachable → honest-empty (warpline signal).",
+            description: "Warpline changes since optional `since`; optional `scope`; honest-empty if unavailable.",
             input_schema: scope_page_schema(true),
         },
         ToolDefinition {
             name: "entity_dead_list",
-            description: "Entities unreachable from roots, optional scope. Conservative heuristic; roots depend on plugin-emitted tags. `roots:\"auto\"` derives roots from tags (derived confidence); `app_only:true` drops test-tagged/non-first-party.",
+            description: "Unreachable-from-root candidates; optional `scope`, `roots`, `app_only`; conservative.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1790,6 +1801,14 @@ impl ServerState {
                 Err(response) => return response.to_json_rpc(id),
             },
             "entity_http_route_list" => match self.tool_find_http_routes(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "entity_exported_api_list" => match self.tool_find_exported_apis(arguments).await {
+                Ok(value) => value,
+                Err(response) => return response.to_json_rpc(id),
+            },
+            "entity_cli_command_list" => match self.tool_find_cli_commands(arguments).await {
                 Ok(value) => value,
                 Err(response) => return response.to_json_rpc(id),
             },
@@ -6304,11 +6323,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // exhaustively pins all 46 tool docstrings by design
+    #[allow(clippy::too_many_lines)] // exhaustively pins all 48 tool docstrings by design
     fn tools_list_exposes_exact_docstrings() {
         let tools = list_tools();
 
-        assert_eq!(tools.len(), 46);
+        assert_eq!(tools.len(), 48);
         assert_eq!(tools[0].name, "entity_at");
         assert_eq!(
             tools[0].description,
@@ -6427,18 +6446,20 @@ mod tests {
         assert_eq!(tools[31].name, "entity_coupling_hotspot_list");
         assert_eq!(tools[32].name, "entity_entry_point_list");
         assert_eq!(tools[33].name, "entity_http_route_list");
-        assert_eq!(tools[34].name, "entity_data_model_list");
-        assert_eq!(tools[35].name, "entity_test_list");
-        assert_eq!(tools[36].name, "entity_deprecation_list");
-        assert_eq!(tools[37].name, "entity_todo_list");
-        assert_eq!(tools[38].name, "entity_test_caller_list");
-        assert_eq!(tools[39].name, "entity_high_churn_list");
-        assert_eq!(tools[40].name, "entity_recent_change_list");
-        assert_eq!(tools[41].name, "entity_dead_list");
-        assert_eq!(tools[42].name, "entity_semantic_search_list");
-        assert_eq!(tools[43].name, "project_finding_list");
-        assert_eq!(tools[44].name, "entity_resolve");
-        assert_eq!(tools[45].name, "entity_relation_list");
+        assert_eq!(tools[34].name, "entity_exported_api_list");
+        assert_eq!(tools[35].name, "entity_cli_command_list");
+        assert_eq!(tools[36].name, "entity_data_model_list");
+        assert_eq!(tools[37].name, "entity_test_list");
+        assert_eq!(tools[38].name, "entity_deprecation_list");
+        assert_eq!(tools[39].name, "entity_todo_list");
+        assert_eq!(tools[40].name, "entity_test_caller_list");
+        assert_eq!(tools[41].name, "entity_high_churn_list");
+        assert_eq!(tools[42].name, "entity_recent_change_list");
+        assert_eq!(tools[43].name, "entity_dead_list");
+        assert_eq!(tools[44].name, "entity_semantic_search_list");
+        assert_eq!(tools[45].name, "project_finding_list");
+        assert_eq!(tools[46].name, "entity_resolve");
+        assert_eq!(tools[47].name, "entity_relation_list");
     }
 
     #[test]

@@ -1635,6 +1635,8 @@ async fn categorisation_shortcuts_are_honest_empty() {
     for tool in [
         "find_entry_points",
         "find_http_routes",
+        "find_exported_apis",
+        "find_cli_commands",
         "find_data_models",
         "find_tests",
         "find_deprecations",
@@ -1690,6 +1692,43 @@ async fn find_tests_lights_up_when_test_tag_is_present() {
     assert_eq!(
         env["result"]["entities"][0]["id"],
         "python:function:test_login"
+    );
+}
+
+#[tokio::test]
+async fn public_surface_shortcuts_light_up_when_tags_are_present() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:api.exported",
+        "function",
+        "api.py",
+        Some((1, 2)),
+    );
+    insert_entity(
+        &conn,
+        "python:function:cli.main",
+        "function",
+        "cli.py",
+        Some((1, 8)),
+    );
+    insert_tag(&conn, "python:function:api.exported", "exported-api");
+    insert_tag(&conn, "python:function:cli.main", "cli-command");
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let exported = call_tool(&state, "find_exported_apis", json!({})).await;
+    assert_eq!(exported["result"]["page"]["total"], 1, "{exported}");
+    assert_eq!(
+        exported["result"]["entities"][0]["id"],
+        "python:function:api.exported"
+    );
+
+    let cli = call_tool(&state, "find_cli_commands", json!({})).await;
+    assert_eq!(cli["result"]["page"]["total"], 1, "{cli}");
+    assert_eq!(
+        cli["result"]["entities"][0]["id"],
+        "python:function:cli.main"
     );
 }
 

@@ -12,6 +12,30 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-07-10
+
+### Added
+
+- **Plainweave public-surface denominator completeness.** Loomweave now exposes
+  MCP shortcuts and plugin tags for the four public-surface classes Plainweave
+  uses for intent coverage: `entry-point`, `http-route`, `exported-api`, and
+  `cli-command`, including Python `__all__ += [...]` exports and common
+  main-guard runner wrappers.
+
+### Changed
+
+- **Coverage honesty over higher-looking ratios.** Expanding these tags can lower
+  Plainweave coverage on real projects by adding previously invisible public
+  surfaces to the denominator. That is the desired result: Plainweave's prior
+  degraded output was correct; requirements are right; Loomweave now sees more
+  doors.
+
+### Security
+
+- Bumped the transitive Rust dependency `crossbeam-epoch` `0.9.18` -> `0.9.20`
+  in both the workspace and standalone Rust-plugin distribution lockfiles to
+  clear RUSTSEC-2026-0204. Lockfile only; no API change.
+
 ## [1.4.0] — 2026-06-30
 
 Feature release on top of `1.3.1`. (Cargo SemVer `1.4.0`; Python wheels `1.4.0`.)

@@ -1262,6 +1262,214 @@ class Config:
     assert "data-model" in config["tags"]
 
 
+def test_main_guard_target_is_cli_command_and_entry_point() -> None:
+    source = """\
+def run():
+    print("interactive")
+
+
+if __name__ == "__main__":
+    run()
+"""
+    entities, _ = extract(source, "cli.py")
+    run = next(e for e in entities if e["id"] == "python:function:cli.run")
+
+    assert "entry-point" in run["tags"]
+    assert "cli-command" in run["tags"]
+    assert "framework-handler" not in run["tags"]
+
+
+def test_main_guard_system_exit_target_is_cli_command_and_entry_point() -> None:
+    source = """\
+def run():
+    print("interactive")
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
+"""
+    entities, _ = extract(source, "cli.py")
+    run = next(e for e in entities if e["id"] == "python:function:cli.run")
+
+    assert "entry-point" in run["tags"]
+    assert "cli-command" in run["tags"]
+    assert "framework-handler" not in run["tags"]
+
+
+def test_main_guard_sys_exit_target_is_cli_command_and_entry_point() -> None:
+    source = """\
+import sys
+
+
+def run():
+    print("interactive")
+
+
+if __name__ == "__main__":
+    sys.exit(run())
+"""
+    entities, _ = extract(source, "cli.py")
+    run = next(e for e in entities if e["id"] == "python:function:cli.run")
+
+    assert "entry-point" in run["tags"]
+    assert "cli-command" in run["tags"]
+    assert "framework-handler" not in run["tags"]
+
+
+@pytest.mark.parametrize(
+    ("source", "module"),
+    [
+        (
+            """\
+import asyncio
+
+
+def cli():
+    print("interactive")
+
+
+if __name__ == "__main__":
+    asyncio.run(cli())
+""",
+            "asyncio_cli",
+        ),
+        (
+            """\
+import asyncio
+
+
+def cli():
+    print("interactive")
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(cli()))
+""",
+            "asyncio_exit_cli",
+        ),
+        (
+            """\
+import typer
+
+
+def cli():
+    print("interactive")
+
+
+if __name__ == "__main__":
+    typer.run(cli)
+""",
+            "typer_cli",
+        ),
+        (
+            """\
+import anyio
+
+
+def cli():
+    print("interactive")
+
+
+if __name__ == "__main__":
+    anyio.run(cli)
+""",
+            "anyio_cli",
+        ),
+    ],
+)
+def test_main_guard_runner_wrapper_target_is_cli_command_and_entry_point(
+    source: str,
+    module: str,
+) -> None:
+    entities, _ = extract(source, f"{module}.py")
+    cli = next(e for e in entities if e["id"] == f"python:function:{module}.cli")
+
+    assert "entry-point" in cli["tags"]
+    assert "cli-command" in cli["tags"]
+    assert "framework-handler" not in cli["tags"]
+
+
+def test_sys_argv_dispatch_function_is_cli_command() -> None:
+    source = """\
+import sys
+
+
+def main():
+    args = sys.argv[1:]
+    return args
+"""
+    entities, _ = extract(source, "tool.py")
+    main = next(e for e in entities if e["id"] == "python:function:tool.main")
+
+    assert "entry-point" in main["tags"]
+    assert "cli-command" in main["tags"]
+
+
+def test_argparse_function_is_cli_command() -> None:
+    source = """\
+import argparse
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+"""
+    entities, _ = extract(source, "gate.py")
+    main = next(e for e in entities if e["id"] == "python:function:gate.main")
+
+    assert "entry-point" in main["tags"]
+    assert "cli-command" in main["tags"]
+
+
+def test_cli_parsing_helper_is_not_cli_command_without_command_candidate() -> None:
+    source = """\
+import argparse
+
+
+def parse_options():
+    parser = argparse.ArgumentParser()
+    return parser.parse_args([])
+"""
+    entities, _ = extract(source, "helper.py")
+    helper = next(e for e in entities if e["id"] == "python:function:helper.parse_options")
+
+    assert "cli-command" not in helper.get("tags", [])
+
+
+def test_nested_cli_parser_is_not_cli_command() -> None:
+    source = """\
+import argparse
+
+
+def main():
+    def parse_options():
+        return argparse.ArgumentParser().parse_args([])
+    return parse_options()
+"""
+    entities, _ = extract(source, "nested.py")
+    nested = next(
+        e for e in entities if e["qualified_name"].endswith("main.<locals>.parse_options")
+    )
+
+    assert "cli-command" not in nested.get("tags", [])
+
+
+def test_class_cli_parser_method_is_not_cli_command() -> None:
+    source = """\
+import sys
+
+
+class CliConfig:
+    def parse_options(self):
+        return sys.argv[1:]
+"""
+    entities, _ = extract(source, "settings.py")
+    method = next(e for e in entities if e["qualified_name"].endswith("CliConfig.parse_options"))
+
+    assert "cli-command" not in method.get("tags", [])
+
+
 def test_no_dunder_all_tags_public_module_surface_as_public_surface() -> None:
     """clarion-4ec50f3d92: a module with no ``__all__`` falls back to the PEP 8
     public-surface heuristic — non-underscore module-level defs/classes become
@@ -1422,6 +1630,25 @@ def public_fn():
     assert "exported-api" not in fn_tags
 
 
+def test_annotation_only_dunder_all_augmented_assignment_stays_empty_surface() -> None:
+    source = """\
+__all__: list[str]
+__all__ += ["exported_fn"]
+
+
+def exported_fn():
+    pass
+"""
+    entities, _ = extract(source, "lib.py")
+    by_id = {e["id"]: e for e in entities}
+
+    module = by_id["python:module:lib"]
+    fn_tags = by_id["python:function:lib.exported_fn"].get("tags", [])
+    assert module["exported_names"] == []
+    assert "public-surface" not in fn_tags
+    assert "exported-api" not in fn_tags
+
+
 def test_empty_dunder_all_declares_empty_public_surface() -> None:
     """clarion-4ec50f3d92: ``__all__ = []`` is an *explicit* empty public
     surface — distinct from the absence of ``__all__`` — so the public-surface
@@ -1440,6 +1667,75 @@ def public_fn():
 
     assert "public-surface" not in fn_tags
     assert "exported-api" not in fn_tags
+
+
+def test_dunder_all_reexport_module_is_exported_api_surface() -> None:
+    source = """\
+from pkg.impl import Thing, do_work
+
+__all__ = ["Thing", "do_work"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    module = by_id["python:module:api"]
+    assert "exported-api" in module["tags"]
+    assert module["exported_names"] == ["Thing", "do_work"]
+
+
+def test_empty_dunder_all_does_not_tag_module_exported_api() -> None:
+    source = """\
+__all__ = []
+"""
+    entities, _ = extract(source, "api.py")
+    module = next(e for e in entities if e["id"] == "python:module:api")
+
+    assert "tags" not in module or "exported-api" not in module["tags"]
+    assert module["exported_names"] == []
+
+
+def test_dunder_all_local_definition_does_not_double_count_module() -> None:
+    source = """\
+__all__ = ["exported_fn"]
+
+
+def exported_fn():
+    return 1
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    module = by_id["python:module:api"]
+    function = by_id["python:function:api.exported_fn"]
+    assert "exported-api" in function["tags"]
+    assert "tags" not in module or "exported-api" not in module["tags"]
+    assert module["exported_names"] == ["exported_fn"]
+
+
+def test_dunder_all_augmented_assignment_extends_exported_api_surface() -> None:
+    source = """\
+__all__ = ["a"]
+__all__ += ["b"]
+
+
+def a():
+    return 1
+
+
+def b():
+    return 2
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    module = by_id["python:module:api"]
+    a = by_id["python:function:api.a"]
+    b = by_id["python:function:api.b"]
+    assert module["exported_names"] == ["a", "b"]
+    assert "exported-api" in a["tags"]
+    assert "exported-api" in b["tags"]
+    assert "public-surface" not in a["tags"]
+    assert "public-surface" not in b["tags"]
 
 
 def test_dunder_all_membership_is_authoritative_over_test_name() -> None:

@@ -17,7 +17,7 @@ produced an entity. The differences below are entirely in what the plugins
 |---|---|---|
 | Status | first-party, v1.0 | first-party, 1.x |
 | Source backend | `pyright` (type-resolved) | `syn` (parse-only, in-project symbol table) |
-| Ontology version | 0.9.0 | 0.7.0 |
+| Ontology version | 0.11.0 | 0.7.0 |
 | Wardline-aware | **yes** (`wardline:*` trust tags) | no |
 | **Entity kinds** | `function`, `class`, `module` | `module`, `struct`, `enum`, `trait`, `function`, `impl`, `type_alias`, `const`, `static`, `macro` |
 | **Structural edges** | `contains`, `calls`, `references`, `imports` | `contains`, `calls`, `references`, `imports` |
@@ -40,6 +40,20 @@ module that declares no `__all__` gets its non-underscore module-level
 defs/classes tagged `public-surface` — a lower-confidence reachability root than
 a declared `exported-api` (ADR-053 / clarion-4ec50f3d92), so a Python codebase is
 not over-reported as dead just because it does not exhaustively declare `__all__`.
+When `__all__` explicitly re-exports imported names, including names added by a
+literal `__all__ += [...]`, the module entity is tagged `exported-api`; local
+functions/classes listed in `__all__` remain the exported entities themselves,
+so the module is not double-counted as a second public surface. Main-guard
+targets, common runner wrappers (`asyncio.run`, `anyio.run`, `typer.run`), and
+module-level command candidates using `sys.argv` or `argparse` are tagged
+`cli-command` without `framework-handler`; decorator/framework-dispatched CLI
+functions still carry `framework-handler`.
+
+Plainweave uses `entry-point`, `http-route`, `exported-api`, and `cli-command`
+as its intent-coverage denominator. If re-analysis lowers a Plainweave coverage
+ratio by adding previously invisible public surfaces, that can be the accurate
+result: Plainweave's incomplete-denominator warning was honest, requirements are
+right, and Loomweave now sees more doors.
 
 **Rust emits** (ADR-054, clarion-05fdd0490e): `exported-api`, `entry-point`,
 `test`, `allow-dead-code`, `http-route`, and `cli-command` (the last two with a
