@@ -116,6 +116,29 @@ fn make_file_entity_named(id: &str, path: &str) -> EntityRecord {
     e
 }
 
+fn make_finding_record(id: &str, run_id: &str, entity_id: &str) -> FindingRecord {
+    FindingRecord {
+        id: id.to_owned(),
+        tool: "loomweave".to_owned(),
+        tool_version: "0.1.0".to_owned(),
+        run_id: run_id.to_owned(),
+        rule_id: "LMWV-FIXTURE-SYNTAX-ERROR".to_owned(),
+        kind: "defect".to_owned(),
+        severity: "WARN".to_owned(),
+        confidence: Some(1.0),
+        confidence_basis: Some("plugin parse_status".to_owned()),
+        entity_id: entity_id.to_owned(),
+        related_entities_json: "[]".to_owned(),
+        message: "syntax error".to_owned(),
+        evidence_json: "{}".to_owned(),
+        properties_json: "{}".to_owned(),
+        supports_json: "[]".to_owned(),
+        supported_by_json: "[]".to_owned(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    }
+}
+
 fn make_contains_edge(from_id: &str, to_id: &str) -> EdgeRecord {
     EdgeRecord {
         kind: "contains".to_owned(),
@@ -590,7 +613,7 @@ async fn round_trip_insert_persists_entity() {
 
     send::<()>(&tx, |ack| WriterCmd::BeginRun {
         run_id: "run-1".into(),
-        config_json: "{}".into(),
+        config_json: r#"{"host_contracts":{"syntax_findings":1}}"#.into(),
         started_at: now_iso(),
         head_commit: None,
         ack,
@@ -880,6 +903,7 @@ async fn resume_run_reopens_existing_row_without_pk_conflict() {
     // Resume the same run id: must NOT raise `UNIQUE constraint failed: runs.id`.
     send::<()>(&tx, |ack| WriterCmd::ResumeRun {
         run_id: "run-1".into(),
+        config_json: r#"{"host_contracts":{"syntax_findings":2}}"#.into(),
         ack,
     })
     .await
@@ -905,7 +929,7 @@ async fn resume_run_reopens_existing_row_without_pk_conflict() {
     handle.await.unwrap().unwrap();
 
     let pool = ReaderPool::open(&path, 2).unwrap();
-    let (run_rows, status, entity_count): (i64, String, i64) = pool
+    let (run_rows, status, config, entity_count): (i64, String, String, i64) = pool
         .with_reader(|conn| {
             let run_rows: i64 =
                 conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
@@ -913,9 +937,13 @@ async fn resume_run_reopens_existing_row_without_pk_conflict() {
                 conn.query_row("SELECT status FROM runs WHERE id = 'run-1'", [], |row| {
                     row.get(0)
                 })?;
+            let config: String =
+                conn.query_row("SELECT config FROM runs WHERE id = 'run-1'", [], |row| {
+                    row.get(0)
+                })?;
             let entity_count: i64 =
                 conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
-            Ok((run_rows, status, entity_count))
+            Ok((run_rows, status, config, entity_count))
         })
         .await
         .unwrap();
@@ -926,6 +954,10 @@ async fn resume_run_reopens_existing_row_without_pk_conflict() {
     assert_eq!(
         status, "completed",
         "the resumed run finalizes to completed"
+    );
+    assert_eq!(
+        config, r#"{"host_contracts":{"syntax_findings":2}}"#,
+        "resume persists the current normalized config and its host contract markers"
     );
     assert_eq!(
         entity_count, 2,
@@ -944,6 +976,7 @@ async fn resume_run_errors_when_run_id_unknown() {
 
     let err = send::<()>(&tx, |ack| WriterCmd::ResumeRun {
         run_id: "never-begun".into(),
+        config_json: "{}".into(),
         ack,
     })
     .await
@@ -1014,6 +1047,7 @@ async fn run_lifecycle_records_owner_pid_and_heartbeat_until_terminal() {
 
     send::<()>(&tx, |ack| WriterCmd::ResumeRun {
         run_id: "run-heartbeat".into(),
+        config_json: "{}".into(),
         ack,
     })
     .await
@@ -1272,6 +1306,131 @@ async fn writer_inserts_fact_findings() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_finding_lifecycle_preserves_operator_state_and_removes_legacy_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-legacy-finding").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_module_entity("python:module:demo")),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+        finding: Box::new(make_finding_record(
+            "finding-legacy",
+            "run-legacy-finding",
+            "python:module:demo",
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-legacy-finding".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE findings SET status = 'promoted_to_issue', \
+             filigree_issue_id = 'clarion-existing' WHERE id = 'finding-legacy'",
+            [],
+        )
+        .unwrap();
+
+    begin_demo_run(&tx, "run-canonical-finding").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+        finding: Box::new(make_finding_record(
+            "finding-canonical",
+            "run-canonical-finding",
+            "python:module:demo",
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    assert!(
+        send::<bool>(&tx, |ack| WriterCmd::MergeFindingLifecycle {
+            canonical_id: "finding-canonical".to_owned(),
+            superseded_id: "finding-legacy".to_owned(),
+            expected_superseded_entity_id: "python:module:demo".to_owned(),
+            ack,
+        })
+        .await
+        .unwrap()
+    );
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-canonical-finding".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    begin_demo_run(&tx, "run-canonical-rerun").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+        finding: Box::new(make_finding_record(
+            "finding-canonical",
+            "run-canonical-rerun",
+            "python:module:demo",
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-canonical-rerun".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let row: (String, String, String) = conn
+        .query_row(
+            "SELECT status, COALESCE(filigree_issue_id, ''), properties \
+             FROM findings WHERE id = 'finding-canonical'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "promoted_to_issue");
+    assert_eq!(row.1, "clarion-existing");
+    let properties: serde_json::Value = serde_json::from_str(&row.2).unwrap();
+    assert_eq!(
+        properties["merged_legacy_findings"][0]["id"].as_str(),
+        Some("finding-legacy")
+    );
+    let legacy_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE id = 'finding-legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_finding_is_idempotent_on_resume() {
     // REQ-FINDING-05 `--resume`: a finding id embeds its run_id, so a resume
     // re-walk regenerates the same id. `InsertFinding` must UPSERT (refresh
@@ -1335,6 +1494,7 @@ async fn insert_finding_is_idempotent_on_resume() {
     // raise UNIQUE; must refresh `message`/`updated_at`, preserve `created_at`.
     send::<()>(&tx, |ack| WriterCmd::ResumeRun {
         run_id: "run-resume".into(),
+        config_json: "{}".into(),
         ack,
     })
     .await

@@ -118,15 +118,7 @@ const POST_RUN_FINDING_RULES: &[&str] = &[
     TIER_MIXING_RULE_ID,
     TIER_UNANIMOUS_RULE_ID,
 ];
-
-/// REQ-ANALYZE-06 "no silent fallbacks": a Python file that fails `ast.parse`
-/// is surfaced by the plugin as a degraded `module` entity carrying
-/// `parse_status="syntax_error"` (extractor.py). The core mints a persisted
-/// finding from that property so the failure is visible in the store, not just
-/// in the plugin's stderr. Pyright degradation findings now ride the plugin
-/// findings wire, but the syntax-error module property remains the stable
-/// source for parse failures because the degraded module entity is the anchor.
-const SYNTAX_ERROR_RULE_ID: &str = "LMWV-PY-SYNTAX-ERROR";
+const HOST_SYNTAX_FINDING_CONTRACT_VERSION: i64 = 2;
 
 /// Writes structured run progress to a JSON file for the MCP `analyze_status`
 /// tool (clarion-7e0c21558a). A no-op unless `analyze_start` passed a
@@ -405,7 +397,20 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     };
 
     let analyze_config = AnalyzeConfig::load(&project_root, options.config_path.as_deref())?;
-    let analyze_config_json = analyze_config.to_json_string()?;
+    let mut analyze_config_value: serde_json::Value =
+        serde_json::from_str(&analyze_config.to_json_string()?)
+            .context("parse normalized analyze config JSON")?;
+    analyze_config_value
+        .as_object_mut()
+        .context("normalized analyze config must be a JSON object")?
+        .insert(
+            "host_contracts".to_owned(),
+            serde_json::json!({
+                "syntax_findings": HOST_SYNTAX_FINDING_CONTRACT_VERSION,
+            }),
+        );
+    let analyze_config_json = serde_json::to_string(&analyze_config_value)
+        .context("serialize analyze config with host contracts")?;
 
     // ── Writer actor ──────────────────────────────────────────────────────────
     let (writer, handle) = Writer::spawn(
@@ -605,6 +610,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     );
     let mut secret_scan_outcome =
         crate::secret_scan::pre_ingest(&project_root, &secret_scan_files, &options.secret_scan)?;
+    let syntax_rule_ids = plugins
+        .iter()
+        .map(|plugin| format!("{}SYNTAX-ERROR", plugin.manifest.ontology.rule_id_prefix))
+        .collect::<BTreeSet<_>>();
+    let prior_syntax_findings = {
+        let conn = Connection::open(&db_path).context("open prior syntax-finding snapshot")?;
+        load_prior_syntax_findings(&conn, &syntax_rule_ids)
+            .context("load prior syntax-finding snapshot")?
+    };
     crate::run_lifecycle::open_run(
         &writer,
         resume,
@@ -795,6 +809,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // plugin-level findings (crash, ontology/protocol violations) anchor to the
     // synthetic project entity minted just before persistence.
     let mut failure_findings: Vec<FindingRecord> = Vec::new();
+    let mut finding_lifecycle_merges = Vec::new();
     let project_anchor = project_anchor_id(&project_root);
     if source_walk_skipped_entries > 0 {
         failure_findings.push(source_walk_finding_record(
@@ -814,6 +829,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
         let plugin_id = plugin.manifest.plugin.plugin_id.clone();
+        let plugin_kind_roles = PluginKindRoles::from_manifest(&plugin.manifest);
         let plugin_extensions: BTreeSet<String> = plugin
             .manifest
             .plugin
@@ -850,7 +866,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // which the MCP dead-code survey's all-or-nothing guard cannot.
         let plugin_version = plugin.manifest.plugin.version.clone();
         let ontology_version = plugin.manifest.ontology.ontology_version.clone();
-        let plugin_tag_schema_changed = match prior_plugin_markers.get(&plugin_id) {
+        let prior_plugin_marker = prior_plugin_markers.get(&plugin_id);
+        let plugin_tag_schema_changed = match prior_plugin_marker {
             Some(prior) => {
                 prior.plugin_version != plugin_version || prior.ontology_version != ontology_version
             }
@@ -860,19 +877,26 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // the safe, fail-toward-work direction.
             None => true,
         };
-        if incremental && plugin_tag_schema_changed && !prior_plugin_markers.is_empty() {
+        let host_syntax_finding_contract_changed = prior_plugin_marker.is_none_or(|prior| {
+            prior.host_syntax_finding_contract != HOST_SYNTAX_FINDING_CONTRACT_VERSION
+        });
+        let plugin_index_contract_changed =
+            plugin_tag_schema_changed || host_syntax_finding_contract_changed;
+        if incremental && plugin_index_contract_changed && !prior_plugin_markers.is_empty() {
             tracing::info!(
                 plugin_id = %plugin_id,
                 plugin_version = %plugin_version,
                 ontology_version = %ontology_version,
-                "plugin tag-schema marker changed since last run; forcing full re-dispatch \
-                 of this plugin's files (clarion-e12d424f1d)"
+                host_syntax_finding_contract_changed,
+                "plugin index contract changed since last run; forcing full re-dispatch \
+                 of this plugin's files"
             );
         }
         current_plugin_markers.push(loomweave_storage::PluginIndexMarker {
             plugin_id: plugin_id.clone(),
             plugin_version,
             ontology_version,
+            host_syntax_finding_contract: HOST_SYNTAX_FINDING_CONTRACT_VERSION,
         });
 
         // Wave 2 / T3.1: partition into files to re-analyse (changed, new,
@@ -891,7 +915,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // nothing plugin-scoped to clear; overriding the partition is both the
         // correct scope and the safe one.
         let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
-            if plugin_tag_schema_changed {
+            if plugin_index_contract_changed {
                 (plugin_files, Vec::new())
             } else {
                 plugin_files.into_iter().partition(|path| {
@@ -1019,6 +1043,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // output flows through a bounded channel so writer backpressure applies
         // during extraction rather than after the whole plugin has returned.
         let manifest = plugin.manifest.clone();
+        let syntax_error_rule_id =
+            format!("{}SYNTAX-ERROR", plugin.manifest.ontology.rule_id_prefix);
         let project_root_clone = project_root.clone();
         let pid_clone = plugin_id.clone();
         let exec_clone = plugin.executable.clone();
@@ -1041,13 +1067,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // invariant holds because the claiming emission is the only one whose
         // entity record is stored, so a skipped file's locator list names
         // exactly the modules it owns. Full runs seed empty.
-        let claim_kind_roles = PluginKindRoles::from_manifest(&plugin.manifest);
         let prior_file_scope_claims: BTreeSet<String> = skipped_file_entity_ids
             .iter()
             .filter(|id| {
                 id.split(':')
                     .nth(1)
-                    .is_some_and(|kind| claim_kind_roles.is_file_scope(kind))
+                    .is_some_and(|kind| plugin_kind_roles.is_file_scope(kind))
             })
             .cloned()
             .collect();
@@ -1076,6 +1101,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let mut insert_err: Option<anyhow::Error> = None;
         let mut plugin_entity_count: u64 = 0;
         let mut plugin_edge_count: u64 = 0;
+        let mut plugin_syntax_fallbacks = Vec::new();
         // Seed the seen-entity gate with this plugin's skipped-file entity ids: an
         // anchored edge from a re-analyzed file into an UNCHANGED file's entity must
         // drain ready (its endpoint exists in the committed DB and survives this
@@ -1113,6 +1139,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     match persist_plugin_file_batch(
                         &writer,
                         batch,
+                        &syntax_error_rule_id,
                         &run_id,
                         &started_at,
                         head_commit.as_deref(),
@@ -1137,7 +1164,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                             }
                             prior_index_entries.extend(effects.prior_index_entries);
                             sei_descriptors.extend(effects.sei_descriptors);
-                            failure_findings.extend(effects.failure_findings);
+                            plugin_syntax_fallbacks.extend(effects.syntax_fallbacks);
                         }
                         Err(e) => {
                             insert_err = Some(e);
@@ -1199,6 +1226,43 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             break 'plugins;
         }
 
+        let reported_findings = match &spawn_result {
+            Ok(result) => &result.findings,
+            Err(error) => &error.findings,
+        };
+        let mut syntax_merges = legacy_plugin_syntax_merges(
+            reported_findings,
+            &syntax_error_rule_id,
+            &plugin_id,
+            &project_root,
+            &project_anchor,
+        );
+        let fallback_merges = suppress_plugin_syntax_fallbacks(
+            &mut plugin_syntax_fallbacks,
+            reported_findings,
+            &syntax_error_rule_id,
+            &plugin_id,
+            &project_root,
+            &project_anchor,
+        );
+        let suppressed_syntax_fallbacks = fallback_merges.len();
+        syntax_merges.extend(fallback_merges);
+        syntax_merges.extend(prior_plugin_syntax_fallback_merges(
+            &plugin_syntax_fallbacks,
+            &prior_syntax_findings,
+            &plugin_id,
+        ));
+        if suppressed_syntax_fallbacks > 0 {
+            tracing::debug!(
+                plugin_id = %plugin_id,
+                rule_id = %syntax_error_rule_id,
+                suppressed = suppressed_syntax_fallbacks,
+                "suppressed host syntax fallback already reported by plugin"
+            );
+        }
+        finding_lifecycle_merges.extend(syntax_merges);
+        failure_findings.extend(plugin_syntax_fallbacks);
+
         match spawn_result {
             Err(plugin_error) => {
                 log_plugin_findings(&plugin_id, &plugin_error.findings);
@@ -1216,6 +1280,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         hf,
                         &plugin_id,
                         &anchor_id,
+                        Some(&syntax_error_rule_id),
                         &run_id,
                         &started_at,
                     ));
@@ -1258,6 +1323,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         hf,
                         &plugin_id,
                         &anchor_id,
+                        Some(&syntax_error_rule_id),
                         &run_id,
                         &started_at,
                     ));
@@ -1335,6 +1401,36 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     reason: format!("failure-finding persistence failed: {e:#}"),
                 };
                 break;
+            }
+        }
+        if !matches!(run_outcome, RunOutcome::HardFailed { .. }) {
+            for merge in finding_lifecycle_merges {
+                if let Err(e) = writer
+                    .send_wait(|ack| WriterCmd::MergeFindingLifecycle {
+                        canonical_id: merge.canonical.clone(),
+                        superseded_id: merge.superseded.clone(),
+                        expected_superseded_entity_id: merge.expected_superseded_entity.clone(),
+                        ack,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .with_context(|| {
+                        format!(
+                            "MergeFindingLifecycle {} <- {}",
+                            merge.canonical, merge.superseded
+                        )
+                    })
+                {
+                    tracing::error!(
+                        run_id = %run_id,
+                        error = %e,
+                        "legacy finding lifecycle merge failed"
+                    );
+                    run_outcome = RunOutcome::HardFailed {
+                        reason: format!("legacy finding lifecycle merge failed: {e:#}"),
+                    };
+                    break;
+                }
             }
         }
         if failure_finding_count > 0 {
@@ -3535,7 +3631,7 @@ async fn insert_weak_modularity_finding(
     Ok(true)
 }
 
-/// Build a `LMWV-PY-SYNTAX-ERROR` finding for an accepted entity the plugin
+/// Build a namespaced syntax-error fallback for an accepted entity the plugin
 /// flagged `parse_status="syntax_error"`, or `None` for cleanly-parsed entities.
 ///
 /// The finding anchors to the degraded entity itself (the plugin still emits one
@@ -3546,6 +3642,7 @@ async fn insert_weak_modularity_finding(
 fn syntax_error_finding(
     record: &EntityRecord,
     kind_roles: &PluginKindRoles,
+    rule_id: &str,
     run_id: &str,
     now: &str,
 ) -> Option<FindingRecord> {
@@ -3565,7 +3662,7 @@ fn syntax_error_finding(
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
-        rule_id: SYNTAX_ERROR_RULE_ID.to_owned(),
+        rule_id: rule_id.to_owned(),
         kind: "defect".to_owned(),
         severity: "WARN".to_owned(),
         confidence: Some(1.0),
@@ -3577,6 +3674,7 @@ fn syntax_error_finding(
             record.name
         ),
         evidence_json: serde_json::json!({
+            "plugin_id": record.plugin_id,
             "parse_status": "syntax_error",
             "source_file_path": record.source_file_path,
         })
@@ -3587,6 +3685,182 @@ fn syntax_error_finding(
         created_at: now.to_owned(),
         updated_at: now.to_owned(),
     })
+}
+
+/// Drop host-generated `parse_status` fallbacks for files whose plugin already
+/// emitted the same namespaced syntax rule. Matching both rule id and the
+/// host-injected file anchor keeps the fallback for partially-reporting plugins.
+struct FindingLifecycleMerge {
+    canonical: String,
+    superseded: String,
+    expected_superseded_entity: String,
+}
+
+#[derive(Clone, Debug)]
+struct PriorSyntaxFinding {
+    id: String,
+    entity_id: String,
+    plugin_id: Option<String>,
+}
+
+type PriorSyntaxFindings = BTreeMap<(String, String), Vec<PriorSyntaxFinding>>;
+
+fn load_prior_syntax_findings(
+    conn: &Connection,
+    rule_ids: &BTreeSet<String>,
+) -> rusqlite::Result<PriorSyntaxFindings> {
+    let mut findings = PriorSyntaxFindings::new();
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.entity_id, e.source_file_path, \
+                json_extract(f.evidence, '$.plugin_id') \
+         FROM findings AS f \
+         JOIN entities AS e ON e.id = f.entity_id \
+         WHERE f.tool = 'loomweave' AND f.rule_id = ?1 \
+           AND e.source_file_path IS NOT NULL \
+         ORDER BY e.source_file_path, f.id",
+    )?;
+    for rule_id in rule_ids {
+        let rows = stmt.query_map([rule_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, entity_id, source_file_path, plugin_id) = row?;
+            findings
+                .entry((rule_id.clone(), source_file_path))
+                .or_default()
+                .push(PriorSyntaxFinding {
+                    id,
+                    entity_id,
+                    plugin_id,
+                });
+        }
+    }
+    Ok(findings)
+}
+
+fn legacy_plugin_syntax_merges(
+    plugin_findings: &[HostFinding],
+    rule_id: &str,
+    plugin_id: &str,
+    project_root: &Path,
+    project_anchor: &str,
+) -> Vec<FindingLifecycleMerge> {
+    plugin_findings
+        .iter()
+        .filter(|finding| finding.subcode == rule_id)
+        .filter_map(|finding| {
+            finding.metadata.get("anchor_file_path")?;
+            let anchor = host_finding_anchor_id(finding, project_root, project_anchor);
+            let canonical = host_finding_record_id(finding, plugin_id, &anchor, Some(rule_id));
+            let superseded = legacy_host_finding_record_id(finding, plugin_id);
+            (canonical != superseded).then_some(FindingLifecycleMerge {
+                canonical,
+                superseded,
+                expected_superseded_entity: anchor,
+            })
+        })
+        .collect()
+}
+
+fn suppress_plugin_syntax_fallbacks(
+    fallbacks: &mut Vec<FindingRecord>,
+    plugin_findings: &[HostFinding],
+    rule_id: &str,
+    plugin_id: &str,
+    project_root: &Path,
+    project_anchor: &str,
+) -> Vec<FindingLifecycleMerge> {
+    let reported_by_path = plugin_findings
+        .iter()
+        .filter(|finding| finding.subcode == rule_id)
+        .filter_map(|finding| {
+            finding
+                .metadata
+                .get("anchor_file_path")
+                .map(|path| (path.clone(), finding))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if reported_by_path.is_empty() {
+        return Vec::new();
+    }
+
+    let mut retained = Vec::with_capacity(fallbacks.len());
+    let mut merges = Vec::new();
+    for fallback in fallbacks.drain(..) {
+        if fallback.rule_id != rule_id {
+            retained.push(fallback);
+            continue;
+        }
+        let source_file_path = serde_json::from_str::<serde_json::Value>(&fallback.evidence_json)
+            .ok()
+            .and_then(|evidence| {
+                evidence
+                    .get("source_file_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let Some(plugin_finding) = source_file_path
+            .as_ref()
+            .and_then(|path| reported_by_path.get(path))
+        else {
+            retained.push(fallback);
+            continue;
+        };
+        let anchor_id = host_finding_anchor_id(plugin_finding, project_root, project_anchor);
+        let canonical_id =
+            host_finding_record_id(plugin_finding, plugin_id, &anchor_id, Some(rule_id));
+        merges.push(FindingLifecycleMerge {
+            canonical: canonical_id,
+            superseded: fallback.id,
+            expected_superseded_entity: fallback.entity_id,
+        });
+    }
+    *fallbacks = retained;
+    merges
+}
+
+fn prior_plugin_syntax_fallback_merges(
+    fallbacks: &[FindingRecord],
+    prior_findings: &PriorSyntaxFindings,
+    plugin_id: &str,
+) -> Vec<FindingLifecycleMerge> {
+    let mut merges = Vec::new();
+    for fallback in fallbacks {
+        let source_file_path = serde_json::from_str::<serde_json::Value>(&fallback.evidence_json)
+            .ok()
+            .and_then(|evidence| {
+                evidence
+                    .get("source_file_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let Some(source_file_path) = source_file_path else {
+            continue;
+        };
+        let Some(prior_for_file) =
+            prior_findings.get(&(fallback.rule_id.clone(), source_file_path))
+        else {
+            continue;
+        };
+        merges.extend(
+            prior_for_file
+                .iter()
+                .filter(|prior| {
+                    prior.id != fallback.id && prior.plugin_id.as_deref() == Some(plugin_id)
+                })
+                .map(|prior| FindingLifecycleMerge {
+                    canonical: fallback.id.clone(),
+                    superseded: prior.id.clone(),
+                    expected_superseded_entity: prior.entity_id.clone(),
+                }),
+        );
+    }
+    merges
 }
 
 /// Core-emitted crash subcode (REQ-ANALYZE-06). Distinct from the crash-loop
@@ -3754,26 +4028,26 @@ fn infra_severity(subcode: &str) -> &'static str {
 }
 
 /// Convert a collected [`HostFinding`] into a persistable [`FindingRecord`]
-/// anchored to `anchor_id` (REQ-ANALYZE-06). The id is deterministic
-/// (run + plugin + subcode + message digest) so `InsertFinding`'s upsert is
-/// idempotent across `--resume` re-walks and dedups identical diagnostics.
+/// anchored to `anchor_id` (REQ-ANALYZE-06). The id is deterministic so
+/// `InsertFinding` is idempotent across `--resume`; the manifest-derived syntax
+/// rule includes the anchor because plugins commonly reuse one parse-error
+/// message across files.
 fn host_finding_to_record(
     hf: &HostFinding,
     plugin_id: &str,
     anchor_id: &str,
+    anchor_scoped_rule_id: Option<&str>,
     run_id: &str,
     now: &str,
 ) -> FindingRecord {
-    let discriminator =
-        blake3::hash(format!("{plugin_id}\u{0}{}\u{0}{}", hf.subcode, hf.message).as_bytes())
-            .to_hex();
+    let id = host_finding_record_id(hf, plugin_id, anchor_id, anchor_scoped_rule_id);
     let evidence = serde_json::json!({
         "plugin_id": plugin_id,
         "metadata": hf.metadata,
     })
     .to_string();
     FindingRecord {
-        id: format!("core:finding:infra:{discriminator}"),
+        id,
         tool: "loomweave".to_owned(),
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
@@ -3792,6 +4066,33 @@ fn host_finding_to_record(
         created_at: now.to_owned(),
         updated_at: now.to_owned(),
     }
+}
+
+fn host_finding_record_id(
+    hf: &HostFinding,
+    plugin_id: &str,
+    anchor_id: &str,
+    anchor_scoped_rule_id: Option<&str>,
+) -> String {
+    if anchor_scoped_rule_id != Some(hf.subcode.as_str()) {
+        return legacy_host_finding_record_id(hf, plugin_id);
+    }
+    let discriminator = blake3::hash(
+        format!(
+            "{plugin_id}\u{0}{}\u{0}{anchor_id}\u{0}{}",
+            hf.subcode, hf.message
+        )
+        .as_bytes(),
+    )
+    .to_hex();
+    format!("core:finding:infra:{discriminator}")
+}
+
+fn legacy_host_finding_record_id(hf: &HostFinding, plugin_id: &str) -> String {
+    let discriminator =
+        blake3::hash(format!("{plugin_id}\u{0}{}\u{0}{}", hf.subcode, hf.message).as_bytes())
+            .to_hex();
+    format!("core:finding:infra:{discriminator}")
 }
 
 fn host_finding_anchor_id(hf: &HostFinding, project_root: &Path, project_anchor: &str) -> String {
@@ -4790,7 +5091,7 @@ struct PersistedPluginBatch {
     entity_count: u64,
     prior_index_entries: Vec<PriorIndexEntry>,
     sei_descriptors: Vec<NewEntityDescriptor>,
-    failure_findings: Vec<FindingRecord>,
+    syntax_fallbacks: Vec<FindingRecord>,
 }
 
 #[derive(Debug)]
@@ -4815,6 +5116,7 @@ impl PluginRunError {
 async fn persist_plugin_file_batch(
     writer: &Writer,
     batch: PluginFileBatch,
+    syntax_error_rule_id: &str,
     run_id: &str,
     started_at: &str,
     head_commit: Option<&str>,
@@ -4822,7 +5124,7 @@ async fn persist_plugin_file_batch(
     let entity_count = batch.entities.len() as u64;
     let mut prior_index_entries = Vec::new();
     let mut sei_descriptors = Vec::new();
-    let mut failure_findings = Vec::new();
+    let mut syntax_fallbacks = Vec::new();
 
     for (id_str, mut record) in batch.entities {
         // Capture the prior-index row and the SEI descriptor BEFORE `record`
@@ -4849,9 +5151,14 @@ async fn persist_plugin_file_batch(
         // REQ-ANALYZE-06: capture a parse-failure finding from the degraded
         // entity BEFORE `record` is moved into the command. Anchors to this
         // same entity (inserted just below), so the finding's FK resolves.
-        if let Some(finding) = syntax_error_finding(&record, &batch.kind_roles, run_id, started_at)
-        {
-            failure_findings.push(finding);
+        if let Some(finding) = syntax_error_finding(
+            &record,
+            &batch.kind_roles,
+            syntax_error_rule_id,
+            run_id,
+            started_at,
+        ) {
+            syntax_fallbacks.push(finding);
         }
         stamp_entity_git_provenance(&mut record, head_commit);
         writer
@@ -4902,7 +5209,7 @@ async fn persist_plugin_file_batch(
         entity_count,
         prior_index_entries,
         sei_descriptors,
-        failure_findings,
+        syntax_fallbacks,
     })
 }
 
@@ -7488,11 +7795,12 @@ mod tests {
         let finding = syntax_error_finding(
             &record,
             &python_kind_roles(),
+            "LMWV-PY-SYNTAX-ERROR",
             "run-1",
             "2026-06-02T00:00:00.000Z",
         )
         .expect("syntax_error entity must mint a finding");
-        assert_eq!(finding.rule_id, SYNTAX_ERROR_RULE_ID);
+        assert_eq!(finding.rule_id, "LMWV-PY-SYNTAX-ERROR");
         assert_eq!(finding.entity_id, "python:module:pkg.broken");
         assert_eq!(finding.kind, "defect");
         assert_eq!(finding.severity, "WARN");
@@ -7507,11 +7815,38 @@ mod tests {
     #[test]
     fn syntax_error_finding_absent_for_clean_or_unflagged_entities() {
         let ok = entity_with_properties("python:module:pkg.ok", r#"{"parse_status":"ok"}"#);
-        assert!(syntax_error_finding(&ok, &python_kind_roles(), "run-1", "t").is_none());
+        assert!(
+            syntax_error_finding(
+                &ok,
+                &python_kind_roles(),
+                "LMWV-PY-SYNTAX-ERROR",
+                "run-1",
+                "t"
+            )
+            .is_none()
+        );
         let plain = entity_with_properties("python:module:pkg.plain", "{}");
-        assert!(syntax_error_finding(&plain, &python_kind_roles(), "run-1", "t").is_none());
+        assert!(
+            syntax_error_finding(
+                &plain,
+                &python_kind_roles(),
+                "LMWV-PY-SYNTAX-ERROR",
+                "run-1",
+                "t"
+            )
+            .is_none()
+        );
         let malformed = entity_with_properties("python:module:pkg.bad", "not json");
-        assert!(syntax_error_finding(&malformed, &python_kind_roles(), "run-1", "t").is_none());
+        assert!(
+            syntax_error_finding(
+                &malformed,
+                &python_kind_roles(),
+                "LMWV-PY-SYNTAX-ERROR",
+                "run-1",
+                "t"
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -7521,7 +7856,110 @@ mod tests {
             r#"{"parse_status":"syntax_error"}"#,
         );
 
-        assert!(syntax_error_finding(&record, &PluginKindRoles::default(), "run-1", "t").is_none());
+        assert!(
+            syntax_error_finding(
+                &record,
+                &PluginKindRoles::default(),
+                "LMWV-FIXTURE-SYNTAX-ERROR",
+                "run-1",
+                "t"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn plugin_syntax_finding_suppresses_only_matching_file_fallback() {
+        let mut first = entity_with_properties(
+            "fixture:module:pkg.first",
+            r#"{"parse_status":"syntax_error"}"#,
+        );
+        first.source_file_path = Some("pkg/first.fixture".to_owned());
+        let mut second = entity_with_properties(
+            "fixture:module:pkg.second",
+            r#"{"parse_status":"syntax_error"}"#,
+        );
+        second.source_file_path = Some("pkg/second.fixture".to_owned());
+        let rule_id = "LMWV-FIXTURE-SYNTAX-ERROR";
+        let mut fallbacks = vec![
+            syntax_error_finding(&first, &python_kind_roles(), rule_id, "run-1", "t").unwrap(),
+            syntax_error_finding(&second, &python_kind_roles(), rule_id, "run-1", "t").unwrap(),
+        ];
+        let plugin_finding = HostFinding {
+            subcode: rule_id.to_owned(),
+            message: "plugin reported first parse failure".to_owned(),
+            metadata: BTreeMap::from([(
+                "anchor_file_path".to_owned(),
+                "pkg/first.fixture".to_owned(),
+            )]),
+        };
+
+        let plugin_findings = [plugin_finding];
+        let legacy_merges = legacy_plugin_syntax_merges(
+            &plugin_findings,
+            rule_id,
+            "fixture",
+            Path::new("/project"),
+            "core:project:project",
+        );
+        assert_eq!(legacy_merges.len(), 1);
+
+        let merges = suppress_plugin_syntax_fallbacks(
+            &mut fallbacks,
+            &plugin_findings,
+            rule_id,
+            "fixture",
+            Path::new("/project"),
+            "core:project:project",
+        );
+        assert_eq!(merges.len(), 1);
+        assert_eq!(
+            merges[0].superseded,
+            "core:finding:syntax-error:fixture:module:pkg.first"
+        );
+        assert_eq!(
+            merges[0].expected_superseded_entity,
+            "fixture:module:pkg.first"
+        );
+        assert_eq!(fallbacks.len(), 1);
+        assert_eq!(fallbacks[0].entity_id, "fixture:module:pkg.second");
+    }
+
+    #[test]
+    fn reverse_syntax_merge_requires_matching_plugin_provenance() {
+        let mut entity = entity_with_properties(
+            "fixture:module:pkg.first",
+            r#"{"parse_status":"syntax_error"}"#,
+        );
+        entity.source_file_path = Some("pkg/first.fixture".to_owned());
+        let rule_id = "LMWV-FIXTURE-SYNTAX-ERROR";
+        let fallback =
+            syntax_error_finding(&entity, &python_kind_roles(), rule_id, "run-1", "t").unwrap();
+        let prior_findings = BTreeMap::from([(
+            (rule_id.to_owned(), "pkg/first.fixture".to_owned()),
+            vec![
+                PriorSyntaxFinding {
+                    id: "matching".to_owned(),
+                    entity_id: "core:file:pkg/first.fixture".to_owned(),
+                    plugin_id: Some("fixture".to_owned()),
+                },
+                PriorSyntaxFinding {
+                    id: "foreign".to_owned(),
+                    entity_id: "core:file:pkg/first.fixture".to_owned(),
+                    plugin_id: Some("other".to_owned()),
+                },
+                PriorSyntaxFinding {
+                    id: "unknown".to_owned(),
+                    entity_id: "core:file:pkg/first.fixture".to_owned(),
+                    plugin_id: None,
+                },
+            ],
+        )]);
+
+        let merges = prior_plugin_syntax_fallback_merges(&[fallback], &prior_findings, "fixture");
+
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].superseded, "matching");
     }
 
     #[test]
@@ -7638,13 +8076,53 @@ mod tests {
             message: "entity failed to deserialise".to_owned(),
             metadata: std::collections::BTreeMap::new(),
         };
-        let rec = host_finding_to_record(&hf, "python", "core:project:demo", "run-1", "t");
+        let rec = host_finding_to_record(&hf, "python", "core:project:demo", None, "run-1", "t");
         assert_eq!(rec.rule_id, "LMWV-INFRA-PLUGIN-MALFORMED-ENTITY");
         assert_eq!(rec.entity_id, "core:project:demo");
         assert_eq!(rec.severity, "WARN");
         assert_eq!(rec.kind, "defect");
         assert_eq!(rec.tool, "loomweave");
         assert!(rec.evidence_json.contains("python"));
+    }
+
+    #[test]
+    fn only_the_manifest_syntax_rule_uses_file_scoped_identity() {
+        let syntax = HostFinding {
+            subcode: "LMWV-FIXTURE-SYNTAX-ERROR".to_owned(),
+            message: "parse failed".to_owned(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let related_diagnostic = HostFinding {
+            subcode: "LMWV-FIXTURE-MACRO-SYNTAX-ERROR".to_owned(),
+            message: "macro expansion failed".to_owned(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+
+        assert_ne!(
+            host_finding_record_id(
+                &syntax,
+                "fixture",
+                "core:file:one.syn",
+                Some("LMWV-FIXTURE-SYNTAX-ERROR")
+            ),
+            host_finding_record_id(
+                &syntax,
+                "fixture",
+                "core:file:two.syn",
+                Some("LMWV-FIXTURE-SYNTAX-ERROR")
+            ),
+            "the manifest-derived syntax rule must be scoped to its file anchor"
+        );
+        assert_eq!(
+            host_finding_record_id(
+                &related_diagnostic,
+                "fixture",
+                "core:file:one.syn",
+                Some("LMWV-FIXTURE-SYNTAX-ERROR")
+            ),
+            legacy_host_finding_record_id(&related_diagnostic, "fixture"),
+            "an unrelated diagnostic that merely shares the suffix must retain its identity"
+        );
     }
 
     #[test]

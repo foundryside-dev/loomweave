@@ -180,8 +180,12 @@ fn run_actor(
                     ),
                 );
             }
-            WriterCmd::ResumeRun { run_id, ack } => {
-                reply(ack, resume_run(conn, &mut state, &run_id));
+            WriterCmd::ResumeRun {
+                run_id,
+                config_json,
+                ack,
+            } => {
+                reply(ack, resume_run(conn, &mut state, &run_id, &config_json));
             }
             WriterCmd::InsertEntity { entity, ack } => {
                 let res = insert_entity(conn, &mut state, &entity, commits_observed);
@@ -240,6 +244,22 @@ fn run_actor(
             }
             WriterCmd::InsertFinding { finding, ack } => {
                 let res = insert_finding(conn, &mut state, &finding, commits_observed);
+                reply(ack, res);
+            }
+            WriterCmd::MergeFindingLifecycle {
+                canonical_id,
+                superseded_id,
+                expected_superseded_entity_id,
+                ack,
+            } => {
+                let res = merge_finding_lifecycle(
+                    conn,
+                    &mut state,
+                    &canonical_id,
+                    &superseded_id,
+                    &expected_superseded_entity_id,
+                    commits_observed,
+                );
                 reply(ack, res);
             }
             WriterCmd::PersistPostRunFinding { finding, ack } => {
@@ -605,14 +625,20 @@ fn begin_run_inner(
 /// Reopen an existing run row instead of inserting a new one (the `--resume`
 /// path, REQ-FINDING-05). `begin_run` does an `INSERT` that fails on the run
 /// PK when handed an existing id; `resume_run` `UPDATE`s the row back to
-/// `running` and clears `completed_at`, then binds it as the active run and
-/// opens the write transaction exactly as `begin_run` does. The subsequent
-/// re-walk upserts entities/edges idempotently (see
+/// `running`, clears `completed_at`, and replaces the stored config with the
+/// current normalized config, then binds it as the active run and opens the
+/// write transaction exactly as `begin_run` does. The subsequent re-walk
+/// upserts entities/edges idempotently (see
 /// `insert_entity_is_idempotent_across_runs`), so a resumed run reproduces the
 /// same durable graph as the original — `--resume` is a re-emit-without-flip
 /// path, not an incremental checkpoint-recovery one.
-fn resume_run(conn: &mut Connection, state: &mut ActorState, run_id: &str) -> Result<()> {
-    resume_run_inner(conn, state, run_id, |_| {}, |_| {})
+fn resume_run(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    run_id: &str,
+    config_json: &str,
+) -> Result<()> {
+    resume_run_inner(conn, state, run_id, config_json, |_| {}, |_| {})
 }
 
 /// `resume_run` with the same two test seams as [`begin_run_inner`].
@@ -620,12 +646,13 @@ fn resume_run(conn: &mut Connection, state: &mut ActorState, run_id: &str) -> Re
 /// Unlike `begin_run`, `resume_run` mutates a PRE-EXISTING row, so the
 /// failure path must *restore* the row's prior terminal state rather than mark
 /// it failed — leaving a previously-`completed` run flipped to `running` would
-/// mis-report it (review #15). The prior `(status, completed_at)` are captured
-/// before the flip and restored if `begin_write_tx` fails.
+/// mis-report it (review #15). The prior `(status, completed_at, config)` are
+/// captured before the flip and restored if `begin_write_tx` fails.
 fn resume_run_inner(
     conn: &mut Connection,
     state: &mut ActorState,
     run_id: &str,
+    config_json: &str,
     mut after_update_committed: impl FnMut(&Connection),
     mut on_write_tx_failed: impl FnMut(&Connection),
 ) -> Result<()> {
@@ -634,16 +661,23 @@ fn resume_run_inner(
             "ResumeRun received while a run is already in progress".to_owned(),
         ));
     }
-    // Capture the row's prior terminal state BEFORE flipping it to `running`,
-    // so it can be restored verbatim if we fail to open the write transaction.
+    // Capture the row's prior terminal state and config BEFORE flipping it to
+    // `running`, so all reopen mutations can be restored verbatim if we fail to
+    // open the write transaction.
     let prior = conn
         .query_row(
-            "SELECT status, completed_at FROM runs WHERE id = ?1",
+            "SELECT status, completed_at, config FROM runs WHERE id = ?1",
             params![run_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((prior_status, prior_completed_at)) = prior else {
+    let Some((prior_status, prior_completed_at, prior_config)) = prior else {
         return Err(StorageError::WriterProtocol(format!(
             "ResumeRun: no run with id {run_id} to resume"
         )));
@@ -652,10 +686,11 @@ fn resume_run_inner(
         "UPDATE runs \
             SET status = 'running', \
                 completed_at = NULL, \
-                owner_pid = ?1, \
+                config = ?1, \
+                owner_pid = ?2, \
                 heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-          WHERE id = ?2",
-        params![owner_pid(), run_id],
+          WHERE id = ?3",
+        params![config_json, owner_pid(), run_id],
     )?;
     if reopened == 0 {
         // Raced away between the SELECT and the UPDATE — treat as not-found.
@@ -672,9 +707,9 @@ fn resume_run_inner(
         on_write_tx_failed(conn);
         let _ = conn.execute(
             "UPDATE runs \
-                SET status = ?1, completed_at = ?2, owner_pid = NULL \
-              WHERE id = ?3",
-            params![prior_status, prior_completed_at, run_id],
+                SET status = ?1, completed_at = ?2, config = ?3, owner_pid = NULL \
+              WHERE id = ?4",
+            params![prior_status, prior_completed_at, prior_config, run_id],
         );
         return Err(err);
     }
@@ -1205,6 +1240,204 @@ fn insert_finding(
     Ok(())
 }
 
+/// Consolidate a legacy duplicate into the canonical finding without dropping
+/// operator-managed status, suppression context, or Filigree linkage. The
+/// strongest lifecycle state wins (`promoted_to_issue` > `suppressed` >
+/// `acknowledged` > `open`). Conflicting legacy details remain in structured
+/// properties for auditability before the old row is removed.
+fn merge_finding_lifecycle(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    canonical_id: &str,
+    superseded_id: &str,
+    expected_superseded_entity_id: &str,
+    commits_observed: &AtomicUsize,
+) -> Result<bool> {
+    if state.current_run.is_none() {
+        return Err(StorageError::WriterProtocol(
+            "MergeFindingLifecycle received without a preceding BeginRun".to_owned(),
+        ));
+    }
+    if canonical_id == superseded_id {
+        return Ok(false);
+    }
+    if !state.in_tx {
+        begin_write_tx(conn, state)?;
+        state.in_tx = true;
+    }
+
+    let Some(canonical) = finding_lifecycle_snapshot(conn, canonical_id)? else {
+        return Ok(false);
+    };
+    let Some(superseded) = finding_lifecycle_snapshot(conn, superseded_id)? else {
+        return Ok(false);
+    };
+    if superseded.entity_id != expected_superseded_entity_id {
+        return Ok(false);
+    }
+    let status =
+        if finding_lifecycle_rank(&superseded.status) > finding_lifecycle_rank(&canonical.status) {
+            superseded.status.as_str()
+        } else {
+            canonical.status.as_str()
+        };
+    let suppression_reason = canonical
+        .suppression_reason
+        .as_deref()
+        .or(superseded.suppression_reason.as_deref());
+    let filigree_issue_id = canonical
+        .filigree_issue_id
+        .as_deref()
+        .or(superseded.filigree_issue_id.as_deref());
+    let created_at = if canonical.created_at <= superseded.created_at {
+        canonical.created_at.as_str()
+    } else {
+        superseded.created_at.as_str()
+    };
+    let properties = merged_finding_audit_properties(
+        canonical_id,
+        &canonical.properties,
+        &superseded.properties,
+        superseded_id,
+        &superseded.status,
+        superseded.suppression_reason.as_deref(),
+        superseded.filigree_issue_id.as_deref(),
+    )?;
+    let merged = conn.execute(
+        "UPDATE findings SET status = ?1, suppression_reason = ?2, \
+         filigree_issue_id = ?3, created_at = ?4, properties = ?5 WHERE id = ?6",
+        params![
+            status,
+            suppression_reason,
+            filigree_issue_id,
+            created_at,
+            properties,
+            canonical_id,
+        ],
+    )?;
+    if merged != 1 {
+        return Err(StorageError::WriterProtocol(format!(
+            "MergeFindingLifecycle updated {merged} canonical rows for {canonical_id}"
+        )));
+    }
+    conn.execute("DELETE FROM findings WHERE id = ?1", [superseded_id])?;
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(true)
+}
+
+struct FindingLifecycleSnapshot {
+    status: String,
+    suppression_reason: Option<String>,
+    filigree_issue_id: Option<String>,
+    entity_id: String,
+    created_at: String,
+    properties: String,
+}
+
+fn finding_lifecycle_snapshot(
+    conn: &Connection,
+    finding_id: &str,
+) -> Result<Option<FindingLifecycleSnapshot>> {
+    conn.query_row(
+        "SELECT status, suppression_reason, filigree_issue_id, entity_id, \
+         created_at, properties FROM findings WHERE id = ?1",
+        [finding_id],
+        |row| {
+            Ok(FindingLifecycleSnapshot {
+                status: row.get(0)?,
+                suppression_reason: row.get(1)?,
+                filigree_issue_id: row.get(2)?,
+                entity_id: row.get(3)?,
+                created_at: row.get(4)?,
+                properties: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
+fn finding_lifecycle_rank(status: &str) -> u8 {
+    match status {
+        "promoted_to_issue" => 3,
+        "suppressed" => 2,
+        "acknowledged" => 1,
+        _ => 0,
+    }
+}
+
+fn merged_finding_audit_properties(
+    canonical_id: &str,
+    canonical_properties: &str,
+    superseded_properties: &str,
+    superseded_id: &str,
+    superseded_status: &str,
+    superseded_suppression_reason: Option<&str>,
+    superseded_filigree_issue_id: Option<&str>,
+) -> Result<String> {
+    let mut canonical =
+        serde_json::from_str::<serde_json::Value>(canonical_properties).map_err(|error| {
+            StorageError::WriterProtocol(format!(
+                "canonical finding properties are not valid JSON: {error}"
+            ))
+        })?;
+    let superseded =
+        serde_json::from_str::<serde_json::Value>(superseded_properties).map_err(|error| {
+            StorageError::WriterProtocol(format!(
+                "superseded finding properties are not valid JSON: {error}"
+            ))
+        })?;
+    let canonical_object = canonical.as_object_mut().ok_or_else(|| {
+        StorageError::WriterProtocol("canonical finding properties must be an object".to_owned())
+    })?;
+    let audit = canonical_object
+        .entry("merged_legacy_findings")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| {
+            StorageError::WriterProtocol(
+                "canonical merged_legacy_findings must be an array".to_owned(),
+            )
+        })?;
+    audit.retain(|entry| entry.get("id").and_then(serde_json::Value::as_str) != Some(canonical_id));
+    if let Some(prior_audit) = superseded
+        .get("merged_legacy_findings")
+        .and_then(serde_json::Value::as_array)
+    {
+        for entry in prior_audit {
+            if entry.get("id").and_then(serde_json::Value::as_str) != Some(canonical_id) {
+                upsert_finding_audit_entry(audit, entry.clone());
+            }
+        }
+    }
+    upsert_finding_audit_entry(
+        audit,
+        serde_json::json!({
+            "id": superseded_id,
+            "status": superseded_status,
+            "suppression_reason": superseded_suppression_reason,
+            "filigree_issue_id": superseded_filigree_issue_id,
+        }),
+    );
+    serde_json::to_string(&canonical).map_err(|error| {
+        StorageError::WriterProtocol(format!(
+            "merged finding properties could not be serialized: {error}"
+        ))
+    })
+}
+
+fn upsert_finding_audit_entry(audit: &mut Vec<serde_json::Value>, entry: serde_json::Value) {
+    let entry_id = entry.get("id").and_then(serde_json::Value::as_str);
+    if let Some(entry_id) = entry_id {
+        audit.retain(|existing| {
+            existing.get("id").and_then(serde_json::Value::as_str) != Some(entry_id)
+        });
+    } else if audit.iter().any(|existing| existing == &entry) {
+        return;
+    }
+    audit.push(entry);
+}
+
 /// The raw `findings` upsert, with no run-state or transaction management — both
 /// the run-scoped [`insert_finding`] (inside the open run tx) and the post-run
 /// path (REQ-ANALYZE-04 deletion findings, emitted after `CommitRun` via
@@ -1249,7 +1482,15 @@ fn write_finding_row(conn: &Connection, finding: &FindingRecord) -> Result<()> {
             related_entities = excluded.related_entities, \
             message = excluded.message, \
             evidence = excluded.evidence, \
-            properties = excluded.properties, \
+            properties = CASE \
+                WHEN json_type(findings.properties, '$.merged_legacy_findings') = 'array' \
+                THEN json_set(\
+                    excluded.properties, \
+                    '$.merged_legacy_findings', \
+                    json(json_extract(findings.properties, '$.merged_legacy_findings'))\
+                ) \
+                ELSE excluded.properties \
+            END, \
             supports = excluded.supports, \
             supported_by = excluded.supported_by, \
             updated_at = excluded.updated_at",
@@ -1688,6 +1929,50 @@ fn ensure_run_update_changed_one(changed: usize, run_id: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+mod finding_lifecycle_merge_tests {
+    use super::merged_finding_audit_properties;
+
+    #[test]
+    fn audit_merge_removes_self_reference_and_refreshes_duplicate_snapshot() {
+        let properties = merged_finding_audit_properties(
+            "finding-canonical",
+            r#"{"merged_legacy_findings":[
+                {"id":"finding-canonical","status":"open"},
+                {"id":"finding-superseded","status":"open"},
+                {"id":"finding-superseded","status":"suppressed"}
+            ]}"#,
+            r#"{"merged_legacy_findings":[
+                {"id":"finding-canonical","status":"acknowledged"},
+                {"id":"finding-older","status":"acknowledged"}
+            ]}"#,
+            "finding-superseded",
+            "promoted_to_issue",
+            None,
+            Some("clarion-current"),
+        )
+        .unwrap();
+        let properties: serde_json::Value = serde_json::from_str(&properties).unwrap();
+        let audit = properties["merged_legacy_findings"].as_array().unwrap();
+
+        assert!(audit.iter().all(|entry| entry["id"] != "finding-canonical"));
+        let refreshed = audit
+            .iter()
+            .find(|entry| entry["id"] == "finding-superseded")
+            .unwrap();
+        assert_eq!(refreshed["status"], "promoted_to_issue");
+        assert_eq!(refreshed["filigree_issue_id"], "clarion-current");
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|entry| entry["id"] == "finding-superseded")
+                .count(),
+            1
+        );
+        assert!(audit.iter().any(|entry| entry["id"] == "finding-older"));
+    }
+}
+
+#[cfg(test)]
 mod run_lifecycle_failpoint_tests {
     //! Deterministic, single-threaded coverage for the `begin_run` / `resume_run`
     //! TOCTOU repair paths (reviews #4 / #15). The competing write lock is held
@@ -1806,6 +2091,7 @@ mod run_lifecycle_failpoint_tests {
             &mut conn,
             &mut state,
             "run-resume",
+            r#"{"host_contracts":{"syntax_findings":2}}"#,
             |_| {
                 competitor
                     .execute_batch("BEGIN IMMEDIATE")
@@ -1823,11 +2109,11 @@ mod run_lifecycle_failpoint_tests {
             matches!(err, StorageError::Sqlite(_)),
             "expected a busy SQLite error, got {err:?}"
         );
-        let (status, completed_at): (String, Option<String>) = conn
+        let (status, completed_at, config): (String, Option<String>, String) = conn
             .query_row(
-                "SELECT status, completed_at FROM runs WHERE id = ?1",
+                "SELECT status, completed_at, config FROM runs WHERE id = ?1",
                 ["run-resume"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(
@@ -1838,6 +2124,10 @@ mod run_lifecycle_failpoint_tests {
             completed_at.as_deref(),
             Some("2026-01-01T00:05:00.000Z"),
             "completed_at must be restored to its prior value"
+        );
+        assert_eq!(
+            config, "{}",
+            "config must be restored when the resumed transaction cannot open"
         );
         assert!(state.current_run.is_none());
         // owner_pid sanity: restored row is unowned.

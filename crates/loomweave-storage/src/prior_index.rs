@@ -42,8 +42,8 @@ pub struct PriorIndexEntry {
     pub signature: Option<String>,
 }
 
-/// The tag-schema marker a plugin last analysed the index under
-/// (`plugin_index_meta`, migration 0011 — clarion-e12d424f1d).
+/// The plugin-owned and host-owned index contracts a plugin last analysed under
+/// (`plugin_index_meta`, migrations 0011-0012).
 ///
 /// `analyze` compares the live manifest's `(version, ontology_version)` against
 /// the stored marker and forces a full re-dispatch of that plugin's files when
@@ -64,6 +64,10 @@ pub struct PluginIndexMarker {
     /// semantic tag-schema signal, but not gate-enforced for every plugin, so
     /// the comparison keys on the PAIR (re-dispatch if either moved).
     pub ontology_version: String,
+    /// Host-owned syntax-finding identity contract last applied to this
+    /// plugin's files. Versioned per plugin so an absent plugin cannot inherit
+    /// a newer contract merely because another plugin completed a run.
+    pub host_syntax_finding_contract: i64,
 }
 
 /// Upsert one prior-index row (`INSERT OR REPLACE` on the `locator` PK).
@@ -198,13 +202,17 @@ pub fn clear_prior_index(conn: &Connection) -> Result<()> {
 ///
 /// Returns [`StorageError::Sqlite`] if the query fails.
 pub fn load_plugin_index_markers(conn: &Connection) -> Result<HashMap<String, PluginIndexMarker>> {
-    let mut stmt =
-        conn.prepare("SELECT plugin_id, plugin_version, ontology_version FROM plugin_index_meta")?;
+    let mut stmt = conn.prepare(
+        "SELECT plugin_id, plugin_version, ontology_version, \
+                host_syntax_finding_contract \
+         FROM plugin_index_meta",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok(PluginIndexMarker {
             plugin_id: row.get::<_, String>(0)?,
             plugin_version: row.get::<_, String>(1)?,
             ontology_version: row.get::<_, String>(2)?,
+            host_syntax_finding_contract: row.get::<_, i64>(3)?,
         })
     })?;
     let mut out = HashMap::new();
@@ -230,16 +238,19 @@ pub fn upsert_plugin_index_marker(
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO plugin_index_meta \
-            (plugin_id, plugin_version, ontology_version, recorded_at) \
-         VALUES (?1, ?2, ?3, ?4) \
+            (plugin_id, plugin_version, ontology_version, \
+             host_syntax_finding_contract, recorded_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
          ON CONFLICT(plugin_id) DO UPDATE SET \
             plugin_version   = excluded.plugin_version, \
             ontology_version = excluded.ontology_version, \
+            host_syntax_finding_contract = excluded.host_syntax_finding_contract, \
             recorded_at      = excluded.recorded_at",
         params![
             marker.plugin_id,
             marker.plugin_version,
             marker.ontology_version,
+            marker.host_syntax_finding_contract,
             recorded_at
         ],
     )?;
@@ -393,6 +404,7 @@ mod tests {
             plugin_id: plugin_id.to_owned(),
             plugin_version: version.to_owned(),
             ontology_version: ontology.to_owned(),
+            host_syntax_finding_contract: 2,
         }
     }
 
@@ -402,6 +414,7 @@ mod tests {
         upsert_plugin_index_marker(&conn, &marker("python", "1.3.1", "0.9.0"), "t0").unwrap();
         let loaded = load_plugin_index_markers(&conn).unwrap();
         assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["python"].host_syntax_finding_contract, 2);
         assert_eq!(
             loaded.get("python"),
             Some(&marker("python", "1.3.1", "0.9.0"))

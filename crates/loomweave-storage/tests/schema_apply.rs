@@ -842,7 +842,10 @@ fn migrations_are_idempotent() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut conn = open_fresh(&tempdir);
     schema::apply_migrations(&mut conn).expect("second apply should be a no-op");
-    assert_eq!(schema::applied_count(&conn).unwrap(), 11);
+    assert_eq!(
+        schema::applied_count(&conn).unwrap(),
+        schema::CURRENT_SCHEMA_VERSION
+    );
     let tables_after = table_names(&conn);
     assert!(tables_after.contains(&"entities".to_owned()));
 }
@@ -856,7 +859,7 @@ fn schema_migrations_records_each_applied_migration() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 11);
+    assert_eq!(count, i64::from(schema::CURRENT_SCHEMA_VERSION));
     let names: Vec<String> = {
         let mut stmt = conn
             .prepare("SELECT name FROM schema_migrations ORDER BY version")
@@ -878,6 +881,7 @@ fn schema_migrations_records_each_applied_migration() {
             "0009_drop_fts_content_text",
             "0010_dedupe_findings_drop_run_scoped_ids",
             "0011_plugin_index_meta",
+            "0012_plugin_syntax_finding_contract",
         ]
     );
 }
@@ -916,6 +920,23 @@ fn migration_0011_creates_plugin_index_meta_table() {
             "missing plugin_index_meta.{expected} in {columns:?}"
         );
     }
+}
+
+#[test]
+fn migration_0012_adds_per_plugin_syntax_finding_contract() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('plugin_index_meta')")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        rows.map(std::result::Result::unwrap).collect()
+    };
+    assert!(
+        columns.contains(&"host_syntax_finding_contract".to_owned()),
+        "migration 0012 must version syntax-finding identity per plugin: {columns:?}"
+    );
 }
 
 // ----------------------------------------------------------------------------

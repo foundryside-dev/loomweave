@@ -2970,6 +2970,18 @@ fn analyze_resume_reuses_run_row_and_emits_mark_unseen_false() {
         run_status, "completed",
         "the resumed run finalizes to completed"
     );
+    let syntax_contract: i64 = conn
+        .query_row(
+            "SELECT json_extract(config, '$.host_contracts.syntax_findings') \
+             FROM runs WHERE id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        syntax_contract, 2,
+        "resume persists the current host syntax-finding contract marker"
+    );
     let stats = latest_run_stats(project_dir.path());
     assert_eq!(
         stats["filigree_emission"]["mark_unseen"].as_bool(),
@@ -4258,6 +4270,7 @@ fn analyze_ontology_bump_forces_full_reanalysis() {
 #[cfg(unix)]
 const SYNTAX_ERROR_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
 import json
+import os
 import pathlib
 import sys
 
@@ -4303,17 +4316,35 @@ while True:
     elif method == "analyze_file":
         path = msg["params"]["file_path"]
         stem = pathlib.Path(path).stem
+        parse_status = "syntax_error" if stem.startswith("broken") else "ok"
         entity = {
             "id": f"synfixture:module:{stem}",
             "kind": "module",
             "qualified_name": stem,
             "source": {"file_path": path},
-            "parse_status": "syntax_error" if stem.startswith("broken") else "ok",
+            "parse_status": parse_status,
         }
+        should_report = parse_status == "syntax_error" or stem == "reported_only"
+        message = (
+            "synthetic parser reported source without degraded entity"
+            if stem == "reported_only"
+            else "synthetic parser rejected source"
+        )
+        findings = [] if not should_report or os.environ.get("SYN_REPORT_FINDINGS") != "1" else [{
+            "subcode": "LMWV-SYN-SYNTAX-ERROR",
+            "severity": "warning",
+            "message": message,
+            "metadata": {"parse_status": parse_status},
+        }]
         write_frame({
             "jsonrpc": "2.0",
             "id": ident,
-            "result": {"entities": [entity], "edges": [], "stats": {}},
+            "result": {
+                "entities": [entity],
+                "edges": [],
+                "stats": {},
+                "findings": findings,
+            },
         })
     elif method == "shutdown":
         write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
@@ -4365,13 +4396,148 @@ fn write_syntax_error_plugin(plugin_dir: &std::path::Path) {
         .expect("write syn plugin manifest");
 }
 
-/// REQ-ANALYZE-06 verification (in part): a file that fails to parse produces a
-/// `LMWV-PY-SYNTAX-ERROR` finding **persisted to the store**, anchored to the
-/// degraded module entity — not merely logged. A cleanly-parsed file produces
-/// no such finding.
+#[cfg(unix)]
+fn seed_legacy_syntax_state(db_path: &std::path::Path) -> (String, String) {
+    let conn = Connection::open(db_path).unwrap();
+    let run_id: String = conn
+        .query_row(
+            "SELECT id FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("find prior run");
+    let file_anchor = |suffix: &str| -> String {
+        conn.query_row(
+            "SELECT id FROM entities WHERE kind = 'file' AND source_file_path LIKE ?1",
+            [format!("%/{suffix}")],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let legacy_broken_plugin_id = format!(
+        "core:finding:infra:{}",
+        blake3::hash(b"synfixture\0LMWV-SYN-SYNTAX-ERROR\0synthetic parser rejected source")
+            .to_hex()
+    );
+    let legacy_reported_only_id = format!(
+        "core:finding:infra:{}",
+        blake3::hash(
+            b"synfixture\0LMWV-SYN-SYNTAX-ERROR\0synthetic parser reported source without degraded entity"
+        )
+        .to_hex()
+    );
+    for (id, anchor, message) in [
+        (
+            &legacy_broken_plugin_id,
+            file_anchor("broken_mod.syn"),
+            "synthetic parser rejected source",
+        ),
+        (
+            &legacy_reported_only_id,
+            file_anchor("reported_only.syn"),
+            "synthetic parser reported source without degraded entity",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO findings (id, tool, tool_version, run_id, rule_id, kind, severity, \
+             confidence, confidence_basis, entity_id, related_entities, message, evidence, \
+             properties, supports, supported_by, status, created_at, updated_at) \
+             VALUES (?1, 'loomweave', 'legacy', ?2, 'LMWV-SYN-SYNTAX-ERROR', 'defect', \
+             'WARN', 1.0, 'host enforcement', ?3, '[]', ?4, '{}', '{}', '[]', '[]', \
+             'acknowledged', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![id, run_id, anchor, message],
+        )
+        .expect("simulate plugin finding id emitted by the older host");
+    }
+    let changed = conn
+        .execute(
+            "UPDATE findings SET rule_id = 'LMWV-PY-SYNTAX-ERROR', \
+             status = 'promoted_to_issue', filigree_issue_id = 'clarion-existing' \
+             WHERE entity_id = 'synfixture:module:broken_mod'",
+            [],
+        )
+        .expect("simulate operator-managed legacy fallback from an older host");
+    assert_eq!(changed, 1, "the first run must persist the fallback");
+    conn.execute(
+        "UPDATE runs SET config = json_remove(config, '$.host_contracts.syntax_findings') \
+         WHERE id = ?1",
+        [&run_id],
+    )
+    .expect("simulate an index written before the host syntax contract marker");
+    conn.execute(
+        "UPDATE plugin_index_meta SET host_syntax_finding_contract = 0 \
+         WHERE plugin_id = 'synfixture'",
+        [],
+    )
+    .expect("simulate a plugin marker written before syntax-finding identity v2");
+    (legacy_broken_plugin_id, legacy_reported_only_id)
+}
+
+#[cfg(unix)]
+fn assert_silent_syntax_reconciliation(
+    db_path: &std::path::Path,
+    legacy_plugin_id: &str,
+    prior_canonical_id: &str,
+) {
+    let conn = Connection::open(db_path).unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT f.id, f.status, COALESCE(f.filigree_issue_id, ''), f.properties \
+             FROM findings AS f JOIN entities AS e ON e.id = f.entity_id \
+             WHERE f.rule_id = 'LMWV-SYN-SYNTAX-ERROR' \
+               AND e.source_file_path LIKE '%/broken_mod.syn' \
+             ORDER BY f.id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a silent pass must reverse-merge the canonical row into the fallback"
+    );
+    assert_eq!(
+        &rows[0].0,
+        "core:finding:syntax-error:synfixture:module:broken_mod"
+    );
+    assert_eq!(&rows[0].1, "promoted_to_issue");
+    assert_eq!(&rows[0].2, "clarion-existing");
+    let properties: serde_json::Value = serde_json::from_str(&rows[0].3).unwrap();
+    let merged_ids = properties["merged_legacy_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        merged_ids.contains(legacy_plugin_id),
+        "reverse reconciliation must retain earlier migration audit: {properties}"
+    );
+    assert!(
+        merged_ids.contains(prior_canonical_id),
+        "reverse reconciliation must audit the superseded canonical row: {properties}"
+    );
+    assert!(
+        !merged_ids.contains("core:finding:syntax-error:synfixture:module:broken_mod"),
+        "a fallback must not carry a self-referential migration audit: {properties}"
+    );
+}
+
+/// REQ-ANALYZE-06 verification (in part): plugin-reported syntax findings are
+/// file-scoped even when messages are identical, and they replace previously
+/// persisted host fallbacks without losing operator lifecycle state.
 #[cfg(unix)]
 #[test]
-fn analyze_persists_syntax_error_finding_for_unparseable_file() {
+fn analyze_replaces_legacy_syntax_fallbacks_with_file_scoped_plugin_findings() {
     let project_dir = tempfile::tempdir().unwrap();
     let plugin_dir = tempfile::tempdir().unwrap();
     write_syntax_error_plugin(plugin_dir.path());
@@ -4382,7 +4548,9 @@ fn analyze_persists_syntax_error_finding_for_unparseable_file() {
         .assert()
         .success();
     std::fs::write(project_dir.path().join("broken_mod.syn"), b"def (\n").unwrap();
+    std::fs::write(project_dir.path().join("broken_other.syn"), b"def (\n").unwrap();
     std::fs::write(project_dir.path().join("clean_mod.syn"), b"ok\n").unwrap();
+    std::fs::write(project_dir.path().join("reported_only.syn"), b"ok\n").unwrap();
 
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
@@ -4393,38 +4561,194 @@ fn analyze_persists_syntax_error_finding_for_unparseable_file() {
         .assert()
         .success();
 
-    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
-    let (count, anchor): (i64, String) = conn
-        .query_row(
-            "SELECT COUNT(*), COALESCE(MIN(entity_id), '') FROM findings \
-             WHERE rule_id = 'LMWV-PY-SYNTAX-ERROR'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let (legacy_broken_plugin_id, legacy_reported_only_id) = seed_legacy_syntax_state(&db_path);
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("SYN_REPORT_FINDINGS", "1")
+        .assert()
+        .success();
+
+    let conn = Connection::open(&db_path).unwrap();
+    let findings = conn
+        .prepare(
+            "SELECT f.id, f.rule_id, e.kind, f.status, \
+                    COALESCE(f.filigree_issue_id, ''), e.source_file_path \
+             FROM findings AS f \
+             JOIN entities AS e ON e.id = f.entity_id \
+             WHERE f.rule_id LIKE 'LMWV-%-SYNTAX-ERROR' ORDER BY e.source_file_path",
         )
-        .expect("query syntax-error findings");
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(
-        count, 1,
-        "exactly one LMWV-PY-SYNTAX-ERROR finding persisted"
+        findings.len(),
+        3,
+        "one canonical finding per plugin-reported file"
     );
-    assert_eq!(
-        anchor, "synfixture:module:broken_mod",
-        "finding anchors to the degraded module entity"
+    assert!(findings.iter().all(|finding| {
+        !finding.0.starts_with("core:finding:syntax-error:")
+            && finding.0 != legacy_broken_plugin_id
+            && finding.0 != legacy_reported_only_id
+            && finding.1 == "LMWV-SYN-SYNTAX-ERROR"
+            && finding.2 == "file"
+    }));
+    let promoted = findings
+        .iter()
+        .find(|finding| finding.5.ends_with("broken_mod.syn"))
+        .expect("canonical broken_mod finding");
+    assert_eq!(promoted.3, "promoted_to_issue");
+    assert_eq!(promoted.4, "clarion-existing");
+    let promoted_canonical_id = promoted.0.clone();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.5.ends_with("broken_other.syn")),
+        "identical plugin messages must not collapse findings across files"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.5.ends_with("reported_only.syn")),
+        "plugin-only syntax findings must migrate their anchor-blind legacy id"
     );
 
-    // The anchor row exists (FK integrity) and the clean file produced no finding.
-    let anchor_exists: i64 = conn
+    drop(conn);
+    loomweave_bin()
+        .args(["analyze", "--no-incremental"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    assert_silent_syntax_reconciliation(&db_path, &legacy_broken_plugin_id, &promoted_canonical_id);
+}
+
+#[cfg(unix)]
+#[test]
+fn syntax_contract_redispatches_plugins_without_degraded_entity_roles() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_syntax_error_plugin(plugin_dir.path());
+    let no_degraded_role =
+        SYNTAX_ERROR_PLUGIN_MANIFEST.replace("syntax_degraded_module = [\"module\"]\n", "");
+    std::fs::write(plugin_dir.path().join("plugin.toml"), no_degraded_role).unwrap();
+
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("reported_only.syn"), b"ok\n").unwrap();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let run_id: String = conn
         .query_row(
-            "SELECT COUNT(*) FROM entities WHERE id = 'synfixture:module:broken_mod'",
+            "SELECT id FROM runs ORDER BY started_at DESC LIMIT 1",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(anchor_exists, 1, "finding anchor entity is present");
+    let file_anchor: String = conn
+        .query_row(
+            "SELECT id FROM entities WHERE kind = 'file' \
+             AND source_file_path LIKE '%/reported_only.syn'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let legacy_id = format!(
+        "core:finding:infra:{}",
+        blake3::hash(
+            b"synfixture\0LMWV-SYN-SYNTAX-ERROR\0synthetic parser reported source without degraded entity"
+        )
+        .to_hex()
+    );
+    conn.execute(
+        "INSERT INTO findings (id, tool, tool_version, run_id, rule_id, kind, severity, \
+         confidence, confidence_basis, entity_id, related_entities, message, evidence, \
+         properties, supports, supported_by, status, created_at, updated_at) \
+         VALUES (?1, 'loomweave', 'legacy', ?2, 'LMWV-SYN-SYNTAX-ERROR', 'defect', \
+         'WARN', 1.0, 'host enforcement', ?3, '[]', \
+         'synthetic parser reported source without degraded entity', '{}', '{}', '[]', \
+         '[]', 'acknowledged', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        rusqlite::params![legacy_id, run_id, file_anchor],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE runs SET config = json_remove(config, '$.host_contracts.syntax_findings') \
+         WHERE id = ?1",
+        [&run_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE plugin_index_meta SET host_syntax_finding_contract = 0 \
+         WHERE plugin_id = 'synfixture'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("SYN_REPORT_FINDINGS", "1")
+        .assert()
+        .success();
+
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "the host syntax contract changes plugin finding identity, so every plugin \
+         must receive the one-time redispatch even without a degraded-entity role"
+    );
+    let conn = Connection::open(db_path).unwrap();
+    let old_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE id = ?1",
+            [&legacy_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let canonical_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SYN-SYNTAX-ERROR' \
+             AND id <> ?1",
+            [&legacy_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_count, 0, "the anchor-blind legacy id must be migrated");
+    assert_eq!(canonical_count, 1, "one file-scoped canonical row remains");
 }
 
 /// A `synfixture`-style plugin whose `parse_status` keys on file *content*
 /// (`BROKEN` substring), not the filename stem. This lets a test toggle a
-/// file-anchored `LMWV-PY-SYNTAX-ERROR` finding on and off by rewriting the SAME
+/// file-anchored `LMWV-SWP-SYNTAX-ERROR` finding on and off by rewriting the SAME
 /// file's bytes — the module entity id is stable, so no entity-deleted noise — and
 /// makes content edits drive the incremental skip/walk decision. Used by the
 /// ADR-048 stale-finding-sweep gate tests.
@@ -4549,7 +4873,7 @@ fn syntax_error_finding_count(project_root: &std::path::Path) -> i64 {
     Connection::open(project_root.join(".weft/loomweave/loomweave.db"))
         .unwrap()
         .query_row(
-            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-PY-SYNTAX-ERROR'",
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SWP-SYNTAX-ERROR'",
             [],
             |row| row.get(0),
         )
@@ -4558,7 +4882,7 @@ fn syntax_error_finding_count(project_root: &std::path::Path) -> i64 {
 
 /// ADR-048 acceptance #1 + #3: a finding the current run no longer reproduces is
 /// retired by the stale-finding sweep, and the whole-project finding count drops.
-/// `mod_a.swp` carries a `BROKEN` marker (→ one `LMWV-PY-SYNTAX-ERROR` finding);
+/// `mod_a.swp` carries a `BROKEN` marker (→ one `LMWV-SWP-SYNTAX-ERROR` finding);
 /// fixing its content and re-running a clean full pass (`--no-incremental`, so the
 /// sweep gate's `skipped_files == 0` holds) must DELETE the now-unreproduced
 /// finding. This fails if the sweep is removed (the row would linger at the old

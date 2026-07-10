@@ -23,11 +23,13 @@ pub(crate) async fn begin_run(
 
 /// Reopen an existing run for `--resume` (REQ-FINDING-05): the writer reuses
 /// the prior run's row instead of inserting a fresh one (which would conflict
-/// on the run PK). See [`WriterCmd::ResumeRun`].
-pub(crate) async fn resume_run(writer: &Writer, run_id: &str) -> Result<()> {
+/// on the run PK) and records the current normalized config. See
+/// [`WriterCmd::ResumeRun`].
+pub(crate) async fn resume_run(writer: &Writer, run_id: &str, config_json: &str) -> Result<()> {
     writer
         .send_wait(|ack| WriterCmd::ResumeRun {
             run_id: run_id.to_owned(),
+            config_json: config_json.to_owned(),
             ack,
         })
         .await
@@ -50,7 +52,7 @@ pub(crate) async fn open_run(
     if resume {
         // Resume reuses the existing run row (and its original
         // `analyzed_at_commit`); the prior-run base must not shift mid-resume.
-        resume_run(writer, run_id).await
+        resume_run(writer, run_id, analyze_config_json).await
     } else {
         begin_run(writer, run_id, analyze_config_json, started_at, head_commit).await
     }

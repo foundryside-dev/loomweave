@@ -159,11 +159,16 @@ pub enum WriterCmd {
     /// Reopen an existing run row for the `--resume` path (REQ-FINDING-05).
     /// `BeginRun` does an `INSERT` that conflicts on the run PK when handed an
     /// id that already exists; `ResumeRun` instead `UPDATE`s the row back to
-    /// `running` (clearing `completed_at`), then binds it as the active run and
-    /// opens the write transaction exactly as `BeginRun` does. Errors if no row
-    /// with `run_id` exists. A re-walk upserts entities/edges idempotently, so
-    /// a resumed run reproduces the same durable graph as the original.
-    ResumeRun { run_id: String, ack: Ack<()> },
+    /// `running` (clearing `completed_at`), replaces its config with the current
+    /// normalized analyze config, then binds it as the active run and opens the
+    /// write transaction exactly as `BeginRun` does. Errors if no row with
+    /// `run_id` exists. A re-walk upserts entities/edges idempotently, so a
+    /// resumed run reproduces the same durable graph as the original.
+    ResumeRun {
+        run_id: String,
+        config_json: String,
+        ack: Ack<()>,
+    },
     /// Insert an entity; also advances the per-batch write counter and
     /// commits the in-flight transaction if the batch boundary is crossed.
     InsertEntity {
@@ -229,6 +234,19 @@ pub enum WriterCmd {
     InsertFinding {
         finding: Box<FindingRecord>,
         ack: Ack<()>,
+    },
+    /// Merge operator lifecycle state from a superseded finding into its
+    /// canonical replacement, then remove the superseded row. Both findings
+    /// must already exist in the active run transaction, and the legacy row's
+    /// anchor must match `expected_superseded_entity_id` so a formerly
+    /// anchor-blind id collision cannot transfer lifecycle to the wrong file.
+    /// Returns `false` when any precondition is absent or mismatched, leaving
+    /// the superseded row untouched.
+    MergeFindingLifecycle {
+        canonical_id: String,
+        superseded_id: String,
+        expected_superseded_entity_id: String,
+        ack: Ack<bool>,
     },
     /// Commit the current analyze batch and reopen it so readers on separate
     /// `SQLite` connections can observe graph rows before `CommitRun`.

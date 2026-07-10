@@ -38,6 +38,17 @@ only when an incompatible change is made to that surface. See
   persisted subsystem graph to each run's authoritative clustering result,
   preserving stable subsystem IDs while removing obsolete subsystem entities
   and membership edges, including on unchanged incremental reruns.
+- **Plugin syntax-finding deduplication.** Host fallbacks now use each plugin's
+  declared rule namespace and are suppressed per file when the plugin already
+  reported that syntax failure, removing wrong-language duplicate findings for
+  degraded Rust files while retaining fallback coverage for silent plugins.
+  Plugin syntax identities are file-scoped, and legacy duplicate rows merge
+  into the canonical finding without losing status or Filigree linkage. A
+  versioned per-plugin marker forces each plugin through the one-time
+  incremental re-dispatch needed to migrate old indexes, including plugins that
+  leave and later return; the run-level marker is retained when a migration
+  resumes. Reconciliation is symmetric, so a later silent or partial plugin
+  pass can fall back without recreating a duplicate or losing migration audit.
 
 ## [1.4.1] — 2026-07-10
 
