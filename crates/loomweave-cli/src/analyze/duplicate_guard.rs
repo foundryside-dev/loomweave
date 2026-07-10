@@ -43,6 +43,9 @@ use loomweave_core::HostFinding;
 /// (clarion-48af930f2a).
 pub(crate) use loomweave_core::DUPLICATE_LOCATOR_RULE_ID;
 
+const EVIDENCE_CONTRACT: &str = "loomweave.duplicate-locator";
+const EVIDENCE_CONTRACT_VERSION: &str = "2";
+
 /// Per-plugin, per-run duplicate-locator tracker. One `HashMap<id, path>`
 /// across the run's entities is fine at the 100k-entity scale `analyze`
 /// targets.
@@ -146,10 +149,27 @@ impl DuplicateLocatorGuard {
         }
         let mut metadata = BTreeMap::new();
         metadata.insert("entity_id".to_owned(), entity_id.to_owned());
-        metadata.insert("first_source_file_path".to_owned(), first_path.to_owned());
+        metadata.insert("evidence_contract".to_owned(), EVIDENCE_CONTRACT.to_owned());
+        metadata.insert(
+            "evidence_contract_version".to_owned(),
+            EVIDENCE_CONTRACT_VERSION.to_owned(),
+        );
+        metadata.insert(
+            "declaration_source_file_path".to_owned(),
+            first_path.to_owned(),
+        );
         metadata.insert(
             "colliding_source_file_path".to_owned(),
             second_path.to_owned(),
+        );
+        // Compatibility alias: before the entity-anchor change, downstream
+        // readers used this key for the planted colliding declaration. Restore
+        // that meaning for the deprecation window; new readers must use the two
+        // explicit path keys above.
+        metadata.insert("first_source_file_path".to_owned(), second_path.to_owned());
+        metadata.insert(
+            "first_source_file_path_deprecated".to_owned(),
+            "use declaration_source_file_path and colliding_source_file_path".to_owned(),
         );
         metadata.insert("shape".to_owned(), shape.as_str().to_owned());
         // Anchor the finding to the COLLIDING ENTITY (the survivor row), not a
@@ -237,6 +257,49 @@ mod tests {
         let finding = guard.record("p:fn:a", "b.rs", false).expect("finding");
         assert_eq!(shape_of(&finding), "in_run_cross_file");
         assert!(finding.message.contains("a.rs") && finding.message.contains("b.rs"));
+        assert_eq!(
+            finding
+                .metadata
+                .get("evidence_contract")
+                .map(String::as_str),
+            Some("loomweave.duplicate-locator")
+        );
+        assert_eq!(
+            finding
+                .metadata
+                .get("evidence_contract_version")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            finding
+                .metadata
+                .get("declaration_source_file_path")
+                .map(String::as_str),
+            Some("a.rs")
+        );
+        assert_eq!(
+            finding
+                .metadata
+                .get("colliding_source_file_path")
+                .map(String::as_str),
+            Some("b.rs")
+        );
+        assert_eq!(
+            finding
+                .metadata
+                .get("first_source_file_path")
+                .map(String::as_str),
+            Some("b.rs"),
+            "deprecated v1 alias retains its original colliding-path meaning"
+        );
+        assert_eq!(
+            finding
+                .metadata
+                .get("first_source_file_path_deprecated")
+                .map(String::as_str),
+            Some("use declaration_source_file_path and colliding_source_file_path")
+        );
     }
 
     #[test]

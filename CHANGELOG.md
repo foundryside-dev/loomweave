@@ -14,6 +14,11 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
+- **Versioned duplicate-locator evidence.** `LMWV-DUPLICATE-LOCATOR` now
+  publishes evidence contract v2 with explicit declaration and collision path
+  keys. The deprecated `first_source_file_path` alias retains its original
+  colliding-path meaning instead of silently changing meaning, while entity
+  collision reads remain compatible with unversioned findings already stored.
 - **Rust dead-code lint scope.** `#[allow(dead_code)]` and
   `#[expect(dead_code)]` now propagate through inline modules and impl blocks,
   while nested `warn` / `deny` / `forbid` levels correctly cancel inherited

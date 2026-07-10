@@ -766,6 +766,51 @@ verbatim, no re-judgement. The `WardlineMeta` entity-property carriage of
 it was retired 2026-06-11 (clarion-7c9336163e, see requirements.md
 REQ-GUIDANCE-04 retirement note). WS9 owns nothing new and adds no adjudication.
 
+## Finding evidence compatibility
+
+Rule-specific finding evidence is a consumer contract, even when it is stored
+inside the generic `evidence.metadata` object rather than served by a dedicated
+HTTP route. Producers must not repurpose an existing key to a new meaning: that
+creates a valid-looking wrong read for consumers that is harder to detect than a
+missing key.
+
+- Additive optional keys may retain the current contract version.
+- Renaming a key, changing its meaning, or moving the finding anchor requires an
+  `evidence_contract_version` bump and a changelog entry.
+- When the old meaning can be retained safely, keep the old key as a deprecated
+  alias for at least the compatibility window and name its replacement in the
+  payload. Readers should prefer the new explicit key and use the old key only
+  for unversioned stored rows.
+- When compatibility cannot be preserved, omit the old key rather than return a
+  different value under the old name. A loud missing-key failure is preferable
+  to a silent wrong read.
+
+### `LMWV-DUPLICATE-LOCATOR` evidence v2
+
+The contract identifier is `loomweave.duplicate-locator`; its current version
+is the string `"2"` because host-finding metadata values are strings. The
+versioned fields under `evidence.metadata` are:
+
+```json
+{
+  "evidence_contract": "loomweave.duplicate-locator",
+  "evidence_contract_version": "2",
+  "declaration_source_file_path": "/project/pkg/__init__.py",
+  "colliding_source_file_path": "/project/pkg.py",
+  "first_source_file_path": "/project/pkg.py",
+  "first_source_file_path_deprecated": "use declaration_source_file_path and colliding_source_file_path"
+}
+```
+
+`declaration_source_file_path` is the first accepted declaration;
+`colliding_source_file_path` is the declaration that triggered the collision.
+`first_source_file_path` is a deprecated compatibility alias for
+`colliding_source_file_path`, preserving its pre-v11 consumer meaning. The
+entity collision read path prefers `declaration_source_file_path` and falls back
+to `first_source_file_path` only when both the contract identifier and version
+are absent. Unversioned v11 findings already stored remain readable, while a
+malformed v2 or future alias is never interpreted as the first declaration.
+
 ## Path normalization
 
 Both `GET /api/v1/files` and `POST /api/v1/files/batch` accept the same

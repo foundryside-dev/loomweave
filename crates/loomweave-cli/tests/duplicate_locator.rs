@@ -240,6 +240,26 @@ fn in_run_cross_file_duplicate_names_both_paths() {
         evidence.contains("in_run_cross_file"),
         "evidence must carry the cross-file shape; got {evidence}"
     );
+    let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+    let metadata = &evidence["metadata"];
+    assert_eq!(metadata["evidence_contract"], "loomweave.duplicate-locator");
+    assert_eq!(metadata["evidence_contract_version"], "2");
+    assert!(
+        metadata["declaration_source_file_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("alpha.mt")),
+        "v2 names the first declaration explicitly: {metadata}"
+    );
+    assert!(
+        metadata["colliding_source_file_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("beta.mt")),
+        "v2 names the colliding declaration explicitly: {metadata}"
+    );
+    assert_eq!(
+        metadata["first_source_file_path"], metadata["colliding_source_file_path"],
+        "deprecated alias retains the pre-v11 colliding-path meaning"
+    );
 }
 
 /// Cross-run shape: run A seeds the gadget from `alpha.mt`; run B (incremental)

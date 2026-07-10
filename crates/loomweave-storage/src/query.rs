@@ -1228,14 +1228,25 @@ pub fn duplicate_locator_collision(
             .and_then(|v| v.as_str())
             .map(str::to_owned)
     };
-    let mut declarations: Vec<String> = [
-        str_field("first_source_file_path"),
-        str_field("colliding_source_file_path"),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|p| !p.is_empty())
-    .collect();
+    let versioned_evidence = metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|fields| {
+            fields.contains_key("evidence_contract")
+                || fields.contains_key("evidence_contract_version")
+        });
+    let declaration_path = str_field("declaration_source_file_path").or_else(|| {
+        if versioned_evidence {
+            None
+        } else {
+            str_field("first_source_file_path")
+        }
+    });
+    let mut declarations: Vec<String> = [declaration_path, str_field("colliding_source_file_path")]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .collect();
     declarations.sort();
     declarations.dedup();
     Ok(Some(LocatorCollision {
@@ -2549,7 +2560,10 @@ mod duplicate_locator_collision_tests {
             "metadata": {
                 "entity_id": COLLIDING_ID,
                 "anchor_entity_id": COLLIDING_ID,
-                "first_source_file_path": "/specimen/colliding/__init__.py",
+                "evidence_contract": "loomweave.duplicate-locator",
+                "evidence_contract_version": "2",
+                "declaration_source_file_path": "/specimen/colliding/__init__.py",
+                "first_source_file_path": "/specimen/colliding.py",
                 "colliding_source_file_path": "/specimen/colliding.py",
                 "shape": "in_run_cross_file",
             }
@@ -2614,6 +2628,105 @@ mod duplicate_locator_collision_tests {
                 .unwrap()
                 .is_some(),
             "a suppressed duplicate-locator finding must NOT hide the collision"
+        );
+    }
+
+    #[test]
+    fn unversioned_evidence_retains_pre_v2_read_compatibility() {
+        let conn = migrated_conn();
+        insert_collision_finding(&conn, "open");
+        let evidence = serde_json::json!({
+            "plugin_id": "python",
+            "metadata": {
+                "entity_id": COLLIDING_ID,
+                "anchor_entity_id": COLLIDING_ID,
+                "first_source_file_path": "/specimen/colliding/__init__.py",
+                "colliding_source_file_path": "/specimen/colliding.py",
+                "shape": "in_run_cross_file",
+            }
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE findings SET evidence = ?1 WHERE id = 'core:finding:infra:dup'",
+            [evidence],
+        )
+        .unwrap();
+
+        let disclosure = duplicate_locator_collision(&conn, COLLIDING_ID)
+            .unwrap()
+            .expect("legacy collision remains readable");
+        assert_eq!(
+            disclosure.declarations,
+            vec![
+                "/specimen/colliding.py".to_owned(),
+                "/specimen/colliding/__init__.py".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn versioned_evidence_never_reinterprets_deprecated_alias_as_declaration() {
+        let conn = migrated_conn();
+        insert_collision_finding(&conn, "open");
+        let evidence = serde_json::json!({
+            "plugin_id": "python",
+            "metadata": {
+                "evidence_contract": "loomweave.duplicate-locator",
+                "evidence_contract_version": "2",
+                "entity_id": COLLIDING_ID,
+                "anchor_entity_id": COLLIDING_ID,
+                "first_source_file_path": "/must-not-be-read-as-declaration.py",
+                "colliding_source_file_path": "/specimen/colliding.py",
+                "shape": "in_run_cross_file",
+            }
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE findings SET evidence = ?1 WHERE id = 'core:finding:infra:dup'",
+            [evidence],
+        )
+        .unwrap();
+
+        let disclosure = duplicate_locator_collision(&conn, COLLIDING_ID)
+            .unwrap()
+            .expect("collision fact remains visible despite malformed v2 metadata");
+        assert_eq!(
+            disclosure.declarations,
+            vec!["/specimen/colliding.py".to_owned()],
+            "versioned evidence must not use the deprecated alias as a declaration fallback"
+        );
+    }
+
+    #[test]
+    fn malformed_contract_markers_do_not_reenable_legacy_alias_fallback() {
+        let conn = migrated_conn();
+        insert_collision_finding(&conn, "open");
+        let evidence = serde_json::json!({
+            "plugin_id": "python",
+            "metadata": {
+                "evidence_contract": 2,
+                "evidence_contract_version": {"future": true},
+                "entity_id": COLLIDING_ID,
+                "anchor_entity_id": COLLIDING_ID,
+                "first_source_file_path": "/must-not-be-read-as-declaration.py",
+                "colliding_source_file_path": "/specimen/colliding.py",
+                "shape": "in_run_cross_file",
+            }
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE findings SET evidence = ?1 WHERE id = 'core:finding:infra:dup'",
+            [evidence],
+        )
+        .unwrap();
+
+        let disclosure = duplicate_locator_collision(&conn, COLLIDING_ID)
+            .unwrap()
+            .expect("collision fact remains visible despite malformed contract markers");
+        assert_eq!(
+            disclosure.declarations,
+            vec!["/specimen/colliding.py".to_owned()],
+            "contract marker presence must disable the deprecated alias fallback regardless of type"
         );
     }
 

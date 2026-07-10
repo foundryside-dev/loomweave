@@ -8271,7 +8271,10 @@ mod tests {
             "metadata": {
                 "entity_id": id,
                 "anchor_entity_id": id,
-                "first_source_file_path": "/specimen/colliding/__init__.py",
+                "evidence_contract": "loomweave.duplicate-locator",
+                "evidence_contract_version": "2",
+                "declaration_source_file_path": "/specimen/colliding/__init__.py",
+                "first_source_file_path": "/specimen/colliding.py",
                 "colliding_source_file_path": "/specimen/colliding.py",
                 "shape": "in_run_cross_file",
             }
