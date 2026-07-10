@@ -1159,6 +1159,7 @@ dependencies = [
  "loomweave-core",
  "loomweave-federation",
  "loomweave-llm",
+ "loomweave-plugin-rust",
  "loomweave-storage",
  "nix",
  "reqwest",

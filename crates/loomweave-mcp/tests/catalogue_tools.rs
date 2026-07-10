@@ -6,12 +6,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use loomweave_core::ontology::tags;
 use loomweave_llm::{EmbeddingRecording, RecordingEmbeddingProvider};
 use loomweave_mcp::config::SemanticSearchConfig;
 use loomweave_mcp::filigree::{
     EntityAssociationsResponse, FiligreeClientError, FiligreeLookup, WardlineFinding,
 };
 use loomweave_mcp::{ServerState, list_tools};
+use loomweave_plugin_rust::extract::extract_file;
 use loomweave_storage::{EmbeddingKey, EmbeddingStore, ReaderPool, pragma, schema};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -3691,6 +3693,23 @@ fn insert_entity_with_plugin(
     .expect("insert entity");
 }
 
+fn insert_extracted_rust_entities(conn: &Connection, src: &str) {
+    let extracted = extract_file("lib", "lib", "src/lib.rs", src).expect("extract rust fixture");
+    for entity in extracted {
+        let id = entity["id"].as_str().expect("entity id");
+        let kind = entity["kind"].as_str().expect("entity kind");
+        insert_entity_with_plugin(conn, id, "rust", kind, "src/lib.rs", "{}");
+        for tag in entity
+            .get("tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            insert_tag_with_plugin(conn, id, "rust", tag.as_str().expect("tag string"));
+        }
+    }
+}
+
 /// B2(1) failing-first: non-code entities — core `file` anchors (the dogfooded
 /// `.env.example`), the project anchor, subsystems, guidance — must never be
 /// "dead CODE" candidates.
@@ -3802,10 +3821,19 @@ async fn find_dead_code_excludes_plugins_without_root_coverage_with_marker() {
     assert_eq!(excluded.len(), 1, "{env}");
     assert_eq!(excluded[0]["plugin"], "rust", "{env}");
     assert_eq!(excluded[0]["entities_excluded"], 1, "{env}");
-    assert!(
-        excluded[0]["reason"].as_str().unwrap().contains("root"),
-        "the marker must explain the missing root coverage: {env}"
-    );
+    let reason = excluded[0]["reason"].as_str().unwrap();
+    for tag in [
+        tags::ENTRY_POINT,
+        tags::EXPORTED_API,
+        tags::CLI_COMMAND,
+        tags::PUBLIC_SURFACE,
+        tags::ALLOW_DEAD_CODE,
+    ] {
+        assert!(
+            reason.contains(tag),
+            "the marker must name the concrete root vocabulary, including {tag}: {env}"
+        );
+    }
 }
 
 /// B2(3) failing-first (revised per PM ruling on weft-3fb0f5dfc7): a
@@ -4390,6 +4418,46 @@ async fn find_dead_code_surveys_rust_once_it_emits_roots() {
             "rust emits roots → no plugin is withheld (app_only={app_only}): {env}"
         );
     }
+}
+
+#[tokio::test]
+async fn find_dead_code_consumes_real_rust_extractor_root_tags() {
+    let (project, db, conn) = open_project();
+    let src = r"
+        pub fn public_api() {}
+        fn dead_helper() {}
+    ";
+    insert_extracted_rust_entities(&conn, src);
+
+    let exported_tags = extract_file("lib", "lib", "src/lib.rs", src)
+        .expect("extract rust fixture")
+        .into_iter()
+        .find(|entity| entity["id"] == "rust:function:lib.public_api")
+        .and_then(|entity| entity.get("tags").and_then(Value::as_array).cloned())
+        .expect("public_api tags");
+    assert!(
+        exported_tags
+            .iter()
+            .any(|tag| tag.as_str() == Some(tags::EXPORTED_API)),
+        "the Rust extractor must emit the shared exported-api vocabulary: {exported_tags:?}"
+    );
+
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        vec!["rust:function:lib.dead_helper".to_owned()],
+        "the MCP dead-code consumer must recognize root tags emitted by the real Rust extractor: {env}"
+    );
 }
 
 /// ADR-054: `module` and `impl` are containment-spine containers rooted at the

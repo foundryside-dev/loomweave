@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 
+use loomweave_core::ontology::tags;
 use syn::{Attribute, Meta, Visibility};
 
 /// actix-web / ntex / rocket route attribute macros (last-segment match). All
@@ -119,30 +120,30 @@ pub fn root_tags(
 ) -> Vec<String> {
     let mut tags: BTreeSet<&'static str> = BTreeSet::new();
     if is_public && ctx.ancestors_all_pub && !ctx.in_bin_target {
-        tags.insert("exported-api");
+        tags.insert(tags::EXPORTED_API);
     }
     if ctx.under_cfg_test || has_test_attr(attrs) {
-        tags.insert("test");
+        tags.insert(tags::TEST);
     }
     // entry-point: a bare module-level `fn main` (fns only), OR an entry
     // attribute (runtime entry / FFI host export / proc-macro) on any item.
     if (is_fn && ctx.at_file_top && name == "main") || has_entry_attr(attrs) {
-        tags.insert("entry-point");
+        tags.insert(tags::ENTRY_POINT);
     }
     // Framework-dispatched handlers — reached by the framework, not by a static
     // caller, so roots regardless of visibility/crate-type. `framework-handler`
     // rides as the excluded-tag companion (mirroring the Python plugin); the
     // ROOT is `http-route` / `cli-command` (ADR-054 increment 2).
     if attr_last_seg_in(attrs, HTTP_ROUTE_ATTRS) {
-        tags.insert("http-route");
-        tags.insert("framework-handler");
+        tags.insert(tags::HTTP_ROUTE);
+        tags.insert(tags::FRAMEWORK_HANDLER);
     }
     if derive_last_seg_in(attrs, CLI_COMMAND_DERIVES) {
-        tags.insert("cli-command");
-        tags.insert("framework-handler");
+        tags.insert(tags::CLI_COMMAND);
+        tags.insert(tags::FRAMEWORK_HANDLER);
     }
     if has_allow_dead_code(attrs) {
-        tags.insert("allow-dead-code");
+        tags.insert(tags::ALLOW_DEAD_CODE);
     }
     tags.into_iter().map(str::to_owned).collect()
 }
@@ -322,7 +323,7 @@ mod tests {
         assert!(descended.ancestors_all_pub);
         assert_eq!(
             root_tags("x", true, false, &[], descended),
-            ["exported-api"]
+            [tags::EXPORTED_API]
         );
     }
 

@@ -9,6 +9,7 @@
 pub mod entity_id;
 pub mod errors;
 pub mod hardened_git;
+pub mod ontology;
 pub mod plugin;
 pub mod store;
 

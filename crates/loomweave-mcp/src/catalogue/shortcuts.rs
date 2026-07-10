@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use loomweave_core::{EdgeConfidence, McpErrorCode};
+use loomweave_core::{EdgeConfidence, McpErrorCode, ontology::tags};
 use loomweave_storage::{
     call_edges_targeting, entities_for_churn_candidates,
     entities_targeted_by_unresolved_call_sites, entity_by_id, resolve_entity_ref, sei_for_locator,
@@ -55,43 +55,18 @@ const EDGE_SCAN_ORDER_BY: &str = "ORDER BY kind, from_id, to_id, confidence, \
 /// emitted and the root set is byte-identical to before. Stale facts cannot
 /// resurrect a deleted entity as a root — `entity_tags` rows cascade-delete
 /// with their entity, and roots join only live `entities`.
-const DEAD_CODE_ROOT_TAGS: &[&str] = &[
-    "entry-point",
-    "http-route",
-    "test",
-    "data-model",
-    "cli-command",
-    "exported-api",
-    // `public-surface` (clarion-4ec50f3d92): the Python plugin's PEP 8 fallback —
-    // a non-underscore module-level def/class in a module that declares no
-    // `__all__` at all. A lower-confidence (inferred) root than a *declared*
-    // `exported-api`; a fail-toward-live posture for public code invoked from
-    // outside the static call graph (library consumers, or an app's
-    // framework-dispatched / DI / CLI handlers), so a codebase that does not
-    // exhaustively declare `__all__` is not read as ~entirely dead. Enrich-only:
-    // a module *with* `__all__` emits no `public-surface`, so well-declared
-    // modules are byte-identical to before.
-    "public-surface",
-    // `allow-dead-code` (ADR-054): the Rust plugin emits this for an item
-    // carrying `#[allow(dead_code)]` / `#[expect(dead_code)]` — an explicit
-    // author "keep this" assertion that suppresses rustc's own dead-code lint.
-    // The lowest-confidence root class (an explicit local suppression, not a
-    // structural surface), but fail-toward-live and consistent with rustc.
-    "allow-dead-code",
-    "wardline:external_boundary",
-    "wardline:trusted",
-];
+const DEAD_CODE_ROOT_TAGS: &[&str] = tags::DEAD_CODE_ROOTS;
 
 /// Tags that force an entity to be treated as live regardless of static
 /// reachability — dynamic-dispatch / reflection barriers. Better to under-report
 /// dead code than to call a reflectively-reached function dead (fail toward
 /// "live").
-const DEAD_CODE_BARRIER_TAGS: &[&str] = &["dynamic-dispatch", "reflection"];
+const DEAD_CODE_BARRIER_TAGS: &[&str] = tags::DEAD_CODE_BARRIERS;
 
 /// Tags excluding an entity from dead-code candidacy even when unreached —
 /// framework-magic entry kinds (decorated handlers, plugin hooks) whose callers
 /// are invisible to static analysis.
-const DEAD_CODE_EXCLUDED_TAGS: &[&str] = &["framework-handler", "plugin-hook"];
+const DEAD_CODE_EXCLUDED_TAGS: &[&str] = tags::DEAD_CODE_EXCLUDED;
 
 /// Entity KINDS that are not code and therefore can never be "dead code":
 /// core `file` anchors (a config sidecar like `.env.example` is not dead
@@ -543,6 +518,10 @@ fn root_tag_levers(plugin_ids: &BTreeSet<String>) -> String {
     format!("the levers are source-level — {}", phrases.join("; "))
 }
 
+fn dead_code_root_vocabulary() -> String {
+    DEAD_CODE_ROOT_TAGS.join(" / ")
+}
+
 /// The honest signal-unavailable envelope for `find_dead_code` when no
 /// reachability root tags exist — zero candidates, never a whole-corpus false
 /// positive. Identical in both `explicit` and `auto` modes: `auto` cannot
@@ -554,9 +533,9 @@ fn dead_code_no_roots_envelope(
     plugin_ids: &BTreeSet<String>,
 ) -> Value {
     let levers = root_tag_levers(plugin_ids);
+    let root_vocabulary = dead_code_root_vocabulary();
     let signal_msg = format!(
-        "this index has no reachability root tags (entry-point / http-route / test / \
-         data-model / cli-command / exported-api / public-surface / allow-dead-code), \
+        "this index has no reachability root tags ({root_vocabulary}), \
          so dead code cannot be determined — this is NOT a guarantee there is no dead \
          code. {levers}"
     );
@@ -634,7 +613,7 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         self.categorisation_shortcut(
             arguments,
-            "entry-point",
+            tags::ENTRY_POINT,
             "no entity is tagged as an entry point in this index (honest-empty, not a guaranteed \
              absence of entry points)",
         )
@@ -649,7 +628,7 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         self.categorisation_shortcut(
             arguments,
-            "http-route",
+            tags::HTTP_ROUTE,
             "no entity is tagged as an HTTP route in this index",
         )
         .await
@@ -663,7 +642,7 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         self.categorisation_shortcut(
             arguments,
-            "exported-api",
+            tags::EXPORTED_API,
             "no entity is tagged as an exported API in this index",
         )
         .await
@@ -677,7 +656,7 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         self.categorisation_shortcut(
             arguments,
-            "cli-command",
+            tags::CLI_COMMAND,
             "no entity is tagged as a CLI command in this index",
         )
         .await
@@ -691,7 +670,7 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         self.categorisation_shortcut(
             arguments,
-            "data-model",
+            tags::DATA_MODEL,
             "no entity is tagged as a data model in this index",
         )
         .await
@@ -705,7 +684,7 @@ impl ServerState {
     ) -> std::result::Result<Value, ParamError> {
         self.categorisation_shortcut(
             arguments,
-            "test",
+            tags::TEST,
             "no entity is tagged as a test in this index",
         )
         .await
@@ -1252,7 +1231,7 @@ fn test_tagged_subset(
 /// `entities`; no summary dependency, no re-analysis. A third-party plugin
 /// blocklist can extend this later without touching callers.
 fn non_app_entity_ids(conn: &rusqlite::Connection) -> loomweave_storage::Result<HashSet<String>> {
-    let mut out = ids_with_any_tag(conn, &["test"])?;
+    let mut out = ids_with_any_tag(conn, &[tags::TEST])?;
     let mut stmt = conn.prepare("SELECT id FROM entities WHERE plugin_id = 'core'")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -1360,6 +1339,7 @@ fn withhold_blocked_candidates(
 /// Render the per-plugin missing-root-coverage exclusions as the in-band
 /// scope marker.
 fn plugins_without_roots_json(excluded_by_plugin: BTreeMap<String, usize>) -> Vec<Value> {
+    let root_vocabulary = dead_code_root_vocabulary();
     excluded_by_plugin
         .into_iter()
         .map(|(plugin, count)| {
@@ -1368,7 +1348,7 @@ fn plugins_without_roots_json(excluded_by_plugin: BTreeMap<String, usize>) -> Ve
                 "entities_excluded": count,
                 "reason": format!(
                     "plugin '{plugin}' emitted no reachability root tags \
-                     (entry-point / exported-api / …), so its entities cannot \
+                     ({root_vocabulary}), so its entities cannot \
                      be honestly surveyed — excluded rather than false-flagged \
                      dead"
                 ),
