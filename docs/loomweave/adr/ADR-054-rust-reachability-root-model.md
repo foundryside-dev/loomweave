@@ -45,10 +45,11 @@ error directions are not symmetric:
   → a false positive that erodes trust in the whole signal. This is the exact
   failure ADR-053 fought.
 
-So every judgement call below resolves toward rooting. Precision (Cargo.toml
-target parsing, full re-export resolution, method-level rooting) is deferred
-where it would only *narrow* the root set, because narrowing is the unsafe
-direction and the safe default already covers the case.
+So every judgement call below resolves toward rooting. Cargo.toml target parsing
+and method-level rooting remain deferred where they would only *narrow* the root
+set. Increment 3 adds cross-file resolver evidence for uniquely-resolved public
+re-exports because the lexical default did **not** cover private-module facades;
+ambiguous/glob resolution remains deferred rather than guessing a target.
 
 ## Decision
 
@@ -229,14 +230,41 @@ deferred FFI frameworks that need it use full-path matching.
 This is a further additive ontology change: Rust plugin `ontology_version`
 **0.6.0 → 0.7.0**.
 
+## Increment 3 (implemented): resolved public re-export roots
+
+The earlier claim that the common private-module facade was covered by the
+target's lexical `exported-api` tag was false: `mod internal { pub struct Thing;
+} pub use internal::Thing;` leaves `Thing` untagged because its enclosing module
+is private. The resolved `pub use` edge now carries
+`properties.public_reexport=true` when the use item's unrestricted-public
+visibility chain reaches a library surface. `entity_dead_list` seeds the
+resolved target as a root directly, so the genuine public API and its transitive
+callees stay live without rooting every import from the facade module.
+
+The producer coalesces duplicate imports under the storage natural key before
+emission, preserving public provenance monotonically when an ordinary import of
+the same target appears later. Test-only re-exports carry a typed companion
+property and seed roots only when `app_only=false`. The consumer accepts the
+marker only when it is the JSON boolean `true` on a resolved edge from a
+Rust-owned module to a Rust-owned target; malformed, numeric, string, or
+cross-plugin markers confer no authority.
+
+This is deliberately edge provenance, not a fabricated entity tag:
+`entity_exported_api_list` remains the lexical declaration-tag surface. Only a
+uniquely `resolved` in-project target confers a root. Ambiguous multi-kind and
+glob re-exports, external targets, and paths the conservative resolver cannot
+resolve remain unrooted. A re-export in an out-of-line module file also remains
+unrooted because the per-file extractor cannot prove the visibility of that
+file's declaring `mod` item; this fail-closed residual is disclosed in the Rust
+limitations page.
+
+This is a further additive ontology change: Rust plugin `ontology_version`
+**0.7.0 -> 0.8.0**. The bump is load-bearing cache invalidation: unchanged Rust
+files must re-dispatch so their resolved public re-export edges acquire the new
+provenance property.
+
 ## Still deferred (second-pass extensions)
 
-- **`pub use` re-export resolution** — a privately-defined item re-exported
-  `pub` is part of the API surface. Resolving the re-export target needs the
-  cross-file symbol table (the resolver). The common facade case (`pub use
-  internal::Thing` where `Thing` is itself `pub`) is **already covered** by
-  `Thing`'s own `exported-api` tag at its definition; only a `pub(crate)` item
-  re-exported `pub` is under-rooted, a narrow residual.
 - **Trait-impl-method rooting** — a method reached only via trait dispatch
   (the Rust framework-dispatch case) has no inbound call edge; the pub rule does
   not root it (inherited visibility). `framework-handler` on a `#[handler]` would
@@ -298,9 +326,11 @@ a precision follow-up, not built.
 
 The chosen model approximates the pub-chain with a threaded `ancestors_all_pub`
 boolean over the lexical module nesting. A fully precise model would resolve
-re-exports and `pub use` paths to compute true external reachability. That is the
-deferred re-export work; the lexical approximation is safe (it can only
-over-root via the pure-bin case, never under-root a lexically-public item).
+every re-export and `pub use` path to compute true external reachability.
+Increment 3 covers uniquely-resolved public targets; ambiguous/glob and
+conservatively unresolved paths remain deferred. The declaration approximation
+can still over-root via the pure-bin case, while unresolved re-export forms can
+under-root.
 
 ## Consequences
 
@@ -316,6 +346,6 @@ over-root via the pure-bin case, never under-root a lexically-public item).
   `exported-api` / `test` root.
 - A Rust corpus that genuinely has little rooted surface still gets an **honest,
   language-correct** advisory (Rust levers, not `__all__`).
-- Increment 2's additions (handler tags, re-export resolution, method rooting)
-  are all additive: new tags join `DEAD_CODE_ROOT_TAGS`; no existing tag
-  semantics change. The Rust ontology bumps again then.
+- Increment 3's public re-export provenance is additive and does not change
+  existing tag semantics; the dead-code engine unions resolved re-export targets
+  with `DEAD_CODE_ROOT_TAGS`.

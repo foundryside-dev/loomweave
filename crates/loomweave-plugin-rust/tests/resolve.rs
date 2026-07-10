@@ -6,7 +6,11 @@ fn resolves_unique_inproject_path_else_ambiguous_or_external() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::create_dir_all(root.join("c/src")).unwrap();
-    std::fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+    std::fs::write(
+        root.join("c/Cargo.toml"),
+        "[package]\nname=\"c_crate\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
     std::fs::write(root.join("c/src/lib.rs"), "pub mod a;\npub trait Tr {}\n").unwrap();
     std::fs::write(root.join("c/src/a.rs"), "pub struct S;\n").unwrap();
     let table = build_symbol_table(root);
@@ -94,17 +98,19 @@ fn super_prefixed_path_never_resolves_to_a_wrong_entity() {
 }
 
 #[test]
-fn external_crate_shadowed_by_inproject_module_stays_external() {
-    // FINDING #2 (H5): an in-project module that SHADOWS an external crate name
-    // must not let a multi-segment `use external::Item` wrong-resolve to the
-    // in-project entity. Here an in-project `mod serde` defines `Serialize`, so
-    // the crate-root fallback would form `c_crate.serde.Serialize` and match —
-    // UNLESS the fallback is gated to bare single-segment paths. `serde::Serialize`
-    // has a `::`, so it stays External (the external crate is meant).
+fn module_aware_import_resolution_honours_local_shadowing() {
+    // The generic path resolver lacks a containing-module context and keeps its
+    // conservative multi-segment under-resolution. Item-level import resolution
+    // does have that context, and rustc resolves the local module before the
+    // extern prelude when both share a name.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::create_dir_all(root.join("c/src")).unwrap();
-    std::fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+    std::fs::write(
+        root.join("c/Cargo.toml"),
+        "[package]\nname=\"c_crate\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
     std::fs::write(root.join("c/src/lib.rs"), "pub mod serde;\n").unwrap();
     std::fs::write(root.join("c/src/serde.rs"), "pub struct Serialize;\n").unwrap();
     let table = build_symbol_table(root);
@@ -116,14 +122,91 @@ fn external_crate_shadowed_by_inproject_module_stays_external() {
         Resolution::Resolved("rust:struct:c_crate.serde.Serialize".to_owned())
     );
 
-    // The H5 guard: `serde::Serialize` means the EXTERNAL crate -> External,
-    // NEVER the in-project shadow.
+    // Context-free references remain conservative.
     let got = r.resolve_use_path("c_crate", "serde::Serialize");
     assert_eq!(got, Resolution::External);
     assert_ne!(
         got,
         Resolution::Resolved("rust:struct:c_crate.serde.Serialize".to_owned())
     );
+
+    // Item-level `use serde::Serialize` at the crate root names the local module
+    // under rustc's import rules, even if an external crate is also called
+    // `serde`.
+    assert_eq!(
+        r.resolve_import_path("c_crate", "c_crate", "serde::Serialize", false),
+        Resolution::Resolved("rust:struct:c_crate.serde.Serialize".to_owned())
+    );
+
+    // A leading `::` is absolute. The extractor must preserve that syntax so
+    // the local shadow is not considered.
+    assert_eq!(
+        r.resolve_import_path("c_crate", "c_crate", "serde::Serialize", true),
+        Resolution::External
+    );
+}
+
+#[test]
+fn edition_ambiguous_nested_imports_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let src = concat!(
+        "mod root { pub struct Thing; }\n",
+        "mod nested { mod root { pub struct Thing; } }\n",
+    );
+    for (directory, crate_name, edition) in
+        [("c15", "crate_2015", "2015"), ("c21", "crate_2021", "2021")]
+    {
+        std::fs::create_dir_all(root.join(directory).join("src")).unwrap();
+        std::fs::write(
+            root.join(directory).join("Cargo.toml"),
+            format!("[package]\nname=\"{crate_name}\"\nedition=\"{edition}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(root.join(directory).join("src/lib.rs"), src).unwrap();
+    }
+    // Workspace-crate collision trap: a nested Rust 2021 import resolves the
+    // local module, not this same-named workspace crate.
+    std::fs::create_dir_all(root.join("workspace-root/src")).unwrap();
+    std::fs::write(
+        root.join("workspace-root/Cargo.toml"),
+        "[package]\nname=\"root\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("workspace-root/src/lib.rs"),
+        "pub struct Thing;\n",
+    )
+    .unwrap();
+    let table = build_symbol_table(root);
+    let resolver = Resolver::new(&table);
+
+    // Rust 2015 chooses <crate>.root.Thing; Rust 2018+ chooses
+    // <crate>.nested.root.Thing. Without edition input, choosing either can
+    // create a false reachability root, so both manifest editions remain
+    // unresolved at a nested use site.
+    for crate_name in ["crate_2015", "crate_2021"] {
+        let got = resolver.resolve_import_path(
+            crate_name,
+            &format!("{crate_name}.nested"),
+            "root::Thing",
+            false,
+        );
+        assert_eq!(got, Resolution::External, "crate={crate_name}");
+        assert_ne!(
+            got,
+            Resolution::Resolved(format!("rust:struct:{crate_name}.root.Thing"))
+        );
+        assert_ne!(
+            got,
+            Resolution::Resolved(format!("rust:struct:{crate_name}.nested.root.Thing"))
+        );
+        assert_ne!(
+            got,
+            Resolution::Resolved("rust:struct:root.Thing".to_owned()),
+            "a workspace crate must not win an edition-ambiguous nested import"
+        );
+    }
 }
 
 #[test]

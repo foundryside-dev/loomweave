@@ -139,6 +139,193 @@ fn group_self_resolves_the_module_and_rename_uses_the_real_path() {
     );
 }
 
+#[test]
+fn resolved_public_reexport_carries_root_provenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("c/src")).unwrap();
+    std::fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+    let src = concat!(
+        "mod internal { pub struct Thing; }\n",
+        "pub use internal::Thing;\n",
+        "use internal::Thing as PrivateThing;\n",
+        "mod private_facade { pub use crate::internal::Thing; }\n",
+    );
+    std::fs::write(root.join("c/src/lib.rs"), src).unwrap();
+
+    let table = build_symbol_table(root);
+    let resolver = Resolver::new(&table);
+    let extracted = extract_file_with_edges(
+        "c_crate",
+        "c_crate",
+        root.join("c/src/lib.rs").to_str().unwrap(),
+        src,
+        &resolver,
+    )
+    .unwrap();
+    let imports: Vec<&Value> = extracted
+        .edges
+        .iter()
+        .filter(|edge| edge["kind"] == "imports")
+        .collect();
+
+    assert_eq!(
+        imports.len(),
+        2,
+        "the root-level duplicate coalesces while the private-module import remains distinct"
+    );
+    let public_start = src.find("pub use").unwrap() as u64;
+    let public = imports
+        .iter()
+        .find(|edge| edge["source_byte_start"] == public_start)
+        .expect("crate-root pub use edge");
+    assert_eq!(public["confidence"], "resolved");
+    assert_eq!(public["properties"]["public_reexport"], true);
+
+    for edge in imports
+        .iter()
+        .filter(|edge| edge["source_byte_start"] != public_start)
+    {
+        assert!(
+            edge.get("properties").is_none(),
+            "private use or pub use under a private module must not confer a root: {edge:#?}",
+        );
+    }
+}
+
+#[test]
+fn duplicate_import_edges_preserve_public_reexport_provenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("c/src")).unwrap();
+    std::fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+    let src = concat!(
+        "mod internal { pub struct Thing; }\n",
+        "pub use crate::internal::Thing;\n",
+        "use crate::internal::Thing as PrivateThing;\n",
+    );
+    std::fs::write(root.join("c/src/lib.rs"), src).unwrap();
+
+    let table = build_symbol_table(root);
+    let resolver = Resolver::new(&table);
+    let extracted = extract_file_with_edges(
+        "c_crate",
+        "c_crate",
+        root.join("c/src/lib.rs").to_str().unwrap(),
+        src,
+        &resolver,
+    )
+    .unwrap();
+    let imports: Vec<&Value> = extracted
+        .edges
+        .iter()
+        .filter(|edge| edge["kind"] == "imports")
+        .collect();
+
+    assert_eq!(
+        imports.len(),
+        1,
+        "the natural edge key must be coalesced before storage: {imports:#?}"
+    );
+    assert_eq!(imports[0]["properties"]["public_reexport"], true);
+    assert!(
+        imports[0]["properties"]
+            .get("public_reexport_test_only")
+            .is_none(),
+        "an ordinary duplicate must not erase or weaken app-visible provenance"
+    );
+}
+
+#[test]
+fn public_reexport_provenance_records_test_only_and_withholds_unknown_file_visibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("c/src")).unwrap();
+    std::fs::write(root.join("c/Cargo.toml"), "[package]\nname=\"c_crate\"\n").unwrap();
+    let lib_src = concat!(
+        "mod internal { pub struct Thing; }\n",
+        "mod private_facade;\n",
+        "#[cfg(test)] pub use crate::internal::Thing;\n",
+    );
+    let private_src = "pub use crate::internal::Thing;\n";
+    std::fs::write(root.join("c/src/lib.rs"), lib_src).unwrap();
+    std::fs::write(root.join("c/src/private_facade.rs"), private_src).unwrap();
+
+    let table = build_symbol_table(root);
+    let resolver = Resolver::new(&table);
+    let root_extracted = extract_file_with_edges(
+        "c_crate",
+        "c_crate",
+        root.join("c/src/lib.rs").to_str().unwrap(),
+        lib_src,
+        &resolver,
+    )
+    .unwrap();
+    let root_import = root_extracted
+        .edges
+        .iter()
+        .find(|edge| edge["kind"] == "imports")
+        .expect("test-only root import");
+    assert_eq!(root_import["properties"]["public_reexport"], true);
+    assert_eq!(
+        root_import["properties"]["public_reexport_test_only"], true,
+        "app_only must be able to exclude a cfg(test)-only public re-export"
+    );
+
+    let private_extracted = extract_file_with_edges(
+        "c_crate",
+        "c_crate.private_facade",
+        root.join("c/src/private_facade.rs").to_str().unwrap(),
+        private_src,
+        &resolver,
+    )
+    .unwrap();
+    let private_import = private_extracted
+        .edges
+        .iter()
+        .find(|edge| edge["kind"] == "imports")
+        .expect("resolved private-module import");
+    assert!(
+        private_import.get("properties").is_none(),
+        "an out-of-line module's visibility chain is unknown to the file extractor and must fail closed"
+    );
+}
+
+#[test]
+fn absolute_public_use_does_not_root_a_local_shadow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("c/src")).unwrap();
+    std::fs::write(
+        root.join("c/Cargo.toml"),
+        "[package]\nname=\"c_crate\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    let src = concat!(
+        "mod serde { pub struct Serialize; }\n",
+        "pub use ::serde::Serialize;\n",
+    );
+    std::fs::write(root.join("c/src/lib.rs"), src).unwrap();
+
+    let table = build_symbol_table(root);
+    let resolver = Resolver::new(&table);
+    let extracted = extract_file_with_edges(
+        "c_crate",
+        "c_crate",
+        root.join("c/src/lib.rs").to_str().unwrap(),
+        src,
+        &resolver,
+    )
+    .unwrap();
+    assert!(
+        extracted.edges.iter().all(|edge| {
+            edge["kind"] != "imports" || edge["to_id"] != "rust:struct:c_crate.serde.Serialize"
+        }),
+        "leading :: must bypass the local serde module: {:#?}",
+        extracted.edges
+    );
+}
+
 /// `use a::{b, c::d};` — a NESTED group: a bare leaf (`b`) AND a `Path`-inside-
 /// `Group` (`c::d`). Both leaves must fan out to their own `imports` edge. The
 /// expansion logic handles a `Path` branch inside a `Group`, but no prior test

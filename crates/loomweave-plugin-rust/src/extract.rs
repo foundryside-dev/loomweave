@@ -203,6 +203,11 @@ struct Phase2Acc {
     /// (last-write-wins on the span) — deduping here keeps the emitted edge
     /// SET exact and FIRST-span-wins deterministic.
     ref_dedup: std::collections::BTreeSet<(String, String)>,
+    /// Index of each emitted `imports` natural key in `edges`. Repeated imports
+    /// of the same target are one stored relationship; coalescing here prevents
+    /// a later ordinary import from erasing public-reexport provenance through
+    /// the writer's last-write-wins upsert.
+    import_edge_indexes: std::collections::BTreeMap<(String, String), usize>,
     /// The three Rust-populated `references` counters (D4).
     ref_stats: ReferenceStats,
 }
@@ -893,7 +898,17 @@ fn walk_items(
             // leaf edge it expands to.
             Item::Use(it) => {
                 if let Some((from_crate, resolver)) = resolution {
-                    emit_use_edges(it, from_crate, parent_id, resolver, edges);
+                    let public_reexport = ctx.exposes_public_reexport(is_unrestricted_pub(&it.vis));
+                    emit_use_edges(
+                        it,
+                        from_crate,
+                        module_path,
+                        parent_id,
+                        resolver,
+                        public_reexport.then(|| ctx.is_test_only(&it.attrs)),
+                        edges,
+                        acc,
+                    );
                 }
             }
             _ => {} // macro invocations / extern / etc. unmodelled.
@@ -916,20 +931,63 @@ fn walk_items(
 fn emit_use_edges(
     it: &ItemUse,
     from_crate: &str,
+    from_module: &str,
     from_id: &str,
     resolver: &Resolver,
+    public_reexport_test_only: Option<bool>,
     edges: &mut Vec<Value>,
+    acc: &mut Phase2Acc,
 ) {
     let span = source_range_of(it);
     let mut leaves = Vec::new();
     collect_use_leaves(&it.tree, "", &mut leaves);
     for leaf in leaves {
-        let (to_id, confidence) = match resolver.resolve_use_path(from_crate, &leaf) {
+        let (to_id, confidence) = match resolver.resolve_import_path(
+            from_crate,
+            from_module,
+            &leaf,
+            it.leading_colon.is_some(),
+        ) {
             Resolution::Resolved(id) => (id, "resolved"),
             Resolution::Ambiguous(id) => (id, "ambiguous"),
             Resolution::External => continue,
         };
-        edges.push(imports_edge(from_id, &to_id, confidence, &span));
+        let candidate = imports_edge(
+            from_id,
+            &to_id,
+            confidence,
+            &span,
+            (confidence == "resolved")
+                .then_some(public_reexport_test_only)
+                .flatten(),
+        );
+        let key = (from_id.to_owned(), to_id);
+        if let Some(index) = acc.import_edge_indexes.get(&key).copied() {
+            merge_import_edge(&mut edges[index], candidate);
+        } else {
+            acc.import_edge_indexes.insert(key, edges.len());
+            edges.push(candidate);
+        }
+    }
+}
+
+/// Merge duplicate import observations under the storage natural key. Public
+/// provenance is monotonic: an ordinary duplicate can never erase it, and an
+/// app-visible public re-export supersedes a test-only one. Otherwise resolved
+/// confidence wins over ambiguous; ties keep the first source anchor.
+fn merge_import_edge(existing: &mut Value, candidate: Value) {
+    let existing_public = existing["properties"]["public_reexport"] == true;
+    let candidate_public = candidate["properties"]["public_reexport"] == true;
+    let existing_test_only = existing["properties"]["public_reexport_test_only"] == true;
+    let candidate_test_only = candidate["properties"]["public_reexport_test_only"] == true;
+    let promotes_public =
+        candidate_public && (!existing_public || (existing_test_only && !candidate_test_only));
+    let promotes_confidence = existing["confidence"] != "resolved"
+        && candidate["confidence"] == "resolved"
+        && existing_public == candidate_public
+        && existing_test_only == candidate_test_only;
+    if promotes_public || promotes_confidence {
+        *existing = candidate;
     }
 }
 

@@ -17,7 +17,7 @@ produced an entity. The differences below are entirely in what the plugins
 |---|---|---|
 | Status | first-party, v1.0 | first-party, 1.x |
 | Source backend | `pyright` (type-resolved) | `syn` (parse-only, in-project symbol table) |
-| Ontology version | 0.11.0 | 0.7.0 |
+| Ontology version | 0.11.0 | 0.8.0 |
 | Wardline-aware | **yes** (`wardline:*` trust tags) | no |
 | **Entity kinds** | `function`, `class`, `module` | `module`, `struct`, `enum`, `trait`, `function`, `impl`, `type_alias`, `const`, `static`, `macro` |
 | **Structural edges** | `contains`, `calls`, `references`, `imports` | `contains`, `calls`, `references`, `imports` |
@@ -29,9 +29,10 @@ produced an entity. The differences below are entirely in what the plugins
 
 ## Categorisation & reachability-root tags
 
-These `entity_tags` drive the dead-code and faceted views. They are what makes
-`entity_dead_list`, `entity_entry_point_list`, `entity_http_route_list`, etc.
-return data.
+These `entity_tags` drive the faceted views and most dead-code roots. Rust also
+contributes typed provenance on uniquely resolved public re-export edges to the
+dead-code root set; that edge-only signal deliberately does not appear in tag
+facets such as `entity_exported_api_list`.
 
 **Python emits:** `entry-point`, `exported-api`, `public-surface`, `test`,
 `data-model`, `http-route`, `cli-command`, `framework-handler`, and the

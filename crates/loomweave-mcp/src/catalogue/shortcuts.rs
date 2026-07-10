@@ -96,6 +96,18 @@ const RUNTIME_IMPORT_EDGE_SQL: &str = "\
      OR json_valid(properties) = 0 \
      OR (COALESCE(json_extract(properties, '$.type_only'), 0) != 1 \
          AND COALESCE(json_extract(properties, '$.scope'), 'module') = 'module'))";
+/// Resolved Rust `pub use` edges whose lexical visibility chain reaches the
+/// external library surface. The target, not the importing module, is the root.
+const PUBLIC_REEXPORT_EDGE_SQL: &str = "\
+    pe.kind = 'imports' \
+    AND pe.confidence = 'resolved' \
+    AND origin.plugin_id = 'rust' \
+    AND origin.kind = 'module' \
+    AND target.plugin_id = 'rust' \
+    AND json_valid(pe.properties) = 1 \
+    AND json_type(pe.properties, '$.public_reexport') = 'true' \
+    AND (json_type(pe.properties, '$.public_reexport_test_only') IS NULL \
+         OR json_type(pe.properties, '$.public_reexport_test_only') IN ('true', 'false'))";
 
 /// Rule id for an emitted dead-code candidate (ADR-017 `LMWV-FACT-*` namespace).
 const DEAD_CODE_RULE_ID: &str = "LMWV-FACT-DEAD-CODE-CANDIDATE";
@@ -375,6 +387,7 @@ impl ServerState {
                     &excluded,
                     in_scope.as_ref(),
                     roots_mode,
+                    app_only,
                     &app_excluded,
                 )?;
 
@@ -519,14 +532,17 @@ fn root_tag_levers(plugin_ids: &BTreeSet<String>) -> String {
 }
 
 fn dead_code_root_vocabulary() -> String {
-    DEAD_CODE_ROOT_TAGS.join(" / ")
+    format!(
+        "{} / resolved-public-reexport",
+        DEAD_CODE_ROOT_TAGS.join(" / ")
+    )
 }
 
 /// The honest signal-unavailable envelope for `find_dead_code` when no
-/// reachability root tags exist — zero candidates, never a whole-corpus false
+/// reachability roots exist — zero candidates, never a whole-corpus false
 /// positive. Identical in both `explicit` and `auto` modes: `auto` cannot
-/// fabricate roots from an empty tag set. `plugin_ids` localises the lever copy
-/// to the languages present (ADR-054).
+/// fabricate roots from empty tag/re-export evidence. `plugin_ids` localises
+/// the lever copy to the languages present (ADR-054).
 fn dead_code_no_roots_envelope(
     page: &Page,
     scope_truncated: bool,
@@ -535,7 +551,7 @@ fn dead_code_no_roots_envelope(
     let levers = root_tag_levers(plugin_ids);
     let root_vocabulary = dead_code_root_vocabulary();
     let signal_msg = format!(
-        "this index has no reachability root tags ({root_vocabulary}), \
+        "this index has no reachability roots ({root_vocabulary}), \
          so dead code cannot be determined — this is NOT a guarantee there is no dead \
          code. {levers}"
     );
@@ -547,7 +563,7 @@ fn dead_code_no_roots_envelope(
         },
         "scope_truncated": scope_truncated,
         "scan_truncated": false,
-        "signal": missing_signal("entity_tags", &signal_msg),
+        "signal": missing_signal("reachability_roots", &signal_msg),
     }))
 }
 
@@ -1261,6 +1277,7 @@ fn dead_code_reachability(
     // Roots = "called from outside" categorisations. Both modes seed from the
     // same emitted tags; `auto` only changes honesty reporting elsewhere.
     let mut roots = ids_with_any_tag(conn, DEAD_CODE_ROOT_TAGS)?;
+    roots.extend(public_reexport_root_ids(conn, app_only)?);
     if app_only {
         roots.retain(|id| !app_excluded.contains(id));
     }
@@ -1313,6 +1330,30 @@ fn ids_with_any_tag(
     Ok(out)
 }
 
+fn public_reexport_root_ids(
+    conn: &rusqlite::Connection,
+    app_only: bool,
+) -> loomweave_storage::Result<HashSet<String>> {
+    let app_filter = if app_only {
+        "AND COALESCE(json_type(pe.properties, '$.public_reexport_test_only'), 'false') != 'true'"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT DISTINCT pe.to_id FROM edges pe \
+         JOIN entities origin ON origin.id = pe.from_id \
+         JOIN entities target ON target.id = pe.to_id \
+         WHERE {PUBLIC_REEXPORT_EDGE_SQL} {app_filter}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = HashSet::new();
+    while let Some(row) = rows.next()? {
+        out.insert(row.get::<_, String>(0)?);
+    }
+    Ok(out)
+}
+
 /// Withhold briefing-blocked candidates from the dead-code row set
 /// (weft-3fb0f5dfc7, dogfood-4 B2 + PM ruling): an all-null stub row is
 /// unactionable noise, and an identity-bearing row would breach the
@@ -1347,7 +1388,7 @@ fn plugins_without_roots_json(excluded_by_plugin: BTreeMap<String, usize>) -> Ve
                 "plugin": plugin,
                 "entities_excluded": count,
                 "reason": format!(
-                    "plugin '{plugin}' emitted no reachability root tags \
+                    "plugin '{plugin}' emitted no reachability roots \
                      ({root_vocabulary}), so its entities cannot \
                      be honestly surveyed — excluded rather than false-flagged \
                      dead"
@@ -1386,6 +1427,7 @@ fn dead_code_candidate_set(
     excluded: &HashSet<String>,
     in_scope: Option<&HashSet<String>>,
     roots_mode: RootsMode,
+    app_only: bool,
     app_excluded: &HashSet<String>,
 ) -> loomweave_storage::Result<CandidateSet> {
     let (all_rows, entity_scan_truncated) = all_entity_rows(conn)?;
@@ -1394,7 +1436,7 @@ fn dead_code_candidate_set(
     // than withheld — the per-plugin missing-root exclusion only applies to the
     // verbatim `explicit` mode.
     let plugins_with_roots = match roots_mode {
-        RootsMode::Explicit => Some(plugins_with_root_tags(conn)?),
+        RootsMode::Explicit => Some(plugins_with_roots(conn, app_only)?),
         RootsMode::Auto => None,
     };
     let mut excluded_by_plugin: BTreeMap<String, usize> = BTreeMap::new();
@@ -1474,19 +1516,35 @@ fn all_entity_rows(
     Ok((out, truncated))
 }
 
-/// The plugins that own at least one ROOT-tagged entity — i.e. the plugins
-/// whose entity sets the dead-code survey can answer honestly. One query over
-/// `entity_tags ⋈ entities`.
-fn plugins_with_root_tags(
+/// Plugins that own an explicit reachability root: either a ROOT-tagged entity
+/// or the resolved target of a public re-export edge.
+fn plugins_with_roots(
     conn: &rusqlite::Connection,
+    app_only: bool,
 ) -> loomweave_storage::Result<HashSet<String>> {
     let placeholders = std::iter::repeat_n("?", DEAD_CODE_ROOT_TAGS.len())
         .collect::<Vec<_>>()
         .join(", ");
+    let tag_filter = if app_only {
+        "AND NOT EXISTS (SELECT 1 FROM entity_tags test_tag \
+         WHERE test_tag.entity_id = e.id AND test_tag.tag = 'test')"
+    } else {
+        ""
+    };
+    let reexport_filter = if app_only {
+        "AND COALESCE(json_type(pe.properties, '$.public_reexport_test_only'), 'false') != 'true'"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT DISTINCT e.plugin_id FROM entity_tags t \
          JOIN entities e ON e.id = t.entity_id \
-         WHERE t.tag IN ({placeholders})"
+         WHERE t.tag IN ({placeholders}) {tag_filter} \
+         UNION \
+         SELECT DISTINCT target.plugin_id FROM edges pe \
+         JOIN entities origin ON origin.id = pe.from_id \
+         JOIN entities target ON target.id = pe.to_id \
+         WHERE {PUBLIC_REEXPORT_EDGE_SQL} {reexport_filter}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(rusqlite::params_from_iter(DEAD_CODE_ROOT_TAGS.iter()))?;

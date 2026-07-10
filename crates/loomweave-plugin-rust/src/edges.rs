@@ -22,15 +22,32 @@ use crate::spans::SourceRange;
 /// `"resolved"` for a unique in-project target, `"ambiguous"` for a glob /
 /// multi-kind candidate. NEVER `"inferred"` (an anchored edge may not be).
 #[must_use]
-pub fn imports_edge(from_id: &str, to_id: &str, confidence: &str, span: &SourceRange) -> Value {
-    json!({
+pub fn imports_edge(
+    from_id: &str,
+    to_id: &str,
+    confidence: &str,
+    span: &SourceRange,
+    public_reexport_test_only: Option<bool>,
+) -> Value {
+    let mut edge = json!({
         "kind": "imports",
         "from_id": from_id,
         "to_id": to_id,
         "source_byte_start": span.byte_start,
         "source_byte_end": span.byte_end,
         "confidence": confidence,
-    })
+    });
+    if let Some(test_only) = public_reexport_test_only {
+        edge["properties"] = if test_only {
+            json!({
+                "public_reexport": true,
+                "public_reexport_test_only": true,
+            })
+        } else {
+            json!({"public_reexport": true})
+        };
+    }
+    edge
 }
 
 /// An anchored `implements` edge from a trait-impl entity (`from_id`) to the

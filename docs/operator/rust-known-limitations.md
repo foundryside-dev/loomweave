@@ -119,22 +119,33 @@ much smaller legitimate envelopes. The deadlines bound damage from a hung or
 hostile plugin without policing the throughput of a legitimate one. Raise an
 override only if a real repo/analyzer trips it in practice.
 
-## No dead-code signal on a pure-Rust index
+## Dead-code roots are conservative
 
-**What you see.** `entity_dead_list` returns nothing useful on a project indexed
-**only** by the Rust plugin — there is no categorisation surface to draw from.
-This is a known limitation, not an error.
+**What you see.** `entity_dead_list` surveys pure-Rust indexes when the plugin
+finds an explicit root: public library declarations (`exported-api`), entry
+points, tests, framework handlers, `#[allow(dead_code)]`, or a uniquely-resolved
+public re-export. The common facade
+`mod internal { pub struct Thing; } pub use internal::Thing;` keeps `Thing` live
+even though the declaration itself has no lexical `exported-api` tag.
 
-**Why.** The dead-code (and related categorisation) views are driven by
-reachability-root tags the language plugin emits (`exported-api`, `entry-point`,
-`test`, …); the Rust plugin emits **no** categorisation tags, so a pure-Rust
-index has no roots and the engine excludes its entities rather than
-false-flagging the whole crate dead. The Python plugin does emit these (including
-the no-`__all__` `public-surface` heuristic, ADR-053); the Rust analog —
-visibility → `exported-api`, `fn main`/bin → `entry-point`, `#[test]` → `test`,
-route/CLI attribute macros → handlers — is tracked as **clarion-05fdd0490e**. The
-structural tools (`entity_find`, `entity_callers_list`,
-`entity_neighborhood_get`, and the edge surfaces) are unaffected. For a
+Public re-export rooting is intentionally narrower than Rust's full name
+resolution. Only a `resolved` in-project import edge whose `pub` visibility
+chain is proven to reach the library surface confers a root. The proof is
+available at the crate root and through inline modules, whose `mod` visibility
+is present in the same syntax tree. An out-of-line module file does not carry
+its declaring `mod` item's visibility, so a `pub use` inside that file fails
+closed and can still false-flag its public target dead. A glob or multi-kind
+re-export is likewise ambiguous, and a path the conservative resolver cannot
+bind is absent. A `#[cfg(test)]`-only re-export roots its target in the default
+survey but not with `app_only=true`. The re-export root is edge provenance, so
+the target does **not** appear in
+`entity_exported_api_list` unless its declaration independently carries that
+tag.
+
+**Why.** Rooting the resolved edge target fixes the facade case without making
+the enclosing module a root, which would transitively keep every ordinary
+import in that module alive. Ambiguous/unresolved targets fail closed because
+guessing which item a public path names would fabricate API reachability. For a
 side-by-side of what each plugin extracts and tags, see
 [language-support.md](./language-support.md).
 

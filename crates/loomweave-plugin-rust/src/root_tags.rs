@@ -43,6 +43,11 @@ pub struct TagCtx {
     /// Every enclosing module back to the crate root is `pub` — a precondition
     /// for `exported-api` (the visibility chain must reach the external surface).
     ancestors_all_pub: bool,
+    /// Whether the extractor has proved the file-scope module itself reaches
+    /// the library surface. Crate-root files are known public; an out-of-line
+    /// module file does not carry its declaring `mod` item's visibility, so its
+    /// re-export chain is unknown and must fail closed.
+    reexport_ancestors_known_public: bool,
     /// An enclosing module carries `#[cfg(test)]` → everything inside is `test`.
     under_cfg_test: bool,
     /// The file routes to a `<crate>@bin(<name>)` target (ADR-049 / scope.rs):
@@ -58,10 +63,12 @@ impl TagCtx {
     /// file's root `module_path` marks a binary target (ADR-049 / scope.rs).
     #[must_use]
     pub fn for_file(module_path: &str) -> Self {
+        let in_bin_target = module_path.contains("@bin(");
         Self {
             ancestors_all_pub: true, // the crate root is the public boundary
+            reexport_ancestors_known_public: !module_path.contains('.') && !in_bin_target,
             under_cfg_test: false,
-            in_bin_target: module_path.contains("@bin("),
+            in_bin_target,
             at_file_top: true,
         }
     }
@@ -71,6 +78,8 @@ impl TagCtx {
     pub fn descend_into_mod(self, vis: &Visibility, attrs: &[Attribute]) -> Self {
         Self {
             ancestors_all_pub: self.ancestors_all_pub && is_unrestricted_pub(vis),
+            reexport_ancestors_known_public: self.reexport_ancestors_known_public
+                && is_unrestricted_pub(vis),
             under_cfg_test: self.under_cfg_test || has_cfg_test(attrs),
             in_bin_target: self.in_bin_target,
             at_file_top: false,
@@ -101,6 +110,29 @@ impl TagCtx {
             ..self
         }
     }
+
+    /// Whether an unrestricted-public item at this lexical position reaches
+    /// the external library surface. Shared by declaration tags and resolved
+    /// `pub use` provenance so both obey the same pub-chain/bin-target rules.
+    #[must_use]
+    pub fn exposes_public_surface(self, is_public: bool) -> bool {
+        is_public && self.ancestors_all_pub && !self.in_bin_target
+    }
+
+    /// Whether a `pub use` at this position is proven to reach the external
+    /// library surface. Unlike lexical declaration tags, re-export provenance
+    /// fails closed for an out-of-line module file because that file does not
+    /// carry the parent `mod` declaration's visibility.
+    #[must_use]
+    pub fn exposes_public_reexport(self, is_public: bool) -> bool {
+        is_public && self.reexport_ancestors_known_public && !self.in_bin_target
+    }
+
+    /// Whether this position or the item itself exists only in test builds.
+    #[must_use]
+    pub fn is_test_only(self, attrs: &[Attribute]) -> bool {
+        self.under_cfg_test || has_cfg_test(attrs)
+    }
 }
 
 /// Reachability-root tags for a walked item, sorted + deduplicated (ADR-054).
@@ -119,7 +151,7 @@ pub fn root_tags(
     ctx: TagCtx,
 ) -> Vec<String> {
     let mut tags: BTreeSet<&'static str> = BTreeSet::new();
-    if is_public && ctx.ancestors_all_pub && !ctx.in_bin_target {
+    if ctx.exposes_public_surface(is_public) {
         tags.insert(tags::EXPORTED_API);
     }
     if ctx.under_cfg_test || has_test_attr(attrs) {

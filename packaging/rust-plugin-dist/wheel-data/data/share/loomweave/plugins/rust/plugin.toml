@@ -62,8 +62,12 @@ rule_id_prefix = "LMWV-RUST-"
 # `framework-handler` (actix/rocket routes, clap derives, pyo3/proc-macro
 # entry-points, rstest runners) + `pub`-method rooting (ADR-054 increment 2 —
 # ADR-027 MINOR).
+# 0.8.0: additive `properties.public_reexport` provenance on uniquely resolved
+# public `use` edges (ADR-054 increment 3 — ADR-027 MINOR). The host uses this
+# property as a dead-code reachability root, so the bump also forces unchanged
+# Rust files to re-dispatch and populate the property.
 # Lockstep with the `serve.rs` handshake constant.
-ontology_version = "0.7.0"
+ontology_version = "0.8.0"
 
 [ontology.roles]
 file_scope = ["module"]

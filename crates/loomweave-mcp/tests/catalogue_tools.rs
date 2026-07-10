@@ -13,7 +13,9 @@ use loomweave_mcp::filigree::{
     EntityAssociationsResponse, FiligreeClientError, FiligreeLookup, WardlineFinding,
 };
 use loomweave_mcp::{ServerState, list_tools};
-use loomweave_plugin_rust::extract::extract_file;
+use loomweave_plugin_rust::extract::{extract_file, extract_file_with_edges};
+use loomweave_plugin_rust::resolve::Resolver;
+use loomweave_plugin_rust::symbol_table::build_symbol_table;
 use loomweave_storage::{EmbeddingKey, EmbeddingStore, ReaderPool, pragma, schema};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -3710,6 +3712,68 @@ fn insert_extracted_rust_entities(conn: &Connection, src: &str) {
     }
 }
 
+fn insert_extracted_rust_graph(conn: &Connection, project_root: &std::path::Path, src: &str) {
+    let crate_dir = project_root.join("rust-fixture");
+    std::fs::create_dir_all(crate_dir.join("src")).expect("create Rust fixture source");
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        "[package]\nname=\"c_crate\"\nversion=\"0.0.0\"\nedition=\"2021\"\n",
+    )
+    .expect("write Rust fixture manifest");
+    let source_path = crate_dir.join("src/lib.rs");
+    std::fs::write(&source_path, src).expect("write Rust fixture source");
+
+    let table = build_symbol_table(project_root);
+    let resolver = Resolver::new(&table);
+    let extracted = extract_file_with_edges(
+        "c_crate",
+        "c_crate",
+        source_path.to_str().expect("UTF-8 fixture path"),
+        src,
+        &resolver,
+    )
+    .expect("extract Rust fixture graph");
+
+    for entity in &extracted.entities {
+        let id = entity["id"].as_str().expect("entity id");
+        let kind = entity["kind"].as_str().expect("entity kind");
+        insert_entity_with_plugin(conn, id, "rust", kind, "rust-fixture/src/lib.rs", "{}");
+        for tag in entity
+            .get("tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            insert_tag_with_plugin(conn, id, "rust", tag.as_str().expect("tag string"));
+        }
+    }
+
+    for edge in &extracted.edges {
+        let properties = edge.get("properties").map(Value::to_string);
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, properties, \
+                source_byte_start, source_byte_end) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(kind, from_id, to_id) DO UPDATE SET \
+                confidence = excluded.confidence, properties = excluded.properties, \
+                source_byte_start = excluded.source_byte_start, \
+                source_byte_end = excluded.source_byte_end",
+            params![
+                edge["kind"].as_str().expect("edge kind"),
+                edge["from_id"].as_str().expect("edge origin"),
+                edge["to_id"].as_str().expect("edge target"),
+                edge.get("confidence")
+                    .and_then(Value::as_str)
+                    .unwrap_or("resolved"),
+                properties,
+                edge.get("source_byte_start").and_then(Value::as_i64),
+                edge.get("source_byte_end").and_then(Value::as_i64),
+            ],
+        )
+        .expect("persist extracted edge");
+    }
+}
+
 /// B2(1) failing-first: non-code entities — core `file` anchors (the dogfooded
 /// `.env.example`), the project anchor, subsystems, guidance — must never be
 /// "dead CODE" candidates.
@@ -4457,6 +4521,175 @@ async fn find_dead_code_consumes_real_rust_extractor_root_tags() {
         dead,
         vec!["rust:function:lib.dead_helper".to_owned()],
         "the MCP dead-code consumer must recognize root tags emitted by the real Rust extractor: {env}"
+    );
+}
+
+#[tokio::test]
+async fn find_dead_code_treats_resolved_public_reexport_targets_as_roots() {
+    let (project, db, conn) = open_project();
+    let src = concat!(
+        "mod internal { pub struct Thing; pub struct Ordinary; }\n",
+        "mod test_internal { pub struct TestThing; }\n",
+        "pub use internal::Thing;\n",
+        "use internal::Thing as PrivateThing;\n",
+        "use internal::Ordinary;\n",
+        "#[cfg(test)] pub use test_internal::TestThing;\n",
+        "fn dead_helper() {}\n",
+    );
+    insert_extracted_rust_graph(&conn, project.path(), src);
+    let lexical_export_tag: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_tags WHERE entity_id = ?1 AND tag = 'exported-api'",
+            ["rust:struct:c_crate.internal.Thing"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        lexical_export_tag, 0,
+        "edge-rooted facade targets must not enter the lexical exported-api facet"
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    for roots in ["explicit", "auto"] {
+        for app_only in [false, true] {
+            let env = call_tool(
+                &state,
+                "find_dead_code",
+                json!({"roots": roots, "app_only": app_only}),
+            )
+            .await;
+            assert_eq!(env["ok"], true, "{env}");
+            let dead: Vec<String> = env["result"]["dead_code"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate["entity"]["id"].as_str().unwrap().to_owned())
+                .collect();
+            let mut expected = vec![
+                "rust:function:c_crate.dead_helper".to_owned(),
+                "rust:struct:c_crate.internal.Ordinary".to_owned(),
+            ];
+            if app_only {
+                expected.push("rust:struct:c_crate.test_internal.TestThing".to_owned());
+            }
+            assert_eq!(
+                dead, expected,
+                "the app-visible facade target stays live, ordinary imports stay dead, and \
+                 cfg(test)-only re-exports are roots only outside app_only \
+                 (roots={roots}, app_only={app_only}): {env}",
+            );
+            assert_eq!(
+                env["result"]["summary"]["not_analysed"]["plugins_without_roots"], 0,
+                "a public re-export is explicit Rust root coverage: {env}",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn find_dead_code_rejects_forged_public_reexport_properties() {
+    let (project, db, conn) = open_project();
+    insert_entity_with_plugin(
+        &conn,
+        "rust:function:lib.entry",
+        "rust",
+        "function",
+        "src/lib.rs",
+        "{}",
+    );
+    insert_tag_with_plugin(&conn, "rust:function:lib.entry", "rust", "entry-point");
+    insert_entity_with_plugin(
+        &conn,
+        "rust:module:lib",
+        "rust",
+        "module",
+        "src/lib.rs",
+        "{}",
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "rust:impl:lib.BadOrigin",
+        "rust",
+        "impl",
+        "src/lib.rs",
+        "{}",
+    );
+    insert_entity_with_plugin(
+        &conn,
+        "python:module:foreign",
+        "python",
+        "module",
+        "foreign.py",
+        "{}",
+    );
+    let targets = ["BadOrigin", "CrossPlugin", "Invalid", "Numeric", "String"];
+    for target in targets {
+        insert_entity_with_plugin(
+            &conn,
+            &format!("rust:struct:lib.{target}"),
+            "rust",
+            "struct",
+            "src/lib.rs",
+            "{}",
+        );
+    }
+    insert_edge_with_properties(
+        &conn,
+        "imports",
+        "rust:impl:lib.BadOrigin",
+        "rust:struct:lib.BadOrigin",
+        "resolved",
+        &json!({"public_reexport": true}),
+    );
+    insert_edge_with_properties(
+        &conn,
+        "imports",
+        "python:module:foreign",
+        "rust:struct:lib.CrossPlugin",
+        "resolved",
+        &json!({"public_reexport": true}),
+    );
+    insert_edge_with_properties(
+        &conn,
+        "imports",
+        "rust:module:lib",
+        "rust:struct:lib.Numeric",
+        "resolved",
+        &json!({"public_reexport": 1}),
+    );
+    insert_edge_with_properties(
+        &conn,
+        "imports",
+        "rust:module:lib",
+        "rust:struct:lib.String",
+        "resolved",
+        &json!({"public_reexport": "true"}),
+    );
+    conn.execute(
+        "INSERT INTO edges (kind, from_id, to_id, confidence, properties) \
+         VALUES ('imports', 'rust:module:lib', 'rust:struct:lib.Invalid', 'resolved', '{bad')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_dead_code", json!({})).await;
+    assert_eq!(env["ok"], true, "{env}");
+    let dead: Vec<String> = env["result"]["dead_code"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["entity"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        dead,
+        targets
+            .iter()
+            .map(|target| format!("rust:struct:lib.{target}"))
+            .collect::<Vec<_>>(),
+        "only boolean provenance on a resolved Rust module-to-Rust target edge may root: {env}",
     );
 }
 

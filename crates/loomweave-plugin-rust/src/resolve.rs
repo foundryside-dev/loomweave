@@ -49,6 +49,71 @@ impl<'t> Resolver<'t> {
         self.resolve_non_glob(from_crate, path, |_| true)
     }
 
+    /// Resolve an item-level `use` path from its containing module.
+    ///
+    /// At the crate root, every Rust edition resolves `pub use internal::Thing`
+    /// through a local `mod internal`, which is load-bearing for the common
+    /// facade. Nested unqualified imports differ between Rust 2015 and 2018+;
+    /// because the extractor does not carry Cargo edition, those fail closed.
+    /// `leading_colon` preserves `ItemUse.leading_colon` so an absolute import
+    /// never falls through to a same-named local module.
+    #[must_use]
+    pub fn resolve_import_path(
+        &self,
+        from_crate: &str,
+        from_module: &str,
+        path: &str,
+        leading_colon: bool,
+    ) -> Resolution {
+        if let Some(prefix) = path.strip_suffix("::*") {
+            return self.resolve_import_candidates(
+                from_crate,
+                from_module,
+                prefix,
+                leading_colon,
+                |id| id.starts_with("rust:module:"),
+                true,
+            );
+        }
+        self.resolve_import_candidates(
+            from_crate,
+            from_module,
+            path,
+            leading_colon,
+            |_| true,
+            false,
+        )
+    }
+
+    fn resolve_import_candidates(
+        &self,
+        from_crate: &str,
+        from_module: &str,
+        path: &str,
+        leading_colon: bool,
+        keep: impl Fn(&str) -> bool,
+        ambiguous_on_match: bool,
+    ) -> Resolution {
+        for qualname in import_qualname_candidates(from_crate, from_module, path, leading_colon) {
+            let ids = self.table.ids_for_qualname(&qualname);
+            if ids.is_empty() {
+                continue;
+            }
+            let resolved = resolve_ids(ids, &keep);
+            return if ambiguous_on_match {
+                match resolved {
+                    Resolution::Resolved(id) | Resolution::Ambiguous(id) => {
+                        Resolution::Ambiguous(id)
+                    }
+                    Resolution::External => Resolution::External,
+                }
+            } else {
+                resolved
+            };
+        }
+        Resolution::External
+    }
+
     /// Resolve a trait path from `from_crate`, keeping only `rust:trait:` ids.
     #[must_use]
     pub fn resolve_trait_path(&self, from_crate: &str, path: &str) -> Resolution {
@@ -115,6 +180,70 @@ impl<'t> Resolver<'t> {
             ids = self.table.ids_for_qualname(&fallback);
         }
         resolve_ids(ids, keep)
+    }
+}
+
+fn import_qualname_candidates(
+    from_crate: &str,
+    from_module: &str,
+    path: &str,
+    leading_colon: bool,
+) -> Vec<String> {
+    let segments: Vec<&str> = path
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let Some(first) = segments.first().copied() else {
+        return Vec::new();
+    };
+    if leading_colon {
+        return vec![segments.join(".")];
+    }
+
+    match first {
+        "crate" => vec![join_module_and_path(from_crate, &segments[1..])],
+        "self" => vec![join_module_and_path(from_module, &segments[1..])],
+        "super" => {
+            let super_count = segments
+                .iter()
+                .take_while(|segment| **segment == "super")
+                .count();
+            let mut base: Vec<&str> = from_module.split('.').collect();
+            if super_count >= base.len() {
+                return Vec::new();
+            }
+            base.truncate(base.len() - super_count);
+            vec![join_module_and_path(
+                &base.join("."),
+                &segments[super_count..],
+            )]
+        }
+        _ if first == from_crate => vec![segments.join(".")],
+        _ => {
+            let external_or_workspace = segments.join(".");
+            // At the crate root every Rust edition agrees that an unqualified
+            // local path is crate-root-relative. In a nested module Rust 2015
+            // resolves it from the crate root while Rust 2018+ resolves it from
+            // the containing module. The extractor has no edition input, so a
+            // nested path fails closed instead of choosing either target.
+            if from_module != from_crate {
+                return Vec::new();
+            }
+            let local = join_module_and_path(from_module, &segments);
+            if local == external_or_workspace {
+                vec![local]
+            } else {
+                vec![local, external_or_workspace]
+            }
+        }
+    }
+}
+
+fn join_module_and_path(module: &str, segments: &[&str]) -> String {
+    if segments.is_empty() {
+        module.to_owned()
+    } else {
+        format!("{module}.{}", segments.join("."))
     }
 }
 
