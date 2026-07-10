@@ -57,10 +57,10 @@ found by the adversarial 4-corpus QA sweep.
      pass; locally nextest 1948 / pytest 220 green under CI-equivalent conditions.
      **Caveat (CI blind spot):** the `wardline_taint_fact_conformance_oracle`
      reads the live `~/wardline` sibling repo and *skip-cleans* when absent — so a
-     vendored-golden drift from that sibling turns the **local** floor red while
-     **CI stays green** (no sibling on the runner). Filed as clarion-72e1c1a07d
-     (pre-existing, not from this bet). Promote to a real guardrail if the
-     CI-invisibility recurs.
+     vendored-golden drift from that sibling previously turned the **local** floor
+     red while **CI stayed green**. Resolved 2026-07-10 (clarion-72e1c1a07d):
+     the required reusable-workflow Rust job now fetches the public Wardline
+     `main` authority fixture and fails on missing or byte-drifted data.
    - `READING (2026-06-28): GREEN on PR #78` — the filigree transport fix merged to
      `main` `b5aabe8` with all CI checks passing (Rust + Rust aarch64 + Python + e2e
      walking-skeleton). 131 loomweave-federation tests green locally; fmt + clippy

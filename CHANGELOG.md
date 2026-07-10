@@ -25,6 +25,11 @@ only when an incompatible change is made to that surface. See
   disjunctions and `cfg_attr` forms that can admit app code remain app-visible.
   Rust ontology `0.8.2` invalidates cached extraction values for the corrected
   tags.
+- **CI-visible Wardline golden drift.** The reusable verify workflow now checks
+  Loomweave's vendored taint-fact fixture byte-for-byte against the public
+  Wardline `main` authority inside the required Rust job, so sibling drift
+  blocks PR merges and releases instead of only failing local workspaces that
+  happen to have both repositories.
 
 ## [1.4.1] — 2026-07-10
 

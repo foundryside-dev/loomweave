@@ -48,6 +48,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      # This deliberately follows Wardline's moving authority. Only the public
+      # fixture bytes are fetched; no sibling code is checked out or executed.
+      # Keeping the guard inside the required Rust context makes drift block PR
+      # merges as well as release verification (clarion-72e1c1a07d).
+      - name: Wardline taint golden lockstep
+        run: |
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 10 --max-time 60 \
+            https://raw.githubusercontent.com/foundryside-dev/wardline/main/tests/conformance/fixtures/wardline-taint-fact-wire.golden.json \
+            --output "$RUNNER_TEMP/wardline-taint-fact-wire.golden.json"
+          python scripts/check-wardline-taint-golden.py --self-test
+          python scripts/check-wardline-taint-golden.py \
+            --authority-file "$RUNNER_TEMP/wardline-taint-fact-wire.golden.json"
+
       - name: fmt
         run: cargo fmt --all -- --check
 

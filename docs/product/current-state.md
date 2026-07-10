@@ -128,12 +128,13 @@ The warpline churn-fill (transport **and** keying gap) has now shipped — see
 - **CI floor GREEN on PR #79** (`a980ef2`): all 4 CI checks (Rust + aarch64 +
   Python + Sprint-1 e2e); locally fmt + workspace clippy (-D warnings) + doc clean,
   nextest **1972/1973**. See `metrics.md`.
-- **CI blind spot — drift RE-VENDORED, spot REMAINS:** the
+- **CI blind spot — RESOLVED 2026-07-10:** the
   `wardline_taint_fact_conformance_oracle` drift flagged 2026-06-29 was re-vendored
-  this cycle (#80, PDR-0009), so the *drift* is cleared — but the underlying
-  local-red/CI-green divergence (the oracle skip-cleans when the `~/wardline`
-  sibling is absent, so a drift still passes CI) is structural and **still open →
-  promote clarion-72e1c1a07d** (open question 4b).
+  this cycle (#80, PDR-0009), and the reusable verify workflow's required Rust
+  job now fetches the authority fixture from public
+  `foundryside-dev/wardline@main` and compares it byte-for-byte. The local
+  Layer-2 test may still skip when the sibling is absent, but cross-repo drift
+  now blocks PR merges and releases (clarion-72e1c1a07d).
 - North-star (open collision families) = 0, **not re-swept** (this was federation
   correctness, not graph identity — no identity/extraction code touched).
 - **`tools/list` 22 KB budget** — re-measured GREEN on 2026-07-10 after the new
@@ -151,13 +152,10 @@ The warpline churn-fill (transport **and** keying gap) has now shipped — see
    `reresolve-sei` to heal already-minted NULL rows (operational, cross-product);
    (b) deep-pagination half now tracked as clarion-obs-acffc4e8a1 (open).
 4. **`tools/list` byte budget** — re-measure; may be breached.
-4b. **Promote clarion-72e1c1a07d to a guardrail (carried, 2026-06-29).** The
-   `wardline_taint_fact_conformance_oracle` local-red/CI-green divergence recurred
-   (flagged 2026-06-26, fired 2026-06-29). The *drift* was re-vendored 2026-07-01
-   (#80, PDR-0009) — but that is another manual re-vendor, not a fix: the oracle
-   still skip-cleans when `~/wardline` is absent, so the next sibling drift passes
-   CI again. Still needs a CI-visible check or a re-vendor cadence. **Promotion
-   remains open.**
+4b. ~~Promote clarion-72e1c1a07d to a guardrail.~~ **RESOLVED 2026-07-10.**
+   The reusable verify workflow's required Rust job now checks the vendored
+   taint-fact golden against the public Wardline `main` authority on every CI
+   run. Missing authority data and byte drift block PR merges and releases.
 5. **Adoption metric** — still undecided; telemetry is escalation-gated (local-first).
 6. **ESCALATION (carried, outward-facing, gated):** Wardline Amendments 4–9 corpus
    re-vendor handoff — prepared, not pushed. Do not push without owner sign-off.
