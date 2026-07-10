@@ -210,6 +210,20 @@ fn run_actor(
                 );
                 reply(ack, res);
             }
+            WriterCmd::ReconcileSubsystemGraph {
+                subsystem_ids,
+                memberships,
+                ack,
+            } => {
+                let res = reconcile_subsystem_graph(
+                    conn,
+                    &mut state,
+                    &subsystem_ids,
+                    &memberships,
+                    commits_observed,
+                );
+                reply(ack, res);
+            }
             WriterCmd::ReconcileBriefingBlockForSourceFile {
                 source_file_path,
                 reason,
@@ -1034,6 +1048,86 @@ fn replace_anchored_edges_for_source_file(
         params![source_file_id],
     )?;
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+/// Remove Phase 3 materialization that is absent from the current clustering
+/// result while preserving rows whose stable ids are still authoritative.
+/// Temporary tables keep the operation parameter-limit independent for large
+/// repositories and let both membership columns participate in exact matching.
+fn reconcile_subsystem_graph(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    subsystem_ids: &[String],
+    memberships: &[(String, String)],
+    commits_observed: &AtomicUsize,
+) -> Result<()> {
+    if state.current_run.is_none() {
+        return Err(StorageError::WriterProtocol(
+            "ReconcileSubsystemGraph received without a preceding BeginRun".to_owned(),
+        ));
+    }
+    if !state.in_tx {
+        begin_write_tx(conn, state)?;
+        state.in_tx = true;
+    }
+
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS current_subsystem_ids (\
+             subsystem_id TEXT PRIMARY KEY\
+         ) WITHOUT ROWID;\
+         CREATE TEMP TABLE IF NOT EXISTS current_subsystem_memberships (\
+             module_id TEXT NOT NULL,\
+             subsystem_id TEXT NOT NULL,\
+             PRIMARY KEY (module_id, subsystem_id)\
+         ) WITHOUT ROWID;\
+         DELETE FROM current_subsystem_ids;\
+         DELETE FROM current_subsystem_memberships;",
+    )?;
+    {
+        let mut insert_id =
+            conn.prepare("INSERT OR IGNORE INTO current_subsystem_ids (subsystem_id) VALUES (?1)")?;
+        for subsystem_id in subsystem_ids {
+            insert_id.execute([subsystem_id])?;
+        }
+    }
+    {
+        let mut insert_membership = conn.prepare(
+            "INSERT OR IGNORE INTO current_subsystem_memberships (module_id, subsystem_id) \
+             VALUES (?1, ?2)",
+        )?;
+        for (module_id, subsystem_id) in memberships {
+            insert_membership.execute(params![module_id, subsystem_id])?;
+        }
+    }
+
+    let stale_memberships = conn.execute(
+        "DELETE FROM edges \
+         WHERE kind = 'in_subsystem' \
+           AND NOT EXISTS (\
+               SELECT 1 FROM current_subsystem_memberships AS current \
+               WHERE current.module_id = edges.from_id \
+                 AND current.subsystem_id = edges.to_id\
+           )",
+        [],
+    )?;
+    let stale_subsystems = conn.execute(
+        "DELETE FROM entities \
+         WHERE kind = 'subsystem' \
+           AND NOT EXISTS (\
+               SELECT 1 FROM current_subsystem_ids AS current \
+               WHERE current.subsystem_id = entities.id\
+           )",
+        [],
+    )?;
+    conn.execute_batch(
+        "DROP TABLE current_subsystem_memberships;\
+         DROP TABLE current_subsystem_ids;",
+    )?;
+
+    if stale_memberships > 0 || stale_subsystems > 0 {
+        bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    }
     Ok(())
 }
 

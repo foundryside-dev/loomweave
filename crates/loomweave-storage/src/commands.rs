@@ -185,6 +185,18 @@ pub enum WriterCmd {
         source_file_id: String,
         ack: Ack<()>,
     },
+    /// Replace the persisted Phase 3 subsystem projection with the current
+    /// clustering result. Stable subsystem ids and memberships are preserved;
+    /// obsolete `in_subsystem` edges and subsystem entities are removed.
+    ///
+    /// This is an in-run command because incremental analysis may skip every
+    /// source file while Phase 3 still recomputes the authoritative clustering
+    /// from the durable module graph.
+    ReconcileSubsystemGraph {
+        subsystem_ids: Vec<String>,
+        memberships: Vec<(String, String)>,
+        ack: Ack<()>,
+    },
     /// Reconcile the `briefing_blocked` marker on every entity row anchored to
     /// one source file to the current pre-ingest secret-scan verdict
     /// (clarion-3c4ed8e9fb). On an incremental run, an UNCHANGED file is skipped

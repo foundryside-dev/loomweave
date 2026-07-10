@@ -89,6 +89,15 @@ fn make_module_entity(id: &str) -> EntityRecord {
     e
 }
 
+fn make_subsystem_entity(id: &str) -> EntityRecord {
+    let mut entity = make_entity(id);
+    "core".clone_into(&mut entity.plugin_id);
+    "subsystem".clone_into(&mut entity.kind);
+    id.clone_into(&mut entity.name);
+    id.clone_into(&mut entity.short_name);
+    entity
+}
+
 fn make_file_entity(id: &str) -> EntityRecord {
     let mut e = make_entity(id);
     "core".clone_into(&mut e.plugin_id);
@@ -2623,6 +2632,104 @@ async fn replace_edges_for_source_file_removes_only_stale_anchored_edges() {
     assert!(!rows.iter().any(|(kind, source_file_id, _, _)| {
         kind == "references" && source_file_id.as_deref() == Some("core:file:demo.py")
     }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_subsystem_graph_removes_only_obsolete_materialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-subsystem-reconcile").await;
+    for entity in [
+        make_module_entity("python:module:current"),
+        make_module_entity("python:module:former"),
+        make_subsystem_entity("core:subsystem:current"),
+        make_subsystem_entity("core:subsystem:obsolete"),
+    ] {
+        send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+            entity: Box::new(entity),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+    for edge in [
+        make_structural_edge(
+            "in_subsystem",
+            "python:module:current",
+            "core:subsystem:current",
+            EdgeConfidence::Resolved,
+        ),
+        make_structural_edge(
+            "in_subsystem",
+            "python:module:former",
+            "core:subsystem:obsolete",
+            EdgeConfidence::Resolved,
+        ),
+    ] {
+        send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+            edge: Box::new(edge),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+
+    send::<()>(&tx, |ack| WriterCmd::ReconcileSubsystemGraph {
+        subsystem_ids: vec!["core:subsystem:current".to_owned()],
+        memberships: vec![(
+            "python:module:current".to_owned(),
+            "core:subsystem:current".to_owned(),
+        )],
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-subsystem-reconcile".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let subsystems = conn
+        .prepare("SELECT id FROM entities WHERE kind = 'subsystem' ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(subsystems, ["core:subsystem:current"]);
+
+    let memberships = conn
+        .prepare(
+            "SELECT from_id, to_id FROM edges \
+             WHERE kind = 'in_subsystem' ORDER BY from_id, to_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        memberships,
+        [(
+            "python:module:current".to_owned(),
+            "core:subsystem:current".to_owned(),
+        )]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

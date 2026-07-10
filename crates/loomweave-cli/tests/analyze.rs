@@ -346,6 +346,10 @@ TARGETS = {
     "auth_b": ["auth_a"],
     "billing_a": ["billing_b"],
     "billing_b": ["billing_a"],
+    "leiden_auth_a": ["leiden_auth_b"] * 16 + ["leiden_billing_a"],
+    "leiden_auth_b": ["leiden_auth_a"] * 14,
+    "leiden_billing_a": ["leiden_billing_b"] * 17,
+    "leiden_billing_b": ["leiden_billing_a"] * 13,
     "weak_a": ["weak_b"],
 }
 
@@ -378,12 +382,12 @@ while True:
                 "kind": "imports",
                 "from_id": module_id,
                 "to_id": f"phase3fixture:module:{target}",
-                "source_byte_start": 0,
-                "source_byte_end": 10,
+                "source_byte_start": index * 10,
+                "source_byte_end": index * 10 + 10,
                 "confidence": "resolved",
                 "properties": {"imported_name": target},
             }
-            for target in TARGETS.get(stem, [])
+            for index, target in enumerate(TARGETS.get(stem, []))
         ]
         write_frame({
             "jsonrpc": "2.0",
@@ -1344,6 +1348,104 @@ fn analyze_phase3_is_deterministic_across_two_runs() {
     let second = run_phase3_fixture(&["auth_a", "auth_b", "billing_a", "billing_b"], &config);
 
     assert_eq!(signature(first.path()), signature(second.path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_phase3_is_stable_on_unchanged_incremental_rerun() {
+    type SubsystemSignature = (Vec<(String, String)>, Vec<(String, String)>);
+
+    fn signature(project_root: &std::path::Path) -> SubsystemSignature {
+        let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
+        let subsystems = conn
+            .prepare("SELECT id, properties FROM entities WHERE kind = 'subsystem' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let memberships = conn
+            .prepare(
+                "SELECT from_id, to_id FROM edges \
+                 WHERE kind = 'in_subsystem' ORDER BY from_id, to_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (subsystems, memberships)
+    }
+
+    let stems = [
+        "leiden_auth_a",
+        "leiden_auth_b",
+        "leiden_billing_a",
+        "leiden_billing_b",
+    ];
+    let (project_dir, plugin_dir, config_path) = phase3_project_for_rerun(&stems);
+    let before = signature(project_dir.path());
+    let before_stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        before_stats["clustering"]["algorithm"].as_str(),
+        Some("leiden"),
+        "the regression fixture must exercise Leiden rather than its fallback: {before_stats}"
+    );
+
+    {
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+             created_at, updated_at) VALUES (?1, 'core', 'subsystem', 'Obsolete', \
+             'obsolete', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            ["core:subsystem:obsolete"],
+        )
+        .expect("inject obsolete subsystem from a prior clustering result");
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence) \
+             VALUES ('in_subsystem', ?1, ?2, 'resolved')",
+            [
+                "phase3fixture:module:leiden_auth_a",
+                "core:subsystem:obsolete",
+            ],
+        )
+        .expect("inject obsolete subsystem membership");
+    }
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(stems.len() as u64),
+        "the second run must exercise the unchanged incremental path: {stats}"
+    );
+    for field in [
+        "algorithm",
+        "module_count",
+        "module_edge_count",
+        "subsystem_count",
+        "modularity_score",
+        "subsystems_inserted",
+        "in_subsystem_edges_inserted",
+    ] {
+        assert_eq!(
+            stats["clustering"][field], before_stats["clustering"][field],
+            "current-run clustering stat {field} changed on an unchanged rerun"
+        );
+    }
+    assert_eq!(
+        signature(project_dir.path()),
+        before,
+        "the current run must replace obsolete subsystem entities and memberships"
+    );
 }
 
 #[cfg(unix)]

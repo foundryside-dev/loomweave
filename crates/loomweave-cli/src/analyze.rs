@@ -3165,6 +3165,7 @@ async fn run_phase3_clustering(
     let started = std::time::Instant::now();
     let config = &analyze_config.analysis.clustering;
     if !config.enabled {
+        reconcile_subsystem_graph(writer, &[], &[]).await?;
         return Ok(Phase3Output {
             subsystems_inserted: 0,
             in_subsystem_edges_inserted: 0,
@@ -3204,6 +3205,7 @@ async fn run_phase3_clustering(
         .context("load module dependency edges for phase3")?;
 
     if dependency_edges.is_empty() {
+        reconcile_subsystem_graph(writer, &[], &[]).await?;
         return Ok(Phase3Output {
             subsystems_inserted: 0,
             in_subsystem_edges_inserted: 0,
@@ -3246,6 +3248,7 @@ async fn run_phase3_clustering(
     let cluster_result = cluster_modules(&graph, &cluster_config).context("cluster modules")?;
 
     if cluster_result.communities.is_empty() {
+        reconcile_subsystem_graph(writer, &[], &[]).await?;
         return Ok(Phase3Output {
             subsystems_inserted: 0,
             in_subsystem_edges_inserted: 0,
@@ -3370,6 +3373,22 @@ async fn run_phase3_clustering(
         false
     };
 
+    let subsystem_ids = inserted_subsystems
+        .iter()
+        .map(|subsystem| subsystem.id.clone())
+        .collect::<Vec<_>>();
+    let memberships = cluster_result
+        .communities
+        .iter()
+        .zip(&inserted_subsystems)
+        .flat_map(|(community, subsystem)| {
+            community
+                .iter()
+                .map(|module_id| (module_id.clone(), subsystem.id.clone()))
+        })
+        .collect::<Vec<_>>();
+    reconcile_subsystem_graph(writer, &subsystem_ids, &memberships).await?;
+
     let subsystems_inserted = u64::try_from(inserted_subsystems.len()).unwrap_or(u64::MAX);
     Ok(Phase3Output {
         subsystems_inserted,
@@ -3390,6 +3409,22 @@ async fn run_phase3_clustering(
             started,
         ),
     })
+}
+
+async fn reconcile_subsystem_graph(
+    writer: &Writer,
+    subsystem_ids: &[String],
+    memberships: &[(String, String)],
+) -> Result<()> {
+    writer
+        .send_wait(|ack| WriterCmd::ReconcileSubsystemGraph {
+            subsystem_ids: subsystem_ids.to_vec(),
+            memberships: memberships.to_vec(),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("ReconcileSubsystemGraph after phase3 clustering")
 }
 
 fn subsystem_entity_id(cluster_hash: &str) -> Result<String> {

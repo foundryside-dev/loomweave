@@ -34,6 +34,10 @@ only when an incompatible change is made to that surface. See
   anchored edges and unresolved call sites owned by vanished source files,
   while retaining cumulative entity rows long enough to preserve deletion
   findings and SEI lineage.
+- **Stable incremental subsystem materialization.** Phase 3 now reconciles the
+  persisted subsystem graph to each run's authoritative clustering result,
+  preserving stable subsystem IDs while removing obsolete subsystem entities
+  and membership edges, including on unchanged incremental reruns.
 
 ## [1.4.1] — 2026-07-10
 
