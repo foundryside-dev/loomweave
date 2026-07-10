@@ -4,21 +4,20 @@
 > horizon, and why. Sequencing, WSJF scoring, and dated forecasts are produced
 > by `/axiom-program-management`, never here. No dates, no commitments.
 >
-> Bootstrapped 2026-06-11. **Updated: 2026-06-29 (PDR-0008)** — the warpline churn
-> keying gap root-caused + fixed loomweave-side (briefing-blocked entities' SEI now
-> rides the read surface; owner-ratified posture reversal; clarion-4b3061b1ac,
-> ADR-034 amendment) → moved to Shipped. Prior same-day: PDR-0007 (stale
-> `weft/legis-conformance` branch disposed → clarion-0715faa9d6); PDR-0006
-> (federation MCP-transport reliability cycle: filigree #78 shipped, warpline #77 in
-> flight). No Now horizon moved. Tracker IDs are Filigree issues.
+> Bootstrapped 2026-06-11. **Updated: 2026-07-10 (PDR-0010)** — local 1.4.1
+> public-surface tag checkpoint banked for Plainweave's denominator; uv tools
+> installed; no public push/publish. Prior: PDR-0009 (1.4.0 shipped to all
+> channels), PDR-0008 (warpline keying gap fixed). No Now horizon moved. Tracker
+> IDs are Filigree issues.
 
 ## Now — turning over (the `loomweave-llm` extraction shipped)
 
 The recorded Now bet (`loomweave-llm` extraction, clarion-141e9c08c8) is
 **accepted and merged** (PDR-0005, PR #76 → `main` `b346328`) — moved to "Shipped
 since" below. The Now horizon is open again. **The next session's DECIDE picks the
-new Now**; this checkpoint records intent only, it does not choose. Candidates,
-each with the metric it moves:
+new Now**; this checkpoint records intent only, it does not choose. The 2026-07-10
+Plainweave public-surface patch is banked under "Shipped since"; it was a tactical
+Loomweave gap fix, not a new Now bet. Candidates, each with the metric it moves:
 
 - **Incremental-analyze correctness cluster** — defends the north-star directly
   (graph correctness is what lets an agent prefer the graph over grep). The
@@ -47,6 +46,13 @@ each with the metric it moves:
 
 ## Shipped since 2026-06-11 (banked, no longer open bets)
 
+- **Plainweave public-surface denominator support / local 1.4.1** (PDR-0010) —
+  local `main` now exposes the public-surface tag/MCP shortcut set Plainweave needs
+  (`entry-point`, `http-route`, `exported-api`, `cli-command`) and the Python
+  extractor handles augmented `__all__`, module re-exports, manual CLI patterns,
+  and common main-guard wrappers. Root + standalone Rust-plugin lockfiles carry
+  `crossbeam-epoch 0.9.20`. Local uv tools installed at 1.4.1. Not a public
+  release: no push, tag, PyPI/GitHub Release, or crates.io publish.
 - **Warpline churn-fill TRANSPORT** (PR #77, PDR-0006) — merged to `main` `1d2b4fa`
   (2026-06-29). Lights up the dead-by-design `entity_high_churn_list` /
   `entity_recent_change_list` surfaces by consuming Warpline's frozen churn read:

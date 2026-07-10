@@ -1,9 +1,9 @@
 # Loomweave — Metrics
 
-> Bootstrapped 2026-06-11. **Updated 2026-07-01** (checkpoint — 1.4.0 release
-> CI-floor reading, PDR-0009). Prior: 2026-06-29 (PR #79 reading; wardline-drift
-> blind spot). Baselines are real observed readings; targets are falsifiable (a
-> number/boolean and a date).
+> Bootstrapped 2026-06-11. **Updated 2026-07-10** (checkpoint — local 1.4.1
+> public-surface tags / Plainweave denominator, PDR-0010). Prior: 2026-07-01
+> (1.4.0 release CI-floor reading, PDR-0009). Baselines are real observed
+> readings; targets are falsifiable (a number/boolean and a date).
 
 ## North star
 
@@ -25,6 +25,9 @@ found by the adversarial 4-corpus QA sweep.
 - `READING (2026-06-28): 0 open collision families` — **not re-swept this
   session** (the cycle was federation transport, not graph correctness — PDR-0006).
   Carried forward unchanged; no identity/extraction code touched.
+- `READING (2026-07-10): 0 carried, not re-swept` — PDR-0010 changed public-surface
+  tags and MCP shortcut exposure for Plainweave's denominator, not entity identity
+  matching. No new collision-family QA sweep was run.
 - **OPEN QUESTION (owner, carried):** the collision-family target is met and needs
   a fresh falsifiable successor. Candidate: fabricated-edge / dropped-file /
   collision defect count on the adversarial sweep stays 0 across the 1.3.x line
@@ -83,6 +86,19 @@ found by the adversarial 4-corpus QA sweep.
      sibling); clarion-72e1c1a07d promotion stays open. Two release-process defects
      fixed in-cycle: crates.io publish-order omitted `loomweave-llm` (#83) and a
      `created_at`-vs-real-clock time-bomb reddened `main` on 2026-07-01 (#84).
+   - `READING (2026-07-10): GREEN for the local 1.4.1 checkpoint` (PDR-0010) —
+     version lockstep scripts passed (`1.4.1`, Rust plugin manifests identical,
+     Python ontology `0.11.0`); `cargo fmt --all -- --check` passed; full Python
+     plugin pytest passed (**239 passed**, coverage **87.08%**); workspace and
+     standalone Rust-plugin `cargo check --locked` passed; selected MCP
+     public-surface/context-budget nextest slices passed; root and standalone
+     `cargo deny check` returned advisories/bans/licenses/sources OK (duplicate
+     and unmatched-license allowance warnings only). The Warpline churn oracle is
+     now hermetic by default: with `WARPLINE_REPO` unset, 9/9 tests pass and the
+     sibling checks skip; with `LOOMWEAVE_DRIFT_REQUIRED=1` and no repo configured,
+     the oracle fails as intended.
+     **Caveat:** `wardline scan . --fail-on ERROR` passed, but reported 0
+     recognized trust boundaries, so it is not yet a meaningful taint guardrail.
    - `TARGET: green on every release/merge — standing, no end date`
 3. **MCP context tax under budget**: `tools/list` payload has a CI-enforced
    22,000-byte budget.
@@ -90,6 +106,10 @@ found by the adversarial 4-corpus QA sweep.
    - `READING (2026-06-24): UNKNOWN — NEEDS RE-CHECK.` The MCP surface grew since
      bootstrap (entity dossier, app_only filters, caller-honesty fields, config
      tools). Margin was 13 bytes; growth may have breached or re-tightened it.
+   - `READING (2026-07-10): GREEN after the new public-surface shortcuts.` The
+     focused nextest `tools_list_fits_the_context_budget` passed after adding the
+     `entity_exported_api_list` / `entity_cli_command_list` shortcut surface and
+     public-surface docstring updates.
    - `TARGET: never exceeds budget; any schema growth buys bytes elsewhere first`
 4. **Identity stability**: SEI churn on unchanged re-analyze of reference corpora.
    - `BASELINE (2026-06-11): 0 SEI churn (Sprint-3 sweep)`
@@ -120,3 +140,7 @@ found by the adversarial 4-corpus QA sweep.
 - **Adoption / operator installs** — no instrumentation exists; local-first
   design makes telemetry an explicit, escalation-gated product decision.
   `BASELINE: unknown → TARGET: TBD by owner`.
+- **Cross-repo conformance hermeticity** — default test runs should not depend on
+  sibling checkout state. `READING (2026-07-10): Warpline churn oracle fixed` —
+  `WARPLINE_REPO` now opt-in; `LOOMWEAVE_DRIFT_REQUIRED=1` preserves release-gate
+  failure when the sibling authority is absent.
