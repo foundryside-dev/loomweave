@@ -116,6 +116,21 @@ found by the adversarial 4-corpus QA sweep.
    - `READING (2026-06-24): presumed 0` — no identity code changed; not re-swept
      this session.
    - `TARGET: stays 0 across the 1.3.x line — standing`
+5. **Python reference-analysis wall time on `elspeth_mini`**: the checked-in
+   80-file / 828-function corpus used by `scripts/b4-gate-run.sh`.
+   - `REGRESSED READING (2026-07-10): 105.106s`, with 6,749 reference sites
+     producing roughly one Pyright definition request per site; the historical
+     `cli_overhead_ms` residual was 99.465s.
+   - `READING (2026-07-10): 14.430s after clarion-c20593d0d8 fix` — unshadowed
+     builtins are classified as external without a language-server request;
+     imported names remain position-query-driven to preserve Python rebinding
+     semantics. Resolved-reference parity held at 1,549/1,549 against the
+     unoptimized control. The next-tier projection fell from 126.381min to
+     17.351min.
+   - `TARGET: <=30s on the calibration machine and >=1,549 resolved references
+     — standing.` Enforced by `scripts/b4-gate-run.sh`; intentional baseline
+     updates use `B4_GATE_MAX_MINI_SECONDS` and
+     `B4_GATE_MIN_RESOLVED_REFERENCES` explicitly.
 
 ## Watchlist (not yet a target)
 
@@ -131,12 +146,6 @@ found by the adversarial 4-corpus QA sweep.
   in PR #78, not yet bounded.
 - **Subsystem-count drift** on unchanged re-analyze (clustering instability,
   clarion-14398b2536, confirmed). Promote to a guardrail when the fix lands.
-- **B.4* analyze wall-time 24× regression** on elspeth_mini (3.99s → 96.99s;
-  next-tier projection 3.1min → 96min), clarion-c20593d0d8 (triage). **Added
-  2026-06-24.** Bears directly on the "graph fast enough to prefer over grep"
-  north-star; promote to a perf guardrail once root-caused. (Note a B.4* week-2
-  gate refresh read GREEN 2026-06-18 — reconcile the conflicting signals during
-  triage.)
 - **Adoption / operator installs** — no instrumentation exists; local-first
   design makes telemetry an explicit, escalation-gated product decision.
   `BASELINE: unknown → TARGET: TBD by owner`.

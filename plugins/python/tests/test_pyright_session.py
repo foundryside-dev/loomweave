@@ -743,6 +743,85 @@ def test_pyright_session_skips_external_base_target(
 
 
 @pytest.mark.pyright
+def test_pyright_session_resolves_nested_builtin_shadow_base(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        def outer():
+            class Exception:
+                pass
+
+            class Child(Exception):
+                pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:class:demo.outer.<locals>.Child",
+        needle="Exception",
+        kind="base",
+        occurrence=1,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == [
+        {
+            "kind": "inherits_from",
+            "from_id": "python:class:demo.outer.<locals>.Child",
+            "to_id": "python:class:demo.outer.<locals>.Exception",
+            "confidence": "resolved",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+        },
+    ]
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolves_nested_builtin_shadow_decorator(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    source = textwrap.dedent(
+        """
+        def outer():
+            def property(fn):
+                return fn
+
+            @property
+            def target():
+                pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:function:demo.outer.<locals>.target",
+        needle="property",
+        kind="decorator",
+        occurrence=1,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_references(module, [site])
+
+    assert result.edges == [
+        {
+            "kind": "decorates",
+            "from_id": "python:function:demo.outer.<locals>.property",
+            "to_id": "python:function:demo.outer.<locals>.target",
+            "confidence": "resolved",
+            "source_byte_start": site.source_byte_start,
+            "source_byte_end": site.source_byte_end,
+        },
+    ]
+
+
+@pytest.mark.pyright
 def test_pyright_session_base_resolving_to_function_is_dropped(
     tmp_path: Path,
     pyright_langserver: str,
@@ -988,6 +1067,60 @@ class CountingReferenceSession(PyrightSession):
         return [self.target_id], False
 
 
+class ExternalReferenceSession(PyrightSession):
+    def __init__(self, project_root: Path) -> None:
+        super().__init__(project_root, executable=sys.executable)
+        self.requested_starts: list[int] = []
+
+    def _ensure_process(self) -> bool:
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = (method, params)
+
+    def _reference_target_ids(
+        self,
+        uri: str,
+        site: ReferenceSite,
+        *,
+        deadline: float,
+        method: str = "textDocument/definition",
+    ) -> tuple[list[str], bool]:
+        _ = (uri, deadline, method)
+        self.requested_starts.append(site.source_byte_start)
+        return [], True
+
+
+class MappedReferenceSession(PyrightSession):
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        results_by_start: dict[int, tuple[list[str], bool]],
+    ) -> None:
+        super().__init__(project_root, executable=sys.executable)
+        self.results_by_start = results_by_start
+        self.requested_starts: list[int] = []
+
+    def _ensure_process(self) -> bool:
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = (method, params)
+
+    def _reference_target_ids(
+        self,
+        uri: str,
+        site: ReferenceSite,
+        *,
+        deadline: float,
+        method: str = "textDocument/definition",
+    ) -> tuple[list[str], bool]:
+        _ = (uri, deadline, method)
+        self.requested_starts.append(site.source_byte_start)
+        return self.results_by_start[site.source_byte_start]
+
+
 @pytest.mark.pyright
 def test_pyright_session_reference_resolution_timeout(
     tmp_path: Path,
@@ -1041,6 +1174,413 @@ def test_pyright_session_reference_lookup_cache_includes_source_position(tmp_pat
             "source_byte_end": first.source_byte_end,
         },
     ]
+
+
+def test_pyright_session_skips_unshadowed_builtin_without_query(tmp_path: Path) -> None:
+    source = "VALUE: str\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="str",
+        kind="annotation",
+    )
+
+    with CountingReferenceSession(
+        tmp_path,
+        target_id="python:class:demo.str",
+    ) as session:
+        result = session.resolve_references(module, [site])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == []
+    assert result.edges == []
+    assert result.reference_sites_total == 1
+    assert result.references_skipped_external_total == 1
+    assert result.unresolved_reference_sites_total == 1
+
+
+@pytest.mark.parametrize(
+    ("source", "occurrence"),
+    [
+        ("class str:\n    pass\n\nVALUE: str\n", 1),
+        ("from custom_builtins import *\n\nVALUE: str\n", 0),
+    ],
+)
+def test_pyright_session_queries_potentially_shadowed_builtin(
+    tmp_path: Path,
+    source: str,
+    occurrence: int,
+) -> None:
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="str",
+        kind="annotation",
+        occurrence=occurrence,
+    )
+
+    with CountingReferenceSession(
+        tmp_path,
+        target_id="python:class:demo.str",
+    ) as session:
+        result = session.resolve_references(module, [site])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [site.source_byte_start]
+    assert result.references_resolved_total == 1
+    assert result.references_skipped_external_total == 0
+    assert result.unresolved_reference_sites_total == 0
+
+
+def test_pyright_session_queries_implicit_module_name(tmp_path: Path) -> None:
+    source = 'if __name__ == "__main__":\n    pass\n'
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="__name__",
+    )
+
+    with CountingReferenceSession(
+        tmp_path,
+        target_id="python:module:demo",
+    ) as session:
+        result = session.resolve_references(module, [site])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [site.source_byte_start]
+    assert result.references_resolved_total == 1
+    assert result.references_skipped_external_total == 0
+    assert result.unresolved_reference_sites_total == 0
+
+
+def test_pyright_session_queries_builtin_named_type_parameter(tmp_path: Path) -> None:
+    source = "def identity[str](value: str) -> str:\n    return value\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(
+        source,
+        from_id="python:function:demo.identity",
+        needle="str",
+        kind="annotation",
+        occurrence=1,
+    )
+
+    with CountingReferenceSession(
+        tmp_path,
+        target_id="python:module:demo",
+    ) as session:
+        result = session.resolve_references(module, [site])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [site.source_byte_start]
+    assert result.references_resolved_total == 1
+    assert result.references_skipped_external_total == 0
+
+
+def test_pyright_session_queries_repeated_external_import_positions(tmp_path: Path) -> None:
+    source = textwrap.dedent(
+        """
+        from external_lib import Remote
+
+        FIRST: Remote
+        SECOND: Remote
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    first = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="Remote",
+        kind="annotation",
+        occurrence=1,
+    )
+    second = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="Remote",
+        kind="annotation",
+        occurrence=2,
+    )
+
+    with ExternalReferenceSession(tmp_path) as session:
+        result = session.resolve_references(module, [first, second])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [first.source_byte_start, second.source_byte_start]
+    assert result.edges == []
+    assert result.reference_sites_total == 2
+    assert result.references_skipped_external_total == 2
+    assert result.unresolved_reference_sites_total == 2
+
+
+def test_pyright_session_does_not_reuse_unconfirmed_import_result(tmp_path: Path) -> None:
+    source = textwrap.dedent(
+        """
+        from project_lib import Remote
+
+        FIRST: Remote
+        SECOND: Remote
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    first = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="Remote",
+        kind="annotation",
+        occurrence=1,
+    )
+    second = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="Remote",
+        kind="annotation",
+        occurrence=2,
+    )
+
+    with CountingReferenceSession(
+        tmp_path,
+        target_id="python:class:project_lib.Remote",
+    ) as session:
+        result = session.resolve_references(module, [first, second])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [first.source_byte_start, second.source_byte_start]
+    assert result.references_resolved_total == 2
+    assert result.references_skipped_external_total == 0
+    assert result.unresolved_reference_sites_total == 0
+
+
+def test_pyright_session_does_not_cache_rebound_import_as_external(tmp_path: Path) -> None:
+    source = textwrap.dedent(
+        """
+        from external_lib import Remote
+
+        class Remote:
+            pass
+
+        FIRST: Remote
+        SECOND: Remote
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    first = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="Remote",
+        kind="annotation",
+        occurrence=2,
+    )
+    second = _reference_site(
+        source,
+        from_id="python:module:demo",
+        needle="Remote",
+        kind="annotation",
+        occurrence=3,
+    )
+
+    with ExternalReferenceSession(tmp_path) as session:
+        result = session.resolve_references(module, [first, second])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [first.source_byte_start, second.source_byte_start]
+    assert result.references_skipped_external_total == 2
+    assert result.unresolved_reference_sites_total == 2
+
+
+def test_pyright_session_does_not_reuse_external_result_across_dotted_targets(
+    tmp_path: Path,
+) -> None:
+    source = textwrap.dedent(
+        """
+        import pkg
+
+        class External(pkg.Path):
+            pass
+
+        class Local(pkg.Local):
+            pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    external = _reference_site(
+        source,
+        from_id="python:class:demo.External",
+        needle="pkg.Path",
+        kind="base",
+    )
+    local = _reference_site(
+        source,
+        from_id="python:class:demo.Local",
+        needle="pkg.Local",
+        kind="base",
+    )
+
+    with MappedReferenceSession(
+        tmp_path,
+        results_by_start={
+            external.source_byte_start: ([], True),
+            local.source_byte_start: (["python:class:project.Local"], False),
+        },
+    ) as session:
+        result = session.resolve_references(module, [external, local])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [external.source_byte_start, local.source_byte_start]
+    assert result.edges == [
+        {
+            "kind": "inherits_from",
+            "from_id": "python:class:demo.Local",
+            "to_id": "python:class:project.Local",
+            "confidence": "resolved",
+            "source_byte_start": local.source_byte_start,
+            "source_byte_end": local.source_byte_end,
+        },
+    ]
+    assert result.references_resolved_total == 1
+    assert result.references_skipped_external_total == 1
+    assert result.unresolved_reference_sites_total == 1
+
+
+def test_pyright_session_does_not_reuse_external_result_across_owners(
+    tmp_path: Path,
+) -> None:
+    source = textwrap.dedent(
+        """
+        import pkg
+
+        class External(pkg.Base):
+            pass
+
+        def outer():
+            class pkg:
+                class Base:
+                    pass
+
+            class Local(pkg.Base):
+                pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    external = _reference_site(
+        source,
+        from_id="python:class:demo.External",
+        needle="pkg.Base",
+        kind="base",
+    )
+    local = _reference_site(
+        source,
+        from_id="python:class:demo.outer.<locals>.Local",
+        needle="pkg.Base",
+        kind="base",
+        occurrence=1,
+    )
+
+    with MappedReferenceSession(
+        tmp_path,
+        results_by_start={
+            external.source_byte_start: ([], True),
+            local.source_byte_start: (
+                ["python:class:demo.outer.<locals>.pkg.Base"],
+                False,
+            ),
+        },
+    ) as session:
+        result = session.resolve_references(module, [external, local])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [external.source_byte_start, local.source_byte_start]
+    assert result.references_resolved_total == 1
+    assert result.references_skipped_external_total == 1
+
+
+def test_pyright_session_does_not_reuse_external_result_across_site_kinds(
+    tmp_path: Path,
+) -> None:
+    source = textwrap.dedent(
+        """
+        from external_lib import Remote
+
+        class Child(Remote):
+            value: Remote
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    base = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Remote",
+        kind="base",
+        occurrence=1,
+    )
+    annotation = _reference_site(
+        source,
+        from_id="python:class:demo.Child",
+        needle="Remote",
+        kind="annotation",
+        occurrence=2,
+    )
+
+    with MappedReferenceSession(
+        tmp_path,
+        results_by_start={
+            base.source_byte_start: ([], True),
+            annotation.source_byte_start: (["python:class:project.Remote"], False),
+        },
+    ) as session:
+        result = session.resolve_references(module, [base, annotation])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [base.source_byte_start, annotation.source_byte_start]
+    assert result.references_resolved_total == 1
+    assert result.references_skipped_external_total == 1
+
+
+def test_pyright_session_does_not_reuse_external_result_after_same_owner_rebinding(
+    tmp_path: Path,
+) -> None:
+    source = textwrap.dedent(
+        """
+        from external_lib import deco
+
+        @deco
+        @(deco := local_deco)
+        @deco
+        def target():
+            pass
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    first = _reference_site(
+        source,
+        from_id="python:function:demo.target",
+        needle="deco",
+        kind="decorator",
+        occurrence=1,
+    )
+    second = _reference_site(
+        source,
+        from_id="python:function:demo.target",
+        needle="deco",
+        kind="decorator",
+        occurrence=4,
+    )
+
+    with MappedReferenceSession(
+        tmp_path,
+        results_by_start={
+            first.source_byte_start: ([], True),
+            second.source_byte_start: (["python:function:demo.local_deco"], False),
+        },
+    ) as session:
+        result = session.resolve_references(module, [first, second])
+        requested_starts = session.requested_starts
+
+    assert requested_starts == [first.source_byte_start, second.source_byte_start]
+    assert result.references_resolved_total == 1
+    assert result.references_skipped_external_total == 1
 
 
 def test_pyright_session_reference_timeout_skips_only_current_site(tmp_path: Path) -> None:

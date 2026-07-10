@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import ctypes
 import ctypes.util
 import errno
@@ -106,6 +107,21 @@ PYRIGHT_EXCLUDE_PATTERNS = [
     "**/node_modules/**",
 ]
 PROJECT_LOCAL_EXTERNAL_DIRS = {".weft", ".git", ".hg", ".svn", ".jj", ".venv", "node_modules"}
+_IMPLICIT_MODULE_NAMES = {
+    "__annotations__",
+    "__builtins__",
+    "__cached__",
+    "__debug__",
+    "__doc__",
+    "__file__",
+    "__loader__",
+    "__name__",
+    "__package__",
+    "__path__",
+    "__spec__",
+}
+_BUILTIN_NAMES = frozenset(dir(builtins)) - _IMPLICIT_MODULE_NAMES
+_TYPE_PARAMETER_NODE_NAMES = frozenset({"ParamSpec", "TypeVar", "TypeVarTuple"})
 
 
 if TYPE_CHECKING:
@@ -527,6 +543,7 @@ class PyrightSession:
                 tuple[str, str, str, int, int, int, int], tuple[list[str], bool]
             ] = {}
             source_bytes = index.source.encode("utf-8")
+            statically_external_names = _reference_fast_path_names(index.tree)
             resolved_total = 0
             skipped_external_total = 0
             unresolved_total = 0
@@ -539,6 +556,11 @@ class PyrightSession:
                         method="analyze_file budget",
                     )
                     break
+                reference_root = _reference_root_name(site, source_bytes)
+                if reference_root in statically_external_names:
+                    unresolved_total += 1
+                    skipped_external_total += 1
+                    continue
                 cache_key = _reference_lookup_cache_key(site, source_bytes)
                 cached = lookup_cache.get(cache_key)
                 if cached is None:
@@ -1315,6 +1337,50 @@ def _reference_lookup_cache_key(
         site.source_byte_start,
         site.source_byte_end,
     )
+
+
+def _reference_root_name(site: ReferenceSite, source_bytes: bytes) -> str:
+    lexeme = source_bytes[site.source_byte_start : site.source_byte_end].decode("utf-8")
+    return lexeme.split(".", 1)[0]
+
+
+def _file_bound_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names if alias.name != "*")
+        elif (
+            isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar))
+            and node.name is not None
+        ):
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            names.add(node.rest)
+        elif type(node).__name__ in _TYPE_PARAMETER_NODE_NAMES:
+            type_parameter_name = getattr(node, "name", None)
+            if isinstance(type_parameter_name, str):
+                names.add(type_parameter_name)
+    return names
+
+
+def _reference_fast_path_names(tree: ast.Module) -> set[str]:
+    has_star_import = any(
+        isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    if has_star_import:
+        return set()
+    # One nested shadow disables a builtin shortcut for the whole file. The
+    # lost optimization is cheaper than maintaining a lexical oracle beside Pyright.
+    return set(_BUILTIN_NAMES - _file_bound_names(tree))
 
 
 def _sorted_reference_accumulators(

@@ -6,6 +6,9 @@
 # Operators on materially slower/faster hardware may set
 # OPERATOR_HARDWARE_RATIO. The ratio scales Green/Yellow/Red thresholds and
 # is recorded in docs/implementation/sprint-2/b4-gate-results.md.
+# B4_GATE_MAX_MINI_SECONDS and B4_GATE_MIN_RESOLVED_REFERENCES are the tighter
+# regression guards; override them only when intentionally updating the corpus
+# or calibration baseline.
 
 set -euo pipefail
 
@@ -16,6 +19,8 @@ OPERATOR_HARDWARE_RATIO="${OPERATOR_HARDWARE_RATIO:-1.0}"
 ELSPETH_FULL_ROOT="${B4_GATE_ELSPETH_FULL_ROOT:-/home/john/elspeth/src}"
 ELSPETH_FULL_LOC="${B4_GATE_ELSPETH_FULL_LOC:-425000}"
 NEXT_TIER_LOC="${B4_GATE_NEXT_TIER_LOC:-4000000}"
+MAX_MINI_SECONDS="${B4_GATE_MAX_MINI_SECONDS:-30}"
+MIN_RESOLVED_REFERENCES="${B4_GATE_MIN_RESOLVED_REFERENCES:-1549}"
 
 cd "$REPO_ROOT"
 
@@ -33,6 +38,8 @@ export OPERATOR_HARDWARE_RATIO
 export ELSPETH_FULL_ROOT
 export ELSPETH_FULL_LOC
 export NEXT_TIER_LOC
+export MAX_MINI_SECONDS
+export MIN_RESOLVED_REFERENCES
 
 "$VENV/bin/python" - <<'PY'
 from __future__ import annotations
@@ -268,6 +275,12 @@ def main() -> int:
     ratio = float(os.environ["OPERATOR_HARDWARE_RATIO"])
     if ratio <= 0:
         raise ValueError("OPERATOR_HARDWARE_RATIO must be > 0")
+    max_mini_seconds = float(os.environ["MAX_MINI_SECONDS"]) * ratio
+    if max_mini_seconds <= 0:
+        raise ValueError("B4_GATE_MAX_MINI_SECONDS must be > 0")
+    min_resolved_references = int(os.environ["MIN_RESOLVED_REFERENCES"])
+    if min_resolved_references < 0:
+        raise ValueError("B4_GATE_MIN_RESOLVED_REFERENCES must be >= 0")
 
     corpora = {
         "elspeth_mini": repo_root / "tests/perf/elspeth_mini",
@@ -291,12 +304,18 @@ def main() -> int:
     mini_seconds = mini.cli_wall_ms / 1000
     full_projection_seconds = mini_seconds * (full_function_count / max(mini.function_count, 1))
     next_projection_seconds = mini_seconds * (next_tier_function_count / max(mini.function_count, 1))
+    resolved_references = int(mini.cli_stats.get("references_resolved_total", 0))
 
     green_mini = 5 * 60 * ratio
     red_mini = 30 * 60 * ratio
     green_full = 60 * 60 * ratio
     red_full = 360 * 60 * ratio
-    if mini_seconds > red_mini or full_projection_seconds > red_full:
+    if (
+        mini_seconds > max_mini_seconds
+        or resolved_references < min_resolved_references
+        or mini_seconds > red_mini
+        or full_projection_seconds > red_full
+    ):
         outcome = "RED"
     elif mini_seconds > green_mini or full_projection_seconds > green_full:
         outcome = "YELLOW"
@@ -330,6 +349,7 @@ def main() -> int:
             f"- next_tier_projected_minutes: {next_projection_seconds / 60:.3f}",
             "",
             "### Decision",
+            f"- regression_guard_scaled_by_ratio: max_mini_seconds={max_mini_seconds:.3f}, min_resolved_references={min_resolved_references}, observed_resolved_references={resolved_references}",
             f"- gate_thresholds_scaled_by_ratio: green_mini_seconds={green_mini:.3f}, red_mini_seconds={red_mini:.3f}, green_full_seconds={green_full:.3f}, red_full_seconds={red_full:.3f}",
             f"- decision: {outcome}",
             "",

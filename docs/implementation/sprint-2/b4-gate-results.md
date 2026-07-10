@@ -2,6 +2,11 @@
 
 Append-only gate log. The latest entry is parsed by the Task 11b CI freshness check.
 
+> `cli_overhead_ms` is a historical residual metric: CLI wall time minus the
+> separately measured call-resolution initialization/query time and parent walk.
+> It includes reference resolution and other CLI-only work; it is not process
+> startup overhead. Use persisted run stats to attribute that residual.
+
 ## 2026-05-17T07:46:54+00:00 - GREEN
 
 date: 2026-05-17
