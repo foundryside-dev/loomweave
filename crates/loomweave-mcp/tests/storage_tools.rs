@@ -6854,7 +6854,13 @@ async fn orientation_pack_dossier_summary_available_true_when_cached() {
     )
     .expect("upsert summary cache");
 
-    let state = state_for(project.path(), &db_path);
+    // Pin the clock just after the seeded created_at so the cache is
+    // unambiguously fresh: with the real wall clock, the 2026-01-01 row ages
+    // past the 180-day summary-cache horizon and summary_available flips to
+    // false (a time-bomb that fires on 2026-07-01). This test is about the
+    // key MATCH, not freshness, so freeze time to isolate that.
+    let state =
+        state_for(project.path(), &db_path).with_clock(|| "2026-01-02T00:00:00Z".to_owned());
     let out = call_tool(
         &state,
         "orientation_pack",
@@ -6902,7 +6908,12 @@ async fn orientation_pack_dossier_summary_available_false_on_stale_cache_key() {
     )
     .expect("upsert summary cache");
 
-    let state = state_for(project.path(), &db_path);
+    // Pin the clock just after the seeded created_at so freshness is NOT a
+    // factor: the row must read as false purely because the model_tier key
+    // mismatches, not because the 2026-01-01 row aged past the cache horizon
+    // under the real wall clock (which would make it false for the wrong reason).
+    let state =
+        state_for(project.path(), &db_path).with_clock(|| "2026-01-02T00:00:00Z".to_owned());
     let out = call_tool(
         &state,
         "orientation_pack",

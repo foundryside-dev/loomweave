@@ -510,6 +510,12 @@ jobs:
           }
 
           publish loomweave-core
+          # loomweave-llm has no internal loomweave deps; it MUST precede its
+          # dependents loomweave-mcp and loomweave-cli (both pin
+          # loomweave-llm==<version>). Omitting it from this list is what left
+          # 1.4.0's crates.io publish partial (loomweave-mcp failed with "no
+          # matching package named loomweave-llm found").
+          publish loomweave-llm
           publish loomweave-scanner
           publish loomweave-analysis
           publish loomweave-storage

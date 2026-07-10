@@ -1,8 +1,9 @@
 # Loomweave — Metrics
 
-> Bootstrapped 2026-06-11. **Updated 2026-06-29** (checkpoint — PR #79 CI-floor
-> reading; wardline-drift CI blind spot recurred). Baselines are real observed
-> readings; targets are falsifiable (a number/boolean and a date).
+> Bootstrapped 2026-06-11. **Updated 2026-07-01** (checkpoint — 1.4.0 release
+> CI-floor reading, PDR-0009). Prior: 2026-06-29 (PR #79 reading; wardline-drift
+> blind spot). Baselines are real observed readings; targets are falsifiable (a
+> number/boolean and a date).
 
 ## North star
 
@@ -72,6 +73,16 @@ found by the adversarial 4-corpus QA sweep.
      local-red / CI-green divergence flagged 2026-06-26. It has now **recurred** →
      per that reading's own trigger, promote clarion-72e1c1a07d to a real guardrail
      (the vendored-golden drift needs a CI-visible check or a re-vendor cadence).
+   - `READING (2026-07-01): GREEN across the 1.4.0 release` (PDR-0009) — the
+     release verify gate + PRs #80 (P2 fixes), #83 (crates.io order), #84 (test
+     time-bomb) all passed (Rust + Rust aarch64 + Python + Sprint-1 e2e). Locally,
+     full-workspace `nextest` **1977 passed** with `WARDLINE_REPO=/home/john/wardline`
+     set (the wardline oracle exercised, not skipped). The 2026-06-29 drift was
+     **re-vendored** this cycle (#80), so the oracle is green again — but the
+     CI-invisibility blind spot itself is unfixed (still skip-cleans without the
+     sibling); clarion-72e1c1a07d promotion stays open. Two release-process defects
+     fixed in-cycle: crates.io publish-order omitted `loomweave-llm` (#83) and a
+     `created_at`-vs-real-clock time-bomb reddened `main` on 2026-07-01 (#84).
    - `TARGET: green on every release/merge — standing, no end date`
 3. **MCP context tax under budget**: `tools/list` payload has a CI-enforced
    22,000-byte budget.

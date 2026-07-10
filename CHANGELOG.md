@@ -12,8 +12,35 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-06-30
+
+Feature release on top of `1.3.1`. (Cargo SemVer `1.4.0`; Python wheels `1.4.0`.)
+Highlights: a new `loomweave-llm` provider crate (so `loomweave-core` links no
+outbound HTTP client), the Warpline churn consumer lighting up the churn/recency
+read surfaces, Rust-plugin dead-code reachability roots (ADR-054), and a batch of
+federation-keying and graph-integrity fixes.
+
+### Added
+
+- **Warpline churn consumer.** Loomweave now consumes Warpline's frozen churn
+  read to populate the `high_churn` and `recently_changed` surfaces
+  (`entity_high_churn_list` / `entity_recent_change_list`). The consumer speaks
+  `warpline-mcp`'s newline JSON-RPC with a bounded timeout and honest
+  paging/keying disclosure. Federation is enrich-only and fail-soft — with
+  Warpline absent the surfaces degrade cleanly.
+- **Rust-plugin dead-code reachability roots (ADR-054).** The Rust language
+  plugin now emits reachability-root tags — visibility / entry-point / test /
+  handler roots, framework handlers, public-method rooting, and edition-2024
+  `#[unsafe(no_mangle)]` / `#[unsafe(export_name)]` FFI entry-points — the Rust
+  analog of the Python public-surface roots, so Rust dead-code analysis no longer
+  reports the whole public API as dead.
+
 ### Changed
 
+- **LLM / embedding providers extracted into a new `loomweave-llm` crate.** The
+  provider traits and implementations moved out of `loomweave-core`; a CI gate
+  now asserts `loomweave-core` links no outbound HTTP client. No change to the
+  `summary` API or provider configuration.
 - **SEI git-rename consumer re-pointed to `legis`'s `/git/rename-feed`.**
   `LegisGitRenameSource` now reads the committed leg of `legis`'s additive
   superset endpoint `GET /git/rename-feed?base=…&head=HEAD` instead of the legacy
@@ -24,6 +51,45 @@ only when an incompatible change is made to that surface. See
   working-tree authority). Enrich-only and fail-soft as before; the wire-drift
   guard now warns on a legacy flat-array body or a `committed`-less envelope.
   (Federation ledger B3.)
+- **Filigree federation transport over newline JSON-RPC.** The filigree-mcp
+  federation client now speaks newline-delimited JSON-RPC instead of
+  `Content-Length` framing (#78).
+
+### Fixed
+
+- **Briefing-blocked entities keep their SEI on the read surface.** Federation
+  keying no longer nulls the Stable Entity Identity of briefing-blocked entities
+  on the MCP read path, so Filigree/Wardline lookups keyed by SEI resolve
+  (#79; PDR-0008).
+- **Same-locator collisions are disclosed on the entity read path.** A duplicate
+  entity locator now surfaces as an entity-anchored `LMWV-DUPLICATE-LOCATOR`
+  finding anchored to the colliding (survivor) entity, so the shadowed
+  declaration is queryable from the entity read path instead of silently
+  resolving to a clean row (clarion-48af930f2a, #74).
+- **Stale `contains` edge pruned when a file-scope claim moves.** The writer
+  prunes a stale parent/`contains` edge when a `file_scope` entity's claim moves,
+  self-healing the module/package dual-claim mismatch on re-emit
+  (clarion-abda98c869, #75).
+- **Incremental re-analyze on a tag-schema move.** A plugin's files are
+  re-dispatched when its ontology tag schema changes between runs, so tag-driven
+  surfaces don't go stale on an incremental walk (clarion-e12d424f1d, #71).
+- **Plugin findings can no longer forge the trusted anchor.**
+  `validate_plugin_finding` strips the host-reserved `anchor_entity_id` metadata
+  key, so a plugin-reported finding can no longer override the trusted file
+  anchor — which previously could hard-fail the analyze run on the findings
+  foreign key, or silently mis-associate the finding (#80).
+
+### Tests
+
+- Cross-repo conformance oracles for the loomweave↔filigree and
+  loomweave↔wardline seams (Filigree entity-associations, the Wardline taint-fact
+  wire, and the Wardline trust-vocabulary descriptor), pinning the wire bytes
+  each sibling produces or consumes so a silent drift reds in CI.
+
+### Security
+
+- Bumped `anyhow` `1.0.102` → `1.0.103` to clear a RUSTSEC soundness advisory in
+  `anyhow`'s `downcast_mut` (dtolnay/anyhow#451). Lockfile only; no API change.
 
 ## [1.3.1] — 2026-06-22
 

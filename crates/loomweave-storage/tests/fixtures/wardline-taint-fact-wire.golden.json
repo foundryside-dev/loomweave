@@ -64,7 +64,7 @@
       },
       "findings": [
         {
-          "fingerprint": "9a291cac4a30b2cd8353f89eb428e184b01cb3919563ebeffd672745bf9cc665",
+          "fingerprint": "242d8565123394582c282d7356cd18a1ddcbe2a4dca9d51bce9d5afaec70230a",
           "line_start": 14,
           "path": "svc.py",
           "rule_id": "PY-WL-101"
