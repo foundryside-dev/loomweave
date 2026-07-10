@@ -17,7 +17,7 @@ produced an entity. The differences below are entirely in what the plugins
 |---|---|---|
 | Status | first-party, v1.0 | first-party, 1.x |
 | Source backend | `pyright` (type-resolved) | `syn` (parse-only, in-project symbol table) |
-| Ontology version | 0.11.0 | 0.8.0 |
+| Ontology version | 0.11.0 | 0.8.1 |
 | Wardline-aware | **yes** (`wardline:*` trust tags) | no |
 | **Entity kinds** | `function`, `class`, `module` | `module`, `struct`, `enum`, `trait`, `function`, `impl`, `type_alias`, `const`, `static`, `macro` |
 | **Structural edges** | `contains`, `calls`, `references`, `imports` | `contains`, `calls`, `references`, `imports` |
@@ -72,10 +72,14 @@ than inferred — so `entity_dead_list` now **works** on a pure-Rust index.
   `#[actix_web::main]` / `#[async_std::main]`); an FFI export (`#[no_mangle]` /
   `#[export_name]`).
 - `test` — `#[test]` / `#[bench]`, the std-replacement runners (`#[rstest]`,
-  `#[test_case]`, `#[quickcheck]`), or any item under a `#[cfg(test)]` module.
+  `#[test_case]`, `#[quickcheck]`), an item carrying `#[cfg(test)]`, or any item
+  under a `#[cfg(test)]` inline module or impl.
 - `allow-dead-code` — an item carrying `#[allow(dead_code)]` /
-  `#[expect(dead_code)]` (an explicit author keep-signal; the lowest-confidence
-  root class).
+  `#[expect(dead_code)]`, plus lexical children of an inline module or impl
+  carrying one of those attributes (an explicit author keep-signal; the
+  lowest-confidence root class). A nested `warn` / `deny` / `forbid` cancels
+  the inherited keep signal. An attribute on a struct does not jump to a
+  separate sibling impl, matching rustc lint scope.
 - `http-route` (+ `framework-handler`) — actix-web / ntex / rocket route
   attribute macros (`#[get("/")]`, `#[post]`, …, `#[route]`).
 - `cli-command` (+ `framework-handler`) — clap / structopt CLI derives

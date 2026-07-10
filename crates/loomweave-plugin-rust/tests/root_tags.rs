@@ -173,6 +173,101 @@ fn allow_dead_code_combines_with_exported_api() {
     );
 }
 
+#[test]
+fn module_allow_and_expect_dead_code_descend_to_children() {
+    for attr in ["allow", "expect"] {
+        let src =
+            format!("#[{attr}(dead_code)]\nmod kept {{ fn helper() {{}} struct Fixture; }}\n");
+        let m = tags_by_id("k", "k.m", &src);
+        assert_eq!(
+            tags(&m, "rust:function:k.m.kept.helper"),
+            ["allow-dead-code"],
+            "#[{attr}(dead_code)] on a module must keep its function children"
+        );
+        assert_eq!(
+            tags(&m, "rust:struct:k.m.kept.Fixture"),
+            ["allow-dead-code"],
+            "#[{attr}(dead_code)] on a module must keep its type children"
+        );
+    }
+}
+
+#[test]
+fn impl_allow_and_expect_dead_code_descend_to_methods() {
+    for attr in ["allow", "expect"] {
+        let src = format!("struct S;\n#[{attr}(dead_code)]\nimpl S {{ fn helper(&self) {{}} }}\n");
+        let m = tags_by_id("k", "k.m", &src);
+        assert_eq!(
+            method_tags(&m, "helper"),
+            ["allow-dead-code"],
+            "#[{attr}(dead_code)] on an impl must keep its methods"
+        );
+    }
+}
+
+#[test]
+fn allow_dead_code_on_struct_does_not_jump_to_separate_impl() {
+    let src = "#[allow(dead_code)]\nstruct S;\nimpl S { fn helper(&self) {} }\n";
+    let m = tags_by_id("k", "k.m", src);
+    assert_eq!(tags(&m, "rust:struct:k.m.S"), ["allow-dead-code"]);
+    assert!(
+        method_tags(&m, "helper").is_empty(),
+        "rustc lint scope does not carry from a struct item to a sibling impl"
+    );
+}
+
+#[test]
+fn inner_dead_code_levels_override_inherited_keep_signal() {
+    let src = concat!(
+        "#[allow(dead_code)]\n",
+        "mod outer {\n",
+        "    #[warn(dead_code)] fn warned() {}\n",
+        "    #[deny(dead_code)] fn denied() {}\n",
+        "    #[forbid(dead_code)] fn forbidden() {}\n",
+        "    #[warn(dead_code)] mod checked { fn nested() {} }\n",
+        "    struct S;\n",
+        "    impl S { #[warn(dead_code)] fn method(&self) {} }\n",
+        "}\n",
+        "#[forbid(dead_code)] mod locked { #[allow(dead_code)] fn helper() {} }\n",
+    );
+    let m = tags_by_id("k", "k.m", src);
+    for id in [
+        "rust:function:k.m.outer.warned",
+        "rust:function:k.m.outer.denied",
+        "rust:function:k.m.outer.forbidden",
+        "rust:function:k.m.outer.checked.nested",
+        "rust:function:k.m.locked.helper",
+    ] {
+        assert!(
+            tags(&m, id).is_empty(),
+            "an inner checked/forbidden lint level must not inherit allow-dead-code: {id}"
+        );
+    }
+    assert!(
+        method_tags(&m, "method").is_empty(),
+        "a method-level warn must override the enclosing module's allow"
+    );
+}
+
+#[test]
+fn direct_and_impl_cfg_test_are_tagged_for_app_only_exclusion() {
+    let src = concat!(
+        "#[cfg(test)] #[allow(dead_code)] fn direct() {}\n",
+        "struct S;\n",
+        "#[cfg(test)] #[allow(dead_code)] impl S { fn method(&self) {} }\n",
+    );
+    let m = tags_by_id("k", "k.m", src);
+    assert_eq!(
+        tags(&m, "rust:function:k.m.direct"),
+        ["allow-dead-code", "test"]
+    );
+    assert_eq!(
+        method_tags(&m, "method"),
+        ["allow-dead-code", "test"],
+        "cfg(test) on an impl must flow to its methods"
+    );
+}
+
 // ---- bin targets (pub is internal; main is the entry) ---------------------
 
 #[test]

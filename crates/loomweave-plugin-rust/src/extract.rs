@@ -1358,7 +1358,7 @@ fn emit_impl(
                     is_unrestricted_pub(&m.vis),
                     true,
                     &m.attrs,
-                    ctx.descend_into_impl(),
+                    ctx.descend_into_impl(&it.attrs),
                 ),
             );
             let method_id = build_id("function", &q)?;

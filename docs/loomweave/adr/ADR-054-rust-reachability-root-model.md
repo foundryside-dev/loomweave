@@ -128,13 +128,18 @@ tag.
 
 ### 4. `allow-dead-code` — explicit author "keep" assertion
 
-An item carrying `#[allow(dead_code)]` is tagged `allow-dead-code`, a **new
-additive entry in `DEAD_CODE_ROOT_TAGS`**. `#[allow(dead_code)]` is the author
-explicitly suppressing rustc's own dead-code lint — an "I am keeping this on
-purpose" assertion. Rooting it is fail-toward-live and consistent with rustc's
-own behaviour (it will not warn). It is the lowest-confidence class (an explicit
-suppression, not a structural surface); the provenance lives in the distinct tag
-value, per the ADR-053 precedent.
+An item carrying `#[allow(dead_code)]` or `#[expect(dead_code)]` is tagged
+`allow-dead-code`, a **new additive entry in `DEAD_CODE_ROOT_TAGS`**. The tag
+also descends to lexical children when either attribute is on an inline module
+or impl, matching rustc lint scope. A nested `warn(dead_code)`,
+`deny(dead_code)`, or `forbid(dead_code)` cancels the inherited keep signal;
+`forbid` cannot be lowered. The tag does not jump from an attributed struct to
+a separate sibling impl. These attributes explicitly suppress or acknowledge
+rustc's own dead-code lint — an "I am keeping this on purpose" assertion.
+Rooting them is fail-toward-live and consistent with rustc's own behaviour. It
+is the lowest-confidence class (an explicit suppression, not a structural
+surface); the provenance lives in the distinct tag value, per the ADR-053
+precedent.
 
 ### Provenance by tag value, not by plumbing
 
@@ -262,6 +267,25 @@ This is a further additive ontology change: Rust plugin `ontology_version`
 **0.7.0 -> 0.8.0**. The bump is load-bearing cache invalidation: unchanged Rust
 files must re-dispatch so their resolved public re-export edges acquire the new
 provenance property.
+
+## Increment 4 (implemented): lexical dead-code allow propagation
+
+The original `allow-dead-code` emitter inspected only each entity's own
+attributes. That diverged from rustc lint scoping for
+`#[allow(dead_code)] mod m { ... }` and attributed impl blocks, dropping the
+author's keep assertion from the children most likely to be unreachable.
+`TagCtx` now carries the effective `dead_code` lint state through inline module
+and impl descent; `#[expect(dead_code)]` follows the same rule. Nested
+`warn` / `deny` / `forbid` levels restore checking, and `forbid` is sticky. A
+struct attribute still does not affect a separate impl block. Out-of-line
+module children remain a documented fail-closed limitation because the
+per-file extractor does not carry the declaring `mod` item's attributes into
+the mounted file.
+
+This corrects values emitted under an existing tag without changing wire shape,
+so ADR-027 requires a PATCH ontology bump **0.8.0 -> 0.8.1**. The bump remains
+load-bearing: unchanged files must re-dispatch to acquire the corrected child
+tags.
 
 ## Still deferred (second-pass extensions)
 

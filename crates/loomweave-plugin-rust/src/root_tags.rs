@@ -34,9 +34,17 @@ const PROC_MACRO_ATTRS: &[&str] = &["proc_macro", "proc_macro_derive", "proc_mac
 /// std-replacement test runners beyond `#[test]`/`#[bench]` (last-segment).
 const TEST_RUNNER_ATTRS: &[&str] = &["rstest", "test_case", "quickcheck"];
 
+/// The effective `dead_code` lint state inherited at the current lexical
+/// position. `forbid` is sticky because Rust rejects attempts to lower it in a
+/// child scope; the other levels may be replaced by a nested attribute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeadCodeLintState {
+    Check,
+    Keep,
+    Forbid,
+}
+
 /// Module context threaded down the recursive item walk for tag derivation.
-/// Four independent lexical facts about the current position — a context bag,
-/// not a state machine; two-variant enums would obscure rather than clarify.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
 pub struct TagCtx {
@@ -50,6 +58,9 @@ pub struct TagCtx {
     reexport_ancestors_known_public: bool,
     /// An enclosing module carries `#[cfg(test)]` → everything inside is `test`.
     under_cfg_test: bool,
+    /// Effective `dead_code` lint state inherited from enclosing inline modules
+    /// and impl blocks. An item may replace it with its own lint attribute.
+    dead_code_lint_state: DeadCodeLintState,
     /// The file routes to a `<crate>@bin(<name>)` target (ADR-049 / scope.rs):
     /// its `pub` items are internal, so `exported-api` is suppressed.
     in_bin_target: bool,
@@ -68,6 +79,7 @@ impl TagCtx {
             ancestors_all_pub: true, // the crate root is the public boundary
             reexport_ancestors_known_public: !module_path.contains('.') && !in_bin_target,
             under_cfg_test: false,
+            dead_code_lint_state: DeadCodeLintState::Check,
             in_bin_target,
             at_file_top: true,
         }
@@ -81,6 +93,7 @@ impl TagCtx {
             reexport_ancestors_known_public: self.reexport_ancestors_known_public
                 && is_unrestricted_pub(vis),
             under_cfg_test: self.under_cfg_test || has_cfg_test(attrs),
+            dead_code_lint_state: apply_dead_code_lint(attrs, self.dead_code_lint_state),
             in_bin_target: self.in_bin_target,
             at_file_top: false,
         }
@@ -88,11 +101,14 @@ impl TagCtx {
 
     /// The context for an `impl` block's methods. The pub-chain and cfg(test)
     /// ancestry are inherited from the enclosing module unchanged (an `impl`
-    /// adds no visibility of its own); only `at_file_top` clears, so a method
+    /// adds no visibility of its own); an impl-level dead-code allow/expect is
+    /// folded into the lexical keep signal. `at_file_top` clears so a method
     /// named `main` is never mistaken for the program entry (ADR-054 increment 2).
     #[must_use]
-    pub fn descend_into_impl(self) -> Self {
+    pub fn descend_into_impl(self, attrs: &[Attribute]) -> Self {
         Self {
+            under_cfg_test: self.under_cfg_test || has_cfg_test(attrs),
+            dead_code_lint_state: apply_dead_code_lint(attrs, self.dead_code_lint_state),
             at_file_top: false,
             ..self
         }
@@ -154,7 +170,7 @@ pub fn root_tags(
     if ctx.exposes_public_surface(is_public) {
         tags.insert(tags::EXPORTED_API);
     }
-    if ctx.under_cfg_test || has_test_attr(attrs) {
+    if ctx.is_test_only(attrs) || has_test_attr(attrs) {
         tags.insert(tags::TEST);
     }
     // entry-point: a bare module-level `fn main` (fns only), OR an entry
@@ -174,7 +190,7 @@ pub fn root_tags(
         tags.insert(tags::CLI_COMMAND);
         tags.insert(tags::FRAMEWORK_HANDLER);
     }
-    if has_allow_dead_code(attrs) {
+    if apply_dead_code_lint(attrs, ctx.dead_code_lint_state) == DeadCodeLintState::Keep {
         tags.insert(tags::ALLOW_DEAD_CODE);
     }
     tags.into_iter().map(str::to_owned).collect()
@@ -272,19 +288,32 @@ fn derive_last_seg_in(attrs: &[Attribute], names: &[&str]) -> bool {
     })
 }
 
-/// `#[allow(dead_code)]` or `#[expect(dead_code)]` — an explicit author keep
-/// signal that suppresses rustc's own dead-code lint.
-fn has_allow_dead_code(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        if let Meta::List(list) = &a.meta {
-            (list.path.is_ident("allow") || list.path.is_ident("expect"))
-                && list
-                    .tokens
-                    .to_string()
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .any(|t| t == "dead_code")
+/// Apply item attributes in source order to the inherited `dead_code` lint
+/// state. `allow` / `expect` are keep signals, `warn` / `deny` resume checking,
+/// and `forbid` cannot be lowered by a nested or later attribute.
+fn apply_dead_code_lint(attrs: &[Attribute], inherited: DeadCodeLintState) -> DeadCodeLintState {
+    attrs.iter().fold(inherited, |state, attr| {
+        let Meta::List(list) = &attr.meta else {
+            return state;
+        };
+        let mentions_dead_code = list
+            .tokens
+            .to_string()
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|token| token == "dead_code");
+        if !mentions_dead_code {
+            return state;
+        }
+        if list.path.is_ident("forbid") {
+            DeadCodeLintState::Forbid
+        } else if state == DeadCodeLintState::Forbid {
+            state
+        } else if list.path.is_ident("allow") || list.path.is_ident("expect") {
+            DeadCodeLintState::Keep
+        } else if list.path.is_ident("warn") || list.path.is_ident("deny") {
+            DeadCodeLintState::Check
         } else {
-            false
+            state
         }
     })
 }
@@ -360,10 +389,28 @@ mod tests {
     }
 
     #[test]
-    fn allow_dead_code_detected_in_list() {
-        assert!(has_allow_dead_code(&attrs("#[allow(unused, dead_code)]")));
-        assert!(has_allow_dead_code(&attrs("#[expect(dead_code)]")));
-        assert!(!has_allow_dead_code(&attrs("#[allow(unused)]")));
+    fn dead_code_lint_state_follows_rust_scope_precedence() {
+        let check = DeadCodeLintState::Check;
+        assert_eq!(
+            apply_dead_code_lint(&attrs("#[allow(unused, dead_code)]"), check),
+            DeadCodeLintState::Keep
+        );
+        assert_eq!(
+            apply_dead_code_lint(&attrs("#[expect(dead_code)]"), check),
+            DeadCodeLintState::Keep
+        );
+        assert_eq!(
+            apply_dead_code_lint(&attrs("#[allow(unused)]"), check),
+            DeadCodeLintState::Check
+        );
+        assert_eq!(
+            apply_dead_code_lint(&attrs("#[warn(dead_code)]"), DeadCodeLintState::Keep),
+            DeadCodeLintState::Check
+        );
+        assert_eq!(
+            apply_dead_code_lint(&attrs("#[forbid(dead_code)] #[allow(dead_code)]"), check,),
+            DeadCodeLintState::Forbid
+        );
     }
 
     #[test]

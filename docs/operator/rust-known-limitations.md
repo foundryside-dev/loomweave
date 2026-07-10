@@ -142,6 +142,13 @@ the target does **not** appear in
 `entity_exported_api_list` unless its declaration independently carries that
 tag.
 
+Dead-code lint attributes propagate to children of inline modules and impl
+blocks, including nested `warn` / `deny` / `forbid` overrides. They cannot
+propagate from an out-of-line `mod` declaration into its separate file because
+the per-file extractor does not carry the declaration's attributes across that
+boundary. The separate module container is not itself a dead-code candidate,
+but its children in the mounted file may be under-rooted.
+
 **Why.** Rooting the resolved edge target fixes the facade case without making
 the enclosing module a root, which would transitively keep every ordinary
 import in that module alive. Ambiguous/unresolved targets fail closed because

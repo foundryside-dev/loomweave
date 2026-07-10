@@ -12,6 +12,15 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rust dead-code lint scope.** `#[allow(dead_code)]` and
+  `#[expect(dead_code)]` now propagate through inline modules and impl blocks,
+  while nested `warn` / `deny` / `forbid` levels correctly cancel inherited
+  keep signals. Direct and impl-level `#[cfg(test)]` items are also classified
+  as tests for `app_only` filtering. Rust ontology `0.8.1` invalidates cached
+  extraction values for the corrected tags.
+
 ## [1.4.1] — 2026-07-10
 
 ### Added

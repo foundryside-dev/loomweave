@@ -66,8 +66,12 @@ rule_id_prefix = "LMWV-RUST-"
 # public `use` edges (ADR-054 increment 3 — ADR-027 MINOR). The host uses this
 # property as a dead-code reachability root, so the bump also forces unchanged
 # Rust files to re-dispatch and populate the property.
+# 0.8.1: fix existing `allow-dead-code` tag semantics so module/impl-level
+# `#[allow(dead_code)]` and `#[expect(dead_code)]` propagate to lexical children
+# (ADR-054 increment 4 — ADR-027 PATCH). The bump forces unchanged Rust files to
+# re-dispatch and acquire the corrected tags.
 # Lockstep with the `serve.rs` handshake constant.
-ontology_version = "0.8.0"
+ontology_version = "0.8.1"
 
 [ontology.roles]
 file_scope = ["module"]
