@@ -1316,6 +1316,24 @@ if __name__ == "__main__":
     assert "framework-handler" not in run["tags"]
 
 
+@pytest.mark.parametrize("wrapper", ["exit", "quit"])
+def test_main_guard_builtin_exit_target_is_cli_command_and_entry_point(wrapper: str) -> None:
+    source = f"""\
+def run():
+    print("interactive")
+
+
+if __name__ == "__main__":
+    {wrapper}(run())
+"""
+    entities, _ = extract(source, f"{wrapper}_cli.py")
+    run = next(e for e in entities if e["id"] == f"python:function:{wrapper}_cli.run")
+
+    assert "entry-point" in run["tags"]
+    assert "cli-command" in run["tags"]
+    assert "framework-handler" not in run["tags"]
+
+
 @pytest.mark.parametrize(
     ("source", "module"),
     [

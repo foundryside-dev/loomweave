@@ -1409,7 +1409,7 @@ def _main_guard_exit_wrapper_targets(expr: ast.expr) -> set[str]:
 
 
 def _is_main_guard_exit_wrapper(call: ast.Call) -> bool:
-    return _expr_qualified_name(call.func) in {"SystemExit", "sys.exit"}
+    return _expr_qualified_name(call.func) in {"SystemExit", "sys.exit", "exit", "quit"}
 
 
 def _main_guard_exit_arg_targets(call: ast.Call) -> set[str]:
