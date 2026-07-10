@@ -5,9 +5,9 @@
 //! `entity_recent_change_list`. The companion `warpline_churn_consumer` test
 //! proves Loomweave's user-facing behaviour. This oracle pins the producer side:
 //! the Warpline vector index and tool inventory are vendored byte-for-byte, the
-//! GV-LW-2 full envelope is parsed by Loomweave's real consumer parser, and a
-//! sibling-repo recheck compares the vendored authority files back to Warpline
-//! when that repo is available.
+//! GV-LW-2 full envelope is parsed by Loomweave's real consumer parser, and an
+//! opt-in sibling-repo recheck compares the vendored authority files back to
+//! Warpline when `WARPLINE_REPO` is set.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -68,8 +68,18 @@ fn drift_required() -> bool {
     )
 }
 
-fn warpline_repo() -> PathBuf {
-    PathBuf::from(std::env::var(WARPLINE_REPO_ENV).unwrap_or_else(|_| "/home/john/warpline".into()))
+fn configured_warpline_repo(value: Option<&str>) -> Option<PathBuf> {
+    let value = value?.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+fn warpline_repo() -> Option<PathBuf> {
+    let value = std::env::var(WARPLINE_REPO_ENV).ok();
+    configured_warpline_repo(value.as_deref())
 }
 
 fn origin_main_bytes(repo: &Path, relative_path: &str) -> Option<Vec<u8>> {
@@ -258,8 +268,22 @@ fn real_parser_accepts_producer_generated_gv_lw_2_envelope() {
 
 #[test]
 fn vendored_authority_artifacts_match_warpline_origin_main() {
-    let repo = warpline_repo();
     let required = drift_required();
+    let Some(repo) = warpline_repo() else {
+        match drift_check_action(required, false) {
+            DriftCheck::SkipClean => {
+                eprintln!(
+                    "Warpline repo not configured — skipping drift recheck \
+                     (set {WARPLINE_REPO_ENV} to enable, or {DRIFT_REQUIRED_ENV}=1 to require it)"
+                );
+            }
+            DriftCheck::FailRequired => {
+                panic!("Warpline repo not configured but {DRIFT_REQUIRED_ENV} is set");
+            }
+            DriftCheck::Compare => unreachable!("absent repo cannot be compared"),
+        }
+        return;
+    };
     let authority_exists = repo.exists();
     match drift_check_action(required, authority_exists) {
         DriftCheck::SkipClean => {
@@ -302,9 +326,23 @@ fn vendored_authority_artifacts_match_warpline_origin_main() {
 }
 
 #[test]
-fn warpline_executable_gv_lw_2_source_oracle_passes_when_repo_available() {
-    let repo = warpline_repo();
+fn warpline_executable_gv_lw_2_source_oracle_passes_when_repo_configured() {
     let required = drift_required();
+    let Some(repo) = warpline_repo() else {
+        match drift_check_action(required, false) {
+            DriftCheck::SkipClean => {
+                eprintln!(
+                    "Warpline repo not configured — skipping producer-source recheck \
+                     (set {WARPLINE_REPO_ENV} to enable, or {DRIFT_REQUIRED_ENV}=1 to require it)"
+                );
+            }
+            DriftCheck::FailRequired => {
+                panic!("Warpline repo not configured but {DRIFT_REQUIRED_ENV} is set");
+            }
+            DriftCheck::Compare => unreachable!("absent repo cannot be compared"),
+        }
+        return;
+    };
     let test_path = repo.join("tests/contracts/test_golden_vectors.py");
     match drift_check_action(required, test_path.exists()) {
         DriftCheck::SkipClean => {
@@ -349,4 +387,15 @@ fn drift_check_action_covers_required_and_skip_postures() {
     assert_eq!(drift_check_action(true, true), DriftCheck::Compare);
     assert_eq!(drift_check_action(false, false), DriftCheck::SkipClean);
     assert_eq!(drift_check_action(true, false), DriftCheck::FailRequired);
+}
+
+#[test]
+fn warpline_repo_configuration_is_explicit() {
+    assert_eq!(configured_warpline_repo(None), None);
+    assert_eq!(configured_warpline_repo(Some("")), None);
+    assert_eq!(configured_warpline_repo(Some("  ")), None);
+    assert_eq!(
+        configured_warpline_repo(Some("/tmp/warpline")),
+        Some(PathBuf::from("/tmp/warpline"))
+    );
 }
