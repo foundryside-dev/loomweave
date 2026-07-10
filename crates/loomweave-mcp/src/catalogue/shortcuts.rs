@@ -655,6 +655,34 @@ impl ServerState {
         .await
     }
 
+    /// `find_exported_apis(scope?)` — entities tagged as exported APIs
+    /// (honest-empty when the `exported-api` tag is not emitted).
+    pub(crate) async fn tool_find_exported_apis(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        self.categorisation_shortcut(
+            arguments,
+            "exported-api",
+            "no entity is tagged as an exported API in this index",
+        )
+        .await
+    }
+
+    /// `find_cli_commands(scope?)` — entities tagged as CLI commands
+    /// (honest-empty when the `cli-command` tag is not emitted).
+    pub(crate) async fn tool_find_cli_commands(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<Value, ParamError> {
+        self.categorisation_shortcut(
+            arguments,
+            "cli-command",
+            "no entity is tagged as a CLI command in this index",
+        )
+        .await
+    }
+
     /// `find_data_models(scope?)` — entities tagged as data models (honest-empty
     /// when the `data-model` tag is not emitted).
     pub(crate) async fn tool_find_data_models(

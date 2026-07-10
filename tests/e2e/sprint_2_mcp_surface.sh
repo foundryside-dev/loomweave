@@ -41,6 +41,11 @@ trap 'rm -rf "$DEMO_DIR"' EXIT
 export LOOMWEAVE_CODEX_CONFIG="$DEMO_DIR/codex-config.toml"
 log "scratch project: $DEMO_DIR"
 cd "$DEMO_DIR"
+cat > demo_impl.py <<'PY'
+def exported_api():
+    return 42
+PY
+
 cat > demo.py <<'PY'
 def world():
     return 42
@@ -53,6 +58,31 @@ class Marker:
 
 def hello():
     return world()
+
+import argparse
+from demo_impl import exported_api
+
+__all__ = ["exported_api"]
+
+class Router:
+    def get(self, path):
+        def wrap(fn):
+            return fn
+        return wrap
+
+router = Router()
+
+@router.get("/health")
+def health():
+    return exported_api()
+
+def cli():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args([])
+
+if __name__ == "__main__":
+    cli()
 
 DISPATCH = {"k": world, "z": z_fallback}
 
@@ -154,6 +184,32 @@ world_entity = conn.execute(
     """,
     ("python:function:demo.world",),
 ).fetchone()
+tag_counts = dict(
+    conn.execute(
+        """
+        SELECT tag, COUNT(*)
+        FROM entity_tags
+        WHERE tag IN ('entry-point', 'http-route', 'exported-api', 'cli-command')
+        GROUP BY tag
+        """
+    ).fetchall()
+)
+assert tag_counts.get("entry-point", 0) >= 1, tag_counts
+assert tag_counts.get("http-route", 0) >= 1, tag_counts
+assert tag_counts.get("exported-api", 0) >= 1, tag_counts
+assert tag_counts.get("cli-command", 0) >= 1, tag_counts
+
+module_export = conn.execute(
+    """
+    SELECT e.kind
+    FROM entities e
+    JOIN entity_tags t ON t.entity_id = e.id
+    WHERE e.id = 'python:module:demo'
+      AND e.kind = 'module'
+      AND t.tag = 'exported-api'
+    """
+).fetchone()
+assert module_export == ("module",), module_export
 conn.close()
 world_source = Path(world_entity[3]).read_text(encoding="utf-8")
 world_lines = world_source.splitlines(keepends=True)
@@ -343,6 +399,23 @@ requests: list[tuple[str, dict[str, object]]] = [
             },
         },
     ),
+    *[
+        (
+            f"public-surface-{tool_name}",
+            {
+                "jsonrpc": "2.0",
+                "id": f"public-surface-{tool_name}",
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": {}},
+            },
+        )
+        for tool_name in [
+            "entity_entry_point_list",
+            "entity_http_route_list",
+            "entity_exported_api_list",
+            "entity_cli_command_list",
+        ]
+    ],
     (
         "callers-default",
         {
@@ -531,6 +604,8 @@ assert tool_names == [
     "entity_coupling_hotspot_list",
     "entity_entry_point_list",
     "entity_http_route_list",
+    "entity_exported_api_list",
+    "entity_cli_command_list",
     "entity_data_model_list",
     "entity_test_list",
     "entity_deprecation_list",
@@ -581,6 +656,15 @@ for site in cs_result["sites"]:
 find_result = assert_tool_ok(responses["find"])
 assert len(find_result["result"]["entities"]) == 2, find_result
 assert find_result["result"]["next_cursor"] == "2", find_result
+
+for tool_name in [
+    "entity_entry_point_list",
+    "entity_http_route_list",
+    "entity_exported_api_list",
+    "entity_cli_command_list",
+]:
+    envelope = assert_tool_ok(responses[f"public-surface-{tool_name}"])
+    assert envelope["result"]["page"]["total"] >= 1, (tool_name, envelope)
 
 default_callers = assert_tool_ok(responses["callers-default"])
 default_ids = {item["entity"]["id"] for item in default_callers["result"]["callers"]}

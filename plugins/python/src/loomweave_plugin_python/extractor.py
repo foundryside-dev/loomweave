@@ -218,6 +218,9 @@ class RawEntity(TypedDict):
     tags: NotRequired[list[str]]
     # Short natural-language text used by analyze-time semantic embeddings.
     docstring: NotRequired[str]
+    # Explicit __all__ names observed on module entities. Stored through the
+    # host RawEntity extra/properties path; omitted unless __all__ is declared.
+    exported_names: NotRequired[list[str]]
     # Wardline descriptor-backed source-observed decorator facts. Wardline owns
     # the vocabulary; Loomweave stores only the annotation facts seen on entities.
     wardline: NotRequired[WardlineEntityMetadata]
@@ -341,12 +344,14 @@ def module_dotted_name(module_path: str) -> str:
     return ".".join(parts)
 
 
-def _build_module_entity(
+def _build_module_entity(  # noqa: PLR0913 - module metadata inputs are computed separately.
     source: str,
     dotted_module: str,
     file_path: str,
     parse_status: Literal["ok", "syntax_error", "too_complex"],
     docstring: str | None = None,
+    exported_names: set[str] | None = None,
+    local_export_entity_names: set[str] | None = None,
 ) -> RawEntity:
     """Build the per-file module entity (Q1 + Q4 resolutions)."""
     entity: RawEntity = {
@@ -359,7 +364,13 @@ def _build_module_entity(
         },
         "parse_status": parse_status,
     }
-    _attach_optional_entity_metadata(entity, docstring=docstring, tags=[])
+    tags: set[str] = set()
+    if exported_names is not None:
+        entity["exported_names"] = sorted(exported_names)
+        reexported_names = exported_names - (local_export_entity_names or set())
+        if reexported_names:
+            tags.add("exported-api")
+    _attach_optional_entity_metadata(entity, docstring=docstring, tags=tags)
     return entity
 
 
@@ -459,8 +470,17 @@ def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vo
         )
     parse_latency_ms = _elapsed_ms(parse_started_ns)
 
+    exported_names = _module_export_names(tree)
+    local_export_entity_names = _module_level_exportable_names(tree)
+    cli_guard_targets = _main_guard_targets(tree)
     module_entity = _build_module_entity(
-        source, dotted_module, file_path, "ok", ast.get_docstring(tree)
+        source,
+        dotted_module,
+        file_path,
+        "ok",
+        ast.get_docstring(tree),
+        exported_names,
+        local_export_entity_names,
     )
     entities: list[RawEntity] = [module_entity]
     edges: list[RawEdge] = []
@@ -469,7 +489,8 @@ def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vo
         walk_state = _WalkState(
             seen_ids={module_entity["id"]},
             file_path=file_path,
-            exported_names=_module_export_names(tree),
+            exported_names=exported_names,
+            cli_guard_targets=cli_guard_targets,
             wardline_vocabulary=wardline_vocabulary,
         )
         _walk(
@@ -1062,6 +1083,7 @@ class _WalkState:
     # heuristic); a set (possibly empty) means ``__all__`` was declared
     # explicitly (clarion-4ec50f3d92).
     exported_names: set[str] | None = None
+    cli_guard_targets: set[str] = field(default_factory=set)
     duplicate_entities_dropped: int = 0
 
 
@@ -1229,6 +1251,7 @@ _HTTP_ROUTE_DECORATOR_NAMES = {
 }
 _CLI_DECORATOR_NAMES = {"command", "group", "callback"}
 _DATA_MODEL_BASE_NAMES = {"BaseModel", "Model", "SQLModel", "TypedDict"}
+_MAIN_GUARD_RUNNER_WRAPPER_NAMES = {"asyncio.run", "anyio.run", "typer.run"}
 
 
 def _attach_optional_entity_metadata(
@@ -1287,15 +1310,17 @@ def _module_export_names(tree: ast.Module) -> set[str] | None:
     public-surface heuristic in :func:`_function_tags` / :func:`_class_tags`.
     Both plain (``__all__ = [...]``) and annotated (``__all__: list[str] = [...]``)
     assignments count as a declaration so an annotated ``__all__`` is never
-    mistaken for an absent one. A non-literal value (``__all__ = a + b``, an
-    alias, a comprehension) or an annotation-only stub (``__all__: list[str]``
-    with no value) counts as a declaration but contributes no names — i.e. it is
-    treated as an explicit *empty* surface, which suppresses ``public-surface``;
-    this matches the prior behaviour for non-literal ``__all__`` (no names were
-    ever extracted from it). Bare ``__all__ += [...]`` (``ast.AugAssign`` without a
+    mistaken for an absent one. A later literal ``__all__ += [...]`` extends that
+    declaration. A non-literal value (``__all__ = a + b``, an alias, a
+    comprehension) or an annotation-only stub (``__all__: list[str]`` with no
+    value) counts as a declaration but contributes no names — i.e. it is treated
+    as an explicit *empty* surface, which suppresses ``public-surface``; this
+    matches the prior behaviour for non-literal ``__all__`` (no names were ever
+    extracted from it). Bare ``__all__ += [...]`` (``ast.AugAssign`` without a
     prior ``=`` assignment) is intentionally not handled: it is a runtime
     ``NameError`` and so unreachable in valid Python."""
     exported: set[str] | None = None
+    can_augment_exports = False
     for statement in tree.body:
         if isinstance(statement, ast.Assign):
             targets: list[ast.expr] = statement.targets
@@ -1303,18 +1328,152 @@ def _module_export_names(tree: ast.Module) -> set[str] | None:
         elif isinstance(statement, ast.AnnAssign):
             targets = [statement.target]
             value = statement.value
+        elif isinstance(statement, ast.AugAssign):
+            if (
+                exported is not None
+                and can_augment_exports
+                and isinstance(statement.op, ast.Add)
+                and isinstance(statement.target, ast.Name)
+                and statement.target.id == "__all__"
+            ):
+                exported.update(_literal_export_names(statement.value))
+            continue
         else:
             continue
         if not any(isinstance(target, ast.Name) and target.id == "__all__" for target in targets):
             continue
         if exported is None:
             exported = set()
-        match value:
-            case ast.List(elts=elts) | ast.Tuple(elts=elts) | ast.Set(elts=elts):
-                for elt in elts:
-                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                        exported.add(elt.value)
+        if value is not None:
+            can_augment_exports = True
+        exported.update(_literal_export_names(value))
     return exported
+
+
+def _literal_export_names(value: ast.expr | None) -> set[str]:
+    exported: set[str] = set()
+    match value:
+        case ast.List(elts=elts) | ast.Tuple(elts=elts) | ast.Set(elts=elts):
+            for elt in elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    exported.add(elt.value)
+    return exported
+
+
+def _module_level_exportable_names(tree: ast.Module) -> set[str]:
+    return {
+        statement.name
+        for statement in tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def _main_guard_targets(tree: ast.Module) -> set[str]:
+    targets: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, ast.If) or not _is_main_guard(statement.test):
+            continue
+        for child in statement.body:
+            targets.update(_main_guard_statement_targets(child))
+    return targets
+
+
+def _main_guard_statement_targets(statement: ast.stmt) -> set[str]:
+    if isinstance(statement, ast.Expr):
+        return _main_guard_expr_targets(statement.value)
+    if isinstance(statement, ast.Return) and statement.value is not None:
+        return _main_guard_expr_targets(statement.value)
+    if isinstance(statement, ast.Raise) and statement.exc is not None:
+        return _main_guard_exit_wrapper_targets(statement.exc)
+    return set()
+
+
+def _main_guard_expr_targets(expr: ast.expr) -> set[str]:
+    if isinstance(expr, ast.Await):
+        return _main_guard_expr_targets(expr.value)
+    if not isinstance(expr, ast.Call):
+        return set()
+    if _is_main_guard_exit_wrapper(expr):
+        return _main_guard_exit_arg_targets(expr)
+    if _is_main_guard_runner_wrapper(expr):
+        return _main_guard_runner_arg_targets(expr)
+    if isinstance(expr.func, ast.Name):
+        return {expr.func.id}
+    return set()
+
+
+def _main_guard_exit_wrapper_targets(expr: ast.expr) -> set[str]:
+    if isinstance(expr, ast.Call) and _is_main_guard_exit_wrapper(expr):
+        return _main_guard_exit_arg_targets(expr)
+    return set()
+
+
+def _is_main_guard_exit_wrapper(call: ast.Call) -> bool:
+    return _expr_qualified_name(call.func) in {"SystemExit", "sys.exit", "exit", "quit"}
+
+
+def _main_guard_exit_arg_targets(call: ast.Call) -> set[str]:
+    if not call.args:
+        return set()
+    return _main_guard_expr_targets(call.args[0])
+
+
+def _is_main_guard_runner_wrapper(call: ast.Call) -> bool:
+    return _expr_qualified_name(call.func) in _MAIN_GUARD_RUNNER_WRAPPER_NAMES
+
+
+def _main_guard_runner_arg_targets(call: ast.Call) -> set[str]:
+    if not call.args:
+        return set()
+    return _main_guard_callable_targets(call.args[0])
+
+
+def _main_guard_callable_targets(expr: ast.expr) -> set[str]:
+    if isinstance(expr, ast.Await):
+        return _main_guard_callable_targets(expr.value)
+    if isinstance(expr, ast.Name):
+        return {expr.id}
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+        return {expr.func.id}
+    return set()
+
+
+def _is_main_guard(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "__name__"
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.Eq)
+        and len(node.comparators) == 1
+        and isinstance(node.comparators[0], ast.Constant)
+        and node.comparators[0].value == "__main__"
+    )
+
+
+def _function_uses_cli_parsing(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Attribute)
+            and child.attr == "argv"
+            and isinstance(child.value, ast.Name)
+            and child.value.id == "sys"
+        ):
+            return True
+        if isinstance(child, ast.Call):
+            func = child.func
+            if isinstance(func, ast.Attribute) and func.attr in {"parse_args", "parse_known_args"}:
+                return True
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "ArgumentParser"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "argparse"
+            ):
+                return True
+            if isinstance(func, ast.Name) and func.id == "ArgumentParser":
+                return True
+    return False
 
 
 def _expr_qualified_name(expr: ast.expr) -> str | None:
@@ -1348,6 +1507,7 @@ def _function_tags(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     parents: list[ast.AST],
     exported_names: set[str] | None,
+    cli_guard_targets: set[str],
 ) -> set[str]:
     tags: set[str] = set()
     module_level = _is_module_level(parents)
@@ -1356,6 +1516,11 @@ def _function_tags(
     )
     if module_level and node.name == "main":
         tags.add("entry-point")
+    if module_level and node.name in cli_guard_targets:
+        tags.update({"entry-point", "cli-command"})
+    command_candidate = module_level and (node.name == "main" or node.name in cli_guard_targets)
+    if command_candidate and _function_uses_cli_parsing(node):
+        tags.add("cli-command")
     if module_level:
         tags.update(_module_surface_tag(node.name, exported_names, is_test=is_test))
     if is_test:
@@ -1480,7 +1645,7 @@ def _build_function_entity(
         "definition": definition,
         "signature": _function_signature(node),
     }
-    tags = _function_tags(node, parents, state.exported_names)
+    tags = _function_tags(node, parents, state.exported_names, state.cli_guard_targets)
     _attach_wardline_entity_metadata(entity, node, tags, state.wardline_vocabulary)
     _attach_optional_entity_metadata(
         entity,
