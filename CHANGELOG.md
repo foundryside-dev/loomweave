@@ -20,6 +20,11 @@ only when an incompatible change is made to that surface. See
   keep signals. Direct and impl-level `#[cfg(test)]` items are also classified
   as tests for `app_only` filtering. Rust ontology `0.8.1` invalidates cached
   extraction values for the corrected tags.
+- **Rust compound test cfg classification.** Test-only tags now cover compound
+  predicates that prove an item cannot exist with `test=false`, while
+  disjunctions and `cfg_attr` forms that can admit app code remain app-visible.
+  Rust ontology `0.8.2` invalidates cached extraction values for the corrected
+  tags.
 
 ## [1.4.1] — 2026-07-10
 

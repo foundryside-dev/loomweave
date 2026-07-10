@@ -318,17 +318,133 @@ fn apply_dead_code_lint(attrs: &[Attribute], inherited: DeadCodeLintState) -> De
     })
 }
 
-/// `#[cfg(test)]` exactly (a bare `test` predicate). Compound forms like
-/// `cfg(all(test, ..))` are out of increment-1 scope (fail-toward-live: a missed
-/// cfg-test item is merely surveyed, never mis-rooted).
+#[derive(Clone, Copy)]
+struct CfgTruthWithoutTest {
+    can_be_true: bool,
+    can_be_false: bool,
+}
+
+impl CfgTruthWithoutTest {
+    const UNKNOWN: Self = Self {
+        can_be_true: true,
+        can_be_false: true,
+    };
+}
+
+/// Whether the item's cfg constraints prove it cannot exist when `test=false`.
+/// This is implication, not token presence: `all(test, unix)` is test-only,
+/// while `any(test, feature = "x")` is not because its feature branch can hold
+/// in an application build. Parse failures fail closed as app-visible.
 fn has_cfg_test(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        if let Meta::List(list) = &a.meta {
-            list.path.is_ident("cfg") && list.tokens.to_string().trim() == "test"
-        } else {
-            false
+    attrs
+        .iter()
+        .filter_map(cfg_constraint_can_be_true_without_test)
+        .any(|can_be_true| !can_be_true)
+}
+
+/// Return the cfg constraint's possible truth in a non-test build. `None`
+/// means the attribute does not constrain item presence.
+fn cfg_constraint_can_be_true_without_test(attr: &Attribute) -> Option<bool> {
+    let Meta::List(list) = &attr.meta else {
+        return None;
+    };
+    if list.path.is_ident("cfg") {
+        return Some(
+            syn::parse2::<Meta>(list.tokens.clone()).map_or(true, |predicate| {
+                cfg_truth_without_test(&predicate).can_be_true
+            }),
+        );
+    }
+    if !list.path.is_ident("cfg_attr") {
+        return None;
+    }
+
+    let Ok(args) =
+        list.parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+    else {
+        return Some(true);
+    };
+    let mut args = args.iter();
+    let Some(condition) = args.next() else {
+        return Some(true);
+    };
+    let condition = cfg_truth_without_test(condition);
+    let inserted_cfgs: Vec<_> = args
+        .filter_map(|meta| match meta {
+            Meta::List(cfg) if cfg.path.is_ident("cfg") => {
+                syn::parse2::<Meta>(cfg.tokens.clone()).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    if inserted_cfgs.is_empty() {
+        return Some(true);
+    }
+
+    // cfg_attr(P, cfg(Q...)) admits the item when P is false OR every injected
+    // cfg predicate holds. It is test-only only when neither branch can hold
+    // with test=false.
+    let injected_cfgs_can_be_true = inserted_cfgs
+        .iter()
+        .all(|predicate| cfg_truth_without_test(predicate).can_be_true);
+    Some(condition.can_be_false || injected_cfgs_can_be_true)
+}
+
+/// Conservative truth possibilities for a cfg predicate with `test=false`.
+/// Other atoms remain unknown; ignoring correlations can only miss a test-only
+/// classification, never incorrectly exclude app code from `app_only`.
+fn cfg_truth_without_test(meta: &Meta) -> CfgTruthWithoutTest {
+    match meta {
+        Meta::Path(path) if path.is_ident("test") => CfgTruthWithoutTest {
+            can_be_true: false,
+            can_be_false: true,
+        },
+        Meta::Path(_) | Meta::NameValue(_) => CfgTruthWithoutTest::UNKNOWN,
+        Meta::List(list) => {
+            let Ok(items) = list.parse_args_with(
+                syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return CfgTruthWithoutTest::UNKNOWN;
+            };
+            if list.path.is_ident("all") {
+                items.iter().fold(
+                    CfgTruthWithoutTest {
+                        can_be_true: true,
+                        can_be_false: false,
+                    },
+                    |combined, item| {
+                        let item = cfg_truth_without_test(item);
+                        CfgTruthWithoutTest {
+                            can_be_true: combined.can_be_true && item.can_be_true,
+                            can_be_false: combined.can_be_false || item.can_be_false,
+                        }
+                    },
+                )
+            } else if list.path.is_ident("any") {
+                items.iter().fold(
+                    CfgTruthWithoutTest {
+                        can_be_true: false,
+                        can_be_false: true,
+                    },
+                    |combined, item| {
+                        let item = cfg_truth_without_test(item);
+                        CfgTruthWithoutTest {
+                            can_be_true: combined.can_be_true || item.can_be_true,
+                            can_be_false: combined.can_be_false && item.can_be_false,
+                        }
+                    },
+                )
+            } else if list.path.is_ident("not") && items.len() == 1 {
+                let item = cfg_truth_without_test(&items[0]);
+                CfgTruthWithoutTest {
+                    can_be_true: item.can_be_false,
+                    can_be_false: item.can_be_true,
+                }
+            } else {
+                CfgTruthWithoutTest::UNKNOWN
+            }
         }
-    })
+    }
 }
 
 /// The attribute's final path segment equals `name` (so `#[test]` and
@@ -414,8 +530,19 @@ mod tests {
     }
 
     #[test]
-    fn cfg_test_only_matches_bare_test() {
+    fn cfg_test_classification_requires_non_test_builds_to_be_impossible() {
         assert!(has_cfg_test(&attrs("#[cfg(test)]")));
+        assert!(has_cfg_test(&attrs("#[cfg(all(test, unix))]")));
+        assert!(has_cfg_test(&attrs("#[cfg(not(not(test)))]")));
+        assert!(has_cfg_test(&attrs("#[cfg_attr(not(test), cfg(test))]")));
         assert!(!has_cfg_test(&attrs("#[cfg(feature = \"x\")]")));
+        assert!(!has_cfg_test(&attrs("#[cfg(any(test, feature = \"x\"))]")));
+        assert!(!has_cfg_test(&attrs("#[cfg_attr(test, allow(dead_code))]")));
+        assert!(!has_cfg_test(&attrs("#[cfg(all(test,, unix))]")));
+        assert!(!has_cfg_test(&attrs("#[cfg_attr(not(test), cfg(,))]")));
+        assert!(!has_cfg_test(&attrs("#[cfg(custom(test))]")));
+        assert!(!has_cfg_test(&attrs(
+            "#[cfg(any(test, feature = \"x\"))] #[cfg(not(feature = \"x\"))]"
+        )));
     }
 }

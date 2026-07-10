@@ -70,8 +70,11 @@ rule_id_prefix = "LMWV-RUST-"
 # `#[allow(dead_code)]` and `#[expect(dead_code)]` propagate to lexical children
 # (ADR-054 increment 4 — ADR-027 PATCH). The bump forces unchanged Rust files to
 # re-dispatch and acquire the corrected tags.
+# 0.8.2: classify compound cfg predicates that prove an item cannot exist when
+# `test=false` (ADR-054 increment 5 — ADR-027 PATCH). Unchanged Rust files must
+# re-dispatch to acquire the corrected `test` tags.
 # Lockstep with the `serve.rs` handshake constant.
-ontology_version = "0.8.1"
+ontology_version = "0.8.2"
 
 [ontology.roles]
 file_scope = ["module"]

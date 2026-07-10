@@ -118,9 +118,11 @@ An item is `entry-point` iff any hold:
 An item is `test` iff any hold:
 
 - it carries `#[test]` or `#[bench]`;
-- it is under a `#[cfg(test)]` ancestor module (the walk threads an
-  `under_cfg_test` boolean, set when descending into a module whose attrs carry
-  a literal `cfg(test)` predicate).
+- its `cfg` constraints prove it cannot exist with `test=false`, directly or
+  through an ancestor inline module or impl. The structured predicate check
+  includes `cfg(test)`, `cfg(all(test, ...))`, equivalent nested `not` forms,
+  and a `cfg_attr` only when the conditional cfg itself excludes every non-test
+  build. A disjunction such as `cfg(any(test, feature = "x"))` is not test-only.
 
 Test items are roots (they are entry points the harness invokes) and are
 excluded from `app_only` reachability by the engine, exactly as Python's `test`
@@ -286,6 +288,23 @@ This corrects values emitted under an existing tag without changing wire shape,
 so ADR-027 requires a PATCH ontology bump **0.8.0 -> 0.8.1**. The bump remains
 load-bearing: unchanged files must re-dispatch to acquire the corrected child
 tags.
+
+## Increment 5 (implemented): semantic compound cfg(test) classification
+
+The original test-only check compared rendered tokens to the exact string
+`test`. It missed compound predicates such as `all(test, unix)`, so entities
+that cannot exist in application builds lacked the `test` tag and leaked into
+`app_only` dead-code surveys. It also invited an unsafe broadening: the mere
+presence of a `test` token is insufficient because `any(test, feature = "x")`
+and ordinary `cfg_attr(test, ...)` can still admit the item when `test=false`.
+
+The extractor now parses `syn::Meta` predicates and conservatively evaluates
+whether each cfg constraint can be true with `test=false`. Only a proof that it
+cannot produces the `test` tag; unknown predicates and ignored correlations
+remain app-visible. The state propagates through inline modules and impls as
+before. This corrects existing tag values without changing wire shape, so
+ADR-027 requires a PATCH ontology bump **0.8.1 -> 0.8.2** and unchanged files
+must re-dispatch.
 
 ## Still deferred (second-pass extensions)
 

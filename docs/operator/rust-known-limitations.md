@@ -149,6 +149,14 @@ the per-file extractor does not carry the declaration's attributes across that
 boundary. The separate module container is not itself a dead-code candidate,
 but its children in the mounted file may be under-rooted.
 
+Test-only classification understands cfg predicates that structurally imply
+`test`, including `all(test, ...)` and equivalent nested `not` forms. It does
+not treat the presence of a `test` token as proof: `any(test, feature = "x")`
+and ordinary `cfg_attr(test, ...)` can admit app code and remain app-visible.
+The evaluator intentionally ignores correlations between separate unknown cfg
+atoms, so unusually interdependent predicates can remain under-classified as a
+fail-closed residual.
+
 **Why.** Rooting the resolved edge target fixes the facade case without making
 the enclosing module a root, which would transitively keep every ordinary
 import in that module alive. Ambiguous/unresolved targets fail closed because

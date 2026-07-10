@@ -156,6 +156,73 @@ fn items_under_cfg_test_mod_are_test() {
     assert_eq!(tags(&m, "rust:struct:k.m.tests.Fixture"), ["test"]);
 }
 
+#[test]
+fn compound_cfg_that_requires_test_propagates_to_lexical_children() {
+    let src = concat!(
+        "#[cfg(all(test, unix))]\n",
+        "mod tests { fn helper() {} }\n",
+        "struct S;\n",
+        "#[cfg(all(test, feature = \"x\"))]\n",
+        "impl S { fn method(&self) {} }\n",
+        "#[cfg(not(not(test)))]\n",
+        "fn direct() {}\n",
+    );
+    let m = tags_by_id("k", "k.m", src);
+    assert_eq!(tags(&m, "rust:function:k.m.tests.helper"), ["test"]);
+    assert_eq!(method_tags(&m, "method"), ["test"]);
+    assert_eq!(tags(&m, "rust:function:k.m.direct"), ["test"]);
+}
+
+#[test]
+fn cfg_forms_that_can_exist_without_test_are_not_test_only() {
+    let src = concat!(
+        "#[cfg(any(test, feature = \"x\"))]\n",
+        "fn maybe_feature() {}\n",
+        "#[cfg_attr(test, allow(dead_code))]\n",
+        "fn conditionally_allowed() {}\n",
+    );
+    let m = tags_by_id("k", "k.m", src);
+    assert!(tags(&m, "rust:function:k.m.maybe_feature").is_empty());
+    assert!(
+        tags(&m, "rust:function:k.m.conditionally_allowed").is_empty(),
+        "cfg_attr(test, ...) changes attributes in test builds but does not make the item test-only"
+    );
+}
+
+#[test]
+fn cfg_attr_that_excludes_non_test_builds_is_test_only() {
+    let src = "#[cfg_attr(not(test), cfg(test))]\nfn test_only() {}\n";
+    let m = tags_by_id("k", "k.m", src);
+    assert_eq!(tags(&m, "rust:function:k.m.test_only"), ["test"]);
+}
+
+#[test]
+fn malformed_unknown_and_correlated_cfg_forms_fail_closed_as_app_visible() {
+    let src = concat!(
+        "#[cfg(all(test,, unix))]\n",
+        "fn malformed_cfg() {}\n",
+        "#[cfg_attr(not(test), cfg(,))]\n",
+        "fn malformed_cfg_attr() {}\n",
+        "#[cfg(custom(test))]\n",
+        "fn unknown_operator() {}\n",
+        "#[cfg(any(test, feature = \"x\"))]\n",
+        "#[cfg(not(feature = \"x\"))]\n",
+        "fn correlated() {}\n",
+    );
+    let m = tags_by_id("k", "k.m", src);
+    for id in [
+        "rust:function:k.m.malformed_cfg",
+        "rust:function:k.m.malformed_cfg_attr",
+        "rust:function:k.m.unknown_operator",
+        "rust:function:k.m.correlated",
+    ] {
+        assert!(
+            tags(&m, id).is_empty(),
+            "an unproved cfg implication must remain app-visible: {id}"
+        );
+    }
+}
+
 // ---- allow-dead-code (explicit author keep-signal) ------------------------
 
 #[test]
