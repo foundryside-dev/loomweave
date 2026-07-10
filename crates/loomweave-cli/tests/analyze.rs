@@ -3778,6 +3778,73 @@ fn analyze_incremental_retains_edge_into_unchanged_file_entity() {
     );
 }
 
+/// A vanished source file never crosses the per-file replacement boundary on
+/// its next incremental run. Its previously stored anchored edges must still be
+/// removed, while the surviving target file remains eligible for an unchanged
+/// skip and the normal entity-deleted finding remains durable.
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_prunes_anchored_edges_owned_by_deleted_file() {
+    let (project_dir, _plugin_dir, plugin_path) = cross_env();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    let path_a = project_dir.path().join("a.cx");
+    let path_b = project_dir.path().join("b.cx");
+    std::fs::write(&path_b, b"entity bar\n").unwrap();
+    std::fs::write(&path_a, b"impl b.bar\n").unwrap();
+    analyze();
+
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let edge_count = |conn: &Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edges \
+             WHERE kind = 'implements' \
+               AND from_id = 'crossfixture:module:a' \
+               AND to_id = 'crossfixture:function:b.bar'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(edge_count(&Connection::open(&db_path).unwrap()), 1);
+
+    std::fs::remove_file(&path_a).unwrap();
+    analyze();
+
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "the surviving target file should remain incrementally skipped: {stats}"
+    );
+    let conn = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        edge_count(&conn),
+        0,
+        "an anchored edge owned by a vanished source file must not survive"
+    );
+    let deletion_findings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings \
+             WHERE rule_id = 'LMWV-FACT-ENTITY-DELETED' \
+               AND entity_id = 'crossfixture:module:a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deletion_findings, 1,
+        "pruning edge provenance must not erase the deletion fact"
+    );
+}
+
 /// NEGATIVE / SAFETY host-seam guard (the test that prevents shipping the
 /// resurrection bug). A CHANGED file C drops a symbol `foo` (no longer emitted this
 /// run) while another CHANGED file A still references `C::foo`. The stale edge must

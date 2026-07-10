@@ -30,6 +30,10 @@ only when an incompatible change is made to that surface. See
   Wardline `main` authority inside the required Rust job, so sibling drift
   blocks PR merges and releases instead of only failing local workspaces that
   happen to have both repositories.
+- **Deleted-file graph pruning.** Incremental analysis now removes scan-time
+  anchored edges and unresolved call sites owned by vanished source files,
+  while retaining cumulative entity rows long enough to preserve deletion
+  findings and SEI lineage.
 
 ## [1.4.1] — 2026-07-10
 

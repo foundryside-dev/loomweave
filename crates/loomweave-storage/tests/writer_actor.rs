@@ -2554,7 +2554,6 @@ async fn replace_edges_for_source_file_removes_only_stale_anchored_edges() {
         .await
         .unwrap();
     }
-
     send::<()>(&tx, |ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
         source_file_id: "core:file:demo.py".to_owned(),
         ack,
@@ -2624,6 +2623,65 @@ async fn replace_edges_for_source_file_removes_only_stale_anchored_edges() {
     assert!(!rows.iter().any(|(kind, source_file_id, _, _)| {
         kind == "references" && source_file_id.as_deref() == Some("core:file:demo.py")
     }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_edges_for_source_file_removes_unresolved_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-site-replace").await;
+    send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+        entity: Box::new(make_file_entity("core:file:demo.py")),
+        ack,
+    })
+    .await
+    .unwrap();
+    seed_module_and_functions(&tx).await;
+    seed_contains_edges_for_demo_functions(&tx).await;
+
+    let mut stale_site = unresolved_site("dynamic_target", 1);
+    stale_site.source_file_id = Some("core:file:demo.py".to_owned());
+    send::<()>(&tx, |ack| WriterCmd::ReplaceUnresolvedCallSitesForCaller {
+        caller_entity_id: "python:function:demo.caller".to_owned(),
+        caller_content_hash: "hash-python:function:demo.caller".to_owned(),
+        sites: vec![stale_site],
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
+        source_file_id: "core:file:demo.py".to_owned(),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-site-replace".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let stale_sites: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_unresolved_call_sites \
+             WHERE source_file_id = 'core:file:demo.py'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_sites, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -178,8 +178,9 @@ pub enum WriterCmd {
     /// Delete all scan-time AST-anchored edges emitted from one source file
     /// before the current file's authoritative edge set is inserted. This is
     /// the re-analysis replacement boundary for calls/references/imports and
-    /// other anchored relationships; structural edges remain governed by their
-    /// own invariants.
+    /// other anchored relationships. Unresolved call sites ride the same source
+    /// provenance boundary; structural edges remain governed by their own
+    /// invariants.
     ReplaceAnchoredEdgesForSourceFile {
         source_file_id: String,
         ack: Ack<()>,

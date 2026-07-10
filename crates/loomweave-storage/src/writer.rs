@@ -1029,6 +1029,10 @@ fn replace_anchored_edges_for_source_file(
             params![source_file_id, kind],
         )?;
     }
+    conn.execute(
+        "DELETE FROM entity_unresolved_call_sites WHERE source_file_id = ?1",
+        params![source_file_id],
+    )?;
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
 }

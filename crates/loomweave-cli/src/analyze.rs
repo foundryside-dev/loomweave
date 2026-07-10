@@ -378,7 +378,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // on a DB that `install` has not re-touched. Idempotent (only pending
     // migrations run) and safe under the analyze lock acquired above; the writer
     // still verifies `user_version` on spawn to reject a forward-incompatible file.
-    {
+    let stale_source_file_ids = {
         let mut conn =
             Connection::open(&db_path).context("open database to apply pending migrations")?;
         loomweave_storage::pragma::apply_write_pragmas(&conn)
@@ -395,7 +395,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "marked stale running analyze runs failed before starting new analyze"
             );
         }
-    }
+        loomweave_storage::integrity::check_integrity(&conn, &project_root)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("detect vanished source files before analyze")?
+            .stale_file_entities
+            .into_iter()
+            .map(|file| file.id)
+            .collect::<Vec<_>>()
+    };
 
     let analyze_config = AnalyzeConfig::load(&project_root, options.config_path.as_deref())?;
     let analyze_config_json = analyze_config.to_json_string()?;
@@ -607,6 +614,30 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         head_commit.as_deref(),
     )
     .await?;
+
+    // A vanished file cannot cross the normal per-file replacement boundary,
+    // so clear its AST-anchored graph evidence explicitly. Keep the cumulative
+    // entity rows: the post-commit SEI pass still needs them to record durable
+    // entity-deleted facts and lineage. Structural contains repair remains the
+    // insert-time parent/contains invariant's responsibility.
+    for source_file_id in &stale_source_file_ids {
+        writer
+            .send_wait(|ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
+                source_file_id: source_file_id.clone(),
+                ack,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| {
+                format!("prune graph evidence for vanished source {source_file_id}")
+            })?;
+    }
+    if !stale_source_file_ids.is_empty() {
+        tracing::info!(
+            source_file_count = stale_source_file_ids.len(),
+            "pruned anchored graph evidence for vanished source files"
+        );
+    }
 
     // ── Wave 2 / T3.1: incremental-analysis skip state ────────────────────────
     //
