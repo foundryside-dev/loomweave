@@ -24,6 +24,78 @@ Filigree is absent (weft.md §5).
 > endpoint specs below are **Loomweave-owned and authoritative**; the hub indexes
 > them, it does not restate them.
 
+## External SQLite Read Contract
+
+Local-only federation consumers may read a narrow, versioned projection of the
+existing `.weft/loomweave/loomweave.db`. The contract is
+`loomweave.external-sqlite.v1`; its Rust authority is
+`loomweave_storage::external_sqlite_compatibility`, and its decision record is
+[ADR-055](../loomweave/adr/ADR-055-external-sqlite-federation-read-contract.md).
+
+### Compatibility header and states
+
+Open the existing database **read-only** (SQLite URI `mode=ro`, or the platform
+equivalent). A consumer must not create the file, apply Loomweave PRAGMAs that
+write headers, or run migrations.
+
+Read these header fields before any catalogue query:
+
+| Field | v1 accepted values |
+|---|---|
+| `PRAGMA application_id` | `0x4c4d5756` (`LMWV`) or legacy `0` |
+| `PRAGMA user_version` | `5..=12` |
+
+The typed compatibility states are:
+
+- `compatible`: `user_version=12`, the newest reviewed v1 schema;
+- `older_supported`: `user_version=5..11`, with the same safe projection;
+- `incompatible`: foreign application ID, version 0, version 1–4, version 13
+  or later, malformed header values, or a missing required table/column.
+
+Legacy `application_id=0` plus the required structure proves format
+compatibility only. It does not authenticate the file as a Loomweave-produced
+database.
+
+The check order is normative:
+
+1. open the existing file read-only;
+2. read `application_id` and `user_version`;
+3. reject an incompatible header;
+4. inspect the required table/column projection;
+5. only then issue catalogue SQL.
+
+In particular, a future-version database is rejected before table inspection,
+so consumers receive `too_new` instead of a downstream `no such table` error.
+
+### Safe v1 projection
+
+Consumers must name columns explicitly; `SELECT *` is not compatible with this
+contract.
+
+| Table | Safe columns |
+|---|---|
+| `runs` | `id`, `started_at`, `completed_at`, `stats`, `status` |
+| `entities` | `id`, `plugin_id`, `kind`, `source_file_path`, `source_byte_start`, `source_byte_end`, `source_line_start`, `source_line_end`, `properties`, `content_hash` |
+| `entity_tags` | `entity_id`, `plugin_id`, `tag` |
+| `sei_bindings` | `sei`, `current_locator`, `body_hash`, `status` |
+| `sei_lineage` | `sei`, `event`, `old_locator`, `new_locator`, `run_id`, `recorded_at` |
+
+All unlisted tables, columns, views, indexes, triggers, constraints, row order,
+and query plans are internal and may change. `schema_migrations`, cache tables,
+FTS tables, finding tables, prior-index/plugin-marker tables, Wardline stores,
+and subsystem materializations are specifically not an external read surface.
+
+`runs.stats` and `entities.properties` are JSON containers rather than blanket
+contracts. Consumers may use only separately versioned subobjects documented by
+Loomweave. Classifier support uses
+`runs.stats.classifier_coverage` with schema
+`loomweave.classifier-coverage.v1`; missing or malformed metadata fails closed.
+
+The latest run is selected deterministically with
+`ORDER BY started_at DESC, id DESC LIMIT 1`. A consumer never falls back to an
+older completed run when the newest row is running, failed, skipped, or
+malformed.
+
 ## HTTP Read API
 
 `loomweave serve` can expose the HTTP read API when enabled in `loomweave.yaml`:
