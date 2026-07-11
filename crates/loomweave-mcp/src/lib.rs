@@ -625,7 +625,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_tag_list",
-            description: "Entities carrying a categorisation `tag`, optional `scope` (entity id → descendants, or path glob). Bounded; honest-empty when no entity carries the tag.",
+            description: "`tag` entities; bounded. loomweave.classification.v1: classification.state + classification.complete; signal.complete; supported+0=supported-empty.",
             input_schema: scope_facet_schema(&[("tag", true)]),
         },
         ToolDefinition {
@@ -669,42 +669,42 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "entity_entry_point_list",
-            description: "Tagged `entry-point`; optional `scope`; honest-empty signal; bounded.",
+            description: "`entry-point`; classification per entity_tag_list; signal.complete; supported-empty.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_http_route_list",
-            description: "Tagged `http-route`; optional `scope`; honest-empty signal; bounded.",
+            description: "`http-route`; classification per entity_tag_list; signal.complete; supported-empty.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_exported_api_list",
-            description: "Tagged `exported-api`; optional `scope`; honest-empty signal; bounded.",
+            description: "`exported-api`; classification per entity_tag_list; signal.complete; supported-empty.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_cli_command_list",
-            description: "Tagged `cli-command`; optional `scope`; honest-empty signal; bounded.",
+            description: "`cli-command`; classification per entity_tag_list; signal.complete; supported-empty.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_data_model_list",
-            description: "Tagged `data-model`; optional `scope`; honest-empty signal; bounded.",
+            description: "`data-model`; classification per entity_tag_list; signal.complete; supported-empty.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_test_list",
-            description: "Tagged `test`; optional `scope`; honest-empty signal; bounded.",
+            description: "`test`; classification per entity_tag_list; signal.complete; supported-empty.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_deprecation_list",
-            description: "Tagged `deprecated`; optional `scope`; honest-empty signal; bounded.",
+            description: "`deprecated`; classification per entity_tag_list; signal.complete; supported-empty.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {
             name: "entity_todo_list",
-            description: "TODO/FIXME-tagged entities; optional `scope`; honest-empty signal; bounded.",
+            description: "TODO/FIXME; classification per entity_tag_list; signal.complete; supported-empty.",
             input_schema: scope_page_schema(false),
         },
         ToolDefinition {

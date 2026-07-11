@@ -18,6 +18,7 @@ use loomweave_storage::{
 
 use crate::ParamError;
 use crate::ServerState;
+use crate::catalogue::classification::attach_tag_classification;
 use crate::catalogue::{Page, RawScope, finalize_entity_page, missing_signal};
 use crate::{entity_json, flatten_storage_envelope_result, required_str, success_envelope};
 
@@ -66,23 +67,44 @@ impl ServerState {
         scope: RawScope,
         page: Page,
     ) -> Value {
+        self.tag_facet_with_snapshot_hook(tag, missing_reason, scope, page, || {})
+            .await
+    }
+
+    async fn tag_facet_with_snapshot_hook<F>(
+        &self,
+        tag: String,
+        missing_reason: &'static str,
+        scope: RawScope,
+        page: Page,
+        after_entity_read: F,
+    ) -> Value
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let project_root = self.project_root.clone();
         let result = self
             .readers
             .with_reader(move |conn| {
-                let filter = scope.resolve(conn)?;
-                let (candidates, scan_truncated) = entities_by_tag(conn, &tag, FACET_SCAN_CAP)?;
+                // Pin entities, tags, page metadata, and the latest-run
+                // coverage to one WAL snapshot. Without an explicit read
+                // transaction an analysis commit between these SELECTs could
+                // pair an old entity generation with new coverage.
+                let tx = conn.unchecked_transaction()?;
+                let filter = scope.resolve(&tx)?;
+                let (candidates, scan_truncated) = entities_by_tag(&tx, &tag, FACET_SCAN_CAP)?;
                 let mut response = finalize_entity_page(
-                    conn,
+                    &tx,
                     &project_root,
                     candidates,
                     &filter,
                     page,
                     scan_truncated,
                 );
+                after_entity_read();
                 attach_facet(&mut response, json!({ "tag": tag }));
                 if response["page"]["total"] == json!(0) {
-                    let known = loomweave_storage::known_entity_tags(conn)?;
+                    let known = loomweave_storage::known_entity_tags(&tx)?;
                     let reason = if known.is_empty() {
                         format!(
                             "{missing_reason}; no categorisation tags are populated in this \
@@ -99,6 +121,9 @@ impl ServerState {
                     }
                     attach_signal(&mut response, missing_signal("entity_tags", &reason));
                 }
+                let latest = loomweave_storage::latest_classifier_coverage(&tx)?;
+                attach_tag_classification(&mut response, &latest, &tag);
+                tx.commit()?;
                 Ok(success_envelope(response))
             })
             .await;
@@ -438,5 +463,129 @@ fn facet_matches(blob: &Value, field: &str, wanted: Option<&String>) -> bool {
         Some(Value::Number(value)) => value.to_string() == *wanted,
         Some(Value::Bool(value)) => value.to_string() == *wanted,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use loomweave_storage::{ReaderPool, latest_classifier_coverage, pragma, schema};
+    use rusqlite::{Connection, params};
+
+    use super::*;
+
+    fn coverage(plugin_id: &str, classifier_tags: &[&str]) -> String {
+        json!({
+            "classifier_coverage": {
+                "schema": "loomweave.classifier-coverage.v1",
+                "source_walk_complete": true,
+                "source_walk_skipped_entries": 0,
+                "plugin_discovery_complete": true,
+                "plugin_discovery_errors": 0,
+                "plugin_discovery_error_samples": [],
+                "plugins": [{
+                    "plugin_id": plugin_id,
+                    "plugin_version": "1.0.0",
+                    "ontology_version": "1.0.0",
+                    "matched_files": 1,
+                    "analyzed_files": 1,
+                    "retained_files": 0,
+                    "degraded_files": 0,
+                    "status": "complete",
+                    "classifier_tags": classifier_tags,
+                }]
+            }
+        })
+        .to_string()
+    }
+
+    fn insert_run(conn: &Connection, id: &str, started_at: &str, stats: &str) {
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES (?1, ?2, '2026-07-12T00:01:00Z', '{}', ?3, 'completed')",
+            params![id, started_at, stats],
+        )
+        .expect("insert run");
+    }
+
+    fn insert_tagged_entity(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+                                    created_at, updated_at) \
+             VALUES (?1, 'python', 'function', ?1, ?1, '{}', \
+                     '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z')",
+            [id],
+        )
+        .expect("insert entity");
+        conn.execute(
+            "INSERT INTO entity_tags (entity_id, plugin_id, tag) VALUES (?1, 'python', 'test')",
+            [id],
+        )
+        .expect("insert tag");
+    }
+
+    #[tokio::test]
+    async fn production_tag_facet_pins_entities_and_coverage_to_one_snapshot() {
+        let project = tempfile::tempdir().expect("temp project");
+        let db_path = project.path().join("loomweave.db");
+        let mut writer = Connection::open(&db_path).expect("open writer");
+        pragma::apply_write_pragmas(&writer).expect("writer pragmas");
+        schema::apply_migrations(&mut writer).expect("migrate database");
+        insert_tagged_entity(&writer, "python:function:old");
+        insert_run(
+            &writer,
+            "run-old",
+            "2026-07-12T00:00:00Z",
+            &coverage("python", &["test"]),
+        );
+
+        let readers = ReaderPool::open(&db_path, 1).expect("reader pool");
+        let state = ServerState::new(project.path().to_path_buf(), readers);
+        let response = state
+            .tag_facet_with_snapshot_hook(
+                "test".to_owned(),
+                "no test entities",
+                RawScope::Project,
+                Page {
+                    limit: 50,
+                    offset: 0,
+                },
+                move || {
+                    insert_tagged_entity(&writer, "python:function:new");
+                    insert_run(
+                        &writer,
+                        "run-new",
+                        "2026-07-12T01:00:00Z",
+                        &coverage("rust", &["entry-point"]),
+                    );
+                },
+            )
+            .await;
+
+        assert_eq!(response["result"]["page"]["total"], 1, "{response}");
+        assert_eq!(
+            response["result"]["entities"][0]["id"], "python:function:old",
+            "{response}"
+        );
+        assert_eq!(
+            response["result"]["classification"]["run_id"], "run-old",
+            "{response}"
+        );
+        assert_eq!(
+            response["result"]["classification"]["state"], "supported",
+            "{response}"
+        );
+
+        let current = Connection::open(&db_path).expect("open current reader");
+        assert_eq!(
+            current
+                .query_row("SELECT COUNT(*) FROM entity_tags", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            latest_classifier_coverage(&current).unwrap().run_id(),
+            Some("run-new")
+        );
     }
 }

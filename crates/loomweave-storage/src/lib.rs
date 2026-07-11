@@ -5,6 +5,7 @@
 //! `deadpool-sqlite` pool. See ADR-011.
 
 pub mod cache;
+pub mod classifier_coverage;
 pub mod commands;
 pub mod embeddings;
 pub mod error;
@@ -30,6 +31,9 @@ pub use cache::{
     delete_summary_cache_for_entity, inferred_edge_cache_key_id, inferred_edge_cache_lookup,
     summary_cache_lookup, touch_inferred_edge_cache, touch_summary_cache,
     upsert_inferred_edge_cache, upsert_summary_cache,
+};
+pub use classifier_coverage::{
+    LatestClassifierCoverage, MAX_CLASSIFIER_STATS_BYTES, latest_classifier_coverage,
 };
 pub use commands::{
     EdgeRecord, EntityRecord, FindingRecord, InferredCallEdgeRecord, InferredEdgeWriteStats,

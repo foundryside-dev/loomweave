@@ -22,6 +22,7 @@
 //! in the submodules; `lib.rs` wires them into `list_tools()` and the
 //! `tools/call` dispatch.
 
+mod classification;
 mod faceted;
 mod inspection;
 mod semantic;

@@ -179,6 +179,97 @@ fn insert_finding(
     .expect("insert finding");
 }
 
+fn insert_classifier_run(
+    conn: &Connection,
+    id: &str,
+    started_at: &str,
+    status: &str,
+    completed_at: Option<&str>,
+    coverage: serde_json::Value,
+) {
+    let mut stats_payload = serde_json::Map::new();
+    stats_payload.insert("classifier_coverage".to_owned(), coverage);
+    conn.execute(
+        "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+         VALUES (?1, ?2, ?3, '{}', ?4, ?5)",
+        params![
+            id,
+            started_at,
+            completed_at,
+            Value::Object(stats_payload).to_string(),
+            status
+        ],
+    )
+    .expect("insert classifier run");
+}
+
+fn coverage(plugins: serde_json::Value) -> serde_json::Value {
+    let mut coverage = json!({
+        "schema": "loomweave.classifier-coverage.v1",
+        "source_walk_complete": true,
+        "source_walk_skipped_entries": 0,
+        "plugin_discovery_complete": true,
+        "plugin_discovery_errors": 0,
+        "plugin_discovery_error_samples": [],
+        "plugins": [],
+    });
+    coverage["plugins"] = plugins;
+    coverage
+}
+
+fn incomplete_discovery_coverage(plugins: serde_json::Value) -> serde_json::Value {
+    let mut coverage = json!({
+        "schema": "loomweave.classifier-coverage.v1",
+        "source_walk_complete": false,
+        "source_walk_skipped_entries": 0,
+        "plugin_discovery_complete": false,
+        "plugin_discovery_errors": 1,
+        "plugin_discovery_error_samples": ["plugin discovery failed"],
+        "plugins": [],
+    });
+    coverage["plugins"] = plugins;
+    coverage
+}
+
+fn skipped_source_coverage(plugins: serde_json::Value) -> serde_json::Value {
+    let mut coverage = json!({
+        "schema": "loomweave.classifier-coverage.v1",
+        "source_walk_complete": false,
+        "source_walk_skipped_entries": 1,
+        "plugin_discovery_complete": true,
+        "plugin_discovery_errors": 0,
+        "plugin_discovery_error_samples": [],
+        "plugins": [],
+    });
+    coverage["plugins"] = plugins;
+    coverage
+}
+
+fn plugin_coverage(
+    plugin_id: &str,
+    status: &str,
+    matched_files: u64,
+    degraded_files: u64,
+    classifier_tags: &[&str],
+) -> serde_json::Value {
+    let analyzed_files = if status == "not-applicable" {
+        0
+    } else {
+        matched_files
+    };
+    json!({
+        "plugin_id": plugin_id,
+        "plugin_version": "1.0.0",
+        "ontology_version": "1.0.0",
+        "matched_files": matched_files,
+        "analyzed_files": analyzed_files,
+        "retained_files": 0,
+        "degraded_files": degraded_files,
+        "status": status,
+        "classifier_tags": classifier_tags,
+    })
+}
+
 fn insert_taint_fact(conn: &Connection, entity_id: &str, wardline_json: &str) {
     conn.execute(
         "INSERT INTO wardline_taint_facts (entity_id, wardline_json, updated_at) \
@@ -1093,6 +1184,482 @@ async fn find_by_tag_returns_tagged_entities() {
     let env = call_tool(&state, "find_by_tag", json!({"tag": "integral_writer"})).await;
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
     assert_eq!(env["result"]["entities"][0]["id"], "python:function:a");
+}
+
+#[tokio::test]
+async fn tag_classification_reports_supported_zero_from_active_declared_plugins() {
+    let (project, db, conn) = open_project();
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        coverage(json!([plugin_coverage(
+            "python",
+            "complete",
+            1,
+            0,
+            &["entry-point", "test"]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "entry-point"})).await;
+    assert_eq!(
+        env["result"]["classification"]["schema"], "loomweave.classification.v1",
+        "{env}"
+    );
+    assert_eq!(
+        env["result"]["classification"]["state"], "supported",
+        "{env}"
+    );
+    assert_eq!(env["result"]["classification"]["complete"], true, "{env}");
+    assert_eq!(env["result"]["classification"]["matches"], 0, "{env}");
+    assert_eq!(
+        env["result"]["classification"]["supporting_plugins"],
+        json!(["python"])
+    );
+    assert_eq!(env["result"]["signal"]["available"], true, "{env}");
+    assert_eq!(env["result"]["signal"]["complete"], true, "{env}");
+}
+
+#[tokio::test]
+async fn tag_classification_reports_supported_nonzero() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_tag(&conn, "python:function:a", "test");
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        coverage(json!([plugin_coverage(
+            "python",
+            "complete",
+            1,
+            0,
+            &["test"]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "entity_test_list", json!({})).await;
+    assert_eq!(
+        env["result"]["classification"]["state"], "supported",
+        "{env}"
+    );
+    assert_eq!(env["result"]["classification"]["complete"], true, "{env}");
+    assert_eq!(env["result"]["classification"]["matches"], 1, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], true, "{env}");
+    assert_eq!(env["result"]["signal"]["complete"], true, "{env}");
+}
+
+#[tokio::test]
+async fn tag_classification_separates_partial_support_from_enumeration_completeness() {
+    let (project, db, conn) = open_project();
+    insert_entity(&conn, "python:function:a", "function", "a.py", Some((1, 2)));
+    insert_tag(&conn, "python:function:a", "test");
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        coverage(json!([
+            plugin_coverage("python", "complete", 1, 0, &["test"]),
+            plugin_coverage("rust", "complete", 1, 0, &["entry-point"])
+        ])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "test"})).await;
+    assert_eq!(env["result"]["classification"]["state"], "partial", "{env}");
+    assert_eq!(env["result"]["classification"]["complete"], false, "{env}");
+    assert_eq!(
+        env["result"]["classification"]["supporting_plugins"],
+        json!(["python"])
+    );
+    assert_eq!(
+        env["result"]["classification"]["unsupported_plugins"],
+        json!(["rust"])
+    );
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+}
+
+#[tokio::test]
+async fn tag_classification_is_unavailable_without_current_completed_coverage() {
+    let (project, db, conn) = open_project();
+    insert_classifier_run(
+        &conn,
+        "run-running",
+        "2026-07-12T00:00:00Z",
+        "running",
+        None,
+        coverage(json!([plugin_coverage(
+            "python",
+            "complete",
+            1,
+            0,
+            &["test"]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "test"})).await;
+    assert_eq!(
+        env["result"]["classification"]["state"], "unavailable",
+        "{env}"
+    );
+    assert_eq!(
+        env["result"]["classification"]["run_id"], "run-running",
+        "{env}"
+    );
+    assert_eq!(
+        env["result"]["classification"]["run_status"], "running",
+        "{env}"
+    );
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+}
+
+#[tokio::test]
+async fn tag_classification_ignores_not_applicable_plugins_when_deciding_support() {
+    let (project, db, conn) = open_project();
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        coverage(json!([plugin_coverage(
+            "python",
+            "not-applicable",
+            0,
+            0,
+            &["test"]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "test"})).await;
+    assert_eq!(
+        env["result"]["classification"]["state"], "unavailable",
+        "{env}"
+    );
+    assert!(
+        env["result"]["classification"]["reasons"]
+            .as_array()
+            .unwrap()[0]
+            .as_str()
+            .unwrap()
+            .contains("active"),
+        "{env}"
+    );
+}
+
+#[tokio::test]
+async fn degraded_support_remains_supported_but_incomplete() {
+    let (project, db, conn) = open_project();
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        coverage(json!([plugin_coverage(
+            "python",
+            "degraded",
+            1,
+            1,
+            &["test"]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "test"})).await;
+    assert_eq!(
+        env["result"]["classification"]["state"], "supported",
+        "{env}"
+    );
+    assert_eq!(env["result"]["classification"]["complete"], false, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], true, "{env}");
+    assert_eq!(env["result"]["signal"]["complete"], false, "{env}");
+}
+
+#[tokio::test]
+async fn unsupported_tag_is_declared_unsupported_not_confirmed_empty() {
+    let (project, db, conn) = open_project();
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        coverage(json!([plugin_coverage(
+            "python",
+            "complete",
+            1,
+            0,
+            &["test"]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "find_by_tag", json!({"tag": "http-route"})).await;
+    assert_eq!(
+        env["result"]["classification"]["state"], "unsupported",
+        "{env}"
+    );
+    assert_eq!(env["result"]["classification"]["complete"], false, "{env}");
+    assert_eq!(env["result"]["signal"]["available"], false, "{env}");
+}
+
+#[tokio::test]
+async fn failed_support_and_incomplete_discovery_preserve_support_but_fail_closed() {
+    for coverage in [
+        coverage(json!([plugin_coverage(
+            "python",
+            "failed",
+            1,
+            0,
+            &["test"]
+        )])),
+        incomplete_discovery_coverage(json!([plugin_coverage(
+            "python",
+            "complete",
+            1,
+            0,
+            &["test"]
+        )])),
+    ] {
+        let (project, db, conn) = open_project();
+        insert_classifier_run(
+            &conn,
+            "run-coverage",
+            "2026-07-12T00:00:00Z",
+            "completed",
+            Some("2026-07-12T00:01:00Z"),
+            coverage,
+        );
+        drop(conn);
+        let state = state_for(project.path(), &db);
+
+        let env = call_tool(&state, "find_by_tag", json!({"tag": "test"})).await;
+        assert_eq!(
+            env["result"]["classification"]["state"], "supported",
+            "{env}"
+        );
+        assert_eq!(env["result"]["classification"]["complete"], false, "{env}");
+        assert_eq!(env["result"]["signal"]["available"], true, "{env}");
+        assert_eq!(env["result"]["signal"]["complete"], false, "{env}");
+    }
+}
+
+#[tokio::test]
+async fn clean_discovery_with_skipped_source_walk_fails_completeness_closed() {
+    let (project, db, conn) = open_project();
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        skipped_source_coverage(json!([plugin_coverage(
+            "python",
+            "complete",
+            1,
+            0,
+            &["test"]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let env = call_tool(&state, "entity_test_list", json!({})).await;
+    assert_eq!(
+        env["result"]["classification"]["state"], "supported",
+        "{env}"
+    );
+    assert_eq!(env["result"]["classification"]["complete"], false, "{env}");
+    assert!(
+        env["result"]["classification"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("source walk")),
+        "{env}"
+    );
+}
+
+#[tokio::test]
+async fn every_tag_backed_catalogue_surface_carries_classification_and_signal_completeness() {
+    let (project, db, conn) = open_project();
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        coverage(json!([plugin_coverage(
+            "python",
+            "complete",
+            1,
+            0,
+            &[
+                "cli-command",
+                "data-model",
+                "entry-point",
+                "exported-api",
+                "http-route",
+                "test"
+            ]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    for (tool, tag) in [
+        ("entity_tag_list", "test"),
+        ("entity_entry_point_list", "entry-point"),
+        ("entity_http_route_list", "http-route"),
+        ("entity_exported_api_list", "exported-api"),
+        ("entity_cli_command_list", "cli-command"),
+        ("entity_data_model_list", "data-model"),
+        ("entity_test_list", "test"),
+        ("entity_deprecation_list", "deprecated"),
+        ("entity_todo_list", "todo"),
+    ] {
+        let arguments = if tool == "entity_tag_list" {
+            json!({"tag": tag})
+        } else {
+            json!({})
+        };
+        let env = call_tool(&state, tool, arguments).await;
+        assert_eq!(
+            env["result"]["classification"]["schema"], "loomweave.classification.v1",
+            "{tool}: {env}"
+        );
+        assert_eq!(env["result"]["classification"]["tag"], tag, "{tool}: {env}");
+        assert!(
+            env["result"]["signal"]["available"].is_boolean(),
+            "{tool}: {env}"
+        );
+        assert!(
+            env["result"]["signal"]["complete"].is_boolean(),
+            "{tool}: {env}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn classification_reason_order_is_independent_of_persisted_plugin_order() {
+    let mut observed = Vec::new();
+    for plugins in [
+        json!([
+            plugin_coverage("rust", "degraded", 1, 1, &["test"]),
+            plugin_coverage("python", "degraded", 1, 1, &["test"])
+        ]),
+        json!([
+            plugin_coverage("python", "degraded", 1, 1, &["test"]),
+            plugin_coverage("rust", "degraded", 1, 1, &["test"])
+        ]),
+    ] {
+        let (project, db, conn) = open_project();
+        insert_classifier_run(
+            &conn,
+            "run-coverage",
+            "2026-07-12T00:00:00Z",
+            "completed",
+            Some("2026-07-12T00:01:00Z"),
+            coverage(plugins),
+        );
+        drop(conn);
+        let state = state_for(project.path(), &db);
+        let env = call_tool(&state, "entity_test_list", json!({})).await;
+        observed.push(env["result"]["classification"]["reasons"].clone());
+    }
+    assert_eq!(observed[0], observed[1]);
+}
+
+#[test]
+fn tag_backed_tool_descriptions_advertise_classification_and_completeness() {
+    let tools = list_tools();
+    for name in [
+        "entity_tag_list",
+        "entity_entry_point_list",
+        "entity_http_route_list",
+        "entity_exported_api_list",
+        "entity_cli_command_list",
+        "entity_data_model_list",
+        "entity_test_list",
+        "entity_deprecation_list",
+        "entity_todo_list",
+    ] {
+        let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+        if name == "entity_tag_list" {
+            assert!(
+                tool.description.contains("loomweave.classification.v1"),
+                "{name}"
+            );
+            for contract in ["classification.state", "classification.complete"] {
+                assert!(tool.description.contains(contract), "{name}: {contract}");
+            }
+        } else {
+            assert!(
+                tool.description
+                    .contains("classification per entity_tag_list"),
+                "{name}"
+            );
+        }
+        for contract in ["signal.complete", "supported-empty"] {
+            assert!(tool.description.contains(contract), "{name}: {contract}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn classification_fails_closed_on_nonzero_offset_and_page_truncation() {
+    let (project, db, conn) = open_project();
+    for index in 0..3 {
+        let id = format!("python:function:f{index}");
+        insert_entity(&conn, &id, "function", "a.py", Some((1, 2)));
+        insert_tag(&conn, &id, "test");
+    }
+    insert_classifier_run(
+        &conn,
+        "run-coverage",
+        "2026-07-12T00:00:00Z",
+        "completed",
+        Some("2026-07-12T00:01:00Z"),
+        coverage(json!([plugin_coverage(
+            "python",
+            "complete",
+            1,
+            0,
+            &["test"]
+        )])),
+    );
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    let first = call_tool(&state, "find_by_tag", json!({"tag": "test", "limit": 1})).await;
+    assert_eq!(
+        first["result"]["classification"]["complete"], false,
+        "{first}"
+    );
+    let later = call_tool(&state, "find_by_tag", json!({"tag": "test", "offset": 1})).await;
+    assert_eq!(
+        later["result"]["classification"]["complete"], false,
+        "{later}"
+    );
 }
 
 #[tokio::test]
