@@ -12,21 +12,43 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## 1.4.2 — 2026-07-12
+
+Patch release on top of `1.4.1`. (Cargo SemVer `1.4.2`; Python wheels `1.4.2`.)
+
 ### Fixed
 
 - **Python export rebinding accuracy.** Explicit `__all__` exports now follow
   final statically visible module bindings, so a local function or class later
   replaced by an import, assignment, or other module-scope binding is no longer
   reported as the runtime exported API object.
+- **Python overload export classification.** Recognized `@overload` stubs no
+  longer compete with their implementation for explicit `__all__` exports; the
+  implementation receives `exported-api`, and the module no longer receives the
+  fallback `exported-api` tag.
+- **Python reference-resolution fanout.** Unshadowed built-in names now bypass
+  Pyright definition queries as known-external references, while imported or
+  potentially shadowed names remain position-resolved so rebinding stays
+  correct. This preserves resolved-reference results while bounding
+  language-server query fanout on large typed files.
+- **Unix project-anchor validation.** Phase 3 now accepts project directory
+  basenames containing `:` when validating protected project anchors on Unix.
+- **Partial-analysis subsystem preservation.** Runs with plugin crashes now skip
+  Phase 3 clustering, preserving the prior authoritative subsystem projection
+  instead of reconciling a mixed old/new graph.
 - **Subsystem finding lifecycle preservation.** Before obsolete subsystem
   entities are removed, acknowledged, suppressed, promoted, or Filigree-linked
   findings are re-anchored to the project entity with their former subsystem
   recorded, preventing graph reconciliation from cascading away operator state.
 - **Versioned duplicate-locator evidence.** `LMWV-DUPLICATE-LOCATOR` now
   publishes evidence contract v2 with explicit declaration and collision path
-  keys. The deprecated `first_source_file_path` alias retains its original
-  colliding-path meaning instead of silently changing meaning, while entity
+  keys. The deprecated `first_source_file_path` alias preserves the first
+  declaration path instead of the colliding path, while entity
   collision reads remain compatible with unversioned findings already stored.
+- **Rust public re-export reachability.** Targets of uniquely resolved,
+  externally visible `pub use` edges now seed dead-code reachability; test-only
+  re-exports remain excluded from `app_only`. Rust ontology `0.8.0` invalidates
+  cached extraction values so unchanged files gain the new edge provenance.
 - **Rust dead-code lint scope.** `#[allow(dead_code)]` and
   `#[expect(dead_code)]` now propagate through inline modules and impl blocks,
   while nested `warn` / `deny` / `forbid` levels correctly cancel inherited
@@ -47,6 +69,9 @@ only when an incompatible change is made to that surface. See
   anchored edges and unresolved call sites owned by vanished source files,
   while retaining cumulative entity rows long enough to preserve deletion
   findings and SEI lineage.
+- **Fail-closed source metadata integrity checks.** Index integrity checks now
+  treat only `NotFound` as a vanished source; other filesystem metadata errors
+  propagate and prevent repair from deleting uncertain file entities.
 - **Stable incremental subsystem materialization.** Phase 3 now reconciles the
   persisted subsystem graph to each run's authoritative clustering result,
   preserving stable subsystem IDs while removing obsolete subsystem entities
@@ -1374,7 +1399,7 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...HEAD
 [1.2.1]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/foundryside-dev/loomweave/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/foundryside-dev/loomweave/compare/v1.0.1...v1.1.0

@@ -19,13 +19,13 @@ anyhow.workspace = true
 axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
-loomweave-core = { path = "../loomweave-core", version = "1.4.1" }
-loomweave-llm = { path = "../loomweave-llm", version = "1.4.1" }
-loomweave-analysis = { path = "../loomweave-analysis", version = "1.4.1" }
-loomweave-federation = { path = "../loomweave-federation", version = "1.4.1" }
-loomweave-mcp = { path = "../loomweave-mcp", version = "1.4.1" }
-loomweave-scanner = { path = "../loomweave-scanner", version = "1.4.1" }
-loomweave-storage = { path = "../loomweave-storage", version = "1.4.1" }
+loomweave-core = { path = "../loomweave-core", version = "1.4.2" }
+loomweave-llm = { path = "../loomweave-llm", version = "1.4.2" }
+loomweave-analysis = { path = "../loomweave-analysis", version = "1.4.2" }
+loomweave-federation = { path = "../loomweave-federation", version = "1.4.2" }
+loomweave-mcp = { path = "../loomweave-mcp", version = "1.4.2" }
+loomweave-scanner = { path = "../loomweave-scanner", version = "1.4.2" }
+loomweave-storage = { path = "../loomweave-storage", version = "1.4.2" }
 dotenvy.workspace = true
 fs2.workspace = true
 hmac.workspace = true

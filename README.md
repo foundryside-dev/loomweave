@@ -117,9 +117,10 @@ pipx install ./plugins/python
 pipx install ./packaging/rust-plugin-dist
 ```
 
-The `loomweave` PyPI package depends on both
-`loomweave-plugin-python==1.2.1` and `loomweave-plugin-rust==1.2.1`; a single
-Python install lands the CLI and both plugin executables in the same environment.
+The `loomweave` package metadata in this checkout depends on both
+`loomweave-plugin-python==1.4.2` and `loomweave-plugin-rust==1.4.2`; installing
+that local package lands the CLI and both plugin executables in the same
+environment.
 
 `loomweave install` is the one-step agent setup path: it initialises `.weft/loomweave/`,
 installs the `loomweave-workflow` skill for Claude Code and Codex, writes Claude
