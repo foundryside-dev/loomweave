@@ -162,11 +162,10 @@ impl DuplicateLocatorGuard {
             "colliding_source_file_path".to_owned(),
             second_path.to_owned(),
         );
-        // Compatibility alias: before the entity-anchor change, downstream
-        // readers used this key for the planted colliding declaration. Restore
-        // that meaning for the deprecation window; new readers must use the two
-        // explicit path keys above.
-        metadata.insert("first_source_file_path".to_owned(), second_path.to_owned());
+        // Compatibility alias: retain the pre-v2 first-declaration meaning for
+        // older readers during the deprecation window. New readers must use the
+        // two explicit path keys above.
+        metadata.insert("first_source_file_path".to_owned(), first_path.to_owned());
         metadata.insert(
             "first_source_file_path_deprecated".to_owned(),
             "use declaration_source_file_path and colliding_source_file_path".to_owned(),
@@ -290,8 +289,8 @@ mod tests {
                 .metadata
                 .get("first_source_file_path")
                 .map(String::as_str),
-            Some("b.rs"),
-            "deprecated v1 alias retains its original colliding-path meaning"
+            Some("a.rs"),
+            "deprecated v1 alias retains its original first-declaration meaning"
         );
         assert_eq!(
             finding

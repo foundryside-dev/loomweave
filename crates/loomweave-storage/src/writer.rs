@@ -858,9 +858,7 @@ fn enforce_entity_kind_contract(entity: &EntityRecord) -> Result<()> {
 }
 
 fn validate_protected_finding_anchor(entity: &EntityRecord) -> Result<()> {
-    let canonical_id = loomweave_core::entity_id::entity_id("core", "project", &entity.name)
-        .ok()
-        .is_some_and(|id| id.as_str() == entity.id);
+    let canonical_id = entity.id.strip_prefix("core:project:") == Some(entity.name.as_str());
     let properties = serde_json::from_str::<serde_json::Value>(&entity.properties_json).ok();
     let has_anchor_marker = properties
         .as_ref()

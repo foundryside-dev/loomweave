@@ -2254,6 +2254,30 @@ __all__ = ["exported"]
     assert "tags" not in module or "exported-api" not in module["tags"]
 
 
+def test_direct_implementation_after_module_overloads_is_local_export() -> None:
+    source = """\
+from typing import overload
+
+@overload
+def exported(value: int) -> int: ...
+
+@overload
+def exported(value: str) -> str: ...
+
+def exported(value: object) -> object:
+    return value
+
+
+__all__ = ["exported"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported"]["tags"]
+    module = by_id["python:module:api"]
+    assert "tags" not in module or "exported-api" not in module["tags"]
+
+
 def test_definition_annotation_rebinding_displaces_local_export() -> None:
     source = """\
 def exported_fn():

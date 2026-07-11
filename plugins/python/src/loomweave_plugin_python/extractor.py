@@ -1412,6 +1412,10 @@ def _module_level_exportable_names(tree: ast.Module) -> set[str]:
         )
         for name in direct_rebindings | potential_expression_rebindings | potential_rebindings:
             local_entities.pop(name, None)
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            _has_overload_decorator(statement)
+        ):
+            continue
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             count = definition_counts.get(statement.name, 0) + 1
             definition_counts[statement.name] = count

@@ -257,8 +257,8 @@ fn in_run_cross_file_duplicate_names_both_paths() {
         "v2 names the colliding declaration explicitly: {metadata}"
     );
     assert_eq!(
-        metadata["first_source_file_path"], metadata["colliding_source_file_path"],
-        "deprecated alias retains the pre-v11 colliding-path meaning"
+        metadata["first_source_file_path"], metadata["declaration_source_file_path"],
+        "deprecated alias retains the pre-v2 first-declaration meaning"
     );
 }
 

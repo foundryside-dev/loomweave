@@ -3142,6 +3142,40 @@ async fn reconcile_subsystem_graph_preserves_operator_managed_findings() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_subsystem_graph_accepts_colon_in_project_anchor_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path, 50, 256).unwrap();
+    let tx = writer.sender();
+
+    begin_demo_run(&tx, "run-colon-project-anchor").await;
+    let reconcile_outcome =
+        send::<SubsystemReconcileOutcome>(&tx, |ack| WriterCmd::ReconcileSubsystemGraph {
+            subsystem_ids: vec![],
+            memberships: vec![],
+            protected_finding_anchor: Box::new(make_project_entity("core:project:valid:name")),
+            ack,
+        })
+        .await
+        .unwrap();
+    assert!(!reconcile_outcome.protected_finding_anchor_present);
+    assert!(!reconcile_outcome.protected_finding_anchor_materialized);
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-colon-project-anchor".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replace_edges_for_source_file_removes_unresolved_call_sites() {
     let dir = tempfile::tempdir().unwrap();
     let path = prepared_db(&dir);
