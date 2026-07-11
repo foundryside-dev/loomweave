@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::classifier_coverage::{MAX_CLASSIFIER_TAGS, classifier_tag_is_valid};
 use crate::entity_id::validate_kind_grammar;
 
 // ── Reserved lists (ADR-022) ──────────────────────────────────────────────────
@@ -274,6 +275,11 @@ pub struct Ontology {
     /// WP6 includes this in the cache key (ADR-007).
     pub ontology_version: String,
 
+    /// Static tag classifiers implemented by this plugin. Missing declarations
+    /// mean support is unknown; declarations do not create entity-tag rows.
+    #[serde(default)]
+    pub classifier_tags: Vec<String>,
+
     /// Optional plugin-owned semantic roles for entity kinds. Roles let the core
     /// ask "which declared kinds are file scopes/callables/degraded parse
     /// anchors?" without hardcoding language-specific kind names.
@@ -361,7 +367,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError> {
     let text = std::str::from_utf8(bytes).map_err(|e| ManifestError::Malformed {
         message: format!("manifest is not valid UTF-8: {e}"),
     })?;
-    let manifest: Manifest = toml::from_str(text).map_err(|e| ManifestError::Malformed {
+    let mut manifest: Manifest = toml::from_str(text).map_err(|e| ManifestError::Malformed {
         message: e.to_string(),
     })?;
 
@@ -454,6 +460,20 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError> {
         validate_kind_string("edge_kinds", kind)?;
     }
 
+    if manifest.ontology.classifier_tags.len() > MAX_CLASSIFIER_TAGS {
+        return Err(ManifestError::Malformed {
+            message: format!(
+                "[ontology].classifier_tags has {} entries; maximum is {MAX_CLASSIFIER_TAGS}",
+                manifest.ontology.classifier_tags.len(),
+            ),
+        });
+    }
+    for tag in &manifest.ontology.classifier_tags {
+        validate_classifier_tag(tag)?;
+    }
+    manifest.ontology.classifier_tags.sort();
+    manifest.ontology.classifier_tags.dedup();
+
     // 5. rule_id_prefix grammar then reserved check.
     validate_rule_id_prefix_grammar(&manifest.ontology.rule_id_prefix)?;
     if RESERVED_RULE_ID_PREFIXES
@@ -485,6 +505,17 @@ fn validate_kind_string(field: &'static str, value: &str) -> Result<(), Manifest
         return Err(ManifestError::GrammarViolation {
             field,
             value: value.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate lowercase kebab case: `[a-z][a-z0-9]*(?:-[a-z0-9]+)*`.
+fn validate_classifier_tag(tag: &str) -> Result<(), ManifestError> {
+    if !classifier_tag_is_valid(tag) {
+        return Err(ManifestError::GrammarViolation {
+            field: "classifier_tags",
+            value: tag.to_owned(),
         });
     }
     Ok(())
@@ -603,6 +634,7 @@ entity_kinds = ["function", "class", "module", "decorator"]
 edge_kinds = ["imports", "calls", "decorates", "contains"]
 rule_id_prefix = "LMWV-PY-"
 ontology_version = "0.1.0"
+classifier_tags = ["http-route", "entry-point", "http-route"]
 
 [ontology.roles]
 file_scope = ["module"]
@@ -694,6 +726,10 @@ syntax_degraded_module = ["module"]
         );
         assert_eq!(manifest.ontology.rule_id_prefix, "LMWV-PY-");
         assert_eq!(manifest.ontology.ontology_version, "0.1.0");
+        assert_eq!(
+            manifest.ontology.classifier_tags,
+            vec!["entry-point", "http-route"]
+        );
         assert_eq!(manifest.ontology.roles.file_scope, vec!["module"]);
         assert_eq!(
             manifest.ontology.roles.callable,
@@ -712,6 +748,67 @@ syntax_degraded_module = ["module"]
             !manifest
                 .ontology
                 .kind_has_role("class", OntologyEntityRole::Callable)
+        );
+    }
+
+    #[test]
+    fn classifier_tags_default_empty_for_legacy_manifest() {
+        let manifest = parse_manifest(manifest_without("classifier_tags").as_bytes()).unwrap();
+
+        assert!(manifest.ontology.classifier_tags.is_empty());
+    }
+
+    #[test]
+    fn classifier_tags_reject_values_outside_lowercase_kebab_case() {
+        for invalid in [
+            "HTTP_ROUTE",
+            "http_route",
+            "1http-route",
+            "http--route",
+            "http-route-",
+        ] {
+            let toml = manifest_with(&format!(r#"classifier_tags = ["{invalid}"]"#));
+            let error = parse_manifest(toml.as_bytes()).unwrap_err();
+            assert!(
+                matches!(error, ManifestError::GrammarViolation {
+                    field: "classifier_tags",
+                    ref value,
+                } if value == invalid),
+                "unexpected error for {invalid:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_tags_reject_more_than_the_bounded_count() {
+        let tags = (0..=MAX_CLASSIFIER_TAGS)
+            .map(|index| format!(r#""tag-{index}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml = manifest_with(&format!("classifier_tags = [{tags}]"));
+
+        let error = parse_manifest(toml.as_bytes()).unwrap_err();
+
+        assert!(
+            matches!(error, ManifestError::Malformed { ref message }
+                if message.contains("classifier_tags") && message.contains("maximum")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn classifier_tags_reject_strings_above_the_length_bound() {
+        let invalid = "a".repeat(crate::classifier_coverage::MAX_CLASSIFIER_TAG_LEN + 1);
+        let toml = manifest_with(&format!(r#"classifier_tags = ["{invalid}"]"#));
+
+        let error = parse_manifest(toml.as_bytes()).unwrap_err();
+
+        assert!(
+            matches!(error, ManifestError::GrammarViolation {
+                field: "classifier_tags",
+                ref value,
+            } if value == &invalid),
+            "unexpected error: {error:?}"
         );
     }
 

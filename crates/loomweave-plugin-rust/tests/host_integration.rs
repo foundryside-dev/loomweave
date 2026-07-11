@@ -188,6 +188,11 @@ fn handshake_analyze_shutdown_roundtrip() {
 
     let (_binary_stage, exec) = staged_rust_plugin();
     let (mut host, mut child) = spawn_with_etxtbsy_retry(&manifest, &project_root, &exec);
+    assert_eq!(
+        host.ontology_version(),
+        Some("0.9.0"),
+        "initialize response must stay in ontology lockstep with plugin.toml"
+    );
 
     let outcome = host
         .analyze_file(&sample_path)

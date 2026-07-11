@@ -26,5 +26,28 @@ mod manifest_tests {
         assert_eq!(m.plugin.plugin_id, "rust");
         assert_eq!(m.plugin.language, "rust");
         assert!(m.ontology.entity_kinds.contains(&"struct".to_owned()));
+        assert_eq!(m.ontology.ontology_version, "0.9.0");
+        assert_eq!(
+            m.ontology.classifier_tags,
+            vec![
+                "allow-dead-code",
+                "cli-command",
+                "entry-point",
+                "exported-api",
+                "framework-handler",
+                "http-route",
+                "test",
+            ]
+        );
+    }
+
+    #[test]
+    fn packaged_manifest_is_byte_identical_to_the_canonical_manifest() {
+        let canonical = include_bytes!("../plugin.toml");
+        let packaged = include_bytes!(
+            "../../../packaging/rust-plugin-dist/wheel-data/data/share/loomweave/plugins/rust/plugin.toml"
+        );
+
+        assert_eq!(canonical, packaged);
     }
 }

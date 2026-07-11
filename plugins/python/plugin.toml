@@ -53,13 +53,26 @@ rule_id_prefix = "LMWV-PY-"
 # adds module-level `exported-api` for explicit `__all__` re-export/imported-name
 # surfaces without double-counting local function/class exports, including
 # literal `__all__ += [...]` extensions; 0.11.0 adds manual main-guard,
-# runner-wrapper, `sys.argv`, and argparse `cli-command` tagging. NOTE:
+# runner-wrapper, `sys.argv`, and argparse `cli-command` tagging; 0.12.0
+# declares the complete static classifier set so supported-empty results are
+# distinguishable from unsupported classifiers and forces unchanged files to
+# re-dispatch. Classifier declarations do not create entity-tag rows. NOTE:
 # ADR-007's summary-cache key is the 5-tuple (entity_id, content_hash,
 # prompt_template_id, model_tier, guidance_fingerprint) — ontology_version is
 # handshake-validation, NOT a cache-key component. New edge rows miss the
 # cache by component-1 of the 5-tuple organically (no edges live in the
 # 5-tuple yet anyway).
-ontology_version = "0.11.0"
+ontology_version = "0.12.0"
+classifier_tags = [
+    "cli-command",
+    "data-model",
+    "entry-point",
+    "exported-api",
+    "framework-handler",
+    "http-route",
+    "public-surface",
+    "test",
+]
 
 [integrations.wardline]
 expected_descriptor_version = "wardline-generic-2"

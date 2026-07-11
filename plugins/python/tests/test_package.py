@@ -47,7 +47,17 @@ def test_manifest_declares_current_v1_ontology_only() -> None:
     assert manifest["integrations"]["wardline"]["expected_descriptor_version"] == (
         EXPECTED_DESCRIPTOR_VERSION
     )
-    assert manifest["ontology"]["ontology_version"] == "0.11.0"
+    assert manifest["ontology"]["ontology_version"] == "0.12.0"
+    assert manifest["ontology"]["classifier_tags"] == [
+        "cli-command",
+        "data-model",
+        "entry-point",
+        "exported-api",
+        "framework-handler",
+        "http-route",
+        "public-surface",
+        "test",
+    ]
     assert manifest["ontology"]["entity_kinds"] == ["function", "class", "module"]
     assert manifest["ontology"]["edge_kinds"] == [
         "contains",

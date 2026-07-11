@@ -73,8 +73,20 @@ rule_id_prefix = "LMWV-RUST-"
 # 0.8.2: classify compound cfg predicates that prove an item cannot exist when
 # `test=false` (ADR-054 increment 5 — ADR-027 PATCH). Unchanged Rust files must
 # re-dispatch to acquire the corrected `test` tags.
+# 0.9.0: declare the complete static classifier set so supported-empty results
+# are distinguishable from unsupported classifiers. Declarations do not create
+# entity-tag rows. The MINOR bump forces unchanged files to re-dispatch.
 # Lockstep with the `serve.rs` handshake constant.
-ontology_version = "0.8.2"
+ontology_version = "0.9.0"
+classifier_tags = [
+    "allow-dead-code",
+    "cli-command",
+    "entry-point",
+    "exported-api",
+    "framework-handler",
+    "http-route",
+    "test",
+]
 
 [ontology.roles]
 file_scope = ["module"]

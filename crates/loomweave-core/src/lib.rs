@@ -6,6 +6,7 @@
 //! root. Implementation types (`Frame`, `TransportError`, `RequestEnvelope`, etc.)
 //! remain accessible via `loomweave_core::plugin::transport::*` and siblings.
 
+pub mod classifier_coverage;
 pub mod entity_id;
 pub mod errors;
 pub mod hardened_git;
@@ -13,6 +14,10 @@ pub mod ontology;
 pub mod plugin;
 pub mod store;
 
+pub use classifier_coverage::{
+    CLASSIFIER_COVERAGE_SCHEMA, ClassifierCoverage, ClassifierCoverageError,
+    PluginClassifierCoverage, PluginClassifierCoverageInput, PluginCoverageStatus,
+};
 pub use entity_id::{EntityId, EntityIdError, entity_id};
 pub use errors::{HttpErrorCode, McpErrorCode};
 pub use hardened_git::{hardened_git_command, list_untracked_files};
