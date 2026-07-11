@@ -692,3 +692,66 @@ fn analyze_persists_completed_file_batches_when_plugin_later_crashes() {
         "the completed file's module must remain durable after the next file crashes"
     );
 }
+
+#[test]
+fn analyze_partial_plugin_crash_preserves_prior_subsystem_projection() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_partial_crash_plugin(plugin_dir.path());
+
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("first.part"), b"first\n").expect("write first.part");
+    std::fs::write(project_dir.path().join("second.part"), b"second\n").expect("write second.part");
+
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
+             created_at, updated_at) VALUES (?1, 'core', 'subsystem', 'Prior', \
+             'prior', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            ["core:subsystem:prior"],
+        )
+        .expect("seed prior subsystem projection");
+    }
+
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .failure();
+
+    let conn = Connection::open(&db_path).unwrap();
+    let subsystem_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = 'core:subsystem:prior'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query prior subsystem");
+    assert_eq!(
+        subsystem_count, 1,
+        "a partial run must not replace the prior authoritative subsystem projection"
+    );
+
+    let stats_raw: String = conn
+        .query_row(
+            "SELECT stats FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query failed run stats");
+    let stats: serde_json::Value = serde_json::from_str(&stats_raw).expect("parse run stats");
+    assert!(
+        stats["clustering"].is_null(),
+        "a partial run must not derive clustering from a mixed old/new graph: {stats}"
+    );
+}

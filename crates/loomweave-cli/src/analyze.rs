@@ -1463,9 +1463,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     }
 
     progress.phase("clustering", None, None);
-    let phase3_output = if matches!(run_outcome, RunOutcome::HardFailed { .. }) {
-        Phase3Output::not_run()
-    } else {
+    let phase3_output = if matches!(run_outcome, RunOutcome::Completed) {
         match run_phase3_clustering(
             &writer,
             &db_path,
@@ -1497,6 +1495,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 Phase3Output::not_run()
             }
         }
+    } else {
+        Phase3Output::not_run()
     };
 
     // Phase 8 (WP9-B): emit findings to Filigree for non-hard-failed runs,
