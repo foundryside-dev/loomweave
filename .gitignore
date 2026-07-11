@@ -64,6 +64,7 @@ CLAUDE.md
 
 # Developer config / local tooling — not part of the solution
 .agents/
+/.worktrees/
 
 # Local tool/federation config — not part of the solution
 .mcp.json
