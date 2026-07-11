@@ -12,12 +12,88 @@ use loomweave_storage::{
     SeiLookupResult, StorageError, is_reserved_sei, resolve_locator, resolve_sei, sei_lineage,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::errors::json_read_error;
 use super::{AppState, json_error};
 
 /// Max locators in one `resolve:batch` request (mirrors `BATCH_MAX_QUERIES`).
 pub(crate) const IDENTITY_BATCH_MAX: usize = 256;
+
+/// Closed failure vocabulary for the producer reference ownership check.
+/// Consumers run the equivalent check before issuing catalogue SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnershipValidationError {
+    MalformedLocalInstanceId,
+    MalformedCapabilityOwnership,
+    MalformedIdentityOwnership,
+    CapabilityApiVersionMismatch,
+    IdentityApiVersionMismatch,
+    CapabilityInstanceMismatch,
+    IdentityInstanceMismatch,
+}
+
+/// Reference implementation of the project-ownership join guard.
+///
+/// Both the unauthenticated capability probe and the protected identity body
+/// must identify this API version and the caller's local project instance.
+/// This helper inspects only response JSON and never opens the catalogue.
+pub(crate) fn validate_response_ownership(
+    local_instance_id: &str,
+    capability_body: &serde_json::Value,
+    identity_body: &serde_json::Value,
+) -> std::result::Result<(), OwnershipValidationError> {
+    let local = Uuid::parse_str(local_instance_id)
+        .map_err(|_| OwnershipValidationError::MalformedLocalInstanceId)?;
+    let (capability_api, capability_instance) = response_ownership(capability_body)
+        .ok_or(OwnershipValidationError::MalformedCapabilityOwnership)?;
+    let (identity_api, identity_instance) = response_ownership(identity_body)
+        .ok_or(OwnershipValidationError::MalformedIdentityOwnership)?;
+
+    if capability_api != super::HTTP_API_VERSION {
+        return Err(OwnershipValidationError::CapabilityApiVersionMismatch);
+    }
+    if identity_api != super::HTTP_API_VERSION {
+        return Err(OwnershipValidationError::IdentityApiVersionMismatch);
+    }
+    if capability_instance != local {
+        return Err(OwnershipValidationError::CapabilityInstanceMismatch);
+    }
+    if identity_instance != local {
+        return Err(OwnershipValidationError::IdentityInstanceMismatch);
+    }
+    Ok(())
+}
+
+fn response_ownership(body: &serde_json::Value) -> Option<(u8, Uuid)> {
+    let api_version = u8::try_from(body.get("api_version")?.as_u64()?).ok()?;
+    let instance_id = Uuid::parse_str(body.get("instance_id")?.as_str()?).ok()?;
+    Some((api_version, instance_id))
+}
+
+fn owned_identity_body(state: &AppState, payload: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut object) = payload else {
+        panic!("identity response payloads are JSON objects");
+    };
+    object.insert(
+        "api_version".to_owned(),
+        serde_json::Value::from(super::HTTP_API_VERSION),
+    );
+    object.insert(
+        "instance_id".to_owned(),
+        serde_json::Value::String(state.instance_id.to_string()),
+    );
+    let body = serde_json::Value::Object(object);
+    let capability_ownership = serde_json::json!({
+        "api_version": super::HTTP_API_VERSION,
+        "instance_id": state.instance_id,
+    });
+    debug_assert_eq!(
+        validate_response_ownership(&state.instance_id.to_string(), &capability_ownership, &body,),
+        Ok(())
+    );
+    body
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,15 +166,27 @@ pub(crate) async fn post_identity_resolve(
     match result {
         Ok(Some(record)) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "sei": record.sei,
-                "current_locator": record.current_locator,
-                "content_hash": record.content_hash,
-                "alive": true,
-            })),
+            Json(owned_identity_body(
+                &state,
+                serde_json::json!({
+                    "sei": record.sei,
+                    "current_locator": record.current_locator,
+                    "content_hash": record.content_hash,
+                    "alive": true,
+                }),
+            )),
         )
             .into_response(),
-        Ok(None) => (StatusCode::OK, Json(serde_json::json!({ "alive": false }))).into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(owned_identity_body(
+                &state,
+                serde_json::json!({
+                    "alive": false,
+                }),
+            )),
+        )
+            .into_response(),
         Err(err) => json_read_error(&err),
     }
 }
@@ -157,11 +245,14 @@ pub(crate) async fn post_identity_resolve_batch(
     match result {
         Ok((resolved, invalid, not_found)) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "resolved": resolved,
-                "invalid": invalid,
-                "not_found": not_found,
-            })),
+            Json(owned_identity_body(
+                &state,
+                serde_json::json!({
+                    "resolved": resolved,
+                    "invalid": invalid,
+                    "not_found": not_found,
+                }),
+            )),
         )
             .into_response(),
         Err(err) => json_read_error(&err),
@@ -180,21 +271,27 @@ pub(crate) async fn get_identity_sei(
     match result {
         Ok(SeiLookupResult::Alive(record)) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "sei": sei,
-                "current_locator": record.current_locator,
-                "content_hash": record.content_hash,
-                "alive": true,
-            })),
+            Json(owned_identity_body(
+                &state,
+                serde_json::json!({
+                    "sei": sei,
+                    "current_locator": record.current_locator,
+                    "content_hash": record.content_hash,
+                    "alive": true,
+                }),
+            )),
         )
             .into_response(),
         Ok(SeiLookupResult::NotAlive { lineage }) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "sei": sei,
-                "alive": false,
-                "lineage": lineage_rows_to_body(lineage),
-            })),
+            Json(owned_identity_body(
+                &state,
+                serde_json::json!({
+                    "sei": sei,
+                    "alive": false,
+                    "lineage": lineage_rows_to_body(lineage),
+                }),
+            )),
         )
             .into_response(),
         Err(err) => json_read_error(&err),
@@ -213,10 +310,13 @@ pub(crate) async fn get_identity_lineage(
     match result {
         Ok(rows) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "sei": sei,
-                "lineage": lineage_rows_to_body(rows),
-            })),
+            Json(owned_identity_body(
+                &state,
+                serde_json::json!({
+                    "sei": sei,
+                    "lineage": lineage_rows_to_body(rows),
+                }),
+            )),
         )
             .into_response(),
         Err(err) => json_read_error(&err),
@@ -249,5 +349,54 @@ mod tests {
         assert!(validate_locator("python:function:auth.tokens.refresh").is_ok());
         // A qualname containing colons is fine (splitn(3) keeps the tail intact).
         assert!(validate_locator("python:function:a.b::c").is_ok());
+    }
+
+    #[test]
+    fn ownership_validator_accepts_only_capability_and_response_for_local_project() {
+        let local = "9bd7234e-6d44-4a38-9ae4-76f912a10221";
+        let matching = serde_json::json!({
+            "api_version": 1,
+            "instance_id": local,
+        });
+        assert_eq!(
+            validate_response_ownership(local, &matching, &matching),
+            Ok(())
+        );
+
+        let other = serde_json::json!({
+            "api_version": 1,
+            "instance_id": "00000000-0000-4000-8000-000000000099",
+        });
+        assert_eq!(
+            validate_response_ownership(local, &matching, &other),
+            Err(OwnershipValidationError::IdentityInstanceMismatch)
+        );
+        assert_eq!(
+            validate_response_ownership(local, &other, &matching),
+            Err(OwnershipValidationError::CapabilityInstanceMismatch)
+        );
+    }
+
+    #[test]
+    fn ownership_validator_rejects_malformed_or_wrong_api_ownership() {
+        let local = "9bd7234e-6d44-4a38-9ae4-76f912a10221";
+        let valid = serde_json::json!({"api_version": 1, "instance_id": local});
+        let malformed = serde_json::json!({"api_version": "1", "instance_id": local});
+        assert_eq!(
+            validate_response_ownership(local, &malformed, &valid),
+            Err(OwnershipValidationError::MalformedCapabilityOwnership)
+        );
+
+        let wrong_api = serde_json::json!({"api_version": 2, "instance_id": local});
+        assert_eq!(
+            validate_response_ownership(local, &valid, &wrong_api),
+            Err(OwnershipValidationError::IdentityApiVersionMismatch)
+        );
+
+        let malformed_uuid = serde_json::json!({"api_version": 1, "instance_id": "not-a-uuid"});
+        assert_eq!(
+            validate_response_ownership(local, &malformed_uuid, &valid),
+            Err(OwnershipValidationError::MalformedCapabilityOwnership)
+        );
     }
 }

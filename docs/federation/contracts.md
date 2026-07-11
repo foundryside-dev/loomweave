@@ -126,6 +126,21 @@ pool; its read paths still use the reader pool.
 
 ### Authentication
 
+Loomweave's server-side secret pointers are
+`serve.http.identity_token_env` (HMAC) and `serve.http.token_env` (bearer;
+default `WEFT_TOKEN`). The canonical consumer-side pointer variables are
+`WEFT_LOOMWEAVE_IDENTITY_TOKEN_ENV` and `WEFT_LOOMWEAVE_TOKEN_ENV`; their
+default target names are `WEFT_IDENTITY_SECRET` and `WEFT_TOKEN`, respectively.
+A pointer contains an environment-variable **name**, never the credential. On
+the consumer side, a blank pointer falls back to its default target name and a
+blank resolved credential is absent. On the Loomweave server,
+`identity_token_env` is an explicit commitment: when configured, a missing or
+blank resolved HMAC secret hard-fails startup with
+`LMWV-CONFIG-HTTP-IDENTITY-MISSING`, including on loopback. A missing or blank
+bearer value is unauthenticated only on loopback; a non-loopback bind then
+hard-fails with `LMWV-CONFIG-HTTP-NO-AUTH`. HMAC takes precedence when both
+credentials are present.
+
 The `/api/v1/files`-family endpoints require
 `X-Weft-Component: loomweave:<hmac>`, `X-Weft-Timestamp: <unix-seconds>`, and
 `X-Weft-Nonce: <opaque-nonce>` when Loomweave has resolved
@@ -133,17 +148,21 @@ The `/api/v1/files`-family endpoints require
 HMAC-SHA256 over the canonical message:
 
 ```text
-<METHOD>
-<PATH_AND_QUERY>
-<SHA256_HEX_OF_REQUEST_BODY>
+<UPPERCASE_METHOD>
+<EXACT_PATH_AND_QUERY>
+<LOWERCASE_SHA256_HEX_OF_EXACT_REQUEST_BODY_BYTES>
 <X_WEFT_TIMESTAMP>
 <X_WEFT_NONCE>
 ```
 
-Loomweave accepts timestamps within a five-minute skew window and rejects nonce
+There is no trailing newline. The method is normalized to uppercase; path and
+query retain their transmitted ordering and encoding; the digest covers the
+same body bytes that are sent. Loomweave accepts timestamps within an inclusive
+five-minute skew window (`now - 300` through `now + 300`) and rejects nonce
 reuse inside that same process-local window. Nonces are scoped to one Loomweave
 server process and one shared secret; clients should use high-entropy unique
-nonces for every signed request. Replays, stale timestamps, missing freshness
+nonces for every signed request. A poisoned replay-cache lock fails closed.
+Replays, stale timestamps, missing freshness
 headers, malformed freshness headers, and wrong signatures all return the same
 `401 UNAUTHENTICATED` envelope.
 
@@ -151,6 +170,14 @@ headers, malformed freshness headers, and wrong signatures all return the same
 API surface pre-auth. Loomweave still accepts the older
 `Authorization: Bearer <token>` path when `token_env` resolves and
 `identity_token_env` is not configured.
+
+Auth header parsing is exact. Bearer scheme/case and the single separator are
+literal; blank or padded bearer forms are rejected. `X-Weft-Component` must be
+exactly `loomweave:` followed by 64 lowercase hexadecimal characters.
+`X-Weft-Timestamp` is canonical decimal Unix seconds with no sign, leading
+zeroes, or padding. The nonce is not trimmed or canonicalized: its exact parsed
+header-value bytes are signed and used as the replay-cache key (an empty,
+whitespace-only, or over-128-byte nonce is invalid).
 
 Trust matrix (enforced by `HttpReadConfig::validate_auth_trust` at
 startup, before binding):
@@ -177,7 +204,11 @@ Content-Type: application/json
 Secret comparison is constant-time so a wrong-length client cannot distinguish
 "header absent" from "secret mismatch" via timing. The secret itself is never
 logged; the bind-time log line records `auth=hmac`, `auth=bearer`, or
-`auth=none`, not the secret value.
+`auth=none`, not the secret value. Request logging scrubs `Authorization`,
+`X-Weft-Component`, `X-Weft-Timestamp`, and `X-Weft-Nonce`; only the non-secret
+component kind `loomweave` may be recorded.
+Malformed `X-Weft-Component` values contribute no structured log field; caller
+text is never copied into the log context.
 
 All non-2xx responses use this closed JSON error envelope:
 
@@ -540,6 +571,11 @@ Successful response:
 {
   "api_version": 1,
   "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
+  "authentication": {
+    "protected_routes": "none",
+    "capabilities_probe": "none",
+    "contract_version": 1
+  },
   "registry_backend": true,
   "file_registry": true,
   "linkages": {
@@ -554,6 +590,13 @@ Successful response:
   }
 }
 ```
+
+`authentication.protected_routes` is exactly `none`, `bearer`, or `hmac` for
+the effective serving mode. `authentication.capabilities_probe` is always
+`none`, so clients never attach credentials to this probe. `contract_version`
+is `1`. The object never contains environment-variable names, credential
+values, signatures, timestamps, or nonces. HMAC mode wins when both HMAC and
+bearer secrets resolve.
 
 Filigree should treat `registry_backend: true` as the flag that the
 `/api/v1/files` resolution surface is present.
@@ -583,9 +626,11 @@ semver. It increments only for incompatible changes to the wire contract
 consumed by existing Filigree clients.
 
 `instance_id` is the stable per-project Loomweave instance fingerprint persisted
-in `.weft/loomweave/instance_id`. Filigree should treat a changed `instance_id` for a
-previously known endpoint as evidence that it is now talking to a different
-Loomweave project instance.
+in `.weft/loomweave/instance_id`. A consumer must treat a changed `instance_id`
+for a previously known endpoint as evidence that it is now talking to a
+different Loomweave project instance. Capability ownership is not sufficient
+for a later local-catalogue join: every identity success body repeats
+`api_version` and `instance_id`, and both must be rechecked before SQL.
 
 The contract fixture at
 [`fixtures/get-api-v1-capabilities.json`](./fixtures/get-api-v1-capabilities.json)
@@ -612,10 +657,12 @@ Resolve a locator to its alive SEI. Request: `{ "locator": "python:function:auth
 Successful response (`200 OK`):
 
 ```json
-{ "sei": "loomweave:eid:<hex>", "current_locator": "python:function:auth.tokens.refresh", "content_hash": "<blake3>", "alive": true }
+{ "api_version": 1, "instance_id": "<uuid>", "sei": "loomweave:eid:<hex>", "current_locator": "python:function:auth.tokens.refresh", "content_hash": "<blake3>", "alive": true }
 ```
 
-When the locator resolves to nothing alive: `{ "alive": false }` (still `200`).
+When the locator resolves to nothing alive:
+`{ "api_version": 1, "instance_id": "<uuid>", "alive": false }` (still
+`200`).
 
 **Fail-closed input validation (REQ-F-02).** `resolve` **rejects** any input that
 is not a locator — including an already-migrated, **SEI-shaped** string — with
@@ -632,6 +679,8 @@ Resolve up to **256** locators in one request. Request:
 
 ```json
 {
+  "api_version": 1,
+  "instance_id": "<uuid>",
   "resolved": { "python:function:a.b": { "sei": "loomweave:eid:<hex>", "current_locator": "python:function:a.b", "content_hash": "<blake3>", "alive": true } },
   "invalid": ["loomweave:eid:…", "malformed"],
   "not_found": ["python:function:gone"]
@@ -644,15 +693,30 @@ no alive binding. Oversize requests get `400` / `code: "BATCH_TOO_LARGE"`.
 
 ### `GET /api/v1/identity/sei/:sei`
 
-Resolve an SEI. Alive: `{ "sei": "…", "current_locator": "…", "content_hash": "…", "alive": true }`.
-Orphaned/superseded/unknown: `{ "sei": "…", "alive": false, "lineage": [ … ] }`,
+Resolve an SEI. Alive:
+`{ "api_version": 1, "instance_id": "<uuid>", "sei": "…", "current_locator": "…", "content_hash": "…", "alive": true }`.
+Orphaned/superseded/unknown:
+`{ "api_version": 1, "instance_id": "<uuid>", "sei": "…", "alive": false, "lineage": [ … ] }`,
 where each lineage event is `{ event, old_locator, new_locator, run_id, recorded_at }`
 and `event ∈ {born, locator_changed, moved, orphaned, superseded}`.
 
 ### `GET /api/v1/identity/lineage/:sei`
 
 The ordered append-only lineage event list for an SEI:
-`{ "sei": "…", "lineage": [ { event, old_locator, new_locator, run_id, recorded_at }, … ] }`.
+`{ "api_version": 1, "instance_id": "<uuid>", "sei": "…", "lineage": [ { event, old_locator, new_locator, run_id, recorded_at }, … ] }`.
+
+### Identity ownership join order
+
+Before joining an HTTP identity result to local SQLite catalogue rows, a
+consumer must: read the existing local `.weft/loomweave/instance_id` without
+creating it; validate capability `api_version == 1` as an integer and
+`instance_id` as the same UUID; issue the authenticated identity request;
+validate the identity body's `api_version` and `instance_id` against both the
+capability response and local UUID; and only then execute catalogue SQL.
+Missing, malformed, unsupported, or mismatched ownership fails closed. This
+second response check detects a reused-port project switch between capability
+probe and identity resolution. Plainweave owns enforcement of the local join
+order; Loomweave owns these producer fields and the reference validator.
 
 ### Conformance
 

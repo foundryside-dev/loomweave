@@ -3,13 +3,13 @@
     "contract": "loomweave-http-read-api",
     "endpoint": "GET /api/v1/_capabilities",
     "api_version": 1,
-    "fixture_version": 5,
+    "fixture_version": 6,
     "stability": "normative",
-    "authority": "Loomweave ADR-014 federation registry-backend contract; Wave 0 / WS2 linkages; Wave 1 / WS1 SEI (ADR-038); T3.4 taint-store read-by-SEI",
+    "authority": "Loomweave ADR-014 federation registry-backend contract; Wave 0 / WS2 linkages; Wave 1 / WS1 SEI (ADR-038); T3.4 taint-store read-by-SEI; ADR-056 auth discovery and response ownership",
     "verification": "cargo test -p loomweave-cli --test serve",
     "normative": true,
-    "updated": "2026-06-02",
-    "description": "Contract example for Loomweave registry-backend capability discovery (advertising the WS2 call-graph linkage routes, the WS1 SEI identity capability, and the T3.4 taint-store read-by-SEI route)."
+    "updated": "2026-07-12",
+    "description": "Contract example for Loomweave registry-backend capability discovery, including non-secret authentication-mode discovery."
   },
   "shape_decl": {
     "kind": "loomweave-http-fixture-shapes",
@@ -31,6 +31,14 @@
           },
           "instance_id": {
             "type": "uuid"
+          },
+          "authentication": {
+            "type": "object",
+            "const": {
+              "protected_routes": "none",
+              "capabilities_probe": "none",
+              "contract_version": 1
+            }
           },
           "linkages": {
             "type": "object",
@@ -74,6 +82,11 @@
           "file_registry": true,
           "api_version": 1,
           "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
+          "authentication": {
+            "protected_routes": "none",
+            "capabilities_probe": "none",
+            "contract_version": 1
+          },
           "linkages": {
             "http": true
           },

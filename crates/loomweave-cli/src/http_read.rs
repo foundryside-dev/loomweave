@@ -632,6 +632,9 @@ struct CapabilitiesResponse {
     file_registry: bool,
     api_version: u8,
     instance_id: crate::instance::InstanceId,
+    /// Additive auth discovery for clients. This reports only the wire mode;
+    /// secret pointers and values are deliberately absent from the response.
+    authentication: AuthenticationCapability,
     /// Structural call-graph linkage routes (Wave 0 / WS2). `http: true` once
     /// the `/api/v1/entities/{id}/callers|callees` routes ship.
     linkages: LinkagesCapability,
@@ -664,12 +667,28 @@ struct TaintStoreCapability {
 }
 
 #[derive(Debug, Serialize)]
+struct AuthenticationCapability {
+    protected_routes: AuthenticationMode,
+    capabilities_probe: &'static str,
+    contract_version: u8,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AuthenticationMode {
+    None,
+    Bearer,
+    Hmac,
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
     code: ErrorCode,
 }
 
 const HTTP_BODY_LIMIT_BYTES: usize = 16 * 1024;
+pub(crate) const HTTP_API_VERSION: u8 = 1;
 
 /// Body limit for the Wardline taint-store routes. Batched writes/resolves
 /// carry thousands of qualnames; the 16 KiB read-API limit is far too small.
@@ -698,11 +717,9 @@ fn request_log_context(headers: &HeaderMap) -> RequestLogContext {
 }
 
 fn log_weft_component_kind(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get("x-weft-component")?.to_str().ok()?.trim();
-    let component = value
-        .split_once(':')
-        .map_or(value, |(component, _)| component);
-    (!component.is_empty()).then(|| component.to_owned())
+    let value = headers.get("x-weft-component")?.to_str().ok()?;
+    auth::parse_weft_component_signature(value)?;
+    Some("loomweave".to_owned())
 }
 
 fn log_non_sensitive_header_value(headers: &HeaderMap, name: &'static str) -> Option<String> {
@@ -738,11 +755,23 @@ fn http_request_span<B>(request: &Request<B>) -> tracing::Span {
 }
 
 async fn get_capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
+    let protected_routes = if state.identity_secret.is_some() {
+        AuthenticationMode::Hmac
+    } else if state.auth_token.is_some() {
+        AuthenticationMode::Bearer
+    } else {
+        AuthenticationMode::None
+    };
     Json(CapabilitiesResponse {
         registry_backend: true,
         file_registry: true,
-        api_version: 1,
+        api_version: HTTP_API_VERSION,
         instance_id: state.instance_id,
+        authentication: AuthenticationCapability {
+            protected_routes,
+            capabilities_probe: "none",
+            contract_version: 1,
+        },
         linkages: LinkagesCapability { http: true },
         sei: SeiCapability {
             supported: true,
@@ -814,7 +843,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Weft-Component",
-            HeaderValue::from_static("loomweave:deadbeefsignature"),
+            HeaderValue::from_static(
+                "loomweave:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
         );
         headers.insert("X-Weft-Timestamp", HeaderValue::from_static("123456"));
         headers.insert("X-Weft-Nonce", HeaderValue::from_static("nonce-value"));
@@ -833,6 +864,28 @@ mod tests {
             log_non_sensitive_header_value(&headers, "authorization"),
             None
         );
+    }
+
+    #[test]
+    fn malformed_weft_component_headers_never_reach_log_context() {
+        for malformed in [
+            "wardline:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "loomweave:deadbeef",
+            "loomweave:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+            " loomweave:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "caller-controlled",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "X-Weft-Component",
+                HeaderValue::from_str(malformed).expect("synthetic header value"),
+            );
+            assert_eq!(
+                log_weft_component_kind(&headers),
+                None,
+                "malformed caller input must not become a structured log field: {malformed}"
+            );
+        }
     }
 
     #[test]

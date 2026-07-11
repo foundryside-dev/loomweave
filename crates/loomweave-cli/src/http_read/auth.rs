@@ -65,6 +65,50 @@ impl HmacReplayCache {
     }
 }
 
+/// Validate freshness and record a nonce against an explicit clock value.
+/// Keeping time outside this helper makes the wire contract deterministic for
+/// producer-owned vectors. A poisoned mutex is a trust-boundary failure and is
+/// therefore rejected rather than recovered.
+pub(crate) fn validate_hmac_replay_at(
+    replay_cache: &SharedHmacReplayCache,
+    nonce: &str,
+    request_timestamp: i64,
+    now_timestamp: i64,
+) -> bool {
+    replay_cache
+        .lock()
+        .is_ok_and(|mut cache| cache.check_and_record(nonce, request_timestamp, now_timestamp))
+}
+
+fn parse_bearer_credential(value: &str) -> Option<&str> {
+    let token = value.strip_prefix("Bearer ")?;
+    (!token.is_empty() && token.trim() == token).then_some(token)
+}
+
+/// Parse the exact Weft component wire shape. Callers may use successful
+/// parsing only as a boolean signal; the signature itself remains sensitive.
+pub(super) fn parse_weft_component_signature(value: &str) -> Option<&str> {
+    let signature = value.strip_prefix("loomweave:")?;
+    (signature.len() == 64
+        && signature
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)))
+    .then_some(signature)
+}
+
+fn parse_hmac_timestamp(value: &str) -> Option<i64> {
+    let parsed = value.parse::<i64>().ok()?;
+    (parsed >= 0 && parsed.to_string() == value).then_some(parsed)
+}
+
+fn parse_hmac_nonce(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= HMAC_NONCE_MAX_LEN
+        && !value.chars().all(char::is_whitespace))
+    .then_some(value)
+}
+
 /// Enforce configured identity on protected routes. Prefer the Weft HMAC
 /// identity when `identity_token_env` is configured; otherwise preserve the
 /// legacy bearer-token path for existing deployments.
@@ -105,9 +149,7 @@ pub(crate) async fn require_http_identity_with_limit(
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|token| !token.is_empty());
+        .and_then(parse_bearer_credential);
     let Some(presented) = presented else {
         return unauthenticated_response();
     };
@@ -136,8 +178,7 @@ pub(crate) async fn require_hmac_identity(
         .headers
         .get("x-weft-component")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().strip_prefix("loomweave:"))
-        .filter(|signature| !signature.is_empty())
+        .and_then(parse_weft_component_signature)
         .map(str::to_owned);
     let Some(presented) = presented else {
         return unauthenticated_response();
@@ -146,7 +187,7 @@ pub(crate) async fn require_hmac_identity(
         .headers
         .get("x-weft-timestamp")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<i64>().ok());
+        .and_then(parse_hmac_timestamp);
     let Some(timestamp) = timestamp else {
         return unauthenticated_response();
     };
@@ -154,8 +195,7 @@ pub(crate) async fn require_hmac_identity(
         .headers
         .get("x-weft-nonce")
         .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|nonce| !nonce.is_empty() && nonce.len() <= HMAC_NONCE_MAX_LEN)
+        .and_then(parse_hmac_nonce)
         .map(str::to_owned);
     let Some(nonce) = nonce else {
         return unauthenticated_response();
@@ -185,9 +225,7 @@ pub(crate) async fn require_hmac_identity(
         return unauthenticated_response();
     }
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let fresh_and_unseen = replay_cache
-        .lock()
-        .is_ok_and(|mut cache| cache.check_and_record(&nonce, timestamp, now));
+    let fresh_and_unseen = validate_hmac_replay_at(replay_cache, &nonce, timestamp, now);
     if !fresh_and_unseen {
         return unauthenticated_response();
     }
@@ -226,7 +264,7 @@ pub(crate) fn canonical_hmac_message(
 ) -> String {
     format!(
         "{}\n{}\n{}\n{}\n{}",
-        method,
+        method.to_ascii_uppercase(),
         path_and_query,
         hex_lower(&Sha256::digest(body)),
         timestamp,
@@ -301,6 +339,153 @@ mod tests {
             digest,
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
+    }
+
+    #[test]
+    fn canonical_hmac_vector_normalizes_method_and_pins_every_signing_field() {
+        let body = br#"{"locator":"python:function:demo.run"}"#;
+        let message = canonical_hmac_message(
+            "post",
+            "/api/v1/identity/resolve?trace=1",
+            body,
+            1_900_000_000,
+            "nonce-vector-001",
+        );
+
+        assert_eq!(
+            message,
+            "POST\n/api/v1/identity/resolve?trace=1\n591e7e32c043fb1bc8f070f7f65d5e262c01e468a7d4a4cf48c1fd997a7211e0\n1900000000\nnonce-vector-001"
+        );
+        assert_eq!(
+            component_hmac_hex(
+                b"federation-secret",
+                "post",
+                "/api/v1/identity/resolve?trace=1",
+                body,
+                1_900_000_000,
+                "nonce-vector-001",
+            ),
+            "38898838931bd6b292917a8734975472bda49ae679960610df1d0db62f4a00c5"
+        );
+    }
+
+    #[test]
+    fn wire_auth_fields_are_exact_and_never_trimmed() {
+        let signature = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_bearer_credential("Bearer exact-token"),
+            Some("exact-token")
+        );
+        assert_eq!(parse_bearer_credential("Bearer  exact-token"), None);
+        assert_eq!(parse_bearer_credential("Bearer exact-token "), None);
+        assert_eq!(parse_bearer_credential(" bearer exact-token"), None);
+
+        let component = format!("loomweave:{signature}");
+        assert_eq!(parse_weft_component_signature(&component), Some(signature));
+        assert_eq!(
+            parse_weft_component_signature(&format!("loomweave:{signature} ")),
+            None
+        );
+        assert_eq!(
+            parse_weft_component_signature(&format!(" loomweave:{signature}")),
+            None
+        );
+        assert_eq!(
+            parse_weft_component_signature(&format!("loomweave:{}", signature.to_uppercase())),
+            None
+        );
+
+        assert_eq!(parse_hmac_timestamp("1900000000"), Some(1_900_000_000));
+        assert_eq!(parse_hmac_timestamp(" 1900000000"), None);
+        assert_eq!(parse_hmac_timestamp("1900000000 "), None);
+        assert_eq!(parse_hmac_timestamp("+1900000000"), None);
+        assert_eq!(parse_hmac_timestamp("01900000000"), None);
+        assert_eq!(parse_hmac_timestamp("-1"), None);
+
+        assert_eq!(
+            parse_hmac_nonce(" nonce-with-padding "),
+            Some(" nonce-with-padding ")
+        );
+        assert_eq!(parse_hmac_nonce(""), None);
+        assert_eq!(parse_hmac_nonce("   "), None);
+    }
+
+    #[test]
+    fn canonical_hmac_signs_exact_nonce_bytes() {
+        let padded = component_hmac_hex(
+            b"federation-secret",
+            "GET",
+            "/api/v1/identity/sei/example",
+            b"",
+            1_900_000_000,
+            " nonce ",
+        );
+        let trimmed = component_hmac_hex(
+            b"federation-secret",
+            "GET",
+            "/api/v1/identity/sei/example",
+            b"",
+            1_900_000_000,
+            "nonce",
+        );
+        assert_ne!(
+            padded, trimmed,
+            "nonce whitespace must be signed, not trimmed"
+        );
+        assert!(
+            canonical_hmac_message(
+                "GET",
+                "/api/v1/identity/sei/example",
+                b"",
+                1_900_000_000,
+                " nonce ",
+            )
+            .ends_with("\n nonce ")
+        );
+    }
+
+    #[test]
+    fn hmac_freshness_window_is_inclusive_and_poisoned_cache_fails_closed() {
+        let now = 1_900_000_000;
+        let cache = new_hmac_replay_cache();
+
+        assert!(validate_hmac_replay_at(
+            &cache,
+            "old-boundary",
+            now - HMAC_FRESHNESS_WINDOW_SECONDS,
+            now,
+        ));
+        assert!(validate_hmac_replay_at(
+            &cache,
+            "future-boundary",
+            now + HMAC_FRESHNESS_WINDOW_SECONDS,
+            now,
+        ));
+        assert!(!validate_hmac_replay_at(
+            &cache,
+            "too-old",
+            now - HMAC_FRESHNESS_WINDOW_SECONDS - 1,
+            now,
+        ));
+        assert!(!validate_hmac_replay_at(
+            &cache,
+            "too-new",
+            now + HMAC_FRESHNESS_WINDOW_SECONDS + 1,
+            now,
+        ));
+
+        let poisoned = new_hmac_replay_cache();
+        let poison_clone = poisoned.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_clone.lock().expect("lock replay cache");
+            panic!("poison replay cache");
+        });
+        assert!(!validate_hmac_replay_at(
+            &poisoned,
+            "must-fail-closed",
+            now,
+            now,
+        ));
     }
 
     #[test]
@@ -447,7 +632,10 @@ mod tests {
             let request = Request::builder()
                 .method("POST")
                 .uri("/api/v1/files/batch")
-                .header("X-Weft-Component", "loomweave:deadbeef")
+                .header(
+                    "X-Weft-Component",
+                    "loomweave:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
                 .header(
                     "X-Weft-Timestamp",
                     OffsetDateTime::now_utc().unix_timestamp().to_string(),

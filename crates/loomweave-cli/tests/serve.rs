@@ -466,6 +466,69 @@ fn serve_http_identity_resolve_rejects_sei_shaped_input_and_resolves_unknown() {
     let unknown = unknown.expect("identity/resolve unknown response");
     assert_eq!(unknown.status_code, 200, "{unknown:?}");
     assert_eq!(unknown.body["alive"], false);
+    assert_eq!(unknown.body["api_version"], 1);
+    assert!(Uuid::parse_str(unknown.body["instance_id"].as_str().expect("instance_id")).is_ok());
+}
+
+#[test]
+fn identity_response_ownership_exposes_cross_project_mismatch_before_join() {
+    let root_a = tempfile::tempdir().expect("project A");
+    let root_b = tempfile::tempdir().expect("project B");
+    for root in [root_a.path(), root_b.path()] {
+        loomweave_bin()
+            .args(["install", "--path"])
+            .arg(root)
+            .env("PATH", "")
+            .assert()
+            .success();
+    }
+    let instance_a = "00000000-0000-4000-8000-0000000000a1";
+    let instance_b = "00000000-0000-4000-8000-0000000000b2";
+    fs::write(
+        root_a.path().join(".weft/loomweave/instance_id"),
+        format!("{instance_a}\n"),
+    )
+    .expect("seed project A instance ID");
+    fs::write(
+        root_b.path().join(".weft/loomweave/instance_id"),
+        format!("{instance_b}\n"),
+    )
+    .expect("seed project B instance ID");
+    let bind_a = free_loopback_bind();
+    let bind_b = free_loopback_bind();
+    write_http_config(root_a.path(), &bind_a);
+    write_http_config(root_b.path(), &bind_b);
+
+    let mut child_a = spawn_serve(root_a.path());
+    let mut child_b = spawn_serve(root_b.path());
+    let capabilities_a =
+        wait_for_http_json(&bind_a, "/api/v1/_capabilities").expect("project A capabilities");
+    let capabilities_b =
+        wait_for_http_json(&bind_b, "/api/v1/_capabilities").expect("project B capabilities");
+    let request = serde_json::json!({"locator": "python:function:missing.entity"}).to_string();
+    let identity_a = wait_for_http_post_json(&bind_a, "/api/v1/identity/resolve", &request, &[])
+        .expect("project A identity response");
+    let identity_b = wait_for_http_post_json(&bind_b, "/api/v1/identity/resolve", &request, &[])
+        .expect("project B identity response");
+    stop_serve(&mut child_a);
+    stop_serve(&mut child_b);
+
+    assert_eq!(capabilities_a["instance_id"], instance_a);
+    assert_eq!(capabilities_b["instance_id"], instance_b);
+    assert_eq!(identity_a.body["instance_id"], instance_a);
+    assert_eq!(identity_b.body["instance_id"], instance_b);
+    assert_eq!(
+        identity_a.body["api_version"],
+        capabilities_a["api_version"]
+    );
+    assert_eq!(
+        identity_b.body["api_version"],
+        capabilities_b["api_version"]
+    );
+    assert_ne!(
+        capabilities_a["instance_id"], identity_b.body["instance_id"],
+        "a client pinned to project A can reject project B's identity body from response ownership alone"
+    );
 }
 
 /// Seed a coherent POST-RENAME snapshot for the WS4 dossier-participation e2e: a
@@ -552,6 +615,25 @@ fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
         .assert()
         .success();
     let sei = seed_renamed_function_dossier(dir.path());
+    let orphaned_sei = "loomweave:eid:ffffffffffffffffffffffffffffffff";
+    let conn = Connection::open(dir.path().join(".weft/loomweave/loomweave.db"))
+        .expect("open sqlite for orphaned SEI");
+    conn.execute(
+        "INSERT INTO sei_bindings
+            (sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at)
+         VALUES (?1, NULL, 'hash-orphaned', NULL, 'orphaned', 'run-1', 'run-2',
+                 '2026-06-02T00:00:00.000Z')",
+        params![orphaned_sei],
+    )
+    .expect("insert orphaned binding");
+    conn.execute(
+        "INSERT INTO sei_lineage (sei, event, old_locator, new_locator, run_id, recorded_at)
+         VALUES (?1, 'orphaned', 'python:function:mod.deleted', NULL, 'run-2',
+                 '2026-06-02T00:00:00.000Z')",
+        params![orphaned_sei],
+    )
+    .expect("insert orphaned lineage");
+    drop(conn);
     let bind = free_loopback_bind();
     write_http_config(dir.path(), &bind);
     let mut child = spawn_serve(dir.path());
@@ -576,6 +658,13 @@ fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
     // Identity axis: resolve_sei(sei) alive at the new locator + lineage rename.
     let sei_lookup = wait_for_http_json(&bind, &format!("/api/v1/identity/sei/{sei}"));
     let lineage = wait_for_http_json(&bind, &format!("/api/v1/identity/lineage/{sei}"));
+    let orphaned = wait_for_http_json(&bind, &format!("/api/v1/identity/sei/{orphaned_sei}"));
+    let batch = wait_for_http_post_json(
+        &bind,
+        "/api/v1/identity/resolve:batch",
+        &serde_json::json!({"locators": [new_locator, old_locator]}).to_string(),
+        &[],
+    );
     // Linkages over HTTP, keyed on the new locator.
     let inbound = wait_for_http_json(&bind, &format!("/api/v1/entities/{new_locator}/callers"));
     let outbound = wait_for_http_json(&bind, &format!("/api/v1/entities/{new_locator}/callees"));
@@ -586,6 +675,11 @@ fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
     let resolve_new = resolve_new.expect("resolve(new) response");
     assert_eq!(resolve_new.status_code, 200, "{resolve_new:?}");
     assert_eq!(resolve_new.body["alive"], true);
+    let identity_instance_id = resolve_new.body["instance_id"]
+        .as_str()
+        .expect("identity response instance_id")
+        .to_owned();
+    assert_eq!(resolve_new.body["api_version"], 1);
     assert_eq!(
         resolve_new.body["sei"], sei,
         "resolve(new) must carry the SEI"
@@ -601,6 +695,8 @@ fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
         resolve_old.body["alive"], false,
         "the renamed-away locator must no longer resolve"
     );
+    assert_eq!(resolve_old.body["api_version"], 1);
+    assert_eq!(resolve_old.body["instance_id"], identity_instance_id);
 
     let sei_lookup = sei_lookup.expect("resolve_sei response");
     assert_eq!(
@@ -608,8 +704,22 @@ fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
         "the carried identity must be alive (not orphaned) after the rename"
     );
     assert_eq!(sei_lookup["current_locator"], new_locator);
+    assert_eq!(sei_lookup["api_version"], 1);
+    assert_eq!(sei_lookup["instance_id"], identity_instance_id);
 
     let lineage = lineage.expect("lineage response");
+    assert_eq!(lineage["api_version"], 1);
+    assert_eq!(lineage["instance_id"], identity_instance_id);
+    let orphaned = orphaned.expect("orphaned SEI response");
+    assert_eq!(orphaned["alive"], false);
+    assert_eq!(orphaned["api_version"], 1);
+    assert_eq!(orphaned["instance_id"], identity_instance_id);
+    let batch = batch.expect("identity batch response");
+    assert_eq!(batch.status_code, 200, "{batch:?}");
+    assert_eq!(batch.body["api_version"], 1);
+    assert_eq!(batch.body["instance_id"], identity_instance_id);
+    assert!(batch.body["resolved"].get(new_locator).is_some());
+    assert_eq!(batch.body["not_found"], serde_json::json!([old_locator]));
     let events = lineage["lineage"].as_array().expect("lineage array");
     assert!(
         events.iter().any(|e| e["event"] == "locator_changed"
@@ -840,7 +950,7 @@ const CAPABILITIES_GOLDEN: &str =
 /// `left != right` mismatch; `capabilities_golden_byte_pin_rejects_a_mutated_byte`
 /// additionally proves a single flipped input byte yields a DIFFERENT digest.
 const CAPABILITIES_GOLDEN_BLAKE3: &str =
-    "74d5fd1230a62f7a279e54d2a798ce85b3ae8b962f593d1d6bd8c0e2db70dbf7";
+    "58cab5192fd80dce2846719a009b800e570c443b0f87666a31b8de18779cc19c";
 
 #[test]
 fn capabilities_golden_bytes_match_layer1_pin() {
@@ -891,6 +1001,14 @@ fn serve_http_capabilities_and_mcp_stdio_coexist() {
     assert_eq!(capabilities["registry_backend"], true);
     assert_eq!(capabilities["file_registry"], true);
     assert_eq!(capabilities["api_version"], 1);
+    assert_eq!(
+        capabilities["authentication"],
+        serde_json::json!({
+            "protected_routes": "none",
+            "capabilities_probe": "none",
+            "contract_version": 1,
+        })
+    );
     assert!(capabilities.get("version").is_none());
     let instance_id = capabilities["instance_id"]
         .as_str()
@@ -1374,7 +1492,13 @@ fn serve_http_batch_requires_auth_when_configured() {
     let authenticated = authenticated.expect("authenticated batch");
 
     assert_eq!(unauthenticated.status_code, 401);
-    assert_eq!(unauthenticated.body["code"], "UNAUTHENTICATED");
+    assert_eq!(
+        unauthenticated.body,
+        serde_json::json!({
+            "error": "authentication required",
+            "code": "UNAUTHENTICATED",
+        })
+    );
     assert_eq!(authenticated.status_code, 200);
     let resolved = authenticated.body["resolved"]
         .as_array()
@@ -1446,20 +1570,34 @@ fn serve_http_files_endpoint_rejects_wrong_token() {
         "/api/v1/files?path=demo.py&language=python",
         &[("Authorization", "Basic correct-horse")],
     );
+    let padded = wait_for_http_raw_response(
+        &bind,
+        "/api/v1/files?path=demo.py&language=python",
+        &[("Authorization", "Bearer  correct-horse")],
+    );
     stop_serve(&mut child);
     let wrong = wrong.expect("wrong-token response");
     let blank = blank.expect("blank-token response");
     let wrong_scheme = wrong_scheme.expect("wrong-scheme response");
+    let padded = padded.expect("padded-token response");
 
     for (name, response) in [
         ("wrong", &wrong),
         ("blank", &blank),
         ("wrong-scheme", &wrong_scheme),
+        ("padded", &padded),
     ] {
         assert_eq!(response.status_code, 401, "{name}: {response:?}");
         let body: Value = serde_json::from_str(&response.body)
             .unwrap_or_else(|err| panic!("{name} body parse: {err}; raw={:?}", response.body));
-        assert_eq!(body["code"], "UNAUTHENTICATED", "{name}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "authentication required",
+                "code": "UNAUTHENTICATED",
+            }),
+            "{name}"
+        );
     }
 }
 
@@ -1478,6 +1616,8 @@ fn serve_http_files_endpoint_requires_hmac_identity_when_configured() {
 
     let mut child =
         spawn_serve_with_env(dir.path(), &[("WEFT_TEST_IDENTITY_REQ", "shared-secret")]);
+    let capabilities =
+        wait_for_http_response(&bind, "/api/v1/_capabilities").expect("capabilities response");
     let path = "/api/v1/files?path=demo.py&language=python";
     let missing = wait_for_http_raw_response(&bind, path, &[]);
     let (signed_header, signed_timestamp, signed_nonce) =
@@ -1491,14 +1631,82 @@ fn serve_http_files_endpoint_requires_hmac_identity_when_configured() {
             ("X-Weft-Nonce", &signed_nonce),
         ],
     );
+    let replayed = wait_for_http_raw_response(
+        &bind,
+        path,
+        &[
+            ("X-Weft-Component", &signed_header),
+            ("X-Weft-Timestamp", &signed_timestamp),
+            ("X-Weft-Nonce", &signed_nonce),
+        ],
+    );
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let stale_timestamp = now - 301;
+    let stale_nonce = "stale-auth-vector";
+    let stale_header = hmac_component_header_with_freshness(
+        "shared-secret",
+        "GET",
+        path,
+        b"",
+        stale_timestamp,
+        stale_nonce,
+    );
+    let stale_timestamp_text = stale_timestamp.to_string();
+    let stale = wait_for_http_raw_response(
+        &bind,
+        path,
+        &[
+            ("X-Weft-Component", &stale_header),
+            ("X-Weft-Timestamp", &stale_timestamp_text),
+            ("X-Weft-Nonce", stale_nonce),
+        ],
+    );
+    let malformed = wait_for_http_raw_response(
+        &bind,
+        path,
+        &[
+            ("X-Weft-Component", "loomweave:not-lowercase-hex"),
+            ("X-Weft-Timestamp", "not-unix-seconds"),
+            ("X-Weft-Nonce", "malformed-auth-vector"),
+        ],
+    );
     stop_serve(&mut child);
     let missing = missing.expect("missing identity response");
     let signed = signed.expect("signed identity response");
+    let replayed = replayed.expect("replayed identity response");
+    let stale = stale.expect("stale identity response");
+    let malformed = malformed.expect("malformed identity response");
 
     assert_eq!(missing.status_code, 401);
     let missing_body: Value =
         serde_json::from_str(&missing.body).expect("missing identity body is JSON");
     assert_eq!(missing_body["code"], "UNAUTHENTICATED");
+    assert_eq!(
+        capabilities.body["authentication"],
+        serde_json::json!({
+            "protected_routes": "hmac",
+            "capabilities_probe": "none",
+            "contract_version": 1,
+        })
+    );
+    assert!(
+        !capabilities
+            .body
+            .to_string()
+            .contains("WEFT_TEST_IDENTITY_REQ")
+    );
+    assert!(!capabilities.body.to_string().contains("shared-secret"));
+    for (name, rejected) in [
+        ("replayed", replayed),
+        ("stale", stale),
+        ("malformed", malformed),
+    ] {
+        assert_eq!(rejected.status_code, 401, "{name}: {rejected:?}");
+        assert_eq!(
+            rejected.body, missing.body,
+            "{name} auth rejection must use the exact same redacted body"
+        );
+    }
     assert_eq!(signed.status_code, 200);
     let signed_body: Value = serde_json::from_str(&signed.body).expect("signed body is JSON");
     assert_eq!(signed_body["entity_id"], "core:file:demo.py");
@@ -1560,6 +1768,16 @@ fn serve_http_capabilities_does_not_require_token() {
     assert_eq!(response.status_code, 200);
     assert_eq!(response.body["registry_backend"], true);
     assert_eq!(response.body["api_version"], 1);
+    assert_eq!(
+        response.body["authentication"],
+        serde_json::json!({
+            "protected_routes": "bearer",
+            "capabilities_probe": "none",
+            "contract_version": 1,
+        })
+    );
+    assert!(!response.body.to_string().contains("WEFT_TEST_TOKEN_CAPS"));
+    assert!(!response.body.to_string().contains("any-token-value"));
 }
 
 #[test]
