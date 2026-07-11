@@ -14,10 +14,10 @@ and trust-topology tools.
 
 ## Status
 
-**v1.2.1 — latest stable release.** A maintenance patch over `v1.2.0` that
-keeps the consult-surface additions (`include` dossiers, `app_only` scoping, and
-per-query caller honesty) while tightening redaction, release metadata, and
-reproducible plugin packaging. Scope:
+**Public release: v1.4.0. Local checkout: v1.4.2.** `v1.4.0` is the latest
+public stable GitHub release. This checkout and the local uv build are versioned
+`1.4.2`; `v1.4.2` is intentionally not tagged or published. The current source
+and public release line include:
 
 - **Python and Rust first-party plugins.** The Python plugin extracts modules,
   classes, functions, calls, references, decorators, and inheritance edges. The
@@ -69,7 +69,7 @@ reproducible plugin packaging. Scope:
 
 ## What it does today
 
-`loomweave serve` exposes a 46-tool MCP surface that a consult-mode agent calls
+`loomweave serve` exposes a 48-tool MCP surface that a consult-mode agent calls
 instead of grep-and-read. Write-gated tools such as `analyze_start`,
 `analyze_cancel`, `propose_guidance`, and `promote_guidance` are hidden unless
 the server policy enables them — with two deliberate exceptions: the
@@ -89,13 +89,13 @@ and live LLM spend. The core tool families are:
 
 ```bash
 # 1. Install from the current GitHub Release
-TAG=v1.2.1
+TAG=v1.4.0
 curl -L -o loomweave-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf loomweave-x86_64-unknown-linux-gnu.tar.gz
 install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
 pipx install \
-  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-plugin-python-1.2.1.tar.gz"
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.4.0.tar.gz"
 
 # 2. Initialise a project
 cd /path/to/your/python/repo
@@ -108,7 +108,7 @@ loomweave analyze
 loomweave serve
 ```
 
-The current stable branch can also be installed from a local checkout:
+This versioned `1.4.2` checkout can also be installed locally:
 
 ```bash
 # From this repository checkout
