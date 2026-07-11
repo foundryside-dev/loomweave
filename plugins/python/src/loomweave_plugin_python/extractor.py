@@ -1391,23 +1391,36 @@ def _module_level_exportable_names(tree: ast.Module) -> set[str]:
         and any(alias.name == "annotations" for alias in statement.names)
         for statement in tree.body
     )
+    nested_entity_definitions: set[str] = set()
     for statement in tree.body:
-        if isinstance(statement, ast.ImportFrom) and any(
-            alias.name == "*" for alias in statement.names
-        ):
-            local_entities.clear()
-        for name in _direct_module_rebindings(
+        potential_expression_rebindings = _potential_statement_expression_rebindings(
             statement,
             evaluate_annotations=evaluate_annotations,
-        ):
+        )
+        potential_rebindings, potential_star_import = _potential_control_flow_rebindings(
+            statement,
+            evaluate_annotations=evaluate_annotations,
+        )
+        if (
+            isinstance(statement, ast.ImportFrom)
+            and any(alias.name == "*" for alias in statement.names)
+        ) or potential_star_import:
+            local_entities.clear()
+        direct_rebindings = _direct_module_rebindings(
+            statement,
+            evaluate_annotations=evaluate_annotations,
+        )
+        for name in direct_rebindings | potential_expression_rebindings | potential_rebindings:
             local_entities.pop(name, None)
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             count = definition_counts.get(statement.name, 0) + 1
             definition_counts[statement.name] = count
-            if count == 1:
+            if count == 1 and statement.name not in nested_entity_definitions:
                 local_entities[statement.name] = statement
             else:
                 local_entities.pop(statement.name, None)
+        else:
+            nested_entity_definitions.update(_nested_entity_definition_names(statement))
     return set(local_entities)
 
 
@@ -1422,6 +1435,370 @@ def _direct_module_rebindings(statement: ast.stmt, *, evaluate_annotations: bool
         if names is not None:
             return names
     return set()
+
+
+def _potential_statement_expression_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> set[str]:
+    """Assignment-expression effects that may execute with one statement."""
+    for classifier in (
+        _potential_definition_expression_rebindings,
+        _potential_assignment_expression_rebindings,
+        _potential_compound_statement_expression_rebindings,
+    ):
+        names = classifier(statement, evaluate_annotations=evaluate_annotations)
+        if names is not None:
+            return names
+    return set()
+
+
+def _potential_definition_expression_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> set[str] | None:
+    collector = _PotentialExpressionBindingCollector()
+    match statement:
+        case ast.FunctionDef() | ast.AsyncFunctionDef():
+            collector.visit_function_header(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            )
+        case ast.ClassDef():
+            collector.visit_expressions([*statement.decorator_list, *statement.bases])
+            collector.visit_expressions([keyword.value for keyword in statement.keywords])
+        case _:
+            return None
+    return collector.names
+
+
+def _potential_assignment_expression_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> set[str] | None:
+    collector = _PotentialExpressionBindingCollector()
+    match statement:
+        case ast.Assign():
+            collector.visit(statement.value)
+            for target in statement.targets:
+                if isinstance(target, (ast.List, ast.Tuple)):
+                    collector.visit_binding_value(target, statement.value)
+            collector.visit_expressions(statement.targets)
+        case ast.AnnAssign():
+            if evaluate_annotations:
+                collector.visit(statement.annotation)
+            if statement.value is not None:
+                collector.visit(statement.value)
+                collector.visit(statement.target)
+        case ast.AugAssign():
+            collector.visit(statement.value)
+            collector.visit(statement.target)
+        case ast.Delete():
+            collector.visit_expressions(statement.targets)
+        case _:
+            return None
+    return collector.names
+
+
+def _potential_compound_statement_expression_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> set[str] | None:
+    _ = evaluate_annotations
+    collector = _PotentialExpressionBindingCollector()
+    match statement:
+        case ast.Expr():
+            collector.visit(statement.value)
+        case ast.If() | ast.While():
+            collector.visit(statement.test)
+        case ast.For() | ast.AsyncFor():
+            collector.visit_binding_iterable(statement.target, statement.iter)
+            collector.visit(statement.target)
+        case ast.With() | ast.AsyncWith():
+            collector.visit_expressions([item.context_expr for item in statement.items])
+            collector.visit_expressions(
+                [item.optional_vars for item in statement.items if item.optional_vars is not None],
+            )
+        case ast.Match():
+            collector.visit(statement.subject)
+        case ast.Assert():
+            collector.visit(statement.test)
+            if statement.msg is not None:
+                collector.visit(statement.msg)
+        case ast.Raise():
+            if statement.exc is not None:
+                collector.visit(statement.exc)
+            if statement.cause is not None:
+                collector.visit(statement.cause)
+        case _:
+            return None
+    return collector.names
+
+
+def _potential_control_flow_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> tuple[set[str], bool]:
+    """Names that may be rebound by a module-level control-flow statement."""
+    if not isinstance(
+        statement,
+        (
+            ast.If,
+            ast.While,
+            ast.For,
+            ast.AsyncFor,
+            ast.With,
+            ast.AsyncWith,
+            ast.Try,
+            ast.TryStar,
+            ast.Match,
+        ),
+    ):
+        return set(), False
+
+    names = _potential_statement_expression_rebindings(
+        statement,
+        evaluate_annotations=evaluate_annotations,
+    )
+    blocks: list[list[ast.stmt]] = []
+    match statement:
+        case ast.If():
+            blocks.extend(_potential_if_blocks(statement))
+        case ast.While():
+            blocks.extend(_potential_while_blocks(statement))
+        case ast.For() | ast.AsyncFor():
+            collector = _ExpressionBindingCollector()
+            collector.visit(statement.target)
+            names.update(collector.names)
+            blocks.extend((statement.body, statement.orelse))
+        case ast.With() | ast.AsyncWith():
+            blocks.append(statement.body)
+        case ast.Try() | ast.TryStar():
+            blocks.extend((statement.body, statement.orelse, statement.finalbody))
+            for handler in statement.handlers:
+                if handler.type is not None:
+                    collector = _PotentialExpressionBindingCollector()
+                    collector.visit(handler.type)
+                    names.update(collector.names)
+                if handler.name is not None:
+                    names.add(handler.name)
+                blocks.append(handler.body)
+        case ast.Match():
+            for case in statement.cases:
+                names.update(_match_pattern_binding_names(case.pattern))
+                if case.guard is not None:
+                    collector = _PotentialExpressionBindingCollector()
+                    collector.visit(case.guard)
+                    names.update(collector.names)
+                blocks.append(case.body)
+        case _:
+            message = "control-flow classifier and dispatch drifted"
+            raise AssertionError(message)
+
+    has_star_import = False
+    for block in blocks:
+        block_names, block_has_star_import = _potential_block_rebindings(
+            block,
+            evaluate_annotations=evaluate_annotations,
+        )
+        names.update(block_names)
+        has_star_import = has_star_import or block_has_star_import
+    return names, has_star_import
+
+
+def _potential_if_blocks(statement: ast.If) -> list[list[ast.stmt]]:
+    truth = _constant_truth_value(statement.test)
+    if truth is True:
+        return [statement.body]
+    if truth is False:
+        return [statement.orelse]
+    return [statement.body, statement.orelse]
+
+
+def _potential_while_blocks(statement: ast.While) -> list[list[ast.stmt]]:
+    truth = _constant_truth_value(statement.test)
+    if truth is True:
+        return [statement.body]
+    if truth is False:
+        return [statement.orelse]
+    return [statement.body, statement.orelse]
+
+
+def _potential_block_rebindings(
+    statements: list[ast.stmt],
+    *,
+    evaluate_annotations: bool,
+) -> tuple[set[str], bool]:
+    names: set[str] = set()
+    has_star_import = False
+    for statement in statements:
+        if isinstance(statement, ast.ImportFrom) and any(
+            alias.name == "*" for alias in statement.names
+        ):
+            has_star_import = True
+        names.update(
+            _direct_module_rebindings(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            ),
+        )
+        names.update(
+            _potential_statement_expression_rebindings(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            ),
+        )
+        nested_names, nested_has_star_import = _potential_control_flow_rebindings(
+            statement,
+            evaluate_annotations=evaluate_annotations,
+        )
+        names.update(nested_names)
+        has_star_import = has_star_import or nested_has_star_import
+    return names, has_star_import
+
+
+def _constant_truth_value(expression: ast.expr) -> bool | None:
+    literal_truth = _literal_truth_value(expression)
+    if literal_truth is not None:
+        return literal_truth
+    if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, ast.Not):
+        truth = _constant_truth_value(expression.operand)
+        return None if truth is None else not truth
+    if isinstance(expression, ast.NamedExpr):
+        return _constant_truth_value(expression.value)
+    if isinstance(expression, ast.BoolOp):
+        return _bool_op_truth_value(expression)
+    if isinstance(expression, ast.IfExp):
+        return _if_expression_truth_value(expression)
+    return None
+
+
+def _literal_truth_value(expression: ast.expr) -> bool | None:
+    if isinstance(expression, ast.Constant):
+        return bool(expression.value)
+    if isinstance(expression, (ast.List, ast.Set, ast.Tuple)):
+        if not expression.elts:
+            return False
+        if any(not isinstance(element, ast.Starred) for element in expression.elts):
+            return True
+        return None
+    if isinstance(expression, ast.Dict):
+        if not expression.keys:
+            return False
+        if any(key is not None for key in expression.keys):
+            return True
+        return None
+    if isinstance(expression, (ast.GeneratorExp, ast.Lambda)):
+        return True
+    return None
+
+
+def _bool_op_truth_value(expression: ast.BoolOp) -> bool | None:
+    truths = [_constant_truth_value(value) for value in expression.values]
+    if isinstance(expression.op, ast.And):
+        if False in truths:
+            return False
+        return True if all(truth is True for truth in truths) else None
+    if True in truths:
+        return True
+    return False if all(truth is False for truth in truths) else None
+
+
+def _if_expression_truth_value(expression: ast.IfExp) -> bool | None:
+    test_truth = _constant_truth_value(expression.test)
+    if test_truth is True:
+        return _constant_truth_value(expression.body)
+    if test_truth is False:
+        return _constant_truth_value(expression.orelse)
+    body_truth = _constant_truth_value(expression.body)
+    else_truth = _constant_truth_value(expression.orelse)
+    if body_truth is not None and body_truth == else_truth:
+        return body_truth
+    return None
+
+
+def _potential_value_results(expression: ast.expr) -> list[ast.expr]:
+    if isinstance(expression, ast.IfExp):
+        truth = _constant_truth_value(expression.test)
+        if truth is True:
+            return [expression.body]
+        if truth is False:
+            return [expression.orelse]
+        return [expression.body, expression.orelse]
+    if isinstance(expression, ast.BoolOp):
+        return _potential_bool_op_results(expression)
+    if isinstance(expression, ast.NamedExpr):
+        return _potential_value_results(expression.value)
+    return [expression]
+
+
+def _potential_bool_op_results(expression: ast.BoolOp) -> list[ast.expr]:
+    results: list[ast.expr] = []
+    for index, value in enumerate(expression.values):
+        if index == len(expression.values) - 1:
+            results.append(value)
+            break
+        truth = _constant_truth_value(value)
+        if isinstance(expression.op, ast.And):
+            if truth is False:
+                results.append(value)
+                break
+            if truth is None:
+                results.append(value)
+        elif truth is True:
+            results.append(value)
+            break
+        elif truth is None:
+            results.append(value)
+    return results
+
+
+def _potential_iterable_items(expression: ast.expr) -> list[ast.expr]:
+    results = _potential_value_results(expression)
+    if len(results) != 1 or results[0] is not expression:
+        return [item for result in results for item in _potential_iterable_items(result)]
+    if isinstance(expression, (ast.List, ast.Set, ast.Tuple)):
+        items: list[ast.expr] = []
+        for element in expression.elts:
+            if isinstance(element, ast.Starred):
+                items.extend(_potential_iterable_items(element.value))
+            else:
+                items.append(element)
+        return items
+    if isinstance(expression, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+        return [expression.elt]
+    if isinstance(expression, ast.DictComp):
+        return [expression.key]
+    if isinstance(expression, ast.Dict):
+        mapping_items: list[ast.expr] = []
+        for key, value in zip(expression.keys, expression.values, strict=True):
+            if key is None:
+                mapping_items.extend(_potential_iterable_items(value))
+            else:
+                mapping_items.append(key)
+        return mapping_items
+    return []
+
+
+def _match_pattern_binding_names(pattern: ast.pattern) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(pattern):
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            names.add(node.rest)
+    return names
+
+
+def _nested_entity_definition_names(statement: ast.stmt) -> set[str]:
+    collector = _NestedEntityDefinitionCollector()
+    collector.visit(statement)
+    return collector.names
 
 
 def _definition_or_import_rebindings(
@@ -1508,20 +1885,52 @@ def _class_body_global_rebindings(
         global_collector.visit(statement)
     rebound: set[str] = set()
     for statement in node.body:
+        nested_global_rebindings = _nested_class_global_rebindings(
+            statement,
+            evaluate_annotations=evaluate_annotations,
+        )
+        rebound.update(nested_global_rebindings)
         if isinstance(statement, ast.ClassDef):
-            nested_global_rebindings = _class_body_global_rebindings(
-                statement,
-                evaluate_annotations=evaluate_annotations,
-            )
             statement_rebindings = _class_header_rebindings(statement) | nested_global_rebindings
+            statement_rebindings.update(
+                _potential_statement_expression_rebindings(
+                    statement,
+                    evaluate_annotations=evaluate_annotations,
+                ),
+            )
             rebound.update(nested_global_rebindings)
         else:
             statement_rebindings = _direct_module_rebindings(
                 statement,
                 evaluate_annotations=evaluate_annotations,
             )
+            statement_rebindings.update(
+                _potential_statement_expression_rebindings(
+                    statement,
+                    evaluate_annotations=evaluate_annotations,
+                ),
+            )
+            potential_rebindings, potential_star_import = _potential_control_flow_rebindings(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            )
+            statement_rebindings.update(potential_rebindings)
+            if potential_star_import:
+                statement_rebindings.update(global_collector.names)
         rebound.update(statement_rebindings & global_collector.names)
     return rebound
+
+
+def _nested_class_global_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> set[str]:
+    collector = _NestedClassGlobalRebindingCollector(
+        evaluate_annotations=evaluate_annotations,
+    )
+    collector.visit(statement)
+    return collector.names
 
 
 class _ClassGlobalCollector(ast.NodeVisitor):
@@ -1539,6 +1948,58 @@ class _ClassGlobalCollector(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         _ = node
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        _ = node
+
+
+class _NestedClassGlobalRebindingCollector(ast.NodeVisitor):
+    def __init__(self, *, evaluate_annotations: bool) -> None:
+        self.evaluate_annotations = evaluate_annotations
+        self.names: set[str] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        _ = node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        _ = node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.update(
+            _class_body_global_rebindings(
+                node,
+                evaluate_annotations=self.evaluate_annotations,
+            ),
+        )
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        _ = node
+
+    def visit_If(self, node: ast.If) -> None:
+        for block in _potential_if_blocks(node):
+            for statement in block:
+                self.visit(statement)
+
+    def visit_While(self, node: ast.While) -> None:
+        for block in _potential_while_blocks(node):
+            for statement in block:
+                self.visit(statement)
+
+
+class _NestedEntityDefinitionCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if not _has_overload_decorator(node):
+            self.names.add(node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        if not _has_overload_decorator(node):
+            self.names.add(node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         _ = node
@@ -1654,6 +2115,117 @@ class _ExpressionBindingCollector(ast.NodeVisitor):
     def _visit_comprehension(self, generators: list[ast.comprehension]) -> None:
         if generators:
             self.visit(generators[0].iter)
+
+
+class _PotentialExpressionBindingCollector(_ExpressionBindingCollector):
+    """Collect effects from every expression branch that may execute."""
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        for value in node.values:
+            self.visit(value)
+            truth = _constant_truth_value(value)
+            if isinstance(node.op, ast.And) and truth is False:
+                break
+            if isinstance(node.op, ast.Or) and truth is True:
+                break
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self.visit(node.test)
+        truth = _constant_truth_value(node.test)
+        if truth is True:
+            self.visit(node.body)
+        elif truth is False:
+            self.visit(node.orelse)
+        else:
+            self.visit(node.body)
+            self.visit(node.orelse)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        self.visit(node.left)
+        for operator, comparator in zip(node.ops, node.comparators, strict=True):
+            if isinstance(operator, (ast.In, ast.NotIn)):
+                self.visit_consumed_iterable(comparator)
+            else:
+                self.visit(comparator)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_potential_comprehension(node.generators, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_potential_comprehension(node.generators, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators)
+
+    def visit_Starred(self, node: ast.Starred) -> None:
+        self.visit_consumed_iterable(node.value)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_potential_comprehension(node.generators, [node.key, node.value])
+
+    def _visit_potential_comprehension(
+        self,
+        generators: list[ast.comprehension],
+        values: list[ast.expr],
+    ) -> None:
+        for generator in generators:
+            self.visit_binding_iterable(generator.target, generator.iter)
+            self.visit_expressions(generator.ifs)
+        self.visit_expressions(values)
+
+    def visit_consumed_iterable(self, expression: ast.expr) -> None:
+        if isinstance(expression, ast.GeneratorExp):
+            self._visit_potential_comprehension(expression.generators, [expression.elt])
+        elif isinstance(expression, ast.Starred):
+            self.visit_consumed_iterable(expression.value)
+        elif isinstance(expression, ast.NamedExpr):
+            self.visit(expression.target)
+            self.visit_consumed_iterable(expression.value)
+        elif isinstance(expression, (ast.BoolOp, ast.IfExp)):
+            self.visit(expression)
+            for result in _potential_value_results(expression):
+                self.visit_consumed_iterable(result)
+        else:
+            self.visit(expression)
+
+    def visit_binding_iterable(self, target: ast.expr, expression: ast.expr) -> None:
+        self.visit_consumed_iterable(expression)
+        for item in _potential_iterable_items(expression):
+            self.visit_binding_value(target, item)
+
+    def visit_binding_value(self, target: ast.expr, value: ast.expr) -> None:
+        if not isinstance(target, (ast.List, ast.Tuple)):
+            self.visit(value)
+            return
+        self.visit_consumed_iterable(value)
+        results = _potential_value_results(value)
+        if len(results) != 1 or results[0] is not value:
+            for result in results:
+                self.visit_binding_value(target, result)
+            return
+        if not isinstance(value, (ast.List, ast.Tuple)):
+            self._visit_dynamic_nested_bindings(target, value)
+            return
+        target_has_star = any(isinstance(element, ast.Starred) for element in target.elts)
+        value_has_star = any(isinstance(element, ast.Starred) for element in value.elts)
+        if not target_has_star and not value_has_star and len(target.elts) == len(value.elts):
+            for nested_target, nested_value in zip(target.elts, value.elts, strict=True):
+                self.visit_binding_value(nested_target, nested_value)
+            return
+        self._visit_dynamic_nested_bindings(target, value)
+
+    def _visit_dynamic_nested_bindings(
+        self,
+        target: ast.List | ast.Tuple,
+        value: ast.expr,
+    ) -> None:
+        items = _potential_iterable_items(value)
+        for element in target.elts:
+            nested_target = element.value if isinstance(element, ast.Starred) else element
+            if not isinstance(nested_target, (ast.List, ast.Tuple)):
+                continue
+            for item in items:
+                self.visit_binding_value(nested_target, item)
 
 
 def _main_guard_targets(tree: ast.Module) -> set[str]:

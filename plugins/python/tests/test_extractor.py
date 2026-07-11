@@ -1780,6 +1780,480 @@ __all__ = ["exported_fn"]
     assert "tags" not in module or "exported-api" not in module["tags"]
 
 
+@pytest.mark.parametrize(
+    "conditional_rebinding",
+    [
+        "if flag:\n    from pkg.impl import exported_fn",
+        "if flag:\n    flag and (exported_fn := object())",
+        "while flag:\n    exported_fn = object()",
+        "try:\n    from pkg.impl import exported_fn\nexcept ImportError:\n    pass",
+        "for replacement in replacements:\n    exported_fn = replacement",
+        "for exported_fn in replacements:\n    pass",
+        "with manager() as exported_fn:\n    pass",
+        "try:\n    pass\nexcept Exception as exported_fn:\n    pass",
+        "try:\n    pass\nexcept* Exception as exported_fn:\n    pass",
+        'match token:\n    case "replace":\n        exported_fn = object()',
+        "match token:\n    case exported_fn:\n        pass",
+        "match token:\n    case _ if flag and (exported_fn := object()):\n        pass",
+        "if flag:\n    from pkg.impl import *",
+    ],
+)
+def test_potential_control_flow_rebinding_uses_module_proxy(
+    conditional_rebinding: str,
+) -> None:
+    source = f"""\
+def exported_fn():
+    return 1
+
+
+flag = bool()
+replacements = []
+token = object()
+
+
+{conditional_rebinding}
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    function = by_id["python:function:api.exported_fn"]
+    module = by_id["python:module:api"]
+    assert "exported-api" not in function.get("tags", [])
+    assert "exported-api" in module["tags"]
+
+
+def test_potential_assignment_expression_in_control_flow_header_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+flag = bool()
+
+
+if flag and (exported_fn := replacement):
+    pass
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_potential_top_level_expression_rebinding_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+flag = bool()
+flag and (exported_fn := replacement)
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_consumed_generator_rebinding_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+for _ in ((exported_fn := replacement) for _ in [0]):
+    pass
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_starred_consumed_generator_rebinding_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+for _ in [*((exported_fn := replacement) for _ in [0])]:
+    pass
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_destructuring_assignment_consumes_generator_rebinding() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+(holder,) = ((exported_fn := replacement) for _ in [0])
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_membership_comparison_consumes_generator_rebinding() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+object() in ((exported_fn := replacement) for _ in [0])
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+@pytest.mark.parametrize(
+    "consumed_expression",
+    [
+        "((exported_fn := replacement) for _ in [0]) if flag else ()",
+        "flag and ((exported_fn := replacement) for _ in [0])",
+        "stream := ((exported_fn := replacement) for _ in [0])",
+    ],
+)
+def test_consumed_value_wrapper_propagates_generator_rebinding(
+    consumed_expression: str,
+) -> None:
+    source = f"""\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+flag = bool()
+for _ in ({consumed_expression}):
+    pass
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+@pytest.mark.parametrize(
+    "nested_unpacking",
+    [
+        "(outer, (inner,)) = (object(), ((exported_fn := replacement) for _ in [0]))",
+        "for outer, (inner,) in [(object(), ((exported_fn := replacement) for _ in [0]))]:\n    pass",
+        "[None for outer, (inner,) in [(object(), ((exported_fn := replacement) for _ in [0]))]]",
+    ],
+)
+def test_nested_unpacking_consumes_generator_rebinding(nested_unpacking: str) -> None:
+    source = f"""\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+{nested_unpacking}
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+@pytest.mark.parametrize(
+    "nested_unpacking",
+    [
+        "((inner,),) = [((exported_fn := replacement) for _ in [0]) for _ in [0]]",
+        "(*prefix, (inner,)) = [object(), ((exported_fn := replacement) for _ in [0])]",
+        "((inner,),) = [*[((exported_fn := replacement) for _ in [0])]]",
+        "for (inner,) in {**{((exported_fn := replacement) for _ in [0]): None}}:\n    pass",
+    ],
+)
+def test_dynamic_unpacking_consumes_generator_rebinding(nested_unpacking: str) -> None:
+    source = f"""\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+{nested_unpacking}
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+@pytest.mark.parametrize(
+    "unreachable_rebinding",
+    [
+        "if ():\n    exported_fn = replacement",
+        "while []:\n    exported_fn = replacement",
+        "if (1,):\n    pass\nelse:\n    exported_fn = replacement",
+    ],
+)
+def test_fixed_container_truth_prunes_unreachable_rebinding(
+    unreachable_rebinding: str,
+) -> None:
+    source = f"""\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+{unreachable_rebinding}
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported_fn"]["tags"]
+    module = by_id["python:module:api"]
+    assert "tags" not in module or "exported-api" not in module["tags"]
+
+
+@pytest.mark.parametrize(
+    "unreachable_rebinding",
+    [
+        "if not True:\n    exported_fn = replacement",
+        "if True and False:\n    exported_fn = replacement",
+        "if (False if True else True):\n    exported_fn = replacement",
+        "if (flag := False) and unknown:\n    exported_fn = replacement",
+    ],
+)
+def test_fixed_wrapper_truth_prunes_unreachable_rebinding(
+    unreachable_rebinding: str,
+) -> None:
+    source = f"""\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+{unreachable_rebinding}
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported_fn"]["tags"]
+    module = by_id["python:module:api"]
+    assert "tags" not in module or "exported-api" not in module["tags"]
+
+
+def test_conditional_class_global_rebinding_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+flag = bool()
+
+
+class Binder:
+    global exported_fn
+    if flag:
+        exported_fn = replacement
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_conditional_nested_class_global_rebinding_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+flag = bool()
+
+
+class Outer:
+    if flag:
+        class Inner:
+            global exported_fn
+            exported_fn = replacement
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_constant_true_while_else_does_not_displace_local_export() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+while True:
+    break
+else:
+    exported_fn = object()
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported_fn"]["tags"]
+    module = by_id["python:module:api"]
+    assert "tags" not in module or "exported-api" not in module["tags"]
+
+
+def test_nested_function_rebinding_does_not_escape_to_module_export() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+def binder():
+    exported_fn = object()
+    return exported_fn
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported_fn"]["tags"]
+
+
+def test_direct_definition_after_conditional_rebinding_is_final_local_export() -> None:
+    source = """\
+flag = bool()
+if flag:
+    exported_fn = object()
+
+
+def exported_fn():
+    return 1
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported_fn"]["tags"]
+
+
+@pytest.mark.parametrize(
+    ("conditional_definition", "direct_definition", "entity_id"),
+    [
+        (
+            "def exported():\n        return 1",
+            "def exported():\n    return 2",
+            "python:function:api.exported",
+        ),
+        (
+            "class exported:\n        pass",
+            "class exported:\n    pass",
+            "python:class:api.exported",
+        ),
+    ],
+)
+def test_direct_definition_after_conditional_definition_uses_module_proxy(
+    conditional_definition: str,
+    direct_definition: str,
+    entity_id: str,
+) -> None:
+    source = f"""\
+flag = bool()
+if flag:
+    {conditional_definition}
+
+
+{direct_definition}
+
+
+__all__ = ["exported"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id[entity_id].get("tags", [])
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_direct_implementation_after_conditional_overload_is_local_export() -> None:
+    source = """\
+from typing import overload
+
+flag = bool()
+if flag:
+    @overload
+    def exported(value: int) -> int: ...
+
+
+def exported(value: int) -> int:
+    return value
+
+
+__all__ = ["exported"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported"]["tags"]
+    module = by_id["python:module:api"]
+    assert "tags" not in module or "exported-api" not in module["tags"]
+
+
 def test_definition_annotation_rebinding_displaces_local_export() -> None:
     source = """\
 def exported_fn():
