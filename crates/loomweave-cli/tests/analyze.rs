@@ -1315,6 +1315,18 @@ fn analyze_phase3_emits_subsystem_entities_and_edges() {
         .expect("query in_subsystem edge count");
     assert_eq!(in_subsystem_edges, 4);
 
+    let project_anchor_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE kind = 'project'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query project finding-anchor count");
+    assert_eq!(
+        project_anchor_count, 0,
+        "a clean Phase 3 run must not mint an unused finding anchor"
+    );
+
     let stats = latest_run_stats(project_dir.path());
     let clustering = &stats["clustering"];
     assert_eq!(clustering["status"].as_str(), Some("completed"));
@@ -1352,6 +1364,7 @@ fn analyze_phase3_is_deterministic_across_two_runs() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)] // one linear two-run Phase 3 replacement scenario
 fn analyze_phase3_is_stable_on_unchanged_incremental_rerun() {
     type SubsystemSignature = (Vec<(String, String)>, Vec<(String, String)>);
 
@@ -1395,6 +1408,13 @@ fn analyze_phase3_is_stable_on_unchanged_incremental_rerun() {
     {
         let conn =
             Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+        let prior_run_id: String = conn
+            .query_row(
+                "SELECT id FROM runs WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load prior run id for subsystem finding fixtures");
         conn.execute(
             "INSERT INTO entities (id, plugin_id, kind, name, short_name, properties, \
              created_at, updated_at) VALUES (?1, 'core', 'subsystem', 'Obsolete', \
@@ -1411,10 +1431,64 @@ fn analyze_phase3_is_stable_on_unchanged_incremental_rerun() {
             ],
         )
         .expect("inject obsolete subsystem membership");
+        for (id, status, filigree_issue_id) in [
+            (
+                "finding-protected-subsystem",
+                "suppressed",
+                Some("clarion-existing"),
+            ),
+            ("finding-transient-subsystem", "open", None),
+        ] {
+            conn.execute(
+                "INSERT INTO findings (\
+                     id, tool, tool_version, run_id, rule_id, kind, severity, entity_id, \
+                     related_entities, message, evidence, properties, supports, supported_by, \
+                     status, filigree_issue_id, created_at, updated_at\
+                 ) VALUES (\
+                     ?1, 'loomweave', '1.4.1', ?2, 'LMWV-FIXTURE-SUBSYSTEM', 'fact', 'WARN', \
+                     'core:subsystem:obsolete', '[]', 'fixture', '{}', '{}', '[]', '[]', \
+                     ?3, ?4, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'\
+                 )",
+                rusqlite::params![id, prior_run_id, status, filigree_issue_id],
+            )
+            .expect("inject obsolete subsystem finding");
+        }
     }
 
     let plugin_path =
         std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    loomweave_bin()
+        .args(["analyze", "--no-sei", "--config"])
+        .arg(std::path::Path::new(&config_path))
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    {
+        let conn =
+            Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+        let reanchored_id: String = conn
+            .query_row(
+                "SELECT entity_id FROM findings WHERE id = 'finding-protected-subsystem'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("operator-managed subsystem finding must survive no-SEI reconciliation");
+        let anchor_sei_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sei_bindings \
+                 WHERE current_locator = ?1 AND status = 'alive'",
+                [&reanchored_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            anchor_sei_count, 0,
+            "the no-SEI re-anchor run must not mint a binding"
+        );
+    }
+
     run_phase3_analyze(
         project_dir.path(),
         std::path::Path::new(&config_path),
@@ -1441,10 +1515,67 @@ fn analyze_phase3_is_stable_on_unchanged_incremental_rerun() {
             "current-run clustering stat {field} changed on an unchanged rerun"
         );
     }
+    let recovery_entities_inserted = stats["entities_inserted"]
+        .as_u64()
+        .expect("recovery run entities_inserted");
+    assert_eq!(
+        recovery_entities_inserted,
+        stats["clustering"]["subsystems_inserted"]
+            .as_u64()
+            .expect("recovery run subsystem insert count"),
+        "an existing project anchor must join SEI recovery without inflating the run delta"
+    );
     assert_eq!(
         signature(project_dir.path()),
         before,
         "the current run must replace obsolete subsystem entities and memberships"
+    );
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    let protected: (String, String) = conn
+        .query_row(
+            "SELECT entity_id, properties FROM findings \
+             WHERE id = 'finding-protected-subsystem'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("operator-managed subsystem finding must survive reconciliation");
+    assert!(protected.0.starts_with("core:project:"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&protected.1).unwrap()["reanchored_from_subsystem_id"],
+        "core:subsystem:obsolete"
+    );
+    let anchor_sei_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sei_bindings \
+             WHERE current_locator = ?1 AND status = 'alive'",
+            [&protected.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        anchor_sei_count, 1,
+        "the next SEI-enabled run must recover the project anchor into the current SEI set"
+    );
+    let transient_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE id = 'finding-transient-subsystem'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(transient_count, 0);
+    drop(conn);
+
+    run_phase3_analyze(
+        project_dir.path(),
+        std::path::Path::new(&config_path),
+        &plugin_path,
+    );
+    let repeated_stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        repeated_stats["entities_inserted"].as_u64(),
+        Some(recovery_entities_inserted),
+        "another clean rerun must not count the persistent project anchor again"
     );
 }
 

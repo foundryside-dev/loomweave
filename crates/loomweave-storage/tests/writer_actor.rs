@@ -8,9 +8,12 @@ use rusqlite::Connection;
 use tokio::sync::oneshot;
 
 use loomweave_storage::{
-    InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey, ReaderPool,
+    InferredCallEdgeRecord, InferredEdgeCacheEntry, InferredEdgeCacheKey, ReaderPool, StorageError,
     SummaryCacheEntry, SummaryCacheKey, UnresolvedCallSiteRecord, Writer,
-    commands::{EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
+    commands::{
+        EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, RunStatus,
+        SubsystemReconcileOutcome, WriterCmd,
+    },
     mark_stale_running_runs_failed, pragma, schema,
 };
 
@@ -95,6 +98,17 @@ fn make_subsystem_entity(id: &str) -> EntityRecord {
     "subsystem".clone_into(&mut entity.kind);
     id.clone_into(&mut entity.name);
     id.clone_into(&mut entity.short_name);
+    entity
+}
+
+fn make_project_entity(id: &str) -> EntityRecord {
+    let mut entity = make_entity(id);
+    "core".clone_into(&mut entity.plugin_id);
+    "project".clone_into(&mut entity.kind);
+    let name = id.strip_prefix("core:project:").unwrap_or(id);
+    name.clone_into(&mut entity.name);
+    name.clone_into(&mut entity.short_name);
+    entity.properties_json = serde_json::json!({"finding_anchor": true}).to_string();
     entity
 }
 
@@ -2837,16 +2851,20 @@ async fn reconcile_subsystem_graph_removes_only_obsolete_materialization() {
         .unwrap();
     }
 
-    send::<()>(&tx, |ack| WriterCmd::ReconcileSubsystemGraph {
-        subsystem_ids: vec!["core:subsystem:current".to_owned()],
-        memberships: vec![(
-            "python:module:current".to_owned(),
-            "core:subsystem:current".to_owned(),
-        )],
-        ack,
-    })
-    .await
-    .unwrap();
+    let reconcile_outcome =
+        send::<SubsystemReconcileOutcome>(&tx, |ack| WriterCmd::ReconcileSubsystemGraph {
+            subsystem_ids: vec!["core:subsystem:current".to_owned()],
+            memberships: vec![(
+                "python:module:current".to_owned(),
+                "core:subsystem:current".to_owned(),
+            )],
+            protected_finding_anchor: Box::new(make_project_entity("core:project:test")),
+            ack,
+        })
+        .await
+        .unwrap();
+    assert!(!reconcile_outcome.protected_finding_anchor_present);
+    assert!(!reconcile_outcome.protected_finding_anchor_materialized);
     send::<()>(&tx, |ack| WriterCmd::CommitRun {
         run_id: "run-subsystem-reconcile".into(),
         status: RunStatus::Completed,
@@ -2890,6 +2908,237 @@ async fn reconcile_subsystem_graph_removes_only_obsolete_materialization() {
             "core:subsystem:current".to_owned(),
         )]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // one linear two-run lifecycle and cascade scenario
+async fn reconcile_subsystem_graph_preserves_operator_managed_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    let cases = [
+        ("acknowledged", "acknowledged", None),
+        ("suppressed", "suppressed", None),
+        ("promoted", "promoted_to_issue", None),
+        ("linked", "open", Some("clarion-existing")),
+        ("transient", "open", None),
+    ];
+    begin_demo_run(&tx, "run-subsystem-findings-seed").await;
+    for entity in [
+        make_module_entity("python:module:former"),
+        make_subsystem_entity("core:subsystem:obsolete"),
+    ] {
+        send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+            entity: Box::new(entity),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+    for (suffix, _, _) in cases {
+        send::<()>(&tx, |ack| WriterCmd::InsertFinding {
+            finding: Box::new(make_finding_record(
+                &format!("finding-{suffix}"),
+                "run-subsystem-findings-seed",
+                "core:subsystem:obsolete",
+            )),
+            ack,
+        })
+        .await
+        .unwrap();
+    }
+    send::<()>(&tx, |ack| WriterCmd::InsertEdge {
+        edge: Box::new(make_structural_edge(
+            "in_subsystem",
+            "python:module:former",
+            "core:subsystem:obsolete",
+            EdgeConfidence::Resolved,
+        )),
+        ack,
+    })
+    .await
+    .unwrap();
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-subsystem-findings-seed".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        for (suffix, status, filigree_issue_id) in cases {
+            conn.execute(
+                "UPDATE findings SET status = ?1, filigree_issue_id = ?2 WHERE id = ?3",
+                rusqlite::params![status, filigree_issue_id, format!("finding-{suffix}")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE findings SET properties = 'not-json' WHERE id = 'finding-suppressed'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE findings SET properties = '[]' WHERE id = 'finding-promoted'",
+            [],
+        )
+        .unwrap();
+    }
+
+    begin_demo_run(&tx, "run-subsystem-findings-reconcile").await;
+    let invalid_result =
+        send::<SubsystemReconcileOutcome>(&tx, |ack| WriterCmd::ReconcileSubsystemGraph {
+            subsystem_ids: vec![],
+            memberships: vec![],
+            protected_finding_anchor: Box::new(make_subsystem_entity(
+                "core:subsystem:invalid-anchor",
+            )),
+            ack,
+        })
+        .await;
+    assert!(matches!(
+        invalid_result,
+        Err(StorageError::WriterProtocol(_))
+    ));
+    send::<()>(&tx, |ack| WriterCmd::FailRun {
+        run_id: "run-subsystem-findings-reconcile".into(),
+        reason: "invalid protected finding anchor".into(),
+        completed_at: now_iso(),
+        ack,
+    })
+    .await
+    .unwrap();
+    {
+        let conn = Connection::open(&path).unwrap();
+        for (sql, expected) in [
+            (
+                "SELECT COUNT(*) FROM entities WHERE id = 'core:subsystem:obsolete'",
+                1_i64,
+            ),
+            (
+                "SELECT COUNT(*) FROM edges WHERE kind = 'in_subsystem' \
+                 AND to_id = 'core:subsystem:obsolete'",
+                1_i64,
+            ),
+            (
+                "SELECT COUNT(*) FROM findings WHERE entity_id = 'core:subsystem:obsolete'",
+                5_i64,
+            ),
+            (
+                "SELECT COUNT(*) FROM entities WHERE id = 'core:subsystem:invalid-anchor'",
+                0_i64,
+            ),
+        ] {
+            let actual: i64 = conn.query_row(sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                actual, expected,
+                "failed reconciliation must roll back: {sql}"
+            );
+        }
+    }
+
+    begin_demo_run(&tx, "run-subsystem-findings-reconcile-valid").await;
+    let reconcile_outcome =
+        send::<SubsystemReconcileOutcome>(&tx, |ack| WriterCmd::ReconcileSubsystemGraph {
+            subsystem_ids: vec![],
+            memberships: vec![],
+            protected_finding_anchor: Box::new(make_project_entity("core:project:test")),
+            ack,
+        })
+        .await
+        .unwrap();
+    assert!(reconcile_outcome.protected_finding_anchor_present);
+    assert!(reconcile_outcome.protected_finding_anchor_materialized);
+    send::<()>(&tx, |ack| WriterCmd::CommitRun {
+        run_id: "run-subsystem-findings-reconcile-valid".into(),
+        status: RunStatus::Completed,
+        completed_at: now_iso(),
+        stats_json: "{}".into(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let subsystems = conn
+        .prepare("SELECT id FROM entities WHERE kind = 'subsystem' ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(subsystems.is_empty());
+
+    let membership_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'in_subsystem'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(membership_count, 0);
+
+    let findings = conn
+        .prepare(
+            "SELECT id, entity_id, related_entities, properties \
+             FROM findings ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        findings
+            .iter()
+            .map(|(id, _, _, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "finding-acknowledged",
+            "finding-linked",
+            "finding-promoted",
+            "finding-suppressed",
+        ]
+    );
+    for (id, entity_id, related_entities, properties) in findings {
+        assert_eq!(entity_id, "core:project:test");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&related_entities).unwrap(),
+            serde_json::json!([])
+        );
+        let properties = serde_json::from_str::<serde_json::Value>(&properties).unwrap();
+        assert_eq!(
+            properties["reanchored_from_subsystem_id"],
+            "core:subsystem:obsolete"
+        );
+        match id.as_str() {
+            "finding-suppressed" => {
+                assert_eq!(properties["reanchored_legacy_properties_raw"], "not-json");
+            }
+            "finding-promoted" => assert_eq!(
+                properties["reanchored_legacy_properties"],
+                serde_json::json!([])
+            ),
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

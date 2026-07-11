@@ -33,7 +33,10 @@ use loomweave_storage::{
     DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, EmbeddingKey, EmbeddingStore, GitRename,
     NewEntityDescriptor, PriorIndexEntry, SeiBindingRecord, SeiDecision, SeiLineageEntry,
     UnresolvedCallSiteRecord, Writer, alive_bindings_snapshot,
-    commands::{EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, RunStatus, WriterCmd},
+    commands::{
+        EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, RunStatus,
+        SubsystemReconcileOutcome, WriterCmd,
+    },
     mint_sei, module_dependency_edges, orphaned_bindings, prior_analyzed_commit, rebind_or_mint,
     sei::{BindingStatus, LineageEvent},
 };
@@ -1466,7 +1469,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         match run_phase3_clustering(
             &writer,
             &db_path,
+            &project_root,
             &run_id,
+            &started_at,
             &analyze_config,
             head_commit.as_deref(),
         )
@@ -1475,6 +1480,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             Ok(output) => {
                 total_entity_count += output.subsystems_inserted;
                 total_edge_count += output.in_subsystem_edges_inserted;
+                total_entity_count += u64::from(output.protected_finding_anchor_materialized);
+                if let Some(descriptor) = output.protected_finding_anchor_descriptor.clone() {
+                    sei_descriptors.push(descriptor);
+                }
                 if output.weak_modularity_finding {
                     tracing::info!(run_id = %run_id, "phase3 emitted weak-modularity finding");
                 }
@@ -3231,6 +3240,8 @@ struct Phase3Output {
     in_subsystem_edges_inserted: u64,
     weak_modularity_finding: bool,
     clustering_stats: serde_json::Value,
+    protected_finding_anchor_descriptor: Option<NewEntityDescriptor>,
+    protected_finding_anchor_materialized: bool,
 }
 
 impl Phase3Output {
@@ -3240,6 +3251,8 @@ impl Phase3Output {
             in_subsystem_edges_inserted: 0,
             weak_modularity_finding: false,
             clustering_stats: serde_json::Value::Null,
+            protected_finding_anchor_descriptor: None,
+            protected_finding_anchor_materialized: false,
         }
     }
 }
@@ -3254,14 +3267,18 @@ struct InsertedSubsystem {
 async fn run_phase3_clustering(
     writer: &Writer,
     db_path: &Path,
+    project_root: &Path,
     run_id: &str,
+    started_at: &str,
     analyze_config: &AnalyzeConfig,
     head_commit: Option<&str>,
 ) -> Result<Phase3Output> {
     let started = std::time::Instant::now();
     let config = &analyze_config.analysis.clustering;
+    let protected_finding_anchor = project_anchor_record(project_root, started_at, head_commit);
     if !config.enabled {
-        reconcile_subsystem_graph(writer, &[], &[]).await?;
+        let reconcile_outcome =
+            reconcile_subsystem_graph(writer, &[], &[], &protected_finding_anchor).await?;
         return Ok(Phase3Output {
             subsystems_inserted: 0,
             in_subsystem_edges_inserted: 0,
@@ -3280,6 +3297,12 @@ async fn run_phase3_clustering(
                 false,
                 started,
             ),
+            protected_finding_anchor_descriptor: project_anchor_descriptor(
+                &protected_finding_anchor,
+                reconcile_outcome.protected_finding_anchor_present,
+            ),
+            protected_finding_anchor_materialized: reconcile_outcome
+                .protected_finding_anchor_materialized,
         });
     }
 
@@ -3301,7 +3324,8 @@ async fn run_phase3_clustering(
         .context("load module dependency edges for phase3")?;
 
     if dependency_edges.is_empty() {
-        reconcile_subsystem_graph(writer, &[], &[]).await?;
+        let reconcile_outcome =
+            reconcile_subsystem_graph(writer, &[], &[], &protected_finding_anchor).await?;
         return Ok(Phase3Output {
             subsystems_inserted: 0,
             in_subsystem_edges_inserted: 0,
@@ -3320,6 +3344,12 @@ async fn run_phase3_clustering(
                 false,
                 started,
             ),
+            protected_finding_anchor_descriptor: project_anchor_descriptor(
+                &protected_finding_anchor,
+                reconcile_outcome.protected_finding_anchor_present,
+            ),
+            protected_finding_anchor_materialized: reconcile_outcome
+                .protected_finding_anchor_materialized,
         });
     }
 
@@ -3344,7 +3374,8 @@ async fn run_phase3_clustering(
     let cluster_result = cluster_modules(&graph, &cluster_config).context("cluster modules")?;
 
     if cluster_result.communities.is_empty() {
-        reconcile_subsystem_graph(writer, &[], &[]).await?;
+        let reconcile_outcome =
+            reconcile_subsystem_graph(writer, &[], &[], &protected_finding_anchor).await?;
         return Ok(Phase3Output {
             subsystems_inserted: 0,
             in_subsystem_edges_inserted: 0,
@@ -3363,6 +3394,12 @@ async fn run_phase3_clustering(
                 false,
                 started,
             ),
+            protected_finding_anchor_descriptor: project_anchor_descriptor(
+                &protected_finding_anchor,
+                reconcile_outcome.protected_finding_anchor_present,
+            ),
+            protected_finding_anchor_materialized: reconcile_outcome
+                .protected_finding_anchor_materialized,
         });
     }
 
@@ -3483,7 +3520,13 @@ async fn run_phase3_clustering(
                 .map(|module_id| (module_id.clone(), subsystem.id.clone()))
         })
         .collect::<Vec<_>>();
-    reconcile_subsystem_graph(writer, &subsystem_ids, &memberships).await?;
+    let reconcile_outcome = reconcile_subsystem_graph(
+        writer,
+        &subsystem_ids,
+        &memberships,
+        &protected_finding_anchor,
+    )
+    .await?;
 
     let subsystems_inserted = u64::try_from(inserted_subsystems.len()).unwrap_or(u64::MAX);
     Ok(Phase3Output {
@@ -3504,6 +3547,20 @@ async fn run_phase3_clustering(
             weak_modularity_finding_emitted,
             started,
         ),
+        protected_finding_anchor_descriptor: project_anchor_descriptor(
+            &protected_finding_anchor,
+            reconcile_outcome.protected_finding_anchor_present,
+        ),
+        protected_finding_anchor_materialized: reconcile_outcome
+            .protected_finding_anchor_materialized,
+    })
+}
+
+fn project_anchor_descriptor(anchor: &EntityRecord, present: bool) -> Option<NewEntityDescriptor> {
+    present.then(|| NewEntityDescriptor {
+        locator: anchor.id.clone(),
+        body_hash: None,
+        signature: None,
     })
 }
 
@@ -3511,11 +3568,13 @@ async fn reconcile_subsystem_graph(
     writer: &Writer,
     subsystem_ids: &[String],
     memberships: &[(String, String)],
-) -> Result<()> {
+    protected_finding_anchor: &EntityRecord,
+) -> Result<SubsystemReconcileOutcome> {
     writer
         .send_wait(|ack| WriterCmd::ReconcileSubsystemGraph {
             subsystem_ids: subsystem_ids.to_vec(),
             memberships: memberships.to_vec(),
+            protected_finding_anchor: Box::new(protected_finding_anchor.clone()),
             ack,
         })
         .await
@@ -3871,9 +3930,10 @@ const SOURCE_WALK_SKIPPED_RULE_ID: &str = "LMWV-INFRA-SOURCE-WALK-SKIPPED";
 const SOURCE_WALK_ERROR_SAMPLE_LIMIT: usize = 10;
 
 /// Anchor entity id for project/plugin-level findings that are not file-scoped
-/// (plugin crash, OOM, protocol/ontology violations). `findings.entity_id` is
-/// NOT NULL + FK, and no project entity otherwise exists, so the run mints one
-/// synthetic `core:project:{name}` anchor (idempotent upsert) before persisting.
+/// (plugin crash, OOM, protocol/ontology violations) and for operator-managed
+/// findings whose generated subsystem anchor retires. `findings.entity_id` is
+/// NOT NULL + FK, so Phase 3 supplies one synthetic `core:project:{name}` anchor
+/// record for the writer transaction to materialize when re-anchoring is needed.
 fn project_anchor_id(project_root: &Path) -> String {
     let name = project_root
         .file_name()
@@ -3890,6 +3950,24 @@ async fn ensure_project_anchor(
     started_at: &str,
     head_commit: Option<&str>,
 ) -> Result<String> {
+    let record = project_anchor_record(project_root, started_at, head_commit);
+    let id = record.id.clone();
+    writer
+        .send_wait(|ack| WriterCmd::InsertEntity {
+            entity: Box::new(record),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("InsertEntity for project finding anchor {id}"))?;
+    Ok(id)
+}
+
+fn project_anchor_record(
+    project_root: &Path,
+    started_at: &str,
+    head_commit: Option<&str>,
+) -> EntityRecord {
     let id = project_anchor_id(project_root);
     let name = project_root
         .file_name()
@@ -3928,15 +4006,7 @@ async fn ensure_project_anchor(
         updated_at: started_at.to_owned(),
     };
     stamp_entity_git_provenance(&mut record, head_commit);
-    writer
-        .send_wait(|ack| WriterCmd::InsertEntity {
-            entity: Box::new(record),
-            ack,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("InsertEntity for project finding anchor {id}"))?;
-    Ok(id)
+    record
 }
 
 /// Core-emitted per-file analysis-timeout subcode (REQ-ANALYZE-06). Host-side:

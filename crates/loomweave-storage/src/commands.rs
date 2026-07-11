@@ -22,6 +22,12 @@ use crate::wardline_taint::TaintFact;
 
 pub type Ack<T> = oneshot::Sender<Result<T, StorageError>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsystemReconcileOutcome {
+    pub protected_finding_anchor_present: bool,
+    pub protected_finding_anchor_materialized: bool,
+}
+
 /// Run status values. Extended in later WPs; Sprint 1 uses only
 /// `SkippedNoPlugins` (from `loomweave analyze` without plugins wired) and
 /// `Failed` (explicit `FailRun`).
@@ -193,6 +199,9 @@ pub enum WriterCmd {
     /// Replace the persisted Phase 3 subsystem projection with the current
     /// clustering result. Stable subsystem ids and memberships are preserved;
     /// obsolete `in_subsystem` edges and subsystem entities are removed.
+    /// Operator-managed findings anchored to an obsolete subsystem are first
+    /// re-anchored to `protected_finding_anchor`; transient siblings still
+    /// retire through the entity FK cascade.
     ///
     /// This is an in-run command because incremental analysis may skip every
     /// source file while Phase 3 still recomputes the authoritative clustering
@@ -200,7 +209,8 @@ pub enum WriterCmd {
     ReconcileSubsystemGraph {
         subsystem_ids: Vec<String>,
         memberships: Vec<(String, String)>,
-        ack: Ack<()>,
+        protected_finding_anchor: Box<EntityRecord>,
+        ack: Ack<SubsystemReconcileOutcome>,
     },
     /// Reconcile the `briefing_blocked` marker on every entity row anchored to
     /// one source file to the current pre-ingest secret-scan verdict

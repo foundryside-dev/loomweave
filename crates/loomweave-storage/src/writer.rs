@@ -26,7 +26,7 @@ use crate::cache::{
 };
 use crate::commands::{
     Ack, EdgeConfidence, EdgeRecord, EntityRecord, FindingRecord, InferredCallEdgeRecord,
-    InferredEdgeWriteStats, RunStatus, WriterCmd,
+    InferredEdgeWriteStats, RunStatus, SubsystemReconcileOutcome, WriterCmd,
 };
 use crate::error::{Result, StorageError};
 use crate::pragma;
@@ -217,6 +217,7 @@ fn run_actor(
             WriterCmd::ReconcileSubsystemGraph {
                 subsystem_ids,
                 memberships,
+                protected_finding_anchor,
                 ack,
             } => {
                 let res = reconcile_subsystem_graph(
@@ -224,6 +225,7 @@ fn run_actor(
                     &mut state,
                     &subsystem_ids,
                     &memberships,
+                    &protected_finding_anchor,
                     commits_observed,
                 );
                 reply(ack, res);
@@ -735,6 +737,12 @@ fn insert_entity(
         begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
+    upsert_entity_row(conn, entity)?;
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+fn upsert_entity_row(conn: &Connection, entity: &EntityRecord) -> Result<()> {
     validate_entity_source_file_anchor(conn, entity)?;
     // ON CONFLICT(id) DO UPDATE makes `loomweave analyze` idempotent across runs:
     // a re-walk that produces the same entity updates the existing row instead
@@ -831,7 +839,6 @@ fn insert_entity(
             params![entity.id, entity.plugin_id, tag],
         )?;
     }
-    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
 }
 
@@ -845,6 +852,45 @@ fn enforce_entity_kind_contract(entity: &EntityRecord) -> Result<()> {
             kind = entity.kind,
             plugin_id = entity.plugin_id,
             id = entity.id,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_protected_finding_anchor(entity: &EntityRecord) -> Result<()> {
+    let canonical_id = loomweave_core::entity_id::entity_id("core", "project", &entity.name)
+        .ok()
+        .is_some_and(|id| id.as_str() == entity.id);
+    let properties = serde_json::from_str::<serde_json::Value>(&entity.properties_json).ok();
+    let has_anchor_marker = properties
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|object| object.get("finding_anchor"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let source_free = entity.parent_id.is_none()
+        && entity.source_file_id.is_none()
+        && entity.source_file_path.is_none()
+        && entity.source_byte_start.is_none()
+        && entity.source_byte_end.is_none()
+        && entity.source_line_start.is_none()
+        && entity.source_line_end.is_none()
+        && entity.content_hash.is_none()
+        && entity.summary_json.is_none()
+        && entity.wardline_json.is_none()
+        && entity.tags.is_empty();
+    if entity.plugin_id != "core"
+        || entity.kind != "project"
+        || entity.short_name != entity.name
+        || !canonical_id
+        || !has_anchor_marker
+        || !source_free
+    {
+        return Err(StorageError::WriterProtocol(format!(
+            "ReconcileSubsystemGraph protected_finding_anchor must be a canonical, \
+             source-free core:project entity with finding_anchor=true; got id={:?}, \
+             plugin_id={:?}, kind={:?}",
+            entity.id, entity.plugin_id, entity.kind
         )));
     }
     Ok(())
@@ -1090,13 +1136,22 @@ fn replace_anchored_edges_for_source_file(
 /// result while preserving rows whose stable ids are still authoritative.
 /// Temporary tables keep the operation parameter-limit independent for large
 /// repositories and let both membership columns participate in exact matching.
+fn entity_row_exists(conn: &Connection, entity_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entities WHERE id = ?1)",
+        [entity_id],
+        |row| row.get(0),
+    )?)
+}
+
 fn reconcile_subsystem_graph(
     conn: &mut Connection,
     state: &mut ActorState,
     subsystem_ids: &[String],
     memberships: &[(String, String)],
+    protected_finding_anchor: &EntityRecord,
     commits_observed: &AtomicUsize,
-) -> Result<()> {
+) -> Result<SubsystemReconcileOutcome> {
     if state.current_run.is_none() {
         return Err(StorageError::WriterProtocol(
             "ReconcileSubsystemGraph received without a preceding BeginRun".to_owned(),
@@ -1106,6 +1161,7 @@ fn reconcile_subsystem_graph(
         begin_write_tx(conn, state)?;
         state.in_tx = true;
     }
+    validate_protected_finding_anchor(protected_finding_anchor)?;
 
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS current_subsystem_ids (\
@@ -1146,6 +1202,55 @@ fn reconcile_subsystem_graph(
            )",
         [],
     )?;
+    let protected_stale_findings: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM findings \
+         WHERE (status <> 'open' OR filigree_issue_id IS NOT NULL) \
+           AND entity_id IN (\
+               SELECT entities.id FROM entities \
+               WHERE entities.kind = 'subsystem' \
+                 AND NOT EXISTS (\
+                     SELECT 1 FROM current_subsystem_ids AS current \
+                     WHERE current.subsystem_id = entities.id\
+                 )\
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    let protected_finding_anchor_was_present =
+        entity_row_exists(conn, &protected_finding_anchor.id)?;
+    if protected_stale_findings > 0 {
+        upsert_entity_row(conn, protected_finding_anchor)?;
+    }
+    let reanchored_findings = conn.execute(
+        "UPDATE findings \
+         SET properties = CASE \
+                 WHEN json_valid(properties) THEN CASE \
+                     WHEN json_type(properties) = 'object' THEN json_set(\
+                         properties, '$.reanchored_from_subsystem_id', entity_id\
+                     ) \
+                     ELSE json_object(\
+                         'reanchored_from_subsystem_id', entity_id, \
+                         'reanchored_legacy_properties', json(properties)\
+                     ) \
+                 END \
+                 ELSE json_object(\
+                     'reanchored_from_subsystem_id', entity_id, \
+                     'reanchored_legacy_properties_raw', properties\
+                 ) \
+             END, \
+             entity_id = ?1, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE (status <> 'open' OR filigree_issue_id IS NOT NULL) \
+           AND entity_id IN (\
+               SELECT entities.id FROM entities \
+               WHERE entities.kind = 'subsystem' \
+                 AND NOT EXISTS (\
+                     SELECT 1 FROM current_subsystem_ids AS current \
+                     WHERE current.subsystem_id = entities.id\
+                 )\
+           )",
+        [protected_finding_anchor.id.as_str()],
+    )?;
     let stale_subsystems = conn.execute(
         "DELETE FROM entities \
          WHERE kind = 'subsystem' \
@@ -1159,11 +1264,16 @@ fn reconcile_subsystem_graph(
         "DROP TABLE current_subsystem_memberships;\
          DROP TABLE current_subsystem_ids;",
     )?;
+    let protected_finding_anchor_present = entity_row_exists(conn, &protected_finding_anchor.id)?;
 
-    if stale_memberships > 0 || stale_subsystems > 0 {
+    if stale_memberships > 0 || reanchored_findings > 0 || stale_subsystems > 0 {
         bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     }
-    Ok(())
+    Ok(SubsystemReconcileOutcome {
+        protected_finding_anchor_present,
+        protected_finding_anchor_materialized: !protected_finding_anchor_was_present
+            && protected_finding_anchor_present,
+    })
 }
 
 /// Reconcile `properties.briefing_blocked` on every entity anchored to one

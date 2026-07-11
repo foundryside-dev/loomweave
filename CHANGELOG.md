@@ -14,6 +14,10 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
+- **Subsystem finding lifecycle preservation.** Before obsolete subsystem
+  entities are removed, acknowledged, suppressed, promoted, or Filigree-linked
+  findings are re-anchored to the project entity with their former subsystem
+  recorded, preventing graph reconciliation from cascading away operator state.
 - **Versioned duplicate-locator evidence.** `LMWV-DUPLICATE-LOCATOR` now
   publishes evidence contract v2 with explicit declaration and collision path
   keys. The deprecated `first_source_file_path` alias retains its original
