@@ -471,7 +471,21 @@ def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vo
     parse_latency_ms = _elapsed_ms(parse_started_ns)
 
     exported_names = _module_export_names(tree)
-    local_export_entity_names = _module_level_exportable_names(tree)
+    try:
+        local_export_entity_names = _module_level_exportable_names(tree)
+    except (RecursionError, MemoryError) as exc:
+        return _too_complex_result(
+            source,
+            dotted_module,
+            file_path,
+            "extract",
+            exc,
+            parse_latency_ms,
+            ast.get_docstring(tree),
+        )
+    entity_export_names = (
+        None if exported_names is None else exported_names & local_export_entity_names
+    )
     cli_guard_targets = _main_guard_targets(tree)
     module_entity = _build_module_entity(
         source,
@@ -489,7 +503,7 @@ def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vo
         walk_state = _WalkState(
             seen_ids={module_entity["id"]},
             file_path=file_path,
-            exported_names=exported_names,
+            exported_names=entity_export_names,
             cli_guard_targets=cli_guard_targets,
             wardline_vocabulary=wardline_vocabulary,
         )
@@ -1310,8 +1324,9 @@ def _module_export_names(tree: ast.Module) -> set[str] | None:
     public-surface heuristic in :func:`_function_tags` / :func:`_class_tags`.
     Both plain (``__all__ = [...]``) and annotated (``__all__: list[str] = [...]``)
     assignments count as a declaration so an annotated ``__all__`` is never
-    mistaken for an absent one. A later literal ``__all__ += [...]`` extends that
-    declaration. A non-literal value (``__all__ = a + b``, an alias, a
+    mistaken for an absent one. A later direct assignment replaces the prior
+    names, while literal ``__all__ += [...]`` extends them. A non-literal value
+    (``__all__ = a + b``, an alias, a
     comprehension) or an annotation-only stub (``__all__: list[str]`` with no
     value) counts as a declaration but contributes no names — i.e. it is treated
     as an explicit *empty* surface, which suppresses ``public-surface``; this
@@ -1323,11 +1338,21 @@ def _module_export_names(tree: ast.Module) -> set[str] | None:
     can_augment_exports = False
     for statement in tree.body:
         if isinstance(statement, ast.Assign):
-            targets: list[ast.expr] = statement.targets
-            value: ast.expr | None = statement.value
+            if not any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in statement.targets
+            ):
+                continue
+            exported = _literal_export_names(statement.value)
+            can_augment_exports = True
         elif isinstance(statement, ast.AnnAssign):
-            targets = [statement.target]
-            value = statement.value
+            if not isinstance(statement.target, ast.Name) or statement.target.id != "__all__":
+                continue
+            if exported is None:
+                exported = set()
+            if statement.value is not None:
+                exported = _literal_export_names(statement.value)
+                can_augment_exports = True
         elif isinstance(statement, ast.AugAssign):
             if (
                 exported is not None
@@ -1340,13 +1365,6 @@ def _module_export_names(tree: ast.Module) -> set[str] | None:
             continue
         else:
             continue
-        if not any(isinstance(target, ast.Name) and target.id == "__all__" for target in targets):
-            continue
-        if exported is None:
-            exported = set()
-        if value is not None:
-            can_augment_exports = True
-        exported.update(_literal_export_names(value))
     return exported
 
 
@@ -1361,11 +1379,281 @@ def _literal_export_names(value: ast.expr | None) -> set[str]:
 
 
 def _module_level_exportable_names(tree: ast.Module) -> set[str]:
-    return {
-        statement.name
+    """Return names with one unambiguously bound direct local definition."""
+    local_entities: dict[
+        str,
+        ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    ] = {}
+    definition_counts: dict[str, int] = {}
+    evaluate_annotations = not any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
         for statement in tree.body
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
+    )
+    for statement in tree.body:
+        if isinstance(statement, ast.ImportFrom) and any(
+            alias.name == "*" for alias in statement.names
+        ):
+            local_entities.clear()
+        for name in _direct_module_rebindings(
+            statement,
+            evaluate_annotations=evaluate_annotations,
+        ):
+            local_entities.pop(name, None)
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            count = definition_counts.get(statement.name, 0) + 1
+            definition_counts[statement.name] = count
+            if count == 1:
+                local_entities[statement.name] = statement
+            else:
+                local_entities.pop(statement.name, None)
+    return set(local_entities)
+
+
+def _direct_module_rebindings(statement: ast.stmt, *, evaluate_annotations: bool) -> set[str]:
+    """Names definitely rebound while one direct module statement executes."""
+    for classifier in (
+        _definition_or_import_rebindings,
+        _assignment_rebindings,
+        _statement_expression_rebindings,
+    ):
+        names = classifier(statement, evaluate_annotations=evaluate_annotations)
+        if names is not None:
+            return names
+    return set()
+
+
+def _definition_or_import_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> set[str] | None:
+    collector = _ExpressionBindingCollector()
+    match statement:
+        case ast.FunctionDef() | ast.AsyncFunctionDef():
+            collector.names.add(statement.name)
+            collector.visit_function_header(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            )
+        case ast.ClassDef():
+            collector.names.update(_class_header_rebindings(statement))
+            collector.names.update(
+                _class_body_global_rebindings(
+                    statement,
+                    evaluate_annotations=evaluate_annotations,
+                ),
+            )
+        case ast.Import():
+            for alias in statement.names:
+                collector.names.add(alias.asname or alias.name.partition(".")[0])
+        case ast.ImportFrom() if statement.module != "__future__":
+            for alias in statement.names:
+                if alias.name != "*":
+                    collector.names.add(alias.asname or alias.name)
+        case ast.ImportFrom():
+            pass
+        case _:
+            return None
+    return collector.names
+
+
+def _assignment_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> set[str] | None:
+    collector = _ExpressionBindingCollector()
+    if statement.__class__.__name__ == "TypeAlias":
+        for child in ast.iter_child_nodes(statement):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                collector.names.add(child.id)
+        return collector.names
+    match statement:
+        case ast.Assign():
+            collector.visit(statement.value)
+            collector.visit_expressions(statement.targets)
+        case ast.AnnAssign():
+            if evaluate_annotations:
+                collector.visit(statement.annotation)
+            if statement.value is not None:
+                collector.visit(statement.value)
+                collector.visit(statement.target)
+        case ast.AugAssign():
+            collector.visit(statement.value)
+            collector.visit(statement.target)
+        case ast.Delete():
+            collector.visit_expressions(statement.targets)
+        case _:
+            return None
+    return collector.names
+
+
+def _class_header_rebindings(node: ast.ClassDef) -> set[str]:
+    collector = _ExpressionBindingCollector()
+    collector.names.add(node.name)
+    collector.visit_expressions([*node.decorator_list, *node.bases])
+    collector.visit_expressions([keyword.value for keyword in node.keywords])
+    return collector.names
+
+
+def _class_body_global_rebindings(
+    node: ast.ClassDef,
+    *,
+    evaluate_annotations: bool,
+) -> set[str]:
+    global_collector = _ClassGlobalCollector()
+    for statement in node.body:
+        global_collector.visit(statement)
+    rebound: set[str] = set()
+    for statement in node.body:
+        if isinstance(statement, ast.ClassDef):
+            nested_global_rebindings = _class_body_global_rebindings(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            )
+            statement_rebindings = _class_header_rebindings(statement) | nested_global_rebindings
+            rebound.update(nested_global_rebindings)
+        else:
+            statement_rebindings = _direct_module_rebindings(
+                statement,
+                evaluate_annotations=evaluate_annotations,
+            )
+        rebound.update(statement_rebindings & global_collector.names)
+    return rebound
+
+
+class _ClassGlobalCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.names.update(node.names)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        _ = node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        _ = node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        _ = node
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        _ = node
+
+
+def _statement_expression_rebindings(
+    statement: ast.stmt,
+    *,
+    evaluate_annotations: bool,
+) -> set[str] | None:
+    _ = evaluate_annotations
+    collector = _ExpressionBindingCollector()
+    match statement:
+        case ast.Expr():
+            collector.visit(statement.value)
+        case ast.If() | ast.While():
+            collector.visit(statement.test)
+        case ast.For() | ast.AsyncFor():
+            collector.visit(statement.iter)
+        case ast.With() | ast.AsyncWith():
+            collector.visit_expressions([item.context_expr for item in statement.items])
+            collector.visit_expressions(
+                [item.optional_vars for item in statement.items if item.optional_vars is not None],
+            )
+        case ast.Match():
+            collector.visit(statement.subject)
+        case ast.Assert():
+            collector.visit(statement.test)
+            if statement.msg is not None:
+                collector.visit(statement.msg)
+        case ast.Raise():
+            if statement.exc is not None:
+                collector.visit(statement.exc)
+            if statement.cause is not None:
+                collector.visit(statement.cause)
+        case _:
+            return None
+    return collector.names
+
+
+class _ExpressionBindingCollector(ast.NodeVisitor):
+    """Collect assignment-expression effects without entering nested scopes."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+    def visit_function_header(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        evaluate_annotations: bool,
+    ) -> None:
+        self.visit_expressions([*node.decorator_list, *node.args.defaults])
+        self.visit_expressions(
+            [default for default in node.args.kw_defaults if default is not None],
+        )
+        if not evaluate_annotations:
+            return
+        arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        if node.args.vararg is not None:
+            arguments.append(node.args.vararg)
+        if node.args.kwarg is not None:
+            arguments.append(node.args.kwarg)
+        self.visit_expressions(
+            [argument.annotation for argument in arguments if argument.annotation is not None],
+        )
+        if node.returns is not None:
+            self.visit(node.returns)
+
+    def visit_expressions(self, expressions: list[ast.expr]) -> None:
+        for expression in expressions:
+            self.visit(expression)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self.visit_expressions(node.args.defaults)
+        self.visit_expressions(
+            [default for default in node.args.kw_defaults if default is not None],
+        )
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        if node.values:
+            self.visit(node.values[0])
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self.visit(node.test)
+        body_effects = _ExpressionBindingCollector()
+        body_effects.visit(node.body)
+        else_effects = _ExpressionBindingCollector()
+        else_effects.visit(node.orelse)
+        self.names.update(body_effects.names & else_effects.names)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        self.visit(node.left)
+        if node.comparators:
+            self.visit(node.comparators[0])
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators)
+
+    def _visit_comprehension(self, generators: list[ast.comprehension]) -> None:
+        if generators:
+            self.visit(generators[0].iter)
 
 
 def _main_guard_targets(tree: ast.Module) -> set[str]:

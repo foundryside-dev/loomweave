@@ -14,6 +14,10 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
+- **Python export rebinding accuracy.** Explicit `__all__` exports now follow
+  final statically visible module bindings, so a local function or class later
+  replaced by an import, assignment, or other module-scope binding is no longer
+  reported as the runtime exported API object.
 - **Subsystem finding lifecycle preservation.** Before obsolete subsystem
   entities are removed, acknowledged, suppressed, promoted, or Filigree-linked
   findings are re-anchored to the project entity with their former subsystem

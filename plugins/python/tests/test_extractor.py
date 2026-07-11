@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -16,6 +18,7 @@ from loomweave_plugin_python.extractor import (
     ExtractResult,
     ImportsEdgeProperties,
     RawEdge,
+    _module_level_exportable_names,
     _module_source_range,
     extract,
     extract_with_stats,
@@ -1728,6 +1731,370 @@ def exported_fn():
     assert "exported-api" in function["tags"]
     assert "tags" not in module or "exported-api" not in module["tags"]
     assert module["exported_names"] == ["exported_fn"]
+
+
+def test_dunder_all_uses_final_module_bindings_after_local_definitions_are_rebound() -> None:
+    source = """\
+def imported_export():
+    return "stale local definition"
+
+
+class AssignedExport:
+    pass
+
+
+from pkg.impl import imported_export
+AssignedExport = object()
+
+__all__ = ["imported_export", "AssignedExport"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    module = by_id["python:module:api"]
+    stale_function = by_id["python:function:api.imported_export"]
+    stale_class = by_id["python:class:api.AssignedExport"]
+    assert "exported-api" in module["tags"]
+    assert "exported-api" not in stale_function.get("tags", [])
+    assert "exported-api" not in stale_class.get("tags", [])
+    assert module["exported_names"] == ["AssignedExport", "imported_export"]
+
+
+def test_dead_conditional_rebinding_does_not_displace_local_export() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+if False:
+    exported_fn = object()
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    function = by_id["python:function:api.exported_fn"]
+    module = by_id["python:module:api"]
+    assert "exported-api" in function["tags"]
+    assert "tags" not in module or "exported-api" not in module["tags"]
+
+
+def test_definition_annotation_rebinding_displaces_local_export() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+replacement = object()
+
+
+def consumer(value: (exported_fn := replacement)):
+    return value
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    stale_function = by_id["python:function:api.exported_fn"]
+    module = by_id["python:module:api"]
+    assert "exported-api" not in stale_function.get("tags", [])
+    assert "exported-api" in module["tags"]
+
+
+def test_dunder_all_repeated_function_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return "stale"
+
+
+def exported_fn():
+    return "runtime"
+
+
+__all__ = ["exported_fn"]
+"""
+    result = extract_with_stats(source, "api.py")
+    module = next(e for e in result.entities if e["id"] == "python:module:api")
+    function = next(e for e in result.entities if e["id"] == "python:function:api.exported_fn")
+
+    assert "exported-api" in module["tags"]
+    assert "exported-api" not in function.get("tags", [])
+    assert function["source"]["source_range"]["start_line"] == 1
+    assert result.stats.duplicate_entities_dropped_total == 1
+
+
+def test_dunder_all_repeated_class_uses_module_proxy() -> None:
+    source = """\
+class Exported:
+    stale = True
+
+
+class Exported:
+    runtime = True
+
+
+__all__ = ["Exported"]
+"""
+    result = extract_with_stats(source, "api.py")
+    by_id = {e["id"]: e for e in result.entities}
+
+    module = by_id["python:module:api"]
+    exported_class = by_id["python:class:api.Exported"]
+    assert "exported-api" in module["tags"]
+    assert "exported-api" not in exported_class.get("tags", [])
+    assert exported_class["source"]["source_range"]["start_line"] == 1
+    assert result.stats.duplicate_entities_dropped_total == 1
+
+
+def test_dunder_all_star_import_after_definition_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+from replacement import *
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+
+
+def test_dunder_all_with_target_after_definition_uses_module_proxy() -> None:
+    source = """\
+def exported_fn():
+    return 1
+
+
+with manager() as exported_fn:
+    pass
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+
+
+def test_postponed_annotations_preserve_local_export_binding() -> None:
+    source = """\
+from __future__ import annotations
+
+
+def exported_fn():
+    return 1
+
+
+def consumer(value: exported_fn) -> exported_fn:
+    return value
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported_fn"]["tags"]
+    module = by_id["python:module:api"]
+    assert "tags" not in module or "exported-api" not in module["tags"]
+
+
+def test_postponed_annotations_skip_annotation_binding_effects() -> None:
+    tree = ast.parse(
+        "from __future__ import annotations\n"
+        "def exported_fn(): pass\n"
+        "def consumer(value: exported_fn): pass\n",
+    )
+    consumer = tree.body[2]
+    assert isinstance(consumer, ast.FunctionDef)
+    consumer.args.args[0].annotation = ast.NamedExpr(
+        target=ast.Name(id="exported_fn", ctx=ast.Store()),
+        value=ast.Name(id="replacement", ctx=ast.Load()),
+    )
+
+    local_names = _module_level_exportable_names(tree)
+
+    assert "exported_fn" in local_names
+
+
+def test_reassigned_dunder_all_replaces_earlier_export_names() -> None:
+    source = """\
+def first_export():
+    return 1
+
+
+def final_export():
+    return 2
+
+
+__all__ = ["first_export"]
+__all__ = ["final_export"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" not in by_id["python:function:api.first_export"].get("tags", [])
+    assert "exported-api" in by_id["python:function:api.final_export"]["tags"]
+    assert by_id["python:module:api"]["exported_names"] == ["final_export"]
+
+
+def test_unexecuted_expression_branches_do_not_displace_local_exports() -> None:
+    source = """\
+replacement = object()
+
+
+def short_circuit_export():
+    return 1
+
+
+False and (short_circuit_export := replacement)
+
+
+def conditional_export():
+    return 2
+
+
+replacement if True else (conditional_export := replacement)
+
+
+def deferred_export():
+    return 3
+
+
+((deferred_export := replacement) for _ in ())
+
+__all__ = ["short_circuit_export", "conditional_export", "deferred_export"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    for name in ["short_circuit_export", "conditional_export", "deferred_export"]:
+        assert "exported-api" in by_id[f"python:function:api.{name}"]["tags"]
+
+
+def test_guaranteed_expression_binding_effects_displace_local_exports() -> None:
+    source = """\
+replacement = object()
+condition = bool()
+
+
+def lambda_default_export():
+    return 1
+
+
+factory = lambda value=(lambda_default_export := replacement): value
+
+
+def conditional_export():
+    return 2
+
+
+(conditional_export := replacement) if condition else (conditional_export := object())
+
+__all__ = ["lambda_default_export", "conditional_export"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+    for name in ["lambda_default_export", "conditional_export"]:
+        assert "exported-api" not in by_id[f"python:function:api.{name}"].get("tags", [])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type aliases require Python 3.12")
+def test_type_alias_after_definition_uses_module_proxy() -> None:
+    source = """\
+def exported_name():
+    return 1
+
+
+type exported_name = int
+
+__all__ = ["exported_name"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+    assert "exported-api" not in by_id["python:function:api.exported_name"].get("tags", [])
+
+
+def test_class_body_global_assignment_after_definition_uses_module_proxy() -> None:
+    source = """\
+replacement = object()
+
+
+def exported_fn():
+    return 1
+
+
+class Binder:
+    global exported_fn
+    exported_fn = replacement
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+
+
+def test_nested_class_body_global_assignment_uses_module_proxy() -> None:
+    source = """\
+replacement = object()
+
+
+def exported_fn():
+    return 1
+
+
+class Outer:
+    class Inner:
+        global exported_fn
+        exported_fn = replacement
+
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:module:api"]["tags"]
+    assert "exported-api" not in by_id["python:function:api.exported_fn"].get("tags", [])
+
+
+def test_deep_nested_class_binding_analysis_is_linear() -> None:
+    lines = ["replacement = object()", "def exported_fn(): pass"]
+    indent = ""
+    for depth in range(20):
+        lines.append(f"{indent}class Level{depth}:")
+        indent += "    "
+    lines.extend(
+        [
+            f"{indent}global exported_fn",
+            f"{indent}exported_fn = replacement",
+            '__all__ = ["exported_fn"]',
+        ],
+    )
+
+    started = time.perf_counter()
+    entities, _ = extract("\n".join(lines), "api.py")
+    elapsed = time.perf_counter() - started
+    by_id = {e["id"]: e for e in entities}
+
+    assert elapsed < 1.0, f"nested class binding analysis took {elapsed:.3f}s"
+    assert "exported-api" in by_id["python:module:api"]["tags"]
 
 
 def test_dunder_all_augmented_assignment_extends_exported_api_surface() -> None:
