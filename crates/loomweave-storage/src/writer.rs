@@ -437,9 +437,17 @@ fn run_actor(
                 run_id,
                 reason,
                 completed_at,
+                stats_json,
                 ack,
             } => {
-                let res = fail_run(conn, &mut state, &run_id, &reason, &completed_at);
+                let res = fail_run(
+                    conn,
+                    &mut state,
+                    &run_id,
+                    &reason,
+                    &completed_at,
+                    &stats_json,
+                );
                 reply(ack, res);
             }
         }
@@ -1851,15 +1859,12 @@ fn commit_run(
         // inside the transaction so a failure rolls back this run's writes,
         // then fold the UPDATE in and commit once.
         if let Some(mismatch) = parent_contains_mismatch(conn)? {
+            let failure_stats = stats_with_failure_reason(stats_json, &mismatch)?;
             let _ = conn.execute_batch("ROLLBACK");
             state.in_tx = false;
             state.writes_in_batch = 0;
             // The run row was inserted in BeginRun's auto-committed write;
             // re-mark it failed under a separate implicit transaction.
-            let failure_stats = serde_json::json!({
-                "failure_reason": mismatch.clone(),
-            })
-            .to_string();
             let changed = conn.execute(
                 "UPDATE runs \
                     SET status = 'failed', completed_at = ?1, stats = ?2, owner_pid = NULL \
@@ -1987,13 +1992,17 @@ fn fail_run(
     run_id: &str,
     reason: &str,
     completed_at: &str,
+    stats_json: &str,
 ) -> Result<()> {
     ensure_current_run_matches(state, "FailRun", run_id)?;
+    // Validate before rolling back or updating the run row. A malformed
+    // caller payload is a writer protocol error, not permission to discard
+    // already-built run evidence.
+    let stats_json = stats_with_failure_reason(stats_json, reason)?;
     if state.in_tx {
         let _ = conn.execute_batch("ROLLBACK");
         state.in_tx = false;
     }
-    let stats_json = serde_json::json!({ "failure_reason": reason }).to_string();
     let changed = conn.execute(
         "UPDATE runs \
             SET status = 'failed', completed_at = ?1, stats = ?2, owner_pid = NULL \
@@ -2008,6 +2017,22 @@ fn fail_run(
     state.current_run = None;
     state.writes_in_batch = 0;
     Ok(())
+}
+
+fn stats_with_failure_reason(stats_json: &str, reason: &str) -> Result<String> {
+    let value = serde_json::from_str::<serde_json::Value>(stats_json).map_err(|error| {
+        StorageError::WriterProtocol(format!("FailRun stats_json is not valid JSON: {error}"))
+    })?;
+    let serde_json::Value::Object(mut stats) = value else {
+        return Err(StorageError::WriterProtocol(
+            "FailRun stats_json must be a JSON object".to_owned(),
+        ));
+    };
+    stats.insert(
+        "failure_reason".to_owned(),
+        serde_json::Value::String(reason.to_owned()),
+    );
+    Ok(serde_json::Value::Object(stats).to_string())
 }
 
 fn ensure_current_run_matches(

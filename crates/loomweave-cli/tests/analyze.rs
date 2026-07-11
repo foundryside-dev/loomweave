@@ -857,6 +857,7 @@ entity_kinds = ["module", "function"]
 edge_kinds = ["contains"]
 rule_id_prefix = "LMWV-CAT-"
 ontology_version = "0.1.0"
+classifier_tags = ["entry-point", "http-route"]
 
 [ontology.roles]
 file_scope = ["module"]
@@ -878,6 +879,420 @@ fn write_categorised_plugin(plugin_dir: &std::path::Path) {
 
     std::fs::write(plugin_dir.join("plugin.toml"), CATEGORISED_PLUGIN_MANIFEST)
         .expect("write categorised plugin manifest");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_persists_complete_classifier_coverage() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("app.cat"), b"app\n").unwrap();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let coverage = latest_run_stats(project_dir.path())["classifier_coverage"].clone();
+    assert_eq!(coverage["schema"], "loomweave.classifier-coverage.v1");
+    assert_eq!(coverage["source_walk_complete"], true);
+    assert_eq!(coverage["plugin_discovery_complete"], true);
+    assert_eq!(coverage["plugins"][0]["plugin_id"], "catfixture");
+    assert_eq!(coverage["plugins"][0]["matched_files"], 1);
+    assert_eq!(coverage["plugins"][0]["analyzed_files"], 1);
+    assert_eq!(coverage["plugins"][0]["retained_files"], 0);
+    assert_eq!(coverage["plugins"][0]["degraded_files"], 0);
+    assert_eq!(coverage["plugins"][0]["status"], "complete");
+    assert_eq!(
+        coverage["plugins"][0]["classifier_tags"],
+        serde_json::json!(["entry-point", "http-route"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_hard_failure_after_run_open_preserves_classifier_coverage() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    let script_path = plugin_dir.path().join("loomweave-plugin-categorised");
+    let script = std::fs::read_to_string(&script_path).unwrap().replace(
+        "                        \"parent_id\": \"catfixture:module:app\",\n",
+        "",
+    );
+    std::fs::write(&script_path, script).unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("app.cat"), b"app\n").unwrap();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .failure();
+
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    let (status, raw): (String, String) = conn
+        .query_row(
+            "SELECT status, stats FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    let stats_value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        stats_value["classifier_coverage"]["schema"],
+        "loomweave.classifier-coverage.v1"
+    );
+    assert_eq!(
+        stats_value["classifier_coverage"]["plugins"][0]["status"],
+        "complete"
+    );
+    assert!(
+        stats_value["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("LMWV-INFRA-PARENT-CONTAINS-MISMATCH")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_generic_commit_failure_terminalizes_with_classifier_coverage() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("app.cat"), b"app\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER inject_completed_commit_failure
+         BEFORE UPDATE OF status ON runs
+         WHEN NEW.status = 'completed'
+         BEGIN
+             SELECT RAISE(ABORT, 'injected completed CommitRun failure');
+         END;",
+    )
+    .unwrap();
+    drop(conn);
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .failure();
+
+    let conn = Connection::open(db_path).unwrap();
+    let (status, raw): (String, String) = conn
+        .query_row(
+            "SELECT status, stats FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    let stats_value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        stats_value["classifier_coverage"]["schema"],
+        "loomweave.classifier-coverage.v1"
+    );
+    assert_eq!(
+        stats_value["classifier_coverage"]["plugins"][0]["status"],
+        "complete"
+    );
+    assert!(
+        stats_value["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("injected completed CommitRun failure")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_shutdown_timeout_does_not_fail_complete_classifier_coverage() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    let script_path = plugin_dir.path().join("loomweave-plugin-categorised");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap()
+        .replace("import sys\n", "import sys\nimport time\n")
+        .replace(
+            "    elif method == \"shutdown\":\n        write_frame({\"jsonrpc\": \"2.0\", \"id\": ident, \"result\": {}})\n",
+            "    elif method == \"shutdown\":\n        time.sleep(60)\n",
+        );
+    std::fs::write(&script_path, script).unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("app.cat"), b"app\n").unwrap();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PLUGIN_SHUTDOWN_TIMEOUT_MS", "10")
+        .assert()
+        .success();
+
+    let plugin = latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(plugin["analyzed_files"], 1);
+    assert_eq!(plugin["status"], "complete");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_host_rejected_entity_marks_classifier_coverage_failed() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    let script_path = plugin_dir.path().join("loomweave-plugin-categorised");
+    let script = std::fs::read_to_string(&script_path).unwrap().replace(
+        "\"id\": \"catfixture:function:app.main\"",
+        "\"id\": \"catfixture:function:app.wrong\"",
+    );
+    std::fs::write(&script_path, script).unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("app.cat"), b"app\n").unwrap();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let plugin = latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(plugin["matched_files"], 1);
+    assert_eq!(plugin["analyzed_files"], 1);
+    assert_eq!(plugin["status"], "failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_partial_output_then_plugin_failure_records_partial_failed_coverage() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    let script_path = plugin_dir.path().join("loomweave-plugin-categorised");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap()
+        .replace(
+            "\nwhile True:\n    msg = read_frame()",
+            "\nanalysis_count = 0\nwhile True:\n    msg = read_frame()",
+        )
+        .replace(
+            "        path = msg[\"params\"][\"file_path\"]\n",
+            "        path = msg[\"params\"][\"file_path\"]\n        analysis_count += 1\n        if analysis_count > 1:\n            raise SystemExit(7)\n",
+        );
+    std::fs::write(&script_path, script).unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("a.cat"), b"a\n").unwrap();
+    std::fs::write(project_dir.path().join("b.cat"), b"b\n").unwrap();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    let output = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+
+    let plugin = latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(plugin["matched_files"], 2);
+    assert_eq!(plugin["analyzed_files"], 1, "analyze stderr: {stderr}");
+    assert_eq!(plugin["status"], "failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_source_walk_error_marks_classifier_coverage_incomplete() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let blocked = project_dir.path().join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("hidden.cat"), b"hidden\n").unwrap();
+    let mut permissions = std::fs::metadata(&blocked).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&blocked, permissions).unwrap();
+    if std::fs::read_dir(&blocked).is_ok() {
+        let mut restore = std::fs::metadata(&blocked).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(&blocked, restore).unwrap();
+        return;
+    }
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let output = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    let mut restore = std::fs::metadata(&blocked).unwrap().permissions();
+    restore.set_mode(0o700);
+    std::fs::set_permissions(&blocked, restore).unwrap();
+    drop(output);
+
+    let coverage = latest_run_stats(project_dir.path())["classifier_coverage"].clone();
+    assert!(coverage["source_walk_skipped_entries"].as_u64().unwrap() > 0);
+    assert_eq!(coverage["source_walk_complete"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_persists_not_applicable_classifier_coverage_for_zero_matching_files() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let plugin = latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(plugin["matched_files"], 0);
+    assert_eq!(plugin["analyzed_files"], 0);
+    assert_eq!(plugin["retained_files"], 0);
+    assert_eq!(plugin["status"], "not-applicable");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_classifier_coverage_fails_closed_on_partial_plugin_discovery() {
+    use std::os::unix::fs::symlink;
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let valid_plugin_dir = tempfile::tempdir().unwrap();
+    let broken_plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(valid_plugin_dir.path());
+    symlink(
+        "/bin/true",
+        broken_plugin_dir.path().join("loomweave-plugin-broken"),
+    )
+    .unwrap();
+    std::fs::write(
+        broken_plugin_dir.path().join("plugin.toml"),
+        b"this is {not = valid toml @@@",
+    )
+    .unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("app.cat"), b"app\n").unwrap();
+    let plugin_path = std::env::join_paths([
+        valid_plugin_dir.path().to_path_buf(),
+        broken_plugin_dir.path().to_path_buf(),
+    ])
+    .unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let coverage = latest_run_stats(project_dir.path())["classifier_coverage"].clone();
+    assert_eq!(coverage["plugin_discovery_complete"], false);
+    assert_eq!(coverage["plugin_discovery_errors"], 1);
+    assert_eq!(coverage["source_walk_complete"], false);
+    assert_eq!(coverage["plugins"][0]["plugin_id"], "catfixture");
+    assert_eq!(coverage["plugins"][0]["status"], "complete");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_classifier_coverage_counts_incrementally_retained_files() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("app.cat"), b"app\n").unwrap();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+    analyze();
+    analyze();
+
+    let plugin = latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(plugin["matched_files"], 1);
+    assert_eq!(plugin["analyzed_files"], 0);
+    assert_eq!(plugin["retained_files"], 1);
+    assert_eq!(plugin["status"], "complete");
 }
 
 #[cfg(unix)]
@@ -1104,6 +1519,61 @@ fn analyze_without_plugins_writes_skipped_run_row() {
         .query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))
         .unwrap();
     assert_eq!(entity_count, 0);
+}
+
+#[test]
+fn analyze_no_plugin_commit_failure_terminalizes_with_classifier_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let db_path = dir.path().join(".weft/loomweave/loomweave.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER inject_skipped_commit_failure
+         BEFORE UPDATE OF status ON runs
+         WHEN NEW.status = 'skipped_no_plugins'
+         BEGIN
+             SELECT RAISE(ABORT, 'injected skipped CommitRun failure');
+         END;",
+    )
+    .unwrap();
+    drop(conn);
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .failure();
+
+    let conn = Connection::open(db_path).unwrap();
+    let (status, raw): (String, String) = conn
+        .query_row(
+            "SELECT status, stats FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    let stats_value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        stats_value["classifier_coverage"]["schema"],
+        "loomweave.classifier-coverage.v1"
+    );
+    assert_eq!(
+        stats_value["classifier_coverage"]["plugins"],
+        serde_json::json!([])
+    );
+    assert!(
+        stats_value["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("injected skipped CommitRun failure")
+    );
 }
 
 /// `analyze` self-migrates a stale DB rather than hard-failing (WS9). `install`
@@ -2848,6 +3318,19 @@ fn analyze_failrun_exits_nonzero_with_run_row_marked_failed() {
         status, "failed",
         "run row must be marked 'failed' to stay consistent with exit code"
     );
+    let coverage_stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        coverage_stats["classifier_coverage"]["plugin_discovery_complete"],
+        false
+    );
+    assert_eq!(
+        coverage_stats["classifier_coverage"]["source_walk_complete"],
+        false
+    );
+    assert_eq!(
+        coverage_stats["classifier_coverage"]["plugin_discovery_errors"],
+        1
+    );
 }
 
 #[cfg(unix)]
@@ -4505,6 +4988,7 @@ entity_kinds = ["module"]
 edge_kinds = []
 rule_id_prefix = "LMWV-SYN-"
 ontology_version = "0.6.0"
+classifier_tags = ["exported-api"]
 
 [ontology.roles]
 file_scope = ["module"]
@@ -4525,6 +5009,86 @@ fn write_syntax_error_plugin(plugin_dir: &std::path::Path) {
 
     std::fs::write(plugin_dir.join("plugin.toml"), SYNTAX_ERROR_PLUGIN_MANIFEST)
         .expect("write syn plugin manifest");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_marks_syntax_degraded_classifier_coverage() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_syntax_error_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("broken_mod.syn"), b"broken\n").unwrap();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let plugin = latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(plugin["matched_files"], 1);
+    assert_eq!(plugin["analyzed_files"], 1);
+    assert_eq!(plugin["degraded_files"], 1);
+    assert_eq!(plugin["status"], "degraded");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    let retained =
+        latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(retained["analyzed_files"], 0);
+    assert_eq!(retained["retained_files"], 1);
+    assert_eq!(retained["degraded_files"], 0);
+    assert_eq!(retained["status"], "failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_classifier_coverage_records_every_discovered_plugin() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let categorised_dir = tempfile::tempdir().unwrap();
+    let syntax_dir = tempfile::tempdir().unwrap();
+    write_categorised_plugin(categorised_dir.path());
+    write_syntax_error_plugin(syntax_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("app.cat"), b"app\n").unwrap();
+    std::fs::write(project_dir.path().join("clean.syn"), b"clean\n").unwrap();
+    let plugin_path = std::env::join_paths([
+        syntax_dir.path().to_path_buf(),
+        categorised_dir.path().to_path_buf(),
+    ])
+    .unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    let plugins = latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(plugins.len(), 2);
+    assert_eq!(plugins[0]["plugin_id"], "catfixture");
+    assert_eq!(plugins[1]["plugin_id"], "synfixture");
+    assert!(plugins.iter().all(|plugin| plugin["status"] == "complete"));
 }
 
 #[cfg(unix)]
@@ -4702,6 +5266,12 @@ fn analyze_replaces_legacy_syntax_fallbacks_with_file_scoped_plugin_findings() {
         .env("SYN_REPORT_FINDINGS", "1")
         .assert()
         .success();
+
+    let coverage =
+        latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(coverage["analyzed_files"], 4);
+    assert_eq!(coverage["degraded_files"], 3);
+    assert_eq!(coverage["status"], "degraded");
 
     let conn = Connection::open(&db_path).unwrap();
     let findings = conn
@@ -5206,6 +5776,7 @@ entity_kinds = ["module"]
 edge_kinds = []
 rule_id_prefix = "LMWV-CRASH-"
 ontology_version = "0.6.0"
+classifier_tags = ["entry-point"]
 
 [ontology.roles]
 file_scope = ["module"]
@@ -5225,6 +5796,84 @@ fn write_crashing_plugin(plugin_dir: &std::path::Path) {
 
     std::fs::write(plugin_dir.join("plugin.toml"), CRASHING_PLUGIN_MANIFEST)
         .expect("write crash plugin manifest");
+}
+
+#[cfg(unix)]
+fn write_numbered_crashing_plugin(plugin_dir: &std::path::Path, index: usize) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = format!("loomweave-plugin-crash{index}");
+    let plugin_id = format!("crashfixture{index}");
+    let extension = format!("cr{index}");
+    let script = CRASHING_PLUGIN_SCRIPT
+        .replace("loomweave-plugin-crash", &executable)
+        .replace("crashfixture", &plugin_id);
+    let manifest = CRASHING_PLUGIN_MANIFEST
+        .replace("loomweave-plugin-crash", &executable)
+        .replace("crashfixture", &plugin_id)
+        .replace(
+            "extensions = [\"crx\"]",
+            &format!("extensions = [\"{extension}\"]"),
+        );
+    let plugin_script = plugin_dir.join(&executable);
+    std::fs::write(&plugin_script, script).unwrap();
+    let mut permissions = std::fs::metadata(&plugin_script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&plugin_script, permissions).unwrap();
+    std::fs::write(plugin_dir.join("plugin.toml"), manifest).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_crash_loop_marks_unstarted_remaining_plugin_coverage_failed() {
+    let project_dir = tempfile::tempdir().unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_dirs = (0..5)
+        .map(|index| {
+            let plugin_dir = tempfile::tempdir().unwrap();
+            write_numbered_crashing_plugin(plugin_dir.path(), index);
+            std::fs::write(project_dir.path().join(format!("file.cr{index}")), b"x\n").unwrap();
+            plugin_dir
+        })
+        .collect::<Vec<_>>();
+    let plugin_path = std::env::join_paths(
+        plugin_dirs
+            .iter()
+            .map(|plugin_dir| plugin_dir.path().to_path_buf()),
+    )
+    .unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .failure();
+
+    let stats = latest_run_stats(project_dir.path());
+    let plugins = stats["classifier_coverage"]["plugins"].as_array().unwrap();
+    assert_eq!(plugins.len(), 5);
+    let unstarted = plugins
+        .iter()
+        .find(|plugin| plugin["plugin_id"] == "crashfixture4")
+        .unwrap();
+    assert_eq!(unstarted["matched_files"], 1);
+    assert_eq!(unstarted["analyzed_files"], 0);
+    assert_eq!(unstarted["status"], "failed");
+
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    let crash_findings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-INFRA-PLUGIN-CRASH'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(crash_findings, 4, "the fifth plugin must never be started");
 }
 
 /// REQ-ANALYZE-06 verification (in part): a plugin that crashes mid-run produces
@@ -5293,6 +5942,12 @@ fn analyze_persists_crash_finding_anchored_to_project() {
             |row| row.get(0),
         )
         .expect("query run stats");
+    let stats: serde_json::Value = serde_json::from_str(&stats_raw).unwrap();
+    let plugin = &stats["classifier_coverage"]["plugins"][0];
+    assert_eq!(plugin["plugin_id"], "crashfixture");
+    assert_eq!(plugin["matched_files"], 1);
+    assert_eq!(plugin["analyzed_files"], 0);
+    assert_eq!(plugin["status"], "failed");
     let stats: serde_json::Value = serde_json::from_str(&stats_raw).expect("stats JSON");
     assert!(
         stats["failure_findings"].as_u64().unwrap_or(0) >= 1,

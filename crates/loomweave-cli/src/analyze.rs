@@ -53,6 +53,7 @@ use crate::config::{AnalyzeConfig, ClusteringConfig};
 use crate::stats::P95Accumulator;
 use duplicate_guard::{DUPLICATE_LOCATOR_RULE_ID, DuplicateLocatorGuard};
 
+mod classifier_coverage;
 mod duplicate_guard;
 use loomweave_analysis::{
     ClusterAlgorithm, ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules,
@@ -499,11 +500,17 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             )
             .await?;
             let completed_at = iso8601_now();
+            let classifier_coverage =
+                classifier_coverage::run_coverage(0, &discovery_errors, Vec::new())?;
             writer
                 .send_wait(|ack| WriterCmd::FailRun {
                     run_id: run_id.clone(),
                     reason: reason.clone(),
                     completed_at,
+                    stats_json: serde_json::json!({
+                        "classifier_coverage": classifier_coverage,
+                    })
+                    .to_string(),
                     ack,
                 })
                 .await
@@ -534,33 +541,34 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         )
         .await?;
         let completed_at = iso8601_now();
-        writer
-            .send_wait(|ack| WriterCmd::CommitRun {
-                run_id: run_id.clone(),
-                status: RunStatus::SkippedNoPlugins,
-                completed_at: completed_at.clone(),
-                stats_json: serde_json::json!({
-                    "entities_inserted": 0,
-                    "edges_inserted": 0,
-                    "dropped_edges_total": 0,
-                    "ambiguous_edges_total": 0,
-                    "unresolved_call_sites_total": 0,
-                    "reference_sites_total": 0,
-                    "references_resolved_total": 0,
-                    "references_skipped_external_total": 0,
-                    "references_skipped_cap_total": 0,
-                    "imports_skipped_external_total": 0,
-                    "unresolved_reference_sites_total": 0,
-                    "pyright_query_latency_p95_ms": 0,
-                    "pyright_index_parse_latency_p95_ms": 0,
-                    "extractor_parse_latency_p95_ms": 0,
-                })
-                .to_string(),
-                ack,
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("CommitRun(SkippedNoPlugins)")?;
+        let classifier_coverage = classifier_coverage::run_coverage(0, &[], Vec::new())?;
+        let stats_json = serde_json::json!({
+            "entities_inserted": 0,
+            "edges_inserted": 0,
+            "dropped_edges_total": 0,
+            "ambiguous_edges_total": 0,
+            "unresolved_call_sites_total": 0,
+            "reference_sites_total": 0,
+            "references_resolved_total": 0,
+            "references_skipped_external_total": 0,
+            "references_skipped_cap_total": 0,
+            "imports_skipped_external_total": 0,
+            "unresolved_reference_sites_total": 0,
+            "pyright_query_latency_p95_ms": 0,
+            "pyright_index_parse_latency_p95_ms": 0,
+            "extractor_parse_latency_p95_ms": 0,
+            "classifier_coverage": classifier_coverage,
+        })
+        .to_string();
+        commit_run_or_terminalize(
+            &writer,
+            &db_path,
+            &run_id,
+            RunStatus::SkippedNoPlugins,
+            &completed_at,
+            stats_json,
+        )
+        .await?;
 
         drop(writer);
         handle
@@ -595,6 +603,29 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         .len()
         .saturating_sub(source_walk_error_samples.len());
     let source_files = source_walk.files;
+    let mut plugin_classifier_coverage = plugins
+        .iter()
+        .map(|plugin| {
+            let extensions = plugin
+                .manifest
+                .plugin
+                .extensions
+                .iter()
+                .map(|extension| extension.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>();
+            let matched_files = source_files
+                .iter()
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            extensions.contains(&extension.to_ascii_lowercase())
+                        })
+                })
+                .count();
+            classifier_coverage::PluginCoverageAccumulator::new(&plugin.manifest, matched_files)
+        })
+        .collect::<Vec<_>>();
     tracing::info!(file_count = source_files.len(), "source tree walk complete");
     progress.set_total(source_files.len() as u64);
     progress.phase("analyzing", None, None);
@@ -638,16 +669,46 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // entity-deleted facts and lineage. Structural contains repair remains the
     // insert-time parent/contains invariant's responsibility.
     for source_file_id in &stale_source_file_ids {
-        writer
+        if let Err(error) = writer
             .send_wait(|ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
                 source_file_id: source_file_id.clone(),
                 ack,
             })
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .with_context(|| {
-                format!("prune graph evidence for vanished source {source_file_id}")
-            })?;
+            .with_context(|| format!("prune graph evidence for vanished source {source_file_id}"))
+        {
+            let reason = format!("post-open stale-source pruning failed: {error:#}");
+            let coverage_stats = match classifier_coverage::run_coverage(
+                source_walk_skipped_entries,
+                &discovery_errors,
+                plugin_classifier_coverage,
+            ) {
+                Ok(coverage) => serde_json::json!({
+                    "classifier_coverage": coverage,
+                }),
+                Err(coverage_error) => serde_json::json!({
+                    "classifier_coverage_error": format!("{coverage_error:#}"),
+                }),
+            };
+            writer
+                .send_wait(|ack| WriterCmd::FailRun {
+                    run_id: run_id.clone(),
+                    reason: reason.clone(),
+                    completed_at: iso8601_now(),
+                    stats_json: coverage_stats.to_string(),
+                    ack,
+                })
+                .await
+                .map_err(|writer_error| anyhow::anyhow!("{writer_error}"))
+                .context("FailRun(post-open stale-source pruning)")?;
+            drop(writer);
+            handle
+                .await
+                .map_err(|join_error| anyhow::anyhow!("writer actor panic: {join_error}"))?
+                .map_err(|writer_error| anyhow::anyhow!("{writer_error}"))?;
+            bail!("analyze run {run_id} failed — {reason}");
+        }
     }
     if !stale_source_file_ids.is_empty() {
         tracing::info!(
@@ -832,6 +893,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let scanned_files = secret_scan_outcome.scanned_files_shared();
     'plugins: for plugin in plugins {
         let plugin_id = plugin.manifest.plugin.plugin_id.clone();
+        let syntax_error_rule_id =
+            format!("{}SYNTAX-ERROR", plugin.manifest.ontology.rule_id_prefix);
+        let coverage_index = plugin_classifier_coverage
+            .iter()
+            .position(|coverage| coverage.plugin_id() == plugin_id)
+            .expect("coverage accumulator exists for every discovered plugin");
         let plugin_kind_roles = PluginKindRoles::from_manifest(&plugin.manifest);
         let plugin_extensions: BTreeSet<String> = plugin
             .manifest
@@ -925,6 +992,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     file_needs_reanalysis(&project_root, path, &prior_file_hashes)
                 })
             };
+        plugin_classifier_coverage[coverage_index].record_retained(skipped_files.len());
         // Locators of THIS plugin's skipped-unchanged entities. These rows stay in
         // the committed DB untouched this run (they are guarded against orphan
         // deletion via `retained_locators` below — see the SEI matcher's
@@ -958,6 +1026,21 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // entity registers an anchor this run — resolve the same anchor the
             // analysed run used (module-preferred) from the committed rows.
             let canonical = crate::secret_scan::canonical_or_original(path);
+            let canonical_source = canonical.display().to_string();
+            if prior_syntax_findings
+                .get(&(syntax_error_rule_id.clone(), canonical_source.clone()))
+                .is_some_and(|findings| {
+                    findings
+                        .iter()
+                        .any(|finding| finding.plugin_id.as_deref() == Some(plugin_id.as_str()))
+                })
+            {
+                // The v1 count defines `degraded_files` as a subset of files
+                // analyzed in this run. A retained degraded file cannot be
+                // recounted as analyzed, so preserve incompleteness by failing
+                // closed instead of laundering it into `complete`.
+                plugin_classifier_coverage[coverage_index].mark_failed();
+            }
             if let Some(anchor) = prior_anchor_by_file
                 .get(&canonical.display().to_string())
                 .or_else(|| prior_anchor_by_file.get(&path.display().to_string()))
@@ -1046,8 +1129,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // output flows through a bounded channel so writer backpressure applies
         // during extraction rather than after the whole plugin has returned.
         let manifest = plugin.manifest.clone();
-        let syntax_error_rule_id =
-            format!("{}SYNTAX-ERROR", plugin.manifest.ontology.rule_id_prefix);
         let project_root_clone = project_root.clone();
         let pid_clone = plugin_id.clone();
         let exec_clone = plugin.executable.clone();
@@ -1151,6 +1232,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     {
                         Ok(effects) => {
                             plugin_entity_count += effects.entity_count;
+                            plugin_classifier_coverage[coverage_index]
+                                .record_completed_file(effects.degraded_source_files.clone());
                             seen_plugin_entity_ids.extend(batch_entity_ids);
                             pending_plugin_edges.extend(batch_edges);
                             let ready_edges = drain_ready_plugin_edges(
@@ -1218,6 +1301,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             handle_plugin_task_join_result(join_handle.await, &plugin_id);
 
         if let Some(e) = insert_err {
+            plugin_classifier_coverage[coverage_index].mark_failed();
             tracing::error!(
                 plugin_id = %plugin_id,
                 error = %e,
@@ -1233,6 +1317,20 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             Ok(result) => &result.findings,
             Err(error) => &error.findings,
         };
+        for finding in reported_findings
+            .iter()
+            .filter(|finding| finding.subcode == syntax_error_rule_id)
+        {
+            if let Some(source_file) = finding.metadata.get("anchor_file_path") {
+                plugin_classifier_coverage[coverage_index]
+                    .record_analyzed_degraded_source(source_file.clone());
+            } else {
+                // Syntax degradation without a file anchor cannot contribute
+                // a sound file count. Preserve the declaration but fail the
+                // plugin's coverage closed.
+                plugin_classifier_coverage[coverage_index].mark_failed();
+            }
+        }
         let mut syntax_merges = legacy_plugin_syntax_merges(
             reported_findings,
             &syntax_error_rule_id,
@@ -1268,6 +1366,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
 
         match spawn_result {
             Err(plugin_error) => {
+                plugin_classifier_coverage[coverage_index].mark_failed();
                 log_plugin_findings(&plugin_id, &plugin_error.findings);
                 // REQ-ANALYZE-06: persist the host findings collected before the
                 // crash. A per-file timeout already rides in as a LMWV-PY-TIMEOUT
@@ -1316,6 +1415,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 // for a crashed plugin, and there's no code after the match.
             }
             Ok(BatchResult { findings }) => {
+                if findings
+                    .iter()
+                    .any(|finding| classifier_evidence_was_rejected(&finding.subcode))
+                {
+                    // A successful transport can still carry host-rejected
+                    // enumeration evidence (ontology/path/protocol drops).
+                    plugin_classifier_coverage[coverage_index].mark_failed();
+                }
                 // Log findings individually (operator-facing stderr) and persist
                 // them (REQ-ANALYZE-06) so an ontology check, malformed-JSON drop,
                 // or path-jail violation is visible in the store, not just logs.
@@ -1578,6 +1685,19 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let pyright_query_latency_p95_ms = pyright_latency.p95_ms();
     let pyright_index_parse_latency_p95_ms = pyright_index_parse_latency.p95_ms();
     let extractor_parse_latency_p95_ms = extractor_parse_latency.p95_ms();
+    let classifier_coverage = match classifier_coverage::run_coverage(
+        source_walk_skipped_entries,
+        &discovery_errors,
+        plugin_classifier_coverage,
+    ) {
+        Ok(coverage) => Some(coverage),
+        Err(error) => {
+            let reason = format!("classifier coverage construction failed: {error:#}");
+            tracing::error!(run_id = %run_id, %reason);
+            run_outcome = RunOutcome::HardFailed { reason };
+            None
+        }
+    };
     // Extract the failure reason (if any) before the match consumes run_outcome.
     let fail_reason: Option<String> = match &run_outcome {
         RunOutcome::SoftFailed { reason } | RunOutcome::HardFailed { reason } => {
@@ -1610,6 +1730,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
                 "failure_findings": failure_finding_count,
+                "classifier_coverage": classifier_coverage,
             });
             secret_scan_outcome.augment_stats(&mut stats_json);
             if !filigree_emission.is_null() {
@@ -1619,17 +1740,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 stats_json["filigree_prune"] = filigree_prune;
             }
             let stats_json = stats_json.to_string();
-            writer
-                .send_wait(|ack| WriterCmd::CommitRun {
-                    run_id: run_id.clone(),
-                    status: RunStatus::Completed,
-                    completed_at,
-                    stats_json,
-                    ack,
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context("CommitRun(Completed)")?;
+            commit_run_or_terminalize(
+                &writer,
+                &db_path,
+                &run_id,
+                RunStatus::Completed,
+                &completed_at,
+                stats_json,
+            )
+            .await?;
             // Wave 1 / WS1: SEI mint pass (ADR-038). Runs AFTER CommitRun (the
             // entity graph is durable, so reads see the complete run) and BEFORE
             // the prior-index flush (it reads the prior alive bindings; both are
@@ -1976,6 +2095,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "clustering": phase3_output.clustering_stats.clone(),
                 "failure_findings": failure_finding_count,
                 "failure_reason": reason,
+                "classifier_coverage": classifier_coverage,
             });
             secret_scan_outcome.augment_stats(&mut stats_json);
             if !filigree_emission.is_null() {
@@ -1985,24 +2105,34 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 stats_json["filigree_prune"] = filigree_prune;
             }
             let stats_json = stats_json.to_string();
-            writer
-                .send_wait(|ack| WriterCmd::CommitRun {
-                    run_id: run_id.clone(),
-                    status: RunStatus::Failed,
-                    completed_at,
-                    stats_json,
-                    ack,
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context("CommitRun(Failed) — soft fail")?;
+            commit_run_or_terminalize(
+                &writer,
+                &db_path,
+                &run_id,
+                RunStatus::Failed,
+                &completed_at,
+                stats_json,
+            )
+            .await?;
         }
         RunOutcome::HardFailed { reason } => {
+            let stats_json = serde_json::json!({
+                "entities_inserted": total_entity_count,
+                "edges_inserted": total_edge_count,
+                "source_walk_skipped_entries": source_walk_skipped_entries,
+                "source_walk_error_samples": source_walk_error_samples,
+                "source_walk_errors_omitted": source_walk_errors_omitted,
+                "skipped_files": skipped_files_total,
+                "failure_findings": failure_finding_count,
+                "classifier_coverage": classifier_coverage,
+            })
+            .to_string();
             writer
                 .send_wait(|ack| WriterCmd::FailRun {
                     run_id: run_id.clone(),
                     reason,
                     completed_at,
+                    stats_json,
                     ack,
                 })
                 .await
@@ -2109,6 +2239,83 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
     }
     Ok(())
+}
+
+/// True only for host findings that prove classifier-bearing entity evidence
+/// was rejected or lost. Diagnostics emitted after enumeration (notably the
+/// shutdown-timeout warning) must not downgrade otherwise-complete coverage.
+fn classifier_evidence_was_rejected(subcode: &str) -> bool {
+    matches!(
+        subcode,
+        "LMWV-INFRA-PLUGIN-UNDECLARED-KIND"
+            | "LMWV-INFRA-PLUGIN-ENTITY-ID-MISMATCH"
+            | "LMWV-INFRA-PLUGIN-PATH-ESCAPE"
+            | "LMWV-INFRA-PLUGIN-DISABLED-PATH-ESCAPE"
+            | "LMWV-INFRA-PLUGIN-ENTITY-CAP"
+            | "LMWV-INFRA-HOST-NON-UTF8-PATH"
+            | "LMWV-INFRA-PLUGIN-MALFORMED-ENTITY"
+            | "LMWV-INFRA-PLUGIN-ENTITY-FIELD-OVERSIZE"
+            | "LMWV-INFRA-PLUGIN-JAIL-OPEN-FAILED"
+            | DUPLICATE_LOCATOR_RULE_ID
+    )
+}
+
+/// Commit a terminal run row, and if the writer rejects that commit for any
+/// reason, use the still-active run transaction to persist the same stats as a
+/// failed run before returning the original error. Structural validation can
+/// already terminalize inside the writer; that case is detected from the row
+/// and does not issue a second `FailRun` command.
+async fn commit_run_or_terminalize(
+    writer: &Writer,
+    db_path: &Path,
+    run_id: &str,
+    status: RunStatus,
+    completed_at: &str,
+    stats_json: String,
+) -> Result<()> {
+    let fallback_stats = stats_json.clone();
+    let commit_result = writer
+        .send_wait(|ack| WriterCmd::CommitRun {
+            run_id: run_id.to_owned(),
+            status,
+            completed_at: completed_at.to_owned(),
+            stats_json,
+            ack,
+        })
+        .await;
+    let Err(commit_error) = commit_result else {
+        return Ok(());
+    };
+
+    let reason = format!(
+        "CommitRun({}) failed after run open: {commit_error}",
+        status.as_str()
+    );
+    let already_failed = Connection::open(db_path)
+        .ok()
+        .and_then(|conn| {
+            conn.query_row("SELECT status FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+        })
+        .as_deref()
+        == Some("failed");
+    if !already_failed {
+        writer
+            .send_wait(|ack| WriterCmd::FailRun {
+                run_id: run_id.to_owned(),
+                reason: reason.clone(),
+                completed_at: completed_at.to_owned(),
+                stats_json: fallback_stats,
+                ack,
+            })
+            .await
+            .map_err(|fail_error| {
+                anyhow::anyhow!("{reason}; fallback FailRun also failed: {fail_error}")
+            })?;
+    }
+    bail!("{reason}")
 }
 
 /// Outcome counts of one SEI mint pass (for logging / observability).
@@ -5162,6 +5369,7 @@ struct PersistedPluginBatch {
     prior_index_entries: Vec<PriorIndexEntry>,
     sei_descriptors: Vec<NewEntityDescriptor>,
     syntax_fallbacks: Vec<FindingRecord>,
+    degraded_source_files: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -5195,6 +5403,7 @@ async fn persist_plugin_file_batch(
     let mut prior_index_entries = Vec::new();
     let mut sei_descriptors = Vec::new();
     let mut syntax_fallbacks = Vec::new();
+    let mut degraded_source_files = BTreeSet::new();
 
     for (id_str, mut record) in batch.entities {
         // Capture the prior-index row and the SEI descriptor BEFORE `record`
@@ -5228,6 +5437,13 @@ async fn persist_plugin_file_batch(
             run_id,
             started_at,
         ) {
+            if let Ok(evidence) = serde_json::from_str::<serde_json::Value>(&finding.evidence_json)
+                && let Some(path) = evidence
+                    .get("source_file_path")
+                    .and_then(serde_json::Value::as_str)
+            {
+                degraded_source_files.insert(path.to_owned());
+            }
             syntax_fallbacks.push(finding);
         }
         stamp_entity_git_provenance(&mut record, head_commit);
@@ -5280,6 +5496,7 @@ async fn persist_plugin_file_batch(
         prior_index_entries,
         sei_descriptors,
         syntax_fallbacks,
+        degraded_source_files,
     })
 }
 
@@ -8259,6 +8476,18 @@ mod tests {
         // exit etiquette only (ADR-050 D7) — WARN, never ERROR.
         assert_eq!(infra_severity(PLUGIN_TIMEOUT_RULE_ID), "ERROR");
         assert_eq!(infra_severity(PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID), "WARN");
+    }
+
+    #[test]
+    fn classifier_coverage_only_fails_for_rejected_entity_evidence() {
+        assert!(classifier_evidence_was_rejected(
+            "LMWV-INFRA-PLUGIN-MALFORMED-ENTITY"
+        ));
+        assert!(classifier_evidence_was_rejected(DUPLICATE_LOCATOR_RULE_ID));
+        assert!(!classifier_evidence_was_rejected(
+            PLUGIN_SHUTDOWN_TIMEOUT_RULE_ID
+        ));
+        assert!(!classifier_evidence_was_rejected("LMWV-PY-PYRIGHT-RESTART"));
     }
 
     #[test]

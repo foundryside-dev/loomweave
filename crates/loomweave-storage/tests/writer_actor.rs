@@ -1186,6 +1186,7 @@ async fn non_core_plugin_cannot_insert_reserved_entity_kind() {
             run_id: "run-reserved-kind".into(),
             completed_at: now_iso(),
             reason: "test cleanup".into(),
+            stats_json: "{}".into(),
             ack,
         })
         .await
@@ -1980,6 +1981,7 @@ async fn fail_run_rolls_back_pending_inserts() {
         run_id: "run-fail".into(),
         reason: "deliberate test failure".into(),
         completed_at: now_iso(),
+        stats_json: "{}".into(),
         ack,
     })
     .await
@@ -2010,6 +2012,117 @@ async fn fail_run_rolls_back_pending_inserts() {
         .await
         .unwrap();
     assert_eq!(status, "failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_run_preserves_caller_stats_and_sets_failure_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+    let tx = writer.sender();
+
+    send::<()>(&tx, |ack| WriterCmd::BeginRun {
+        run_id: "run-fail-stats".into(),
+        config_json: "{}".into(),
+        started_at: now_iso(),
+        head_commit: None,
+        ack,
+    })
+    .await
+    .unwrap();
+
+    send::<()>(&tx, |ack| WriterCmd::FailRun {
+        run_id: "run-fail-stats".into(),
+        reason: "authoritative failure".into(),
+        completed_at: now_iso(),
+        stats_json: serde_json::json!({
+            "classifier_coverage": {
+                "schema": "loomweave.classifier-coverage.v1"
+            },
+            "failure_reason": "caller must not override writer reason"
+        })
+        .to_string(),
+        ack,
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+
+    let conn = Connection::open(path).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT stats FROM runs WHERE id = 'run-fail-stats'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        stats["classifier_coverage"]["schema"],
+        "loomweave.classifier-coverage.v1"
+    );
+    assert_eq!(stats["failure_reason"], "authoritative failure");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_run_rejects_malformed_or_non_object_stats_before_mutation() {
+    for (run_id, invalid_stats) in [("run-fail-malformed", "{"), ("run-fail-non-object", "[]")] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = prepared_db(&dir);
+        let (writer, handle) = Writer::spawn(path.clone(), 50, 256).unwrap();
+        let tx = writer.sender();
+        send::<()>(&tx, |ack| WriterCmd::BeginRun {
+            run_id: run_id.into(),
+            config_json: "{}".into(),
+            started_at: now_iso(),
+            head_commit: None,
+            ack,
+        })
+        .await
+        .unwrap();
+        send::<()>(&tx, |ack| WriterCmd::InsertEntity {
+            entity: Box::new(make_entity("python:function:demo.pending")),
+            ack,
+        })
+        .await
+        .unwrap();
+
+        let error = send::<()>(&tx, |ack| WriterCmd::FailRun {
+            run_id: run_id.into(),
+            reason: "must not mutate".into(),
+            completed_at: now_iso(),
+            stats_json: invalid_stats.into(),
+            ack,
+        })
+        .await
+        .expect_err("invalid FailRun stats must be rejected");
+        assert!(error.to_string().contains("stats_json"));
+
+        let conn = Connection::open(&path).unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "running", "invalid stats must not terminalize");
+        drop(conn);
+
+        send::<()>(&tx, |ack| WriterCmd::FailRun {
+            run_id: run_id.into(),
+            reason: "cleanup".into(),
+            completed_at: now_iso(),
+            stats_json: "{}".into(),
+            ack,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        drop(writer);
+        handle.await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2045,6 +2158,7 @@ async fn fail_run_after_prior_batch_commit_rolls_back_only_pending_inserts() {
         run_id: "run-fail-after-batch".into(),
         reason: "deliberate test failure".into(),
         completed_at: now_iso(),
+        stats_json: "{}".into(),
         ack,
     })
     .await
@@ -2141,6 +2255,7 @@ async fn fail_run_without_begin_run_is_protocol_violation() {
         run_id: "run-cold".into(),
         reason: "test".into(),
         completed_at: now_iso(),
+        stats_json: "{}".into(),
         ack,
     })
     .await;
@@ -2206,6 +2321,7 @@ async fn fail_run_with_stale_run_id_is_protocol_violation() {
         run_id: "run-stale".into(),
         reason: "test".into(),
         completed_at: now_iso(),
+        stats_json: "{}".into(),
         ack,
     })
     .await;
@@ -3010,6 +3126,7 @@ async fn reconcile_subsystem_graph_preserves_operator_managed_findings() {
         run_id: "run-subsystem-findings-reconcile".into(),
         reason: "invalid protected finding anchor".into(),
         completed_at: now_iso(),
+        stats_json: "{}".into(),
         ack,
     })
     .await
@@ -3274,7 +3391,12 @@ async fn parent_id_without_matching_contains_edge_rejects_run() {
         run_id: "run-m".into(),
         status: RunStatus::Completed,
         completed_at: now_iso(),
-        stats_json: "{}".into(),
+        stats_json: serde_json::json!({
+            "classifier_coverage": {
+                "schema": "loomweave.classifier-coverage.v1"
+            }
+        })
+        .to_string(),
         ack,
     })
     .await;
@@ -3290,18 +3412,33 @@ async fn parent_id_without_matching_contains_edge_rejects_run() {
 
     // Transaction rolled back; run row marked failed.
     let pool = ReaderPool::open(&path, 1).unwrap();
-    let (status, entity_count): (String, i64) = pool
+    let (status, stats_raw, entity_count): (String, String, i64) = pool
         .with_reader(|conn| {
             let s: String =
                 conn.query_row("SELECT status FROM runs WHERE id = 'run-m'", [], |row| {
                     row.get(0)
                 })?;
+            let stats: String =
+                conn.query_row("SELECT stats FROM runs WHERE id = 'run-m'", [], |row| {
+                    row.get(0)
+                })?;
             let n: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
-            Ok((s, n))
+            Ok((s, stats, n))
         })
         .await
         .unwrap();
     assert_eq!(status, "failed");
+    let stats_value: serde_json::Value = serde_json::from_str(&stats_raw).unwrap();
+    assert_eq!(
+        stats_value["classifier_coverage"]["schema"],
+        "loomweave.classifier-coverage.v1"
+    );
+    assert!(
+        stats_value["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("LMWV-INFRA-PARENT-CONTAINS-MISMATCH")
+    );
     assert_eq!(entity_count, 0, "rejection must roll back entity inserts");
 }
 
@@ -3521,6 +3658,7 @@ async fn flush_run_batch_rejects_parent_contains_mismatch_before_commit() {
         run_id: "run-flush-mismatch".into(),
         reason: "phase3 clustering failed: parent mismatch".into(),
         completed_at: now_iso(),
+        stats_json: "{}".into(),
         ack,
     })
     .await

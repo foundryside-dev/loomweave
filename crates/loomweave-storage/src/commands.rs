@@ -419,6 +419,9 @@ pub enum WriterCmd {
         run_id: String,
         reason: String,
         completed_at: String,
+        /// Valid JSON object carrying run evidence accumulated before the
+        /// hard failure. The writer adds the authoritative `failure_reason`.
+        stats_json: String,
         ack: Ack<()>,
     },
 }
