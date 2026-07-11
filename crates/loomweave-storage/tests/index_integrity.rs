@@ -118,6 +118,37 @@ fn detects_stale_file_and_parent_contains_mismatch() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn integrity_check_propagates_source_metadata_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("loop.py", dir.path().join("loop.py"))
+        .expect("create self-referential source symlink");
+
+    let mut conn = Connection::open(dir.path().join("test.db")).unwrap();
+    pragma::apply_write_pragmas(&conn).unwrap();
+    schema::apply_migrations(&mut conn).unwrap();
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_id, \
+         source_file_path, properties, created_at, updated_at) \
+         VALUES ('core:file:loop.py', 'core', 'file', 'loop.py', 'loop.py', \
+         'core:file:loop.py', 'loop.py', '{}', 't', 't')",
+        [],
+    )
+    .expect("seed indexed file with unreadable metadata");
+
+    let err = check_integrity(&conn, dir.path())
+        .expect_err("metadata uncertainty must not be reported as a vanished source file");
+    match err {
+        loomweave_storage::StorageError::Io(err) => assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the fixture must exercise a metadata error rather than a missing path"
+        ),
+        other => panic!("expected source metadata IO error, got {other}"),
+    }
+}
+
 #[test]
 fn repair_removes_stale_rows_and_restores_integrity() {
     let dir = tempfile::tempdir().unwrap();

@@ -24,7 +24,7 @@
 //! (genuine writer corruption) are surfaced as *residual* for a full re-analyze.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
@@ -76,7 +76,8 @@ pub struct RepairReport {
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::StorageError::Sqlite`] on any query failure.
+/// Returns an error on any query failure or when a source path's metadata cannot
+/// be read conclusively. Filesystem uncertainty is never reported as deletion.
 pub fn check_integrity(conn: &Connection, project_root: &Path) -> Result<IntegrityReport> {
     Ok(IntegrityReport {
         stale_file_entities: stale_file_entities(conn, project_root)?,
@@ -170,7 +171,7 @@ fn stale_file_entities(conn: &Connection, project_root: &Path) -> Result<Vec<Sta
     let mut stale = Vec::new();
     for row in rows {
         let (id, source_path) = row?;
-        if !file_entity_exists(&id, source_path.as_deref(), project_root) {
+        if !file_entity_exists(&id, source_path.as_deref(), project_root)? {
             let path = source_path
                 .or_else(|| id.strip_prefix("core:file:").map(ToOwned::to_owned))
                 .unwrap_or_else(|| id.clone());
@@ -181,22 +182,36 @@ fn stale_file_entities(conn: &Connection, project_root: &Path) -> Result<Vec<Sta
 }
 
 /// Does the file backing a `core:file:*` entity still exist on disk?
-fn file_entity_exists(id: &str, source_path: Option<&str>, project_root: &Path) -> bool {
-    if let Some(rel) = id.strip_prefix("core:file:")
-        && project_root.join(rel).exists()
-    {
-        return true;
+///
+/// Returns `Ok(false)` only when every candidate path is conclusively absent.
+/// Metadata errors are retained while fallback candidates are checked, then
+/// propagated if none proves the file is present.
+fn file_entity_exists(id: &str, source_path: Option<&str>, project_root: &Path) -> Result<bool> {
+    let mut candidates = BTreeSet::<PathBuf>::new();
+    if let Some(rel) = id.strip_prefix("core:file:") {
+        candidates.insert(project_root.join(rel));
     }
     if let Some(path) = source_path {
         let raw = Path::new(path);
-        if raw.is_absolute() && raw.exists() {
-            return true;
-        }
-        if project_root.join(path).exists() {
-            return true;
+        candidates.insert(if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            project_root.join(raw)
+        });
+    }
+
+    let mut metadata_error = None;
+    for candidate in candidates {
+        match std::fs::metadata(&candidate) {
+            Ok(_) => return Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                metadata_error.get_or_insert(err);
+            }
         }
     }
-    false
+
+    metadata_error.map_or(Ok(false), |err| Err(err.into()))
 }
 
 /// Both directions of the parent/contains dual-encoding invariant (mirrors the
