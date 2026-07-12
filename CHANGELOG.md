@@ -12,6 +12,13 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Fixed
+
+- **Doctor bootstrap-state repair.** `loomweave doctor` now warns when an
+  installed catalogue has never been analysed or lacks its local instance
+  identity. `loomweave doctor --fix` materialises a private project UUID and
+  runs an authoritative analysis to regenerate classifier coverage metadata.
+
 ## 1.5.0 — 2026-07-12
 
 Minor release on top of `1.4.2`. (Cargo SemVer `1.5.0`; Python wheels `1.5.0`.)

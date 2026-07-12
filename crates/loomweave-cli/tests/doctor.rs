@@ -5,13 +5,18 @@
 //! detection/merge correctness is unit-tested in the owning modules
 //! (`skill_pack`, `hooks_settings`, `mcp_registration`).
 
+use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use rusqlite::Connection;
+#[cfg(unix)]
+use tempfile::TempDir;
 
 fn loomweave_bin() -> Command {
     let mut cmd = Command::cargo_bin("loomweave").expect("loomweave binary");
@@ -141,6 +146,58 @@ fn check<'a>(json: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
         .iter()
         .find(|candidate| candidate["id"] == id)
         .unwrap_or_else(|| panic!("doctor check {id:?} missing from {json}"))
+}
+
+#[cfg(unix)]
+fn fixture_binary_path() -> PathBuf {
+    if let Ok(path) = env::var("CARGO_BIN_EXE_loomweave-fixture-plugin") {
+        return PathBuf::from(path);
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let target_dir =
+        env::var("CARGO_TARGET_DIR").map_or_else(|_| workspace_root.join("target"), PathBuf::from);
+    for profile in ["debug", "release"] {
+        let candidate = target_dir.join(profile).join("loomweave-fixture-plugin");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    panic!(
+        "loomweave-fixture-plugin binary not found under {}",
+        target_dir.display()
+    );
+}
+
+#[cfg(unix)]
+fn setup_classifier_plugin_dir() -> TempDir {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = TempDir::new().expect("plugin tempdir");
+    std::os::unix::fs::symlink(
+        &fixture_bin,
+        plugin_dir.path().join("loomweave-plugin-fixture"),
+    )
+    .expect("symlink fixture plugin");
+    assert_ne!(
+        fs::metadata(&fixture_bin).unwrap().permissions().mode() & 0o111,
+        0,
+        "fixture plugin must be executable"
+    );
+
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("loomweave-core/tests/fixtures/plugin.toml");
+    let manifest = fs::read_to_string(manifest_path).unwrap().replace(
+        "ontology_version = \"0.1.0\"",
+        "ontology_version = \"0.1.0\"\nclassifier_tags = [\"http-route\"]",
+    );
+    fs::write(plugin_dir.path().join("plugin.toml"), manifest).unwrap();
+    plugin_dir
 }
 
 fn insert_run_stats(root: &Path, id: &str, run_status: &str, stats_json: &serde_json::Value) {
@@ -324,8 +381,8 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
         dir.path(),
     );
     // Materialise a healthy DB so the index health check reports ok rather than
-    // the absent-DB warning; with the DB present, only the integration bindings
-    // surface warns, keeping the "1 warning" count stable.
+    // the absent-DB warning. A never-analysed DB and its missing identity are
+    // now reported independently from the integration binding warning.
     write_healthy_db(dir.path());
 
     let (code, out) = doctor(dir.path(), false);
@@ -339,8 +396,8 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
         "missing bindings should surface as a warning, not a problem:\n{out}"
     );
     assert!(
-        out.contains("1 warning; no problems"),
-        "summary should report the warning without claiming a problem:\n{out}"
+        out.contains("warnings; no problems"),
+        "summary should report warnings without claiming a problem:\n{out}"
     );
 
     let (code, out) = doctor(dir.path(), true);
@@ -918,6 +975,105 @@ fn doctor_reports_external_sqlite_current_legacy_and_older_states() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_warns_for_an_unanalysed_catalogue_and_missing_instance_identity() {
+    let project = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], project.path());
+    write_healthy_db(project.path());
+    fs::write(project.path().join("sample.mt"), "gadget sample\n").unwrap();
+    let plugin_dir = setup_classifier_plugin_dir();
+    let plugin_path = env::join_paths([plugin_dir.path()]).unwrap();
+
+    let (code, json) = doctor_json_with_env(
+        project.path(),
+        false,
+        &[("PATH", plugin_path.to_str().unwrap())],
+        &[],
+    );
+
+    assert_eq!(code, 0, "warnings remain advisory: {json}");
+    for id in [
+        "classifier.enumeration",
+        "classifier.tags",
+        "index.freshness",
+        "http.instance_id",
+    ] {
+        assert_eq!(
+            check(&json, id)["status"],
+            "warning",
+            "{id} must detect the uninitialised federation state: {json}"
+        );
+    }
+    assert_eq!(
+        check(&json, "http.instance_id")["details"]["present"],
+        false
+    );
+    assert!(
+        !project.path().join(".weft/loomweave/instance_id").exists(),
+        "read-only doctor must not materialise identity"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fix_materialises_identity_and_authoritative_classifier_metadata() {
+    let project = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], project.path());
+    write_healthy_db(project.path());
+    fs::write(project.path().join("sample.mt"), "gadget sample\n").unwrap();
+    let plugin_dir = setup_classifier_plugin_dir();
+    let plugin_path = env::join_paths([plugin_dir.path()]).unwrap();
+    let env = [("PATH", plugin_path.to_str().unwrap())];
+
+    let (code, json) = doctor_json_with_env(project.path(), true, &env, &[]);
+
+    assert_eq!(code, 0, "--fix must converge: {json}");
+    for id in [
+        "classifier.enumeration",
+        "classifier.tags",
+        "http.instance_id",
+    ] {
+        assert_eq!(check(&json, id)["status"], "fixed", "{id}: {json}");
+        assert_eq!(check(&json, id)["fixed"], true, "{id}: {json}");
+    }
+    assert_eq!(check(&json, "index.freshness")["status"], "ok", "{json}");
+    assert_eq!(check(&json, "sei.population")["status"], "ok", "{json}");
+
+    let instance_path = project.path().join(".weft/loomweave/instance_id");
+    let instance = fs::read_to_string(&instance_path).unwrap();
+    uuid::Uuid::parse_str(instance.trim()).expect("doctor --fix writes a UUID");
+    assert_eq!(
+        fs::metadata(&instance_path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "instance identity must remain private"
+    );
+
+    let conn = Connection::open(project.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    let (status, coverage_schema): (String, String) = conn
+        .query_row(
+            "SELECT status, json_extract(stats, '$.classifier_coverage.schema') \
+             FROM runs ORDER BY started_at DESC, id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "completed");
+    assert_eq!(coverage_schema, "loomweave.classifier-coverage.v1");
+
+    let (rerun_code, rerun) = doctor_json_with_env(project.path(), false, &env, &[]);
+    assert_eq!(rerun_code, 0, "{rerun}");
+    for id in [
+        "classifier.enumeration",
+        "classifier.tags",
+        "index.freshness",
+        "http.instance_id",
+        "sei.population",
+    ] {
+        assert_eq!(check(&rerun, id)["status"], "ok", "{id}: {rerun}");
+    }
+}
+
 #[test]
 fn doctor_rejects_foreign_and_too_new_external_sqlite_before_catalogue_queries() {
     let foreign = tempfile::tempdir().unwrap();
@@ -1322,7 +1478,7 @@ fn doctor_reports_malformed_config_and_instance_identity() {
     install(&["install", "--all"], missing_instance.path());
     let (_, json) = doctor_json(missing_instance.path(), false);
     let instance = check(&json, "http.instance_id");
-    assert_eq!(instance["status"], "ok", "{instance}");
+    assert_eq!(instance["status"], "warning", "{instance}");
     assert_eq!(instance["details"]["present"], false);
     let (_, text) = doctor(missing_instance.path(), false);
     assert!(

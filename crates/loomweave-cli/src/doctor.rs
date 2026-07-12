@@ -91,11 +91,12 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_gitignore_current(&project_root, fix);
     tally += check_loomweave_dir(&project_root);
     tally += emit_json_check_text(&check_external_sqlite_json(&project_root));
-    let (enumeration, tags) = check_classifier_json(&project_root);
+    let instance_id = check_http_instance_id_json(&project_root, fix);
+    let (enumeration, tags) = check_classifier_json(&project_root, fix);
     tally += emit_json_check_text(&enumeration);
     tally += emit_json_check_text(&tags);
     tally += emit_json_check_text(&check_http_authentication_json(&project_root));
-    tally += emit_json_check_text(&check_http_instance_id_json(&project_root));
+    tally += emit_json_check_text(&instance_id);
     tally += check_index_integrity(&project_root, fix);
     println!("--- llm ---");
     tally += check_llm_provider(&project_root);
@@ -199,10 +200,21 @@ impl DoctorJsonCheck {
         self.next_action = Some(next_action.into());
         self
     }
+
+    fn mark_fixed(mut self, message: impl Into<String>) -> Self {
+        self.status = "fixed";
+        self.fixed = true;
+        self.message = message.into();
+        self.next_action = None;
+        self
+    }
 }
 
 fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
-    let (classifier_enumeration, classifier_tags) = check_classifier_json(project_root);
+    // Materialise project identity before an automatic analysis so the repaired
+    // catalogue and every serving surface converge on one project UUID.
+    let instance_id = check_http_instance_id_json(project_root, fix);
+    let (classifier_enumeration, classifier_tags) = check_classifier_json(project_root, fix);
     let mut checks = vec![
         check_loomweave_dir_json(project_root),
         check_external_sqlite_json(project_root),
@@ -217,7 +229,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_instructions_json(project_root, fix),
         check_http_config_json(project_root),
         check_http_authentication_json(project_root),
-        check_http_instance_id_json(project_root),
+        instance_id,
         check_filigree_url_json(project_root),
         check_llm_provider_json(project_root),
         check_sei_population_json(project_root),
@@ -273,19 +285,19 @@ fn default_next_action(id: &str) -> String {
                     .to_owned()
             }
             "index.freshness" => {
-                "Run `loomweave analyze <project>` to refresh the index.".to_owned()
+                "Run `loomweave doctor --fix --path <project>` or `loomweave analyze <project>` to refresh the index.".to_owned()
             }
             "federation.sqlite_compatibility" => {
                 "Rebuild the local index with this Loomweave version before allowing an external SQLite reader.".to_owned()
             }
             "classifier.enumeration" | "classifier.tags" => {
-                "Run `loomweave analyze <project>` and inspect the latest analysis-run diagnostics.".to_owned()
+                "Run `loomweave doctor --fix --path <project>` or `loomweave analyze <project>`, then inspect the latest analysis-run diagnostics.".to_owned()
             }
             "http.authentication" => {
                 "Set the configured HTTP authentication secret, or disable/reconfigure the HTTP read API.".to_owned()
             }
             "http.instance_id" => {
-                "Remove a malformed `.weft/loomweave/instance_id`; `loomweave serve` will create a valid replacement.".to_owned()
+                "Run `loomweave doctor --fix --path <project>` to materialise a missing identity; inspect and remove a malformed identity before retrying.".to_owned()
             }
             "llm.provider" => {
                 "Run `loomweave config check` to see the effective LLM state; to enable live \
@@ -569,7 +581,7 @@ fn validate_external_sqlite_read_gate(
     Ok(())
 }
 
-fn check_classifier_json(project_root: &Path) -> (DoctorJsonCheck, DoctorJsonCheck) {
+fn check_classifier_json(project_root: &Path, fix: bool) -> (DoctorJsonCheck, DoctorJsonCheck) {
     const ENUMERATION_ID: &str = "classifier.enumeration";
     const TAGS_ID: &str = "classifier.tags";
     let db_path = loomweave_core::store::db_path(project_root);
@@ -614,8 +626,42 @@ fn check_classifier_json(project_root: &Path) -> (DoctorJsonCheck, DoctorJsonChe
             "run_status": latest.run_status(),
             "reason": reason,
         });
+        if fix && latest.run_status().is_none() && latest.run_id().is_none() {
+            return match repair_classifier_analysis(project_root) {
+                Ok(()) => {
+                    let (enumeration, tags) = check_classifier_json(project_root, false);
+                    (
+                        mark_classifier_repair(enumeration, "classifier enumeration regenerated"),
+                        mark_classifier_repair(tags, "active classifier declarations regenerated"),
+                    )
+                }
+                Err(err) => {
+                    let details = serde_json::json!({
+                        "available": false,
+                        "run_id": null,
+                        "run_status": null,
+                        "reason": reason,
+                        "repair_error": err.to_string(),
+                    });
+                    (
+                        DoctorJsonCheck::problem(
+                            ENUMERATION_ID,
+                            format!("automatic classifier analysis repair failed: {err}"),
+                        )
+                        .with_details(details.clone()),
+                        DoctorJsonCheck::problem(
+                            TAGS_ID,
+                            format!("automatic classifier declaration repair failed: {err}"),
+                        )
+                        .with_details(details),
+                    )
+                }
+            };
+        }
         let (status, message_prefix) = match latest.run_status() {
-            None if latest.run_id().is_none() => ("ok", "no classifier analysis run exists yet"),
+            None if latest.run_id().is_none() => {
+                ("warning", "no classifier analysis run exists yet")
+            }
             Some("running") => ("warning", "latest classifier analysis is not completed"),
             _ => ("problem", "latest classifier evidence is unusable"),
         };
@@ -638,6 +684,29 @@ fn check_classifier_json(project_root: &Path) -> (DoctorJsonCheck, DoctorJsonChe
         classifier_enumeration_json(&latest, coverage),
         classifier_tags_json(&latest, coverage),
     )
+}
+
+fn repair_classifier_analysis(project_root: &Path) -> Result<()> {
+    let executable = std::env::current_exe().context("resolve current Loomweave executable")?;
+    let output = Command::new(executable)
+        .arg("analyze")
+        .arg(project_root)
+        .output()
+        .context("start automatic Loomweave analysis repair")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!("`loomweave analyze` exited with {}", output.status)
+    }
+}
+
+fn mark_classifier_repair(check: DoctorJsonCheck, message: &str) -> DoctorJsonCheck {
+    if check.status == "ok" {
+        let healthy_message = check.message.clone();
+        check.mark_fixed(format!("{message}; {healthy_message}"))
+    } else {
+        check
+    }
 }
 
 fn classifier_external_gate_problem(
@@ -1215,10 +1284,10 @@ fn gitignore_what(state: &GitignoreState) -> &'static str {
 
 fn check_index_freshness_json(project_root: &Path) -> DoctorJsonCheck {
     let lines = hook::snapshot_report(project_root);
-    if lines
-        .iter()
-        .any(|line| line.to_ascii_lowercase().contains("may be stale"))
-    {
+    if lines.iter().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("may be stale") || line.contains("no analysis recorded yet")
+    }) {
         DoctorJsonCheck::warning("index.freshness", lines.join("\n"))
     } else {
         DoctorJsonCheck::ok("index.freshness", lines.join("\n"))
@@ -1552,21 +1621,48 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
     }
 }
 
-fn check_http_instance_id_json(project_root: &Path) -> DoctorJsonCheck {
+fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     const ID: &str = "http.instance_id";
     let path = loomweave_core::store::store_dir(project_root).join("instance_id");
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return DoctorJsonCheck::ok(
+            if fix && loomweave_core::store::db_path(project_root).exists() {
+                return match crate::instance::load_or_create(project_root) {
+                    Ok(instance_id) => DoctorJsonCheck::fixed(
+                        ID,
+                        format!("project instance ID materialised: {instance_id}"),
+                    )
+                    .with_details(serde_json::json!({
+                        "present": true,
+                        "valid": true,
+                        "instance_id": instance_id.to_string(),
+                    })),
+                    Err(err) => DoctorJsonCheck::problem(
+                        ID,
+                        format!("project instance ID repair failed: {err}"),
+                    )
+                    .with_details(serde_json::json!({
+                        "present": false,
+                        "valid": false,
+                        "instance_id": null,
+                    })),
+                };
+            }
+            return DoctorJsonCheck::warning(
                 ID,
-                "project instance ID is not materialised yet; `loomweave serve` will create it",
+                "project instance ID is not materialised yet",
             )
             .with_details(serde_json::json!({
                 "present": false,
                 "valid": null,
                 "instance_id": null,
-            }));
+            }))
+            .with_next_action(if loomweave_core::store::db_path(project_root).exists() {
+                "Run `loomweave doctor --fix`; serving and federation consumers require a project instance ID."
+            } else {
+                "Run `loomweave install --path <project>` before materialising a project instance ID."
+            });
         }
         Err(err) => {
             return DoctorJsonCheck::problem(
