@@ -13,7 +13,7 @@ fn valid_coverage_json() -> serde_json::Value {
         "plugin_discovery_error_samples": [],
         "plugins": [{
             "plugin_id": "python",
-            "plugin_version": "1.4.2",
+            "plugin_version": "1.5.0",
             "ontology_version": "0.12.0",
             "matched_files": 1,
             "analyzed_files": 1,
@@ -249,7 +249,7 @@ fn plugin_coverage_accepts_each_valid_status_and_count_shape() {
 fn validated_constructors_reject_invalid_records_and_build_canonical_coverage() {
     let plugin = PluginClassifierCoverage::try_from(PluginClassifierCoverageInput {
         plugin_id: "python".to_owned(),
-        plugin_version: "1.4.2".to_owned(),
+        plugin_version: "1.5.0".to_owned(),
         ontology_version: "0.12.0".to_owned(),
         matched_files: 1,
         analyzed_files: 1,
@@ -269,7 +269,7 @@ fn validated_constructors_reject_invalid_records_and_build_canonical_coverage() 
 
     let invalid = PluginClassifierCoverage::try_from(PluginClassifierCoverageInput {
         plugin_id: "python".to_owned(),
-        plugin_version: "1.4.2".to_owned(),
+        plugin_version: "1.5.0".to_owned(),
         ontology_version: "0.12.0".to_owned(),
         matched_files: 0,
         analyzed_files: 0,

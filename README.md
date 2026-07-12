@@ -14,9 +14,9 @@ and trust-topology tools.
 
 ## Status
 
-**Public release: v1.4.0. Local checkout: v1.4.2.** `v1.4.0` is the latest
+**Public release: v1.4.0. Local checkout: v1.5.0.** `v1.4.0` is the latest
 public stable GitHub release. This checkout and the local uv build are versioned
-`1.4.2`; `v1.4.2` is intentionally not tagged or published. The current source
+`1.5.0`; `v1.5.0` is intentionally not tagged or published. The current source
 and public release line include:
 
 - **Python and Rust first-party plugins.** The Python plugin extracts modules,
@@ -108,7 +108,7 @@ loomweave analyze
 loomweave serve
 ```
 
-This versioned `1.4.2` checkout can also be installed locally:
+This versioned `1.5.0` checkout can also be installed locally:
 
 ```bash
 # From this repository checkout
@@ -118,7 +118,7 @@ pipx install ./packaging/rust-plugin-dist
 ```
 
 The `loomweave` package metadata in this checkout depends on both
-`loomweave-plugin-python==1.4.2` and `loomweave-plugin-rust==1.4.2`; installing
+`loomweave-plugin-python==1.5.0` and `loomweave-plugin-rust==1.5.0`; installing
 that local package lands the CLI and both plugin executables in the same
 environment.
 

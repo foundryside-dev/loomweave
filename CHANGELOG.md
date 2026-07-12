@@ -12,6 +12,10 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+## 1.5.0 — 2026-07-12
+
+Minor release on top of `1.4.2`. (Cargo SemVer `1.5.0`; Python wheels `1.5.0`.)
+
 ### Added
 
 - **Versioned classifier coverage evidence.** Completed analyses now persist
