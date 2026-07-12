@@ -8,8 +8,9 @@
 //!
 //! The two paths differ in what the writer persists into `runs.stats`:
 //!
-//! - `HardFailed` (`FailRun`): stats is `{"failure_reason": "..."}` only —
-//!   no `entities_inserted` / `edges_inserted` keys.
+//! - `HardFailed` (`FailRun`): stats preserves bounded counters and classifier
+//!   coverage accumulated before the failure, plus `failure_reason`; it omits
+//!   post-analysis sections such as clustering.
 //! - `SoftFailed` (`CommitRun(Failed)`): stats carries the full schema
 //!   (`entities_inserted`, `edges_inserted`, clustering, ...) plus a
 //!   `failure_reason` naming the plugin crash.
@@ -515,9 +516,8 @@ fn analyze_defers_cross_file_edges_until_target_entity_batch_arrives() {
 /// 2. Carry a `stats.failure_reason` naming the writer-actor failure
 ///    (`LMWV-INFRA-EDGE-UNKNOWN-KIND` from `enforce_edge_contract`), not a
 ///    plugin-crash reason.
-/// 3. Have the minimal `FailRun` stats shape — no `entities_inserted`
-///    key, distinguishing this from the `SoftFailed` path which writes the
-///    full `CommitRun(Failed)` stats blob.
+/// 3. Preserve the bounded counters and classifier coverage accumulated before
+///    failure while omitting post-analysis-only sections such as clustering.
 /// 4. Have NO `findings` rows tagged with the crash-loop `rule_id` — the
 ///    failure here is writer-side, not plugin-side.
 ///
@@ -594,25 +594,22 @@ fn analyze_promotes_run_to_hard_failed_when_writer_actor_fails_mid_run() {
          got: {failure_reason}"
     );
 
-    // (3) Stats shape is the minimal FailRun blob — no SoftFailed keys.
-    // SoftFailed's `CommitRun(Failed)` writes the full stats schema with
-    // `entities_inserted`, `edges_inserted`, clustering, etc.; FailRun
-    // writes only `{"failure_reason": ...}`. Asserting the absence of
-    // SoftFailed-only keys is the load-bearing discriminator between the
-    // two branches.
-    assert!(
-        stats.get("entities_inserted").is_none(),
-        "FailRun stats must not contain entities_inserted (SoftFailed key); \
-         got: {run_stats_raw}"
+    // (3) FailRun preserves already-accumulated evidence. The writer rejected
+    // the first edge before a batch commit, so both durable counters are zero;
+    // classifier coverage still records that the plugin matched and failed.
+    assert_eq!(stats["entities_inserted"], 0, "{run_stats_raw}");
+    assert_eq!(stats["edges_inserted"], 0, "{run_stats_raw}");
+    assert_eq!(
+        stats["classifier_coverage"]["schema"], "loomweave.classifier-coverage.v1",
+        "{run_stats_raw}"
     );
-    assert!(
-        stats.get("edges_inserted").is_none(),
-        "FailRun stats must not contain edges_inserted (SoftFailed key); \
-         got: {run_stats_raw}"
+    assert_eq!(
+        stats["classifier_coverage"]["plugins"][0]["status"], "failed",
+        "{run_stats_raw}"
     );
     assert!(
         stats.get("clustering").is_none(),
-        "FailRun stats must not contain clustering (SoftFailed key); \
+        "FailRun stats must not contain post-analysis clustering; \
          got: {run_stats_raw}"
     );
 
