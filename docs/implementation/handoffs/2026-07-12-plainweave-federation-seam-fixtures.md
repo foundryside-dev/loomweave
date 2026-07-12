@@ -8,7 +8,7 @@ Loomweave now publishes the classifier, external SQLite, identity-ownership,
 and authentication contracts exposed by the Plainweave seam audit. This page
 records the exact producer bytes, the copy/validation procedure, and one live
 end-to-end fixture proof. It does not claim that Plainweave's repository-owned
-golden oracle has landed.
+golden oracle or every required consumer-side enforcement check has landed.
 
 ## Producer authorities
 
@@ -213,5 +213,25 @@ present in either artifact.
   the local project instance. This closes the reused-port project-switch
   window.
 
-Plainweave still owns the final vendored fixture, byte pin, and repository-local
-consumer oracle under `plainweave-f8303b4b50`.
+## Plainweave work still open
+
+A final read-only crawl of the live Plainweave adapter on 2026-07-12 confirmed
+that the producer fixtures and focused consumer tests pass, but also reproduced
+consumer-side gaps that those tests do not yet reject. Under
+`plainweave-f8303b4b50`, Plainweave still must:
+
+- validate `api_version` and `instance_id` from the identity response itself,
+  not only capability probes before and after the identity request;
+- validate every required safe-surface column before reporting an in-range
+  SQLite database compatible, distinguish older-supported versions 5--11 from
+  the current compatible version 12, and replace `SELECT *` catalogue reads
+  with the explicitly named public columns;
+- parse and validate the exact capability `authentication` descriptor, then
+  use its declared `none`, `bearer`, or `hmac` mode when authenticating the
+  protected identity request; and
+- vendor the authoritative fixture and byte pin and add the repository-local
+  producer-consumer oracle described above.
+
+Until these items land, the read-only harness proves classifier-golden parsing
+and supported-complete zero-route behavior only. It is not evidence that
+Plainweave enforces the complete identity/auth/SQLite join contract.

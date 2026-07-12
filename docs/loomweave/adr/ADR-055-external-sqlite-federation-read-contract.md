@@ -1,8 +1,8 @@
 # ADR-055: Versioned External SQLite Federation Read Contract
 
-**Status**: Accepted  
-**Date**: 2026-07-12  
-**Deciders**: john  
+**Status**: Accepted
+**Date**: 2026-07-12
+**Deciders**: john
 **Extends**: [ADR-011](./ADR-011-writer-actor-and-sqlite.md), [ADR-035](./ADR-035-sqlite-operational-tuning.md)
 
 ## Context
@@ -119,4 +119,3 @@ Zero is accepted with an explicit non-authenticating warning posture.
 
 - [Federation contracts](../../federation/contracts.md#external-sqlite-read-contract)
 - `crates/loomweave-storage/src/external_sqlite.rs`
-
