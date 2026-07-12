@@ -15,6 +15,8 @@ use rusqlite::Connection;
 
 fn loomweave_bin() -> Command {
     let mut cmd = Command::cargo_bin("loomweave").expect("loomweave binary");
+    cmd.env_remove("WEFT_TOKEN");
+    cmd.env_remove("WEFT_IDENTITY_SECRET");
     cmd.env(
         "LOOMWEAVE_CODEX_CONFIG",
         std::env::temp_dir().join(format!(
@@ -69,7 +71,22 @@ fn write_healthy_db(root: &Path) {
 
 /// Run `doctor` (optionally with `--fix`) and return `(exit_code, stdout)`.
 fn doctor(dir: &Path, fix: bool) -> (i32, String) {
+    doctor_with_env(dir, fix, &[], &[])
+}
+
+fn doctor_with_env(
+    dir: &Path,
+    fix: bool,
+    env: &[(&str, &str)],
+    env_remove: &[&str],
+) -> (i32, String) {
     let mut cmd = loomweave_bin();
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    for name in env_remove {
+        cmd.env_remove(name);
+    }
     cmd.arg("doctor");
     if fix {
         cmd.arg("--fix");
@@ -82,7 +99,22 @@ fn doctor(dir: &Path, fix: bool) -> (i32, String) {
 }
 
 fn doctor_json(dir: &Path, fix: bool) -> (i32, serde_json::Value) {
+    doctor_json_with_env(dir, fix, &[], &[])
+}
+
+fn doctor_json_with_env(
+    dir: &Path,
+    fix: bool,
+    env: &[(&str, &str)],
+    env_remove: &[&str],
+) -> (i32, serde_json::Value) {
     let mut cmd = loomweave_bin();
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    for name in env_remove {
+        cmd.env_remove(name);
+    }
     cmd.arg("doctor");
     if fix {
         cmd.arg("--fix");
@@ -100,6 +132,70 @@ fn doctor_json(dir: &Path, fix: bool) -> (i32, serde_json::Value) {
             panic!("doctor --format json must emit parseable JSON: {err}\nstdout:\n{stdout}")
         }),
     )
+}
+
+fn check<'a>(json: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    json["checks"]
+        .as_array()
+        .expect("doctor checks array")
+        .iter()
+        .find(|candidate| candidate["id"] == id)
+        .unwrap_or_else(|| panic!("doctor check {id:?} missing from {json}"))
+}
+
+fn insert_run_stats(root: &Path, id: &str, run_status: &str, stats_json: &serde_json::Value) {
+    insert_run_stats_raw(root, id, run_status, &stats_json.to_string());
+}
+
+fn insert_run_stats_raw(root: &Path, id: &str, run_status: &str, stats_json: &str) {
+    let db = root.join(".weft/loomweave/loomweave.db");
+    let conn = Connection::open(db).expect("open test catalogue");
+    let completed_at = (run_status != "running").then_some("2026-07-12T02:00:00Z");
+    conn.execute(
+        "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+         VALUES (?1, '2026-07-12T01:00:00Z', ?2, '{}', ?3, ?4)",
+        rusqlite::params![id, completed_at, stats_json, run_status],
+    )
+    .expect("insert analysis run");
+}
+
+fn classifier_coverage(
+    source_walk_complete: bool,
+    source_walk_skipped_entries: u64,
+    plugins: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "classifier_coverage": {
+            "schema": "loomweave.classifier-coverage.v1",
+            "source_walk_complete": source_walk_complete,
+            "source_walk_skipped_entries": source_walk_skipped_entries,
+            "plugin_discovery_complete": true,
+            "plugin_discovery_errors": 0,
+            "plugin_discovery_error_samples": [],
+            "plugins": plugins,
+        }
+    })
+}
+
+fn plugin_coverage(
+    id: &str,
+    status: &str,
+    matched: u64,
+    analyzed: u64,
+    degraded: u64,
+    tags: &[&str],
+) -> serde_json::Value {
+    serde_json::json!({
+        "plugin_id": id,
+        "plugin_version": "1.0.0",
+        "ontology_version": "1.0.0",
+        "matched_files": matched,
+        "analyzed_files": analyzed,
+        "retained_files": 0,
+        "degraded_files": degraded,
+        "status": status,
+        "classifier_tags": tags,
+    })
 }
 
 fn spawn_one_shot_health_server() -> (u16, std::thread::JoinHandle<()>) {
@@ -307,6 +403,20 @@ fn doctor_json_reports_stable_check_shape_for_healthy_install() {
             && check["status"] == "ok"
             && check["fixed"] == serde_json::json!(false)
     }));
+    let legacy_shape = check(&json, "mcp.registration")
+        .as_object()
+        .expect("legacy doctor check object")
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        legacy_shape,
+        ["fixed", "id", "message", "status"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "machine-readable details must be additive only on new checks"
+    );
     assert!(json["checks"].as_array().unwrap().iter().any(|check| {
         check["id"] == "integration.bindings"
             && check["status"] == "ok"
@@ -698,10 +808,8 @@ fn doctor_warns_when_published_ephemeral_port_is_stale() {
 fn doctor_index_health_absent_db_is_warning_gate_passes() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
-    // `check_sei_population_json` opens the DB with `Connection::open` which
-    // creates it as a side-effect when absent. Remove any DB that install or a
-    // prior doctor run may have materialised so this test exercises the
-    // genuine absence path.
+    // Install materialises an index; remove it once so both doctor surfaces
+    // must preserve the genuine absent state.
     let db_path = dir.path().join(".weft/loomweave/loomweave.db");
     if db_path.exists() {
         fs::remove_file(&db_path).unwrap();
@@ -734,13 +842,12 @@ fn doctor_index_health_absent_db_is_warning_gate_passes() {
             .contains("loomweave install"),
         "warning message must suggest loomweave install + analyze: {check}"
     );
+    assert!(
+        !db_path.exists(),
+        "doctor --format json must inspect an absent index read-only and never create loomweave.db"
+    );
 
     // Text path: warnings-only → exit 0.
-    // Re-delete the DB: doctor_json may have recreated it as a side-effect
-    // of check_sei_population_json (which uses Connection::open, not read-only).
-    if db_path.exists() {
-        fs::remove_file(&db_path).unwrap();
-    }
     let (code, out) = doctor(dir.path(), false);
     assert_eq!(
         code, 0,
@@ -749,6 +856,542 @@ fn doctor_index_health_absent_db_is_warning_gate_passes() {
     assert!(
         out.contains("⚠ no index"),
         "absent DB must surface as a text-path warning: stdout:\n{out}"
+    );
+    assert!(
+        !db_path.exists(),
+        "doctor must inspect an absent index read-only and never create loomweave.db"
+    );
+}
+
+#[test]
+fn doctor_reports_external_sqlite_current_legacy_and_older_states() {
+    let current = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], current.path());
+    write_healthy_db(current.path());
+    let (_, json) = doctor_json(current.path(), false);
+    let current_check = check(&json, "federation.sqlite_compatibility");
+    assert_eq!(current_check["status"], "ok", "{current_check}");
+    assert_eq!(current_check["details"]["compatibility"], "compatible");
+    assert_eq!(current_check["details"]["user_version"], 12);
+    let (_, text) = doctor(current.path(), false);
+    assert!(
+        text.contains("federation.sqlite_compatibility")
+            && text.contains("compatible at user_version=12"),
+        "text output must carry the same current compatibility verdict:\n{text}"
+    );
+
+    let legacy = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], legacy.path());
+    write_healthy_db(legacy.path());
+    Connection::open(legacy.path().join(".weft/loomweave/loomweave.db"))
+        .unwrap()
+        .execute_batch("PRAGMA application_id = 0;")
+        .unwrap();
+    let (_, json) = doctor_json(legacy.path(), false);
+    let legacy_check = check(&json, "federation.sqlite_compatibility");
+    assert_eq!(legacy_check["status"], "warning", "{legacy_check}");
+    assert_eq!(legacy_check["details"]["legacy_application_id"], true);
+    let (_, text) = doctor(legacy.path(), false);
+    assert!(
+        text.contains("federation.sqlite_compatibility")
+            && text.contains("legacy application_id=0"),
+        "text output must report accepted legacy compatibility:\n{text}"
+    );
+
+    let older = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], older.path());
+    write_healthy_db(older.path());
+    Connection::open(older.path().join(".weft/loomweave/loomweave.db"))
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 11;")
+        .unwrap();
+    let (_, json) = doctor_json(older.path(), false);
+    let older_check = check(&json, "federation.sqlite_compatibility");
+    assert_eq!(older_check["status"], "warning", "{older_check}");
+    assert_eq!(older_check["details"]["compatibility"], "older_supported");
+    assert_eq!(older_check["details"]["user_version"], 11);
+    let (_, text) = doctor(older.path(), false);
+    assert!(
+        text.contains("federation.sqlite_compatibility")
+            && text.contains("user_version=11 is older but supported"),
+        "text output must report the actual older-supported version:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_rejects_foreign_and_too_new_external_sqlite_before_catalogue_queries() {
+    let foreign = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], foreign.path());
+    write_healthy_db(foreign.path());
+    Connection::open(foreign.path().join(".weft/loomweave/loomweave.db"))
+        .unwrap()
+        .execute_batch("PRAGMA application_id = 1234;")
+        .unwrap();
+    let (code, json) = doctor_json(foreign.path(), false);
+    let foreign_check = check(&json, "federation.sqlite_compatibility");
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(foreign_check["status"], "problem", "{foreign_check}");
+    assert_eq!(foreign_check["details"]["reason"], "foreign_database");
+    assert_eq!(
+        check(&json, "classifier.enumeration")["status"],
+        "problem",
+        "classifier rows must not be interpreted from a foreign catalogue: {json}"
+    );
+    assert!(
+        check(&json, "classifier.enumeration")["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("external SQLite catalogue is incompatible"),
+        "{json}"
+    );
+    assert_eq!(
+        check(&json, "classifier.tags")["status"],
+        "problem",
+        "{json}"
+    );
+    assert_eq!(
+        check(&json, "sei.population")["status"],
+        "problem",
+        "SEI rows must not be interpreted from a foreign catalogue: {json}"
+    );
+    let (_, text) = doctor(foreign.path(), false);
+    assert!(
+        text.contains("federation.sqlite_compatibility")
+            && text.contains("incompatible")
+            && text.contains("ForeignDatabase"),
+        "text output must report a foreign catalogue:\n{text}"
+    );
+
+    let too_new = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], too_new.path());
+    write_healthy_db(too_new.path());
+    Connection::open(too_new.path().join(".weft/loomweave/loomweave.db"))
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 13;")
+        .unwrap();
+    let (code, json) = doctor_json(too_new.path(), false);
+    let incompatible = check(&json, "federation.sqlite_compatibility");
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(incompatible["status"], "problem", "{incompatible}");
+    assert_eq!(incompatible["details"]["reason"], "too_new");
+    assert_eq!(
+        check(&json, "classifier.enumeration")["status"],
+        "problem",
+        "classifier rows must not be interpreted from a future catalogue: {json}"
+    );
+    assert!(
+        check(&json, "classifier.enumeration")["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("external SQLite catalogue is incompatible"),
+        "{json}"
+    );
+    assert_eq!(
+        check(&json, "classifier.tags")["status"],
+        "problem",
+        "{json}"
+    );
+    assert_eq!(
+        check(&json, "sei.population")["status"],
+        "problem",
+        "SEI rows must not be interpreted from a future catalogue: {json}"
+    );
+    let (_, text) = doctor(too_new.path(), false);
+    assert!(
+        text.contains("federation.sqlite_compatibility")
+            && text.contains("incompatible")
+            && text.contains("TooNew"),
+        "text output must report a non-foreign incompatible catalogue:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_classifier_latest_run_states_fail_closed() {
+    for (status, stats, expected_status, expected_reason) in [
+        ("running", "{}", "warning", "not completed"),
+        ("failed", "{}", "problem", "not completed"),
+        ("completed", "{}", "problem", "missing classifier_coverage"),
+        ("completed", "{broken", "problem", "malformed stats JSON"),
+        (
+            "completed",
+            r#"{"classifier_coverage":{"schema":"wrong","source_walk_complete":true,"source_walk_skipped_entries":0,"plugin_discovery_complete":true,"plugin_discovery_errors":0,"plugin_discovery_error_samples":[],"plugins":[]}}"#,
+            "problem",
+            "invalid classifier_coverage metadata",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        install(&["install", "--all"], dir.path());
+        write_healthy_db(dir.path());
+        insert_run_stats_raw(dir.path(), "latest", status, stats);
+
+        let (_, json) = doctor_json(dir.path(), false);
+        let enumeration = check(&json, "classifier.enumeration");
+        let tags = check(&json, "classifier.tags");
+        assert_eq!(enumeration["status"], expected_status, "{enumeration}");
+        assert!(
+            enumeration["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected_reason),
+            "{enumeration}"
+        );
+        assert_eq!(enumeration["details"]["run_id"], "latest");
+        assert_eq!(tags["status"], expected_status, "{tags}");
+
+        let (_, text) = doctor(dir.path(), false);
+        assert!(
+            text.contains("classifier.enumeration") && text.contains(expected_reason),
+            "text output must preserve the latest-run verdict:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn doctor_separates_classifier_enumeration_from_active_tag_support() {
+    let healthy = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], healthy.path());
+    write_healthy_db(healthy.path());
+    insert_run_stats(
+        healthy.path(),
+        "healthy",
+        "completed",
+        &classifier_coverage(
+            true,
+            0,
+            &serde_json::json!([
+                plugin_coverage(
+                    "python",
+                    "complete",
+                    2,
+                    2,
+                    0,
+                    &["cli-command", "http-route"]
+                ),
+                plugin_coverage("rust", "not-applicable", 0, 0, 0, &["cli-command"]),
+            ]),
+        ),
+    );
+    let (_, json) = doctor_json(healthy.path(), false);
+    let enumeration = check(&json, "classifier.enumeration");
+    let tags = check(&json, "classifier.tags");
+    assert_eq!(enumeration["status"], "ok", "{enumeration}");
+    assert_eq!(enumeration["details"]["source_walk_complete"], true);
+    assert_eq!(tags["status"], "ok", "{tags}");
+    assert_eq!(
+        tags["details"]["active_plugins"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(tags["details"]["active_plugins"][0]["plugin_id"], "python");
+    assert_eq!(
+        tags["details"]["active_plugins"][0]["classifier_tags"],
+        serde_json::json!(["cli-command", "http-route"])
+    );
+    assert_eq!(
+        tags["details"]["not_applicable_plugins"],
+        serde_json::json!(["rust"])
+    );
+    let (_, text) = doctor(healthy.path(), false);
+    assert!(
+        text.contains("classifier.enumeration: classifier enumeration is complete")
+            && text.contains("classifier.tags: active classifier tags: python")
+            && !text.contains("classifier.tags: active classifier tags: rust"),
+        "text output must report complete enumeration and active tags only:\n{text}"
+    );
+
+    let not_applicable = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], not_applicable.path());
+    write_healthy_db(not_applicable.path());
+    insert_run_stats(
+        not_applicable.path(),
+        "not-applicable",
+        "completed",
+        &classifier_coverage(
+            true,
+            0,
+            &serde_json::json!([plugin_coverage(
+                "rust",
+                "not-applicable",
+                0,
+                0,
+                0,
+                &["cli-command"]
+            )]),
+        ),
+    );
+    let (_, json) = doctor_json(not_applicable.path(), false);
+    assert_eq!(
+        check(&json, "classifier.tags")["details"]["active_plugins"],
+        serde_json::json!([])
+    );
+    let (_, text) = doctor(not_applicable.path(), false);
+    assert!(
+        text.contains("no active plugins; all discovered plugins were not applicable"),
+        "text output must not infer support from a not-applicable plugin:\n{text}"
+    );
+
+    let incomplete = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], incomplete.path());
+    write_healthy_db(incomplete.path());
+    insert_run_stats(
+        incomplete.path(),
+        "incomplete",
+        "completed",
+        &classifier_coverage(
+            false,
+            1,
+            &serde_json::json!([plugin_coverage(
+                "python",
+                "complete",
+                1,
+                1,
+                0,
+                &["cli-command"]
+            )]),
+        ),
+    );
+    let (code, json) = doctor_json(incomplete.path(), false);
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(check(&json, "classifier.enumeration")["status"], "problem");
+    assert_eq!(check(&json, "classifier.tags")["status"], "ok");
+    let (_, text) = doctor(incomplete.path(), false);
+    assert!(
+        text.contains("classifier.enumeration: classifier enumeration is incomplete")
+            && text.contains("source_walk_complete=false")
+            && text.contains("classifier.tags: active classifier tags: python"),
+        "text output must separate incomplete enumeration from tag support:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_reports_degraded_failed_and_empty_classifier_declarations() {
+    for (plugin_status, analyzed, degraded, tags, expected, expected_text) in [
+        (
+            "degraded",
+            1,
+            1,
+            &["cli-command"][..],
+            "warning",
+            "active classifier plugin degraded",
+        ),
+        (
+            "failed",
+            0,
+            0,
+            &["cli-command"][..],
+            "problem",
+            "active classifier plugin failed",
+        ),
+        (
+            "complete",
+            1,
+            0,
+            &[][..],
+            "warning",
+            "active plugin declares no classifier tags",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        install(&["install", "--all"], dir.path());
+        write_healthy_db(dir.path());
+        insert_run_stats(
+            dir.path(),
+            "coverage",
+            "completed",
+            &classifier_coverage(
+                true,
+                0,
+                &serde_json::json!([plugin_coverage(
+                    "python",
+                    plugin_status,
+                    1,
+                    analyzed,
+                    degraded,
+                    tags
+                )]),
+            ),
+        );
+        let (_, json) = doctor_json(dir.path(), false);
+        let tags_check = check(&json, "classifier.tags");
+        assert_eq!(tags_check["status"], expected, "{tags_check}");
+        assert_eq!(
+            tags_check["details"]["active_plugins"][0]["status"],
+            plugin_status
+        );
+        let (_, text) = doctor(dir.path(), false);
+        assert!(
+            text.contains("classifier.tags") && text.contains(expected_text),
+            "text output must preserve the active-plugin verdict:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn doctor_reports_authentication_modes_and_missing_configured_secret() {
+    for (yaml, env, expected_mode, expected_status, expected_text) in [
+        (
+            "version: 1\nserve:\n  http:\n    enabled: true\n",
+            None,
+            "none",
+            "ok",
+            "enabled on loopback without authentication",
+        ),
+        (
+            "version: 1\nserve:\n  http:\n    enabled: true\n    token_env: DOCTOR_BEARER\n",
+            Some(("DOCTOR_BEARER", "secret")),
+            "bearer",
+            "ok",
+            "protected routes use bearer authentication",
+        ),
+        (
+            "version: 1\nserve:\n  http:\n    enabled: true\n    identity_token_env: DOCTOR_HMAC\n",
+            Some(("DOCTOR_HMAC", "secret")),
+            "hmac",
+            "ok",
+            "protected routes use HMAC authentication",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        install(&["install", "--all"], dir.path());
+        fs::write(dir.path().join("loomweave.yaml"), yaml).unwrap();
+        let env_pairs = env.map_or_else(Vec::new, |pair| vec![pair]);
+        let (_, json) = doctor_json_with_env(dir.path(), false, &env_pairs, &[]);
+        let auth = check(&json, "http.authentication");
+        assert_eq!(auth["status"], expected_status, "{auth}");
+        assert_eq!(auth["details"]["protected_routes"], expected_mode);
+        let (_, text) = doctor_with_env(dir.path(), false, &env_pairs, &[]);
+        assert!(
+            text.contains("http.authentication") && text.contains(expected_text),
+            "text output must report the effective {expected_mode} posture:\n{text}"
+        );
+    }
+
+    let missing = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], missing.path());
+    fs::write(
+        missing.path().join("loomweave.yaml"),
+        "version: 1\nserve:\n  http:\n    enabled: true\n    identity_token_env: DOCTOR_MISSING_HMAC\n",
+    )
+    .unwrap();
+    let (code, json) = doctor_json_with_env(missing.path(), false, &[], &["DOCTOR_MISSING_HMAC"]);
+    let auth = check(&json, "http.authentication");
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(auth["status"], "problem", "{auth}");
+    assert_eq!(auth["details"]["secret_present"], false);
+    assert!(
+        json["next_actions"].as_array().unwrap().iter().any(|action| {
+            action
+                == "Set $DOCTOR_MISSING_HMAC to a non-empty HMAC secret, then run `loomweave doctor` again."
+        }),
+        "missing-secret remediation must name the configured pointer without exposing its value: {json}"
+    );
+    let (_, text) = doctor_with_env(missing.path(), false, &[], &["DOCTOR_MISSING_HMAC"]);
+    assert!(
+        text.contains("http.authentication")
+            && text.contains("configured but unusable")
+            && text.contains("DOCTOR_MISSING_HMAC"),
+        "text output must report a configured-but-missing secret without its value:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_reports_malformed_config_and_instance_identity() {
+    let malformed_yaml = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], malformed_yaml.path());
+    fs::write(
+        malformed_yaml.path().join("loomweave.yaml"),
+        "serve: [broken\n",
+    )
+    .unwrap();
+    let (code, json) = doctor_json(malformed_yaml.path(), false);
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(check(&json, "http.authentication")["status"], "problem");
+    assert!(
+        json["next_actions"].as_array().unwrap().iter().any(|action| {
+            action
+                == "Repair `loomweave.yaml` syntax and validation errors, then run `loomweave doctor` again."
+        }),
+        "malformed config needs a config-specific next action: {json}"
+    );
+    let (_, text) = doctor(malformed_yaml.path(), false);
+    assert!(
+        text.contains("http.authentication") && text.contains("cannot parse loomweave.yaml"),
+        "text output must surface malformed auth discovery:\n{text}"
+    );
+
+    let missing_instance = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], missing_instance.path());
+    let (_, json) = doctor_json(missing_instance.path(), false);
+    let instance = check(&json, "http.instance_id");
+    assert_eq!(instance["status"], "ok", "{instance}");
+    assert_eq!(instance["details"]["present"], false);
+    let (_, text) = doctor(missing_instance.path(), false);
+    assert!(
+        text.contains("http.instance_id") && text.contains("not materialised yet"),
+        "text output must report an absent instance ID:\n{text}"
+    );
+
+    let malformed_instance = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], malformed_instance.path());
+    fs::write(
+        malformed_instance
+            .path()
+            .join(".weft/loomweave/instance_id"),
+        "not-a-uuid\n",
+    )
+    .unwrap();
+    let (code, json) = doctor_json(malformed_instance.path(), false);
+    let instance = check(&json, "http.instance_id");
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(instance["status"], "problem", "{instance}");
+    assert_eq!(instance["details"]["present"], true);
+    assert!(
+        json["next_actions"].as_array().unwrap().iter().any(|action| {
+            action
+                == "Remove the malformed `.weft/loomweave/instance_id`; `loomweave serve` will create a valid replacement."
+        }),
+        "malformed UUID needs a safe replacement action: {json}"
+    );
+    let (_, text) = doctor(malformed_instance.path(), false);
+    assert!(
+        text.contains("http.instance_id") && text.contains("malformed; expected a UUID"),
+        "text output must report a malformed instance ID:\n{text}"
+    );
+
+    let valid_instance = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], valid_instance.path());
+    let uuid = "00000000-0000-4000-8000-000000000007";
+    fs::write(
+        valid_instance.path().join(".weft/loomweave/instance_id"),
+        format!("{uuid}\n"),
+    )
+    .unwrap();
+    let (_, json) = doctor_json(valid_instance.path(), false);
+    let instance = check(&json, "http.instance_id");
+    assert_eq!(instance["status"], "ok", "{instance}");
+    assert_eq!(instance["details"]["instance_id"], uuid);
+    let (_, text) = doctor(valid_instance.path(), false);
+    assert!(
+        text.contains("http.instance_id") && text.contains(uuid),
+        "text output must report the valid serving identity:\n{text}"
+    );
+
+    let unreadable_instance = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], unreadable_instance.path());
+    fs::create_dir(
+        unreadable_instance
+            .path()
+            .join(".weft/loomweave/instance_id"),
+    )
+    .unwrap();
+    let (code, json) = doctor_json(unreadable_instance.path(), false);
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(check(&json, "http.instance_id")["status"], "problem");
+    assert!(
+        json["next_actions"].as_array().unwrap().iter().any(|action| {
+            action
+                == "Restore read access to `.weft/loomweave/instance_id` and inspect it before replacing any data."
+        }),
+        "an unreadable identity needs a distinct non-destructive remedy: {json}"
     );
 }
 

@@ -230,12 +230,27 @@ To verify (and repair) these surfaces later, run `loomweave doctor`:
 ```bash
 loomweave doctor --path /tmp/requests-2.32.4          # report only; exits non-zero if anything is off
 loomweave doctor --fix --path /tmp/requests-2.32.4    # repair the skill pack, hook, and .mcp.json entry in place
+loomweave doctor --format json --path /tmp/requests-2.32.4  # stable check IDs + machine-readable details
 ```
 
 `doctor` also checks the `loomweave` entry in `.mcp.json` — which `install` does
 not register automatically — and `--fix` adds it (preserving any sibling MCP
 servers and a customised `command`). The non-zero exit on remaining problems
 makes it usable as a CI / pre-commit gate.
+
+The federation diagnostics use the same fail-closed readers as the serving
+surfaces. `federation.sqlite_compatibility` reports the exact application ID,
+user version, and external-read compatibility without migrating the database.
+`classifier.enumeration` reports latest-run discovery/source-walk completeness,
+while `classifier.tags` separately lists declarations only for plugins that
+actually matched source files (a `not-applicable` plugin is not active).
+`http.authentication` reports the effective `none`, `bearer`, or `hmac` posture
+without exposing secret values, and `http.instance_id` validates the persisted
+project UUID. A failed latest run, malformed coverage/config/instance ID, or an
+incompatible database is a gating problem; an absent optional index and an
+accepted legacy/older external schema are advisory. All database diagnostics,
+including `sei.population`, open the catalogue read-only: running doctor never
+creates a missing `loomweave.db`.
 
 Over MCP, the same orientation is available without install: the `initialize`
 result carries an `instructions` field, the `loomweave://context` resource returns

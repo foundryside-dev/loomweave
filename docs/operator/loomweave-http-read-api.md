@@ -48,6 +48,13 @@ siblings can probe the API surface before sending protected reads.
 Loomweave still accepts the older `serve.http.token_env` bearer-token path for
 compatibility. Prefer `identity_token_env` for new deployments.
 
+Run `loomweave doctor --format json` to inspect the local discovery posture.
+The stable `http.authentication` check reports `protected_routes` as `none`,
+`bearer`, or `hmac`, plus whether the configured secret is present; it never
+includes the secret value. `http.instance_id` independently reports whether the
+project UUID is absent, valid, or malformed. A configured HMAC secret that is
+missing and a malformed instance ID are gate failures, matching `serve` startup.
+
 Loomweave refuses non-loopback binds unless `serve.http.allow_non_loopback: true`
 is set. Non-loopback deployments must also configure authentication; otherwise
 Loomweave refuses to bind. Treat the endpoint as source-code metadata exposure:

@@ -30,8 +30,13 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use loomweave_core::{ClassifierCoverage, PluginCoverageStatus};
 use loomweave_federation::config::{McpConfig, ProviderSelection, select_provider_with_env};
-use rusqlite::Connection;
+use loomweave_storage::{
+    ExternalSqliteCompatibility, ExternalSqliteCompatibilityStatus, LatestClassifierCoverage,
+    external_sqlite_compatibility, latest_classifier_coverage,
+};
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -85,6 +90,12 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_db_tracked(&project_root, fix);
     tally += check_gitignore_current(&project_root, fix);
     tally += check_loomweave_dir(&project_root);
+    tally += emit_json_check_text(&check_external_sqlite_json(&project_root));
+    let (enumeration, tags) = check_classifier_json(&project_root);
+    tally += emit_json_check_text(&enumeration);
+    tally += emit_json_check_text(&tags);
+    tally += emit_json_check_text(&check_http_authentication_json(&project_root));
+    tally += emit_json_check_text(&check_http_instance_id_json(&project_root));
     tally += check_index_integrity(&project_root, fix);
     println!("--- llm ---");
     tally += check_llm_provider(&project_root);
@@ -128,6 +139,10 @@ struct DoctorJsonCheck {
     status: &'static str,
     fixed: bool,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
+    #[serde(skip)]
+    next_action: Option<String>,
 }
 
 impl DoctorJsonCheck {
@@ -137,6 +152,8 @@ impl DoctorJsonCheck {
             status: "ok",
             fixed: false,
             message: message.into(),
+            details: None,
+            next_action: None,
         }
     }
 
@@ -146,6 +163,8 @@ impl DoctorJsonCheck {
             status: "warning",
             fixed: false,
             message: message.into(),
+            details: None,
+            next_action: None,
         }
     }
 
@@ -155,6 +174,8 @@ impl DoctorJsonCheck {
             status: "problem",
             fixed: false,
             message: message.into(),
+            details: None,
+            next_action: None,
         }
     }
 
@@ -164,13 +185,29 @@ impl DoctorJsonCheck {
             status: "fixed",
             fixed: true,
             message: message.into(),
+            details: None,
+            next_action: None,
         }
+    }
+
+    fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    fn with_next_action(mut self, next_action: impl Into<String>) -> Self {
+        self.next_action = Some(next_action.into());
+        self
     }
 }
 
 fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
+    let (classifier_enumeration, classifier_tags) = check_classifier_json(project_root);
     let mut checks = vec![
         check_loomweave_dir_json(project_root),
+        check_external_sqlite_json(project_root),
+        classifier_enumeration,
+        classifier_tags,
         check_index_integrity_json(project_root, fix),
         check_index_freshness_json(project_root),
         check_plugin_availability_json(),
@@ -179,6 +216,8 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_mcp_json(project_root, fix),
         check_instructions_json(project_root, fix),
         check_http_config_json(project_root),
+        check_http_authentication_json(project_root),
+        check_http_instance_id_json(project_root),
         check_filigree_url_json(project_root),
         check_llm_provider_json(project_root),
         check_sei_population_json(project_root),
@@ -191,7 +230,25 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
     let next_actions: Vec<String> = checks
         .iter()
         .filter(|check| check.status == "problem" || check.status == "warning")
-        .map(|check| match check.id {
+        .map(|check| {
+            check
+                .next_action
+                .clone()
+                .unwrap_or_else(|| default_next_action(check.id))
+        })
+        .collect();
+    let ok = checks.iter().all(|check| check.status != "problem");
+    // Keep ordering stable even when future checks append conditionally.
+    checks.shrink_to_fit();
+    DoctorJsonReport {
+        ok,
+        checks,
+        next_actions,
+    }
+}
+
+fn default_next_action(id: &str) -> String {
+    match id {
             "skill.pack" => {
                 "Run `loomweave doctor --fix` or `loomweave install --skills`.".to_owned()
             }
@@ -218,6 +275,18 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
             "index.freshness" => {
                 "Run `loomweave analyze <project>` to refresh the index.".to_owned()
             }
+            "federation.sqlite_compatibility" => {
+                "Rebuild the local index with this Loomweave version before allowing an external SQLite reader.".to_owned()
+            }
+            "classifier.enumeration" | "classifier.tags" => {
+                "Run `loomweave analyze <project>` and inspect the latest analysis-run diagnostics.".to_owned()
+            }
+            "http.authentication" => {
+                "Set the configured HTTP authentication secret, or disable/reconfigure the HTTP read API.".to_owned()
+            }
+            "http.instance_id" => {
+                "Remove a malformed `.weft/loomweave/instance_id`; `loomweave serve` will create a valid replacement.".to_owned()
+            }
             "llm.provider" => {
                 "Run `loomweave config check` to see the effective LLM state; to enable live \
                  summaries set llm_policy.enabled: true + allow_live_provider: true and supply the \
@@ -235,16 +304,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
                  `.weft/loomweave/.gitignore` to the current template."
                     .to_owned()
             }
-            _ => format!("Review doctor check `{}`.", check.id),
-        })
-        .collect();
-    let ok = checks.iter().all(|check| check.status != "problem");
-    // Keep ordering stable even when future checks append conditionally.
-    checks.shrink_to_fit();
-    DoctorJsonReport {
-        ok,
-        checks,
-        next_actions,
+            _ => format!("Review doctor check `{id}`."),
     }
 }
 
@@ -371,6 +431,397 @@ fn check_loomweave_dir(project_root: &Path) -> Tally {
             Some("upgrade loomweave to match or exceed the schema version of the database"),
         ),
     }
+}
+
+/// External-consumer compatibility is stricter than Loomweave's own migration
+/// acceptance. Keep it as a separate stable check so operators can distinguish
+/// "Loomweave can open this" from "a federation peer may safely read it".
+fn check_external_sqlite_json(project_root: &Path) -> DoctorJsonCheck {
+    const ID: &str = "federation.sqlite_compatibility";
+    let db_path = loomweave_core::store::db_path(project_root);
+    if !db_path.exists() {
+        return DoctorJsonCheck::warning(ID, "external SQLite catalogue is absent")
+            .with_details(serde_json::json!({"database_present": false}));
+    }
+    let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return DoctorJsonCheck::problem(
+                ID,
+                format!("external SQLite compatibility probe could not open the index: {err}"),
+            )
+            .with_details(serde_json::json!({
+                "database_present": true,
+                "probe_error": err.to_string(),
+            }));
+        }
+    };
+    let report = match external_sqlite_compatibility(&conn) {
+        Ok(report) => report,
+        Err(err) => {
+            return DoctorJsonCheck::problem(
+                ID,
+                format!("external SQLite compatibility probe failed: {err}"),
+            )
+            .with_details(serde_json::json!({
+                "database_present": true,
+                "probe_error": err.to_string(),
+            }));
+        }
+    };
+    let details = serde_json::json!({
+        "database_present": true,
+        "schema": report.schema,
+        "compatibility": report.status,
+        "reason": report.reason,
+        "application_id": report.application_id,
+        "user_version": report.user_version,
+        "min_user_version": report.min_user_version,
+        "max_user_version": report.max_user_version,
+        "legacy_application_id": report.legacy_application_id,
+        "missing_surface": report.missing_surface,
+    });
+    match report.status {
+        ExternalSqliteCompatibilityStatus::Compatible if report.legacy_application_id => {
+            DoctorJsonCheck::warning(
+                ID,
+                format!(
+                    "external SQLite schema v{} is compatible via legacy application_id=0; structure does not authenticate provenance",
+                    report.user_version
+                ),
+            )
+            .with_details(details)
+        }
+        ExternalSqliteCompatibilityStatus::Compatible => DoctorJsonCheck::ok(
+            ID,
+            format!(
+                "external SQLite schema {} is compatible at user_version={}",
+                report.schema, report.user_version
+            ),
+        )
+        .with_details(details),
+        ExternalSqliteCompatibilityStatus::OlderSupported => DoctorJsonCheck::warning(
+            ID,
+            format!(
+                "external SQLite user_version={} is older but supported{}",
+                report.user_version,
+                if report.legacy_application_id {
+                    " via legacy application_id=0"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .with_details(details),
+        ExternalSqliteCompatibilityStatus::Incompatible => DoctorJsonCheck::problem(
+            ID,
+            format!(
+                "external SQLite catalogue is incompatible: {:?} (application_id={}, user_version={})",
+                report.reason, report.application_id, report.user_version
+            ),
+        )
+        .with_details(details),
+    }
+}
+
+enum ExternalSqliteReadGateError {
+    Probe(String),
+    Incompatible(ExternalSqliteCompatibility),
+}
+
+impl ExternalSqliteReadGateError {
+    fn message(&self) -> String {
+        match self {
+            Self::Probe(detail) => format!("external SQLite compatibility probe failed: {detail}"),
+            Self::Incompatible(report) => format!(
+                "external SQLite catalogue is incompatible: {:?} (application_id={}, user_version={})",
+                report.reason, report.application_id, report.user_version
+            ),
+        }
+    }
+
+    fn details(&self) -> Value {
+        match self {
+            Self::Probe(detail) => serde_json::json!({"probe_error": detail}),
+            Self::Incompatible(report) => serde_json::json!({
+                "schema": report.schema,
+                "compatibility": report.status,
+                "reason": report.reason,
+                "application_id": report.application_id,
+                "user_version": report.user_version,
+                "missing_surface": report.missing_surface,
+            }),
+        }
+    }
+}
+
+/// Gate a catalogue connection before any contract-specific row query. Header
+/// checks and required-surface introspection happen on this same read-only
+/// connection; callers may query `runs`/`sei_bindings` only after `Ok(())`.
+fn validate_external_sqlite_read_gate(
+    conn: &Connection,
+) -> std::result::Result<(), ExternalSqliteReadGateError> {
+    let report = external_sqlite_compatibility(conn)
+        .map_err(|err| ExternalSqliteReadGateError::Probe(err.to_string()))?;
+    if report.status == ExternalSqliteCompatibilityStatus::Incompatible {
+        return Err(ExternalSqliteReadGateError::Incompatible(report));
+    }
+    Ok(())
+}
+
+fn check_classifier_json(project_root: &Path) -> (DoctorJsonCheck, DoctorJsonCheck) {
+    const ENUMERATION_ID: &str = "classifier.enumeration";
+    const TAGS_ID: &str = "classifier.tags";
+    let db_path = loomweave_core::store::db_path(project_root);
+    if !db_path.exists() {
+        let details = serde_json::json!({
+            "available": false,
+            "run_id": null,
+            "run_status": null,
+            "reason": "external SQLite catalogue is absent",
+        });
+        return (
+            DoctorJsonCheck::warning(
+                ENUMERATION_ID,
+                "classifier enumeration is unavailable because the index is absent",
+            )
+            .with_details(details.clone()),
+            DoctorJsonCheck::warning(
+                TAGS_ID,
+                "active classifier declarations are unavailable because the index is absent",
+            )
+            .with_details(details),
+        );
+    }
+    let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => conn,
+        Err(err) => return classifier_probe_problem(&err.to_string()),
+    };
+    if let Err(err) = validate_external_sqlite_read_gate(&conn) {
+        return classifier_external_gate_problem(&err);
+    }
+    let latest = match latest_classifier_coverage(&conn) {
+        Ok(latest) => latest,
+        Err(err) => return classifier_probe_problem(&err.to_string()),
+    };
+    let Some(coverage) = latest.coverage() else {
+        let reason = latest
+            .reason()
+            .unwrap_or("classifier coverage is unavailable");
+        let details = serde_json::json!({
+            "available": false,
+            "run_id": latest.run_id(),
+            "run_status": latest.run_status(),
+            "reason": reason,
+        });
+        let (status, message_prefix) = match latest.run_status() {
+            None if latest.run_id().is_none() => ("ok", "no classifier analysis run exists yet"),
+            Some("running") => ("warning", "latest classifier analysis is not completed"),
+            _ => ("problem", "latest classifier evidence is unusable"),
+        };
+        let enumeration = classifier_unavailable_check(
+            ENUMERATION_ID,
+            status,
+            format!("{message_prefix}: {reason}"),
+            details.clone(),
+        );
+        let tags = classifier_unavailable_check(
+            TAGS_ID,
+            status,
+            format!("active classifier declarations are unavailable: {reason}"),
+            details,
+        );
+        return (enumeration, tags);
+    };
+
+    (
+        classifier_enumeration_json(&latest, coverage),
+        classifier_tags_json(&latest, coverage),
+    )
+}
+
+fn classifier_external_gate_problem(
+    error: &ExternalSqliteReadGateError,
+) -> (DoctorJsonCheck, DoctorJsonCheck) {
+    let message = error.message();
+    let details = serde_json::json!({
+        "available": false,
+        "external_sqlite": error.details(),
+    });
+    (
+        DoctorJsonCheck::problem(
+            "classifier.enumeration",
+            format!("classifier evidence unavailable: {message}"),
+        )
+        .with_details(details.clone()),
+        DoctorJsonCheck::problem(
+            "classifier.tags",
+            format!("active classifier declarations unavailable: {message}"),
+        )
+        .with_details(details),
+    )
+}
+
+fn classifier_enumeration_json(
+    latest: &LatestClassifierCoverage,
+    coverage: &ClassifierCoverage,
+) -> DoctorJsonCheck {
+    const ID: &str = "classifier.enumeration";
+    let enumeration_details = serde_json::json!({
+        "available": true,
+        "schema": coverage.schema(),
+        "run_id": latest.run_id(),
+        "run_status": latest.run_status(),
+        "source_walk_complete": coverage.source_walk_complete(),
+        "source_walk_skipped_entries": coverage.source_walk_skipped_entries(),
+        "plugin_discovery_complete": coverage.plugin_discovery_complete(),
+        "plugin_discovery_errors": coverage.plugin_discovery_errors(),
+        "plugin_discovery_error_samples": coverage.plugin_discovery_error_samples(),
+    });
+    if coverage.source_walk_complete()
+        && coverage.plugin_discovery_complete()
+        && coverage.source_walk_skipped_entries() == 0
+    {
+        DoctorJsonCheck::ok(
+            ID,
+            format!(
+                "classifier enumeration is complete for run {}",
+                latest.run_id().unwrap_or("<unknown>")
+            ),
+        )
+        .with_details(enumeration_details)
+    } else {
+        DoctorJsonCheck::problem(
+            ID,
+            format!(
+                "classifier enumeration is incomplete: source_walk_complete={}, skipped_entries={}, plugin_discovery_complete={}, discovery_errors={}",
+                coverage.source_walk_complete(),
+                coverage.source_walk_skipped_entries(),
+                coverage.plugin_discovery_complete(),
+                coverage.plugin_discovery_errors(),
+            ),
+        )
+        .with_details(enumeration_details)
+    }
+}
+
+fn classifier_tags_json(
+    latest: &LatestClassifierCoverage,
+    coverage: &ClassifierCoverage,
+) -> DoctorJsonCheck {
+    const ID: &str = "classifier.tags";
+    let active_plugins: Vec<Value> = coverage
+        .plugins()
+        .iter()
+        .filter(|plugin| plugin.matched_files() > 0)
+        .map(|plugin| {
+            serde_json::json!({
+                "plugin_id": plugin.plugin_id(),
+                "plugin_version": plugin.plugin_version(),
+                "ontology_version": plugin.ontology_version(),
+                "status": plugin.status(),
+                "matched_files": plugin.matched_files(),
+                "analyzed_files": plugin.analyzed_files(),
+                "retained_files": plugin.retained_files(),
+                "degraded_files": plugin.degraded_files(),
+                "classifier_tags": plugin.classifier_tags(),
+            })
+        })
+        .collect();
+    let not_applicable_plugins: Vec<&str> = coverage
+        .plugins()
+        .iter()
+        .filter(|plugin| plugin.status() == PluginCoverageStatus::NotApplicable)
+        .map(loomweave_core::PluginClassifierCoverage::plugin_id)
+        .collect();
+    let has_failed = coverage.plugins().iter().any(|plugin| {
+        plugin.matched_files() > 0 && plugin.status() == PluginCoverageStatus::Failed
+    });
+    let has_degraded = coverage.plugins().iter().any(|plugin| {
+        plugin.matched_files() > 0 && plugin.status() == PluginCoverageStatus::Degraded
+    });
+    let has_empty_declaration = coverage
+        .plugins()
+        .iter()
+        .any(|plugin| plugin.matched_files() > 0 && plugin.classifier_tags().is_empty());
+    let tag_summary = if active_plugins.is_empty() {
+        "no active plugins; all discovered plugins were not applicable".to_owned()
+    } else {
+        coverage
+            .plugins()
+            .iter()
+            .filter(|plugin| plugin.matched_files() > 0)
+            .map(|plugin| {
+                format!(
+                    "{}({:?})=[{}]",
+                    plugin.plugin_id(),
+                    plugin.status(),
+                    plugin.classifier_tags().join(",")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let tag_details = serde_json::json!({
+        "available": true,
+        "schema": coverage.schema(),
+        "run_id": latest.run_id(),
+        "run_status": latest.run_status(),
+        "active_plugins": active_plugins,
+        "not_applicable_plugins": not_applicable_plugins,
+    });
+    if has_failed {
+        DoctorJsonCheck::problem(
+            ID,
+            format!("active classifier plugin failed: {tag_summary}"),
+        )
+        .with_details(tag_details)
+    } else if has_degraded {
+        DoctorJsonCheck::warning(
+            ID,
+            format!("active classifier plugin degraded: {tag_summary}"),
+        )
+        .with_details(tag_details)
+    } else if has_empty_declaration {
+        DoctorJsonCheck::warning(
+            ID,
+            format!("active plugin declares no classifier tags: {tag_summary}"),
+        )
+        .with_details(tag_details)
+    } else {
+        DoctorJsonCheck::ok(ID, format!("active classifier tags: {tag_summary}"))
+            .with_details(tag_details)
+    }
+}
+
+fn classifier_probe_problem(detail: &str) -> (DoctorJsonCheck, DoctorJsonCheck) {
+    let details = serde_json::json!({"available": false, "probe_error": detail});
+    (
+        DoctorJsonCheck::problem(
+            "classifier.enumeration",
+            format!("classifier coverage probe failed: {detail}"),
+        )
+        .with_details(details.clone()),
+        DoctorJsonCheck::problem(
+            "classifier.tags",
+            format!("active classifier declarations could not be read: {detail}"),
+        )
+        .with_details(details),
+    )
+}
+
+fn classifier_unavailable_check(
+    id: &'static str,
+    status: &str,
+    message: String,
+    details: Value,
+) -> DoctorJsonCheck {
+    let check = match status {
+        "ok" => DoctorJsonCheck::ok(id, message),
+        "warning" => DoctorJsonCheck::warning(id, message),
+        _ => DoctorJsonCheck::problem(id, message),
+    };
+    check.with_details(details)
 }
 
 /// Outcome of the index-integrity check (clarion-abda98c869 recovery). Shared by
@@ -1001,6 +1452,161 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     }
 }
 
+fn load_mcp_config_for_doctor(project_root: &Path) -> std::result::Result<McpConfig, String> {
+    let path = project_root.join("loomweave.yaml");
+    if path.exists() {
+        McpConfig::from_path(&path).map_err(|err| err.to_string())
+    } else {
+        Ok(McpConfig::default())
+    }
+}
+
+fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
+    const ID: &str = "http.authentication";
+    let config = match load_mcp_config_for_doctor(project_root) {
+        Ok(config) => config,
+        Err(err) => {
+            return DoctorJsonCheck::problem(
+                ID,
+                format!("HTTP authentication discovery cannot parse loomweave.yaml: {err}"),
+            )
+            .with_details(serde_json::json!({
+                "config_valid": false,
+                "protected_routes": "unavailable",
+            }))
+            .with_next_action(
+                "Repair `loomweave.yaml` syntax and validation errors, then run `loomweave doctor` again.",
+            );
+        }
+    };
+    let http = &config.serve.http;
+    if !http.enabled {
+        return DoctorJsonCheck::ok(ID, "HTTP read API is disabled; protected routes are absent")
+            .with_details(serde_json::json!({
+                "config_valid": true,
+                "http_enabled": false,
+                "protected_routes": "none",
+                "secret_configured": false,
+                "secret_present": false,
+            }));
+    }
+
+    let identity_secret_present = http.identity_token_env.as_deref().is_some_and(|name| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let bearer_secret_present = std::env::var(&http.token_env)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let configured_mode = if http.identity_token_env.is_some() {
+        "hmac"
+    } else if bearer_secret_present {
+        "bearer"
+    } else {
+        "none"
+    };
+    let secret_present = match configured_mode {
+        "hmac" => identity_secret_present,
+        "bearer" => bearer_secret_present,
+        _ => false,
+    };
+    let details = serde_json::json!({
+        "config_valid": true,
+        "http_enabled": true,
+        "protected_routes": configured_mode,
+        "secret_configured": http.identity_token_env.is_some() || configured_mode == "bearer",
+        "secret_present": secret_present,
+        "loopback": http.is_loopback_bind(),
+    });
+    if let Err(err) = http.validate_auth_trust(|name| std::env::var(name).ok()) {
+        let check = DoctorJsonCheck::problem(
+            ID,
+            format!("HTTP authentication is configured but unusable: {err}"),
+        )
+        .with_details(details);
+        if let Some(secret_env) = http
+            .identity_token_env
+            .as_deref()
+            .filter(|_| !identity_secret_present)
+        {
+            return check.with_next_action(format!(
+                "Set ${secret_env} to a non-empty HMAC secret, then run `loomweave doctor` again."
+            ));
+        }
+        return check.with_next_action(format!(
+            "Set ${} to a non-empty bearer secret, then run `loomweave doctor` again.",
+            http.token_env
+        ));
+    }
+    match configured_mode {
+        "hmac" => DoctorJsonCheck::ok(ID, "HTTP protected routes use HMAC authentication")
+            .with_details(details),
+        "bearer" => DoctorJsonCheck::ok(ID, "HTTP protected routes use bearer authentication")
+            .with_details(details),
+        _ => DoctorJsonCheck::ok(
+            ID,
+            "HTTP read API is enabled on loopback without authentication",
+        )
+        .with_details(details),
+    }
+}
+
+fn check_http_instance_id_json(project_root: &Path) -> DoctorJsonCheck {
+    const ID: &str = "http.instance_id";
+    let path = loomweave_core::store::store_dir(project_root).join("instance_id");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return DoctorJsonCheck::ok(
+                ID,
+                "project instance ID is not materialised yet; `loomweave serve` will create it",
+            )
+            .with_details(serde_json::json!({
+                "present": false,
+                "valid": null,
+                "instance_id": null,
+            }));
+        }
+        Err(err) => {
+            return DoctorJsonCheck::problem(
+                ID,
+                format!("project instance ID is unreadable: {err}"),
+            )
+            .with_details(serde_json::json!({
+                "present": true,
+                "valid": false,
+                "instance_id": null,
+            }))
+            .with_next_action(
+                "Restore read access to `.weft/loomweave/instance_id` and inspect it before replacing any data.",
+            );
+        }
+    };
+    match uuid::Uuid::parse_str(raw.trim()) {
+        Ok(instance_id) => {
+            DoctorJsonCheck::ok(ID, format!("project instance ID is valid: {instance_id}"))
+                .with_details(serde_json::json!({
+                    "present": true,
+                    "valid": true,
+                    "instance_id": instance_id.to_string(),
+                }))
+        }
+        Err(err) => DoctorJsonCheck::problem(
+            ID,
+            format!("project instance ID is malformed; expected a UUID: {err}"),
+        )
+        .with_details(serde_json::json!({
+            "present": true,
+            "valid": false,
+            "instance_id": null,
+        }))
+        .with_next_action(
+            "Remove the malformed `.weft/loomweave/instance_id`; `loomweave serve` will create a valid replacement.",
+        ),
+    }
+}
+
 fn http_health_reachable(base_url: &str) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(250))
@@ -1111,9 +1717,21 @@ fn check_llm_provider_json(project_root: &Path) -> DoctorJsonCheck {
 
 fn check_sei_population_json(project_root: &Path) -> DoctorJsonCheck {
     let db = loomweave_core::store::db_path(project_root);
-    let Ok(conn) = Connection::open(&db) else {
+    if !db.exists() {
+        return DoctorJsonCheck::warning("sei.population", "loomweave.db is absent");
+    }
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return DoctorJsonCheck::warning("sei.population", "loomweave.db is absent or unreadable");
     };
+    if let Err(err) = validate_external_sqlite_read_gate(&conn) {
+        return DoctorJsonCheck::problem(
+            "sei.population",
+            format!("SEI population unavailable: {}", err.message()),
+        )
+        .with_details(serde_json::json!({
+            "external_sqlite": err.details(),
+        }));
+    }
     let count: rusqlite::Result<i64> = conn.query_row(
         "SELECT COUNT(*) FROM sei_bindings WHERE status = 'alive'",
         [],
@@ -1319,6 +1937,20 @@ fn problem(line: &str, fix_hint: Option<&str>) -> Tally {
     Tally {
         problems: 1,
         warnings: 0,
+    }
+}
+
+/// Render one of the shared JSON diagnostic results on the human surface.
+/// Keeping severity and wording in a single result prevents text/JSON drift.
+fn emit_json_check_text(check: &DoctorJsonCheck) -> Tally {
+    match check.status {
+        "ok" | "fixed" => ok(&format!("{}: {}", check.id, check.message)),
+        "warning" => warn(&format!("{}: {}", check.id, check.message), None),
+        "problem" => problem(&format!("{}: {}", check.id, check.message), None),
+        _ => problem(
+            &format!("{}: unknown doctor status {}", check.id, check.status),
+            None,
+        ),
     }
 }
 
