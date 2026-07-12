@@ -1,0 +1,122 @@
+{
+  "schema": "loomweave.http-auth.v1",
+  "canonical_hmac": {
+    "secret": "federation-secret",
+    "method_input": "post",
+    "method_on_wire": "POST",
+    "path_and_query": "/api/v1/identity/resolve?trace=1",
+    "body_utf8": "{\"locator\":\"python:function:demo.run\"}",
+    "body_sha256": "591e7e32c043fb1bc8f070f7f65d5e262c01e468a7d4a4cf48c1fd997a7211e0",
+    "timestamp": 1900000000,
+    "nonce": "nonce-vector-001",
+    "signing_bytes_utf8": "POST\n/api/v1/identity/resolve?trace=1\n591e7e32c043fb1bc8f070f7f65d5e262c01e468a7d4a4cf48c1fd997a7211e0\n1900000000\nnonce-vector-001",
+    "component_signature": "loomweave:38898838931bd6b292917a8734975472bda49ae679960610df1d0db62f4a00c5"
+  },
+  "freshness": {
+    "window_seconds": 300,
+    "now": 1900000000,
+    "accepted_timestamps": [
+      1899999700,
+      1900000300
+    ],
+    "rejected_timestamps": [
+      1899999699,
+      1900000301
+    ]
+  },
+  "redacted_unauthenticated": {
+    "status": 401,
+    "body": {
+      "error": "authentication required",
+      "code": "UNAUTHENTICATED"
+    }
+  },
+  "handler_matrix": {
+    "endpoint": {
+      "method": "GET",
+      "path": "/api/v1/identity/sei/normalized-sei:15b345ca8d2bc5bd1e416fa7"
+    },
+    "bearer": {
+      "missing": {
+        "status": 401,
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      },
+      "malformed": {
+        "status": 401,
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      },
+      "wrong": {
+        "status": 401,
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      },
+      "valid": {
+        "status": 200,
+        "body": {
+          "alive": true,
+          "api_version": 1,
+          "content_hash": "1e0bdf0ca83ed0c0a538313f1f63e0ff64c5e33c3c7879e7c86de238382b3248",
+          "current_locator": "python:function:command_alpha.command_alpha",
+          "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
+          "sei": "normalized-sei:15b345ca8d2bc5bd1e416fa7"
+        }
+      }
+    },
+    "hmac": {
+      "missing": {
+        "status": 401,
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      },
+      "malformed": {
+        "status": 401,
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      },
+      "wrong": {
+        "status": 401,
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      },
+      "stale": {
+        "status": 401,
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      },
+      "valid": {
+        "status": 200,
+        "body": {
+          "alive": true,
+          "api_version": 1,
+          "content_hash": "1e0bdf0ca83ed0c0a538313f1f63e0ff64c5e33c3c7879e7c86de238382b3248",
+          "current_locator": "python:function:command_alpha.command_alpha",
+          "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
+          "sei": "normalized-sei:15b345ca8d2bc5bd1e416fa7"
+        }
+      },
+      "replayed": {
+        "status": 401,
+        "body": {
+          "error": "authentication required",
+          "code": "UNAUTHENTICATED"
+        }
+      }
+    }
+  }
+}

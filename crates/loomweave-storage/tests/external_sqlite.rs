@@ -4,6 +4,12 @@ use loomweave_storage::{
     ExternalSqliteIncompatibilityReason, external_sqlite_compatibility, pragma, schema,
 };
 use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
+
+const COMPATIBILITY_GOLDEN: &[u8] =
+    include_bytes!("../../../docs/federation/fixtures/external-sqlite-compatibility-v1.json");
+const COMPATIBILITY_GOLDEN_SHA256: &str =
+    include_str!("../../../docs/federation/fixtures/external-sqlite-compatibility-v1.json.sha256");
 
 fn current_database() -> Connection {
     let mut conn = Connection::open_in_memory().expect("open current database");
@@ -44,6 +50,60 @@ fn create_surface(
         conn.execute_batch(&format!("CREATE TABLE {table} ({definitions});"))
             .unwrap_or_else(|error| panic!("create {table}: {error}"));
     }
+}
+
+#[test]
+fn compatibility_golden_rechecks_real_reports_surface_and_byte_pin() {
+    let fixture: serde_json::Value =
+        serde_json::from_slice(COMPATIBILITY_GOLDEN).expect("parse compatibility golden");
+    let current = external_sqlite_compatibility(&current_database()).expect("current report");
+    assert_eq!(
+        serde_json::to_value(current).expect("serialize current report"),
+        fixture["reports"]["current"]
+    );
+    let older = external_sqlite_compatibility(&minimal_external_surface(
+        EXTERNAL_READ_MIN_USER_VERSION,
+        pragma::LOOMWEAVE_APPLICATION_ID,
+    ))
+    .expect("older report");
+    assert_eq!(
+        serde_json::to_value(older).expect("serialize older report"),
+        fixture["reports"]["older_supported"]
+    );
+    let future = Connection::open_in_memory().expect("future database");
+    future
+        .execute_batch(&format!(
+            "PRAGMA application_id = {}; PRAGMA user_version = {};",
+            pragma::LOOMWEAVE_APPLICATION_ID,
+            EXTERNAL_READ_MAX_USER_VERSION + 1
+        ))
+        .expect("stamp future database");
+    let future = external_sqlite_compatibility(&future).expect("future report");
+    assert_eq!(
+        serde_json::to_value(future).expect("serialize future report"),
+        fixture["reports"]["future"]
+    );
+
+    let expected_surface = serde_json::to_value(
+        EXTERNAL_SQLITE_REQUIRED_SURFACE
+            .iter()
+            .map(|(table, columns)| (*table, *columns))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    )
+    .expect("serialize required surface");
+    assert_eq!(fixture["required_surface"], expected_surface);
+
+    let expected = COMPATIBILITY_GOLDEN_SHA256
+        .split_whitespace()
+        .next()
+        .expect("digest sidecar");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(COMPATIBILITY_GOLDEN)),
+        expected
+    );
+    let mut mutated = COMPATIBILITY_GOLDEN.to_vec();
+    mutated[0] ^= 1;
+    assert_ne!(format!("{:x}", Sha256::digest(mutated)), expected);
 }
 
 #[test]

@@ -3,11 +3,110 @@ use loomweave_storage::{
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+
+const PRODUCER_GOLDEN: &[u8] = include_bytes!("fixtures/classifier-coverage-v1.golden.json");
+const PRODUCER_GOLDEN_SHA256: &str =
+    include_str!("fixtures/classifier-coverage-v1.golden.json.sha256");
+const AUTHORITY_NOTE: &str =
+    include_str!("../../../docs/federation/2026-07-12-federation-seam-golden-authority.md");
 
 fn database() -> Connection {
     let mut conn = Connection::open_in_memory().expect("open database");
     schema::apply_migrations(&mut conn).expect("apply migrations");
     conn
+}
+
+#[test]
+fn producer_golden_is_strict_valid_5_file_python_coverage_and_byte_pinned() {
+    let coverage: loomweave_core::ClassifierCoverage =
+        serde_json::from_slice(PRODUCER_GOLDEN).expect("strictly parse producer golden");
+    let plugin = &coverage.plugins()[0];
+    assert_eq!(coverage.schema(), "loomweave.classifier-coverage.v1");
+    assert!(coverage.source_walk_complete());
+    assert!(coverage.plugin_discovery_complete());
+    assert_eq!(plugin.plugin_id(), "python");
+    assert_eq!(plugin.matched_files(), 5);
+    assert_eq!(plugin.analyzed_files(), 5);
+    assert_eq!(plugin.retained_files(), 0);
+    assert_eq!(plugin.degraded_files(), 0);
+    assert_eq!(
+        plugin.status(),
+        loomweave_core::PluginCoverageStatus::Complete
+    );
+    for tag in ["cli-command", "entry-point", "http-route", "exported-api"] {
+        assert!(
+            plugin
+                .classifier_tags()
+                .iter()
+                .any(|declared| declared == tag)
+        );
+    }
+
+    let expected = PRODUCER_GOLDEN_SHA256
+        .split_whitespace()
+        .next()
+        .expect("digest sidecar");
+    let actual = format!("{:x}", Sha256::digest(PRODUCER_GOLDEN));
+    assert_eq!(actual, expected);
+
+    let mut mutated = PRODUCER_GOLDEN.to_vec();
+    mutated[0] ^= 1;
+    assert_ne!(format!("{:x}", Sha256::digest(mutated)), expected);
+}
+
+#[test]
+fn authority_note_hash_table_is_locked_to_every_fixture_and_sidecar() {
+    let fixtures: &[(&str, &[u8], &str)] = &[
+        (
+            "crates/loomweave-storage/tests/fixtures/classifier-coverage-v1.golden.json",
+            PRODUCER_GOLDEN,
+            PRODUCER_GOLDEN_SHA256,
+        ),
+        (
+            "docs/federation/fixtures/classification.python.json",
+            include_bytes!("../../../docs/federation/fixtures/classification.python.json"),
+            include_str!("../../../docs/federation/fixtures/classification.python.json.sha256"),
+        ),
+        (
+            "docs/federation/fixtures/get-api-v1-capabilities.json",
+            include_bytes!("../../../docs/federation/fixtures/get-api-v1-capabilities.json"),
+            include_str!("../../../docs/federation/fixtures/get-api-v1-capabilities.json.sha256"),
+        ),
+        (
+            "docs/federation/fixtures/loomweave-http-auth-v1.golden.json",
+            include_bytes!("../../../docs/federation/fixtures/loomweave-http-auth-v1.golden.json"),
+            include_str!(
+                "../../../docs/federation/fixtures/loomweave-http-auth-v1.golden.json.sha256"
+            ),
+        ),
+        (
+            "docs/federation/fixtures/external-sqlite-compatibility-v1.json",
+            include_bytes!(
+                "../../../docs/federation/fixtures/external-sqlite-compatibility-v1.json"
+            ),
+            include_str!(
+                "../../../docs/federation/fixtures/external-sqlite-compatibility-v1.json.sha256"
+            ),
+        ),
+        (
+            "docs/federation/fixtures/identity-ownership-v1.golden.json",
+            include_bytes!("../../../docs/federation/fixtures/identity-ownership-v1.golden.json"),
+            include_str!(
+                "../../../docs/federation/fixtures/identity-ownership-v1.golden.json.sha256"
+            ),
+        ),
+    ];
+    for (path, bytes, sidecar) in fixtures {
+        let actual = format!("{:x}", Sha256::digest(bytes));
+        let pinned = sidecar.split_whitespace().next().expect("sidecar digest");
+        assert_eq!(&actual, pinned, "sidecar drift for {path}");
+        let expected_row = format!("| `{path}` | `{actual}` |");
+        assert!(
+            AUTHORITY_NOTE.lines().any(|line| line == expected_row),
+            "authority note hash table drift for {path}: expected {expected_row}"
+        );
+    }
 }
 
 fn valid_coverage() -> serde_json::Value {

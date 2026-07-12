@@ -601,22 +601,9 @@ fn seed_renamed_function_dossier(project_root: &Path) -> String {
     sei
 }
 
-#[test]
-fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
-    // WS4 core-paradise e2e (Wave 2 DoD): the Wardline dossier assembler can build
-    // a complete, freshness-stamped, SEI-keyed view of a RENAMED function using
-    // ONLY Loomweave's HTTP surface — SEI carried, facts not orphaned, freshness
-    // stamped. Exercises every slice the participation spec pins.
-    let dir = tempfile::tempdir().expect("temp project");
-    loomweave_bin()
-        .args(["install", "--path"])
-        .arg(dir.path())
-        .env("PATH", "")
-        .assert()
-        .success();
-    let sei = seed_renamed_function_dossier(dir.path());
+fn seed_orphaned_dossier_identity(project_root: &Path) -> &'static str {
     let orphaned_sei = "loomweave:eid:ffffffffffffffffffffffffffffffff";
-    let conn = Connection::open(dir.path().join(".weft/loomweave/loomweave.db"))
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db"))
         .expect("open sqlite for orphaned SEI");
     conn.execute(
         "INSERT INTO sei_bindings
@@ -633,7 +620,24 @@ fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
         params![orphaned_sei],
     )
     .expect("insert orphaned lineage");
-    drop(conn);
+    orphaned_sei
+}
+
+#[test]
+fn serve_http_dossier_participation_surface_serves_a_renamed_function() {
+    // WS4 core-paradise e2e (Wave 2 DoD): the Wardline dossier assembler can build
+    // a complete, freshness-stamped, SEI-keyed view of a RENAMED function using
+    // ONLY Loomweave's HTTP surface — SEI carried, facts not orphaned, freshness
+    // stamped. Exercises every slice the participation spec pins.
+    let dir = tempfile::tempdir().expect("temp project");
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    let sei = seed_renamed_function_dossier(dir.path());
+    let orphaned_sei = seed_orphaned_dossier_identity(dir.path());
     let bind = free_loopback_bind();
     write_http_config(dir.path(), &bind);
     let mut child = spawn_serve(dir.path());
@@ -939,6 +943,16 @@ fn serve_http_files_storage_failure_returns_closed_error_without_raw_detail() {
 /// `get_capabilities` handler against.
 const CAPABILITIES_GOLDEN: &str =
     include_str!("../../../docs/federation/fixtures/get-api-v1-capabilities.json");
+const CAPABILITIES_GOLDEN_SHA256: &str =
+    include_str!("../../../docs/federation/fixtures/get-api-v1-capabilities.json.sha256");
+const AUTH_GOLDEN: &str =
+    include_str!("../../../docs/federation/fixtures/loomweave-http-auth-v1.golden.json");
+const AUTH_GOLDEN_SHA256: &str =
+    include_str!("../../../docs/federation/fixtures/loomweave-http-auth-v1.golden.json.sha256");
+const IDENTITY_OWNERSHIP_GOLDEN: &str =
+    include_str!("../../../docs/federation/fixtures/identity-ownership-v1.golden.json");
+const IDENTITY_OWNERSHIP_GOLDEN_SHA256: &str =
+    include_str!("../../../docs/federation/fixtures/identity-ownership-v1.golden.json.sha256");
 
 /// Layer-1 byte-pin: lowercase-hex `blake3` over the EXACT bytes of the
 /// capabilities golden. Pins the whole fixture file so a silent reformat,
@@ -975,6 +989,253 @@ fn capabilities_golden_byte_pin_rejects_a_mutated_byte() {
         mutated, CAPABILITIES_GOLDEN_BLAKE3,
         "a single mutated byte must NOT collide with the pinned digest"
     );
+}
+
+#[test]
+fn federation_http_goldens_have_sha256_pins_and_auth_vector_rechecks() {
+    for (name, bytes, sidecar) in [
+        (
+            "capabilities",
+            CAPABILITIES_GOLDEN.as_bytes(),
+            CAPABILITIES_GOLDEN_SHA256,
+        ),
+        ("auth", AUTH_GOLDEN.as_bytes(), AUTH_GOLDEN_SHA256),
+        (
+            "identity-ownership",
+            IDENTITY_OWNERSHIP_GOLDEN.as_bytes(),
+            IDENTITY_OWNERSHIP_GOLDEN_SHA256,
+        ),
+    ] {
+        let expected = sidecar.split_whitespace().next().expect("digest sidecar");
+        assert_eq!(hex_lower(&Sha256::digest(bytes)), expected, "{name}");
+        let mut mutated = bytes.to_vec();
+        mutated[0] ^= 1;
+        assert_ne!(hex_lower(&Sha256::digest(mutated)), expected, "{name}");
+    }
+
+    let auth: Value = serde_json::from_str(AUTH_GOLDEN).expect("parse auth golden");
+    let vector = &auth["canonical_hmac"];
+    let method = vector["method_on_wire"].as_str().expect("method");
+    let path = vector["path_and_query"].as_str().expect("path");
+    let body = vector["body_utf8"].as_str().expect("body").as_bytes();
+    let timestamp = vector["timestamp"].as_i64().expect("timestamp");
+    let nonce = vector["nonce"].as_str().expect("nonce");
+    assert_eq!(
+        canonical_hmac_message(method, path, body, timestamp, nonce),
+        vector["signing_bytes_utf8"]
+    );
+    assert_eq!(
+        hmac_component_header_with_freshness(
+            vector["secret"].as_str().expect("secret"),
+            method,
+            path,
+            body,
+            timestamp,
+            nonce,
+        ),
+        vector["component_signature"]
+    );
+    assert_eq!(
+        auth["redacted_unauthenticated"]["body"],
+        serde_json::json!({
+            "error": "authentication required",
+            "code": "UNAUTHENTICATED",
+        })
+    );
+
+    let identity: Value =
+        serde_json::from_str(IDENTITY_OWNERSHIP_GOLDEN).expect("parse identity golden");
+    assert_eq!(identity["join_allowed"], true);
+    assert_eq!(identity["capabilities_ownership"]["api_version"], 1);
+    assert_eq!(
+        identity["identity_response"]["api_version"],
+        identity["capabilities_ownership"]["api_version"]
+    );
+    assert_eq!(
+        identity["identity_response"]["instance_id"],
+        identity["local_instance_id"]
+    );
+}
+
+fn seed_identity_golden(project_root: &Path, fixture: &Value) {
+    let body = fixture
+        .get("identity_response")
+        .unwrap_or_else(|| &fixture["handler_matrix"]["bearer"]["valid"]["body"]);
+    fs::write(
+        project_root.join(".weft/loomweave/instance_id"),
+        format!("{}\n", body["instance_id"].as_str().expect("instance ID")),
+    )
+    .expect("write fixture instance ID");
+    let locator = body["current_locator"].as_str().expect("locator");
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db"))
+        .expect("open fixture catalogue");
+    conn.execute(
+        "INSERT INTO entities( \
+             id, plugin_id, kind, name, short_name, properties, content_hash, created_at, updated_at \
+         ) VALUES (?1, 'python', 'function', ?1, ?1, '{}', ?2, \
+                   '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z')",
+        params![locator, body["content_hash"].as_str().expect("content hash")],
+    )
+    .expect("insert fixture entity");
+    conn.execute(
+        "INSERT INTO sei_bindings( \
+             sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at \
+         ) VALUES (?1, ?2, ?3, NULL, 'alive', 'golden', 'golden', '2026-07-12T00:00:00Z')",
+        params![
+            body["sei"].as_str().expect("SEI"),
+            locator,
+            body["content_hash"].as_str().expect("content hash"),
+        ],
+    )
+    .expect("insert fixture SEI");
+}
+
+fn assert_raw_matches(response: &HttpRawResponse, expected: &Value, case: &str) {
+    assert_eq!(response.status_code, expected["status"], "{case}");
+    let body: Value = serde_json::from_str(&response.body).expect("HTTP JSON body");
+    assert_eq!(body, expected["body"], "{case}");
+}
+
+#[test]
+fn identity_ownership_golden_directly_matches_live_handler() {
+    let fixture: Value =
+        serde_json::from_str(IDENTITY_OWNERSHIP_GOLDEN).expect("parse identity golden");
+    let dir = tempfile::tempdir().expect("temp project");
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_identity_golden(dir.path(), &fixture);
+    let bind = free_loopback_bind();
+    write_http_config(dir.path(), &bind);
+    let mut child = spawn_serve(dir.path());
+    let response = wait_for_http_response(
+        &bind,
+        fixture["request"]["path"].as_str().expect("request path"),
+    )
+    .expect("live identity handler response");
+    stop_serve(&mut child);
+    assert_eq!(response.status_code, 200);
+    assert_eq!(response.body, fixture["identity_response"]);
+}
+
+fn verify_bearer_handler_matrix(dir: &Path, path: &str, matrix: &Value) {
+    let bind = free_loopback_bind();
+    write_http_config_with_token_env(dir, &bind, "LOOMWEAVE_GOLDEN_BEARER_TEST");
+    let mut child = spawn_serve_with_env(
+        dir,
+        &[("LOOMWEAVE_GOLDEN_BEARER_TEST", "federation-secret")],
+    );
+    for (case, headers) in [
+        ("missing", vec![]),
+        (
+            "malformed",
+            vec![("Authorization", "Basic federation-secret")],
+        ),
+        ("wrong", vec![("Authorization", "Bearer wrong-value")]),
+        ("valid", vec![("Authorization", "Bearer federation-secret")]),
+    ] {
+        let response = wait_for_http_raw_response(&bind, path, &headers).expect("bearer response");
+        assert_raw_matches(&response, &matrix[case], case);
+    }
+    stop_serve(&mut child);
+}
+
+fn verify_hmac_handler_matrix(dir: &Path, path: &str, matrix: &Value) {
+    let bind = free_loopback_bind();
+    write_http_config_with_identity_token_env(dir, &bind, "LOOMWEAVE_GOLDEN_HMAC_TEST");
+    let mut child =
+        spawn_serve_with_env(dir, &[("LOOMWEAVE_GOLDEN_HMAC_TEST", "federation-secret")]);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let valid_nonce = "golden-valid-replay";
+    let valid = hmac_component_header_with_freshness(
+        "federation-secret",
+        "GET",
+        path,
+        b"",
+        now,
+        valid_nonce,
+    );
+    let now_text = now.to_string();
+    let stale = now - 301;
+    let stale_text = stale.to_string();
+    let stale_header = hmac_component_header_with_freshness(
+        "federation-secret",
+        "GET",
+        path,
+        b"",
+        stale,
+        "golden-stale",
+    );
+    let wrong =
+        hmac_component_header_with_freshness("wrong-value", "GET", path, b"", now, "golden-wrong");
+    let cases = [
+        ("missing", vec![]),
+        (
+            "malformed",
+            vec![
+                ("X-Weft-Component", "loomweave:not-lowercase-hex"),
+                ("X-Weft-Timestamp", "not-unix-seconds"),
+                ("X-Weft-Nonce", "golden-malformed"),
+            ],
+        ),
+        (
+            "wrong",
+            vec![
+                ("X-Weft-Component", wrong.as_str()),
+                ("X-Weft-Timestamp", now_text.as_str()),
+                ("X-Weft-Nonce", "golden-wrong"),
+            ],
+        ),
+        (
+            "stale",
+            vec![
+                ("X-Weft-Component", stale_header.as_str()),
+                ("X-Weft-Timestamp", stale_text.as_str()),
+                ("X-Weft-Nonce", "golden-stale"),
+            ],
+        ),
+        (
+            "valid",
+            vec![
+                ("X-Weft-Component", valid.as_str()),
+                ("X-Weft-Timestamp", now_text.as_str()),
+                ("X-Weft-Nonce", valid_nonce),
+            ],
+        ),
+        (
+            "replayed",
+            vec![
+                ("X-Weft-Component", valid.as_str()),
+                ("X-Weft-Timestamp", now_text.as_str()),
+                ("X-Weft-Nonce", valid_nonce),
+            ],
+        ),
+    ];
+    for (case, headers) in cases {
+        let response = wait_for_http_raw_response(&bind, path, &headers).expect("HMAC response");
+        assert_raw_matches(&response, &matrix[case], case);
+    }
+    stop_serve(&mut child);
+}
+
+#[test]
+fn auth_golden_matrix_directly_matches_live_bearer_and_hmac_handlers() {
+    let fixture: Value = serde_json::from_str(AUTH_GOLDEN).expect("parse auth golden");
+    let dir = tempfile::tempdir().expect("temp project");
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    seed_identity_golden(dir.path(), &fixture);
+    let matrix = &fixture["handler_matrix"];
+    let path = matrix["endpoint"]["path"].as_str().expect("endpoint path");
+    verify_bearer_handler_matrix(dir.path(), path, &matrix["bearer"]);
+    verify_hmac_handler_matrix(dir.path(), path, &matrix["hmac"]);
 }
 
 #[test]

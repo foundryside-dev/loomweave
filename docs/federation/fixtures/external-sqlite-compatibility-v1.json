@@ -1,0 +1,78 @@
+{
+  "schema": "loomweave.external-sqlite-fixture.v1",
+  "required_surface": {
+    "runs": [
+      "id",
+      "started_at",
+      "completed_at",
+      "stats",
+      "status"
+    ],
+    "entities": [
+      "id",
+      "plugin_id",
+      "kind",
+      "source_file_path",
+      "source_byte_start",
+      "source_byte_end",
+      "source_line_start",
+      "source_line_end",
+      "properties",
+      "content_hash"
+    ],
+    "entity_tags": [
+      "entity_id",
+      "plugin_id",
+      "tag"
+    ],
+    "sei_bindings": [
+      "sei",
+      "current_locator",
+      "body_hash",
+      "status"
+    ],
+    "sei_lineage": [
+      "sei",
+      "event",
+      "old_locator",
+      "new_locator",
+      "run_id",
+      "recorded_at"
+    ]
+  },
+  "reports": {
+    "current": {
+      "schema": "loomweave.external-sqlite.v1",
+      "reason": null,
+      "application_id": 1280137046,
+      "min_user_version": 5,
+      "max_user_version": 12,
+      "legacy_application_id": false,
+      "missing_surface": [],
+      "status": "compatible",
+      "user_version": 12
+    },
+    "older_supported": {
+      "schema": "loomweave.external-sqlite.v1",
+      "reason": null,
+      "application_id": 1280137046,
+      "min_user_version": 5,
+      "max_user_version": 12,
+      "legacy_application_id": false,
+      "missing_surface": [],
+      "status": "older_supported",
+      "user_version": 5
+    },
+    "future": {
+      "schema": "loomweave.external-sqlite.v1",
+      "reason": "too_new",
+      "application_id": 1280137046,
+      "min_user_version": 5,
+      "max_user_version": 12,
+      "legacy_application_id": false,
+      "missing_surface": [],
+      "status": "incompatible",
+      "user_version": 13
+    }
+  }
+}

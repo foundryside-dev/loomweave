@@ -1,0 +1,21 @@
+{
+  "schema": "loomweave.identity-ownership.v1",
+  "local_instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
+  "capabilities_ownership": {
+    "api_version": 1,
+    "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/identity/sei/normalized-sei:15b345ca8d2bc5bd1e416fa7"
+  },
+  "identity_response": {
+    "alive": true,
+    "api_version": 1,
+    "content_hash": "1e0bdf0ca83ed0c0a538313f1f63e0ff64c5e33c3c7879e7c86de238382b3248",
+    "current_locator": "python:function:command_alpha.command_alpha",
+    "instance_id": "9bd7234e-6d44-4a38-9ae4-76f912a10221",
+    "sei": "normalized-sei:15b345ca8d2bc5bd1e416fa7"
+  },
+  "join_allowed": true
+}

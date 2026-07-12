@@ -33,4 +33,5 @@ nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 loomweave-plugin-rust = { path = "../loomweave-plugin-rust", version = "1.4.2" }
+sha2.workspace = true
 tempfile.workspace = true

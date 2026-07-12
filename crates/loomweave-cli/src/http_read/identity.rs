@@ -378,6 +378,26 @@ mod tests {
     }
 
     #[test]
+    fn producer_identity_golden_rechecks_reference_ownership_validator() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/federation/fixtures/identity-ownership-v1.golden.json"
+        ))
+        .expect("parse producer identity golden");
+        let local = fixture["local_instance_id"]
+            .as_str()
+            .expect("local instance ID");
+        assert_eq!(
+            validate_response_ownership(
+                local,
+                &fixture["capabilities_ownership"],
+                &fixture["identity_response"],
+            ),
+            Ok(())
+        );
+        assert_eq!(fixture["join_allowed"], true);
+    }
+
+    #[test]
     fn ownership_validator_rejects_malformed_or_wrong_api_ownership() {
         let local = "9bd7234e-6d44-4a38-9ae4-76f912a10221";
         let valid = serde_json::json!({"api_version": 1, "instance_id": local});

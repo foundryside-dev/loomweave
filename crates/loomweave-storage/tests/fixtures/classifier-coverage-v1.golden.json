@@ -1,0 +1,30 @@
+{
+  "plugin_discovery_complete": true,
+  "plugin_discovery_error_samples": [],
+  "plugin_discovery_errors": 0,
+  "plugins": [
+    {
+      "analyzed_files": 5,
+      "classifier_tags": [
+        "cli-command",
+        "data-model",
+        "entry-point",
+        "exported-api",
+        "framework-handler",
+        "http-route",
+        "public-surface",
+        "test"
+      ],
+      "degraded_files": 0,
+      "matched_files": 5,
+      "ontology_version": "0.12.0",
+      "plugin_id": "python",
+      "plugin_version": "1.4.2",
+      "retained_files": 0,
+      "status": "complete"
+    }
+  ],
+  "schema": "loomweave.classifier-coverage.v1",
+  "source_walk_complete": true,
+  "source_walk_skipped_entries": 0
+}

@@ -370,6 +370,66 @@ mod tests {
     }
 
     #[test]
+    fn producer_auth_golden_rechecks_production_canonicalizer_and_freshness() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/federation/fixtures/loomweave-http-auth-v1.golden.json"
+        ))
+        .expect("parse producer auth golden");
+        let vector = &fixture["canonical_hmac"];
+        let body = vector["body_utf8"].as_str().expect("body").as_bytes();
+        let method = vector["method_input"].as_str().expect("input method");
+        let path = vector["path_and_query"].as_str().expect("path and query");
+        let timestamp = vector["timestamp"].as_i64().expect("timestamp");
+        let nonce = vector["nonce"].as_str().expect("nonce");
+        assert_eq!(
+            canonical_hmac_message(method, path, body, timestamp, nonce),
+            vector["signing_bytes_utf8"]
+                .as_str()
+                .expect("signing bytes")
+        );
+        assert_eq!(
+            format!(
+                "loomweave:{}",
+                component_hmac_hex(
+                    vector["secret"].as_str().expect("secret").as_bytes(),
+                    method,
+                    path,
+                    body,
+                    timestamp,
+                    nonce,
+                )
+            ),
+            vector["component_signature"]
+                .as_str()
+                .expect("component signature")
+        );
+
+        let now = fixture["freshness"]["now"].as_i64().expect("now");
+        for accepted in fixture["freshness"]["accepted_timestamps"]
+            .as_array()
+            .expect("accepted timestamps")
+        {
+            assert!(validate_hmac_replay_at(
+                &new_hmac_replay_cache(),
+                &format!("accepted-{accepted}"),
+                accepted.as_i64().expect("accepted timestamp"),
+                now,
+            ));
+        }
+        for rejected in fixture["freshness"]["rejected_timestamps"]
+            .as_array()
+            .expect("rejected timestamps")
+        {
+            assert!(!validate_hmac_replay_at(
+                &new_hmac_replay_cache(),
+                &format!("rejected-{rejected}"),
+                rejected.as_i64().expect("rejected timestamp"),
+                now,
+            ));
+        }
+    }
+
+    #[test]
     fn wire_auth_fields_are_exact_and_never_trimmed() {
         let signature = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(
