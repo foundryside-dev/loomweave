@@ -17,7 +17,7 @@ produced an entity. The differences below are entirely in what the plugins
 |---|---|---|
 | Status | first-party, v1.0 | first-party, 1.x |
 | Source backend | `pyright` (type-resolved) | `syn` (parse-only, in-project symbol table) |
-| Ontology version | 0.11.0 | 0.8.2 |
+| Ontology version | 0.12.0 | 0.9.0 |
 | Wardline-aware | **yes** (`wardline:*` trust tags) | no |
 | **Entity kinds** | `function`, `class`, `module` | `module`, `struct`, `enum`, `trait`, `function`, `impl`, `type_alias`, `const`, `static`, `macro` |
 | **Structural edges** | `contains`, `calls`, `references`, `imports` | `contains`, `calls`, `references`, `imports` |
@@ -55,6 +55,42 @@ as its intent-coverage denominator. If re-analysis lowers a Plainweave coverage
 ratio by adding previously invisible public surfaces, that can be the accurate
 result: Plainweave's incomplete-denominator warning was honest, requirements are
 right, and Loomweave now sees more doors.
+
+### Classifier support and completeness
+
+An empty tag page is meaningful only when the latest completed analysis proves
+that every active source plugin declares the tag and that enumeration was
+complete. `entity_tag_list` and the tag shortcuts therefore return a
+`classification` object with schema `loomweave.classification.v1`:
+
+| `state` | Meaning |
+|---|---|
+| `supported` | Every active source plugin declares the requested tag. |
+| `partial` | At least one active plugin declares it and at least one does not. |
+| `unsupported` | No active plugin declares it. |
+| `unavailable` | No valid latest-run evidence exists, or no plugin matched source files. |
+
+`state` describes declaration support; `complete` describes the evidence for
+this particular enumeration. A result is complete only when the latest run has
+complete plugin discovery and source walking, every active plugin has status
+`complete` with zero degraded files, and the response is the whole enumeration:
+offset zero, `returned == total`, and `page.truncated`, `scope_truncated`, and
+`scan_truncated` all false.
+
+This makes **supported-zero** explicit. For example, `http-route` with
+`state: "supported"`, `complete: true`, and `matches: 0` means the active
+plugins could classify routes and found none. Zero with `partial`,
+`unsupported`, `unavailable`, or `complete: false` is not proof of absence.
+Likewise, a nonzero page with `complete: false` proves only that the returned
+entities matched; it does not prove that the denominator is exhaustive.
+
+Each analysis run stores the evidence behind this decision in
+`runs.stats.classifier_coverage` (`loomweave.classifier-coverage.v1`). Per-plugin
+status is `complete`, `degraded`, `failed`, or `not-applicable`; the record also
+names the declared tags, matched/analyzed/retained/degraded file counts, plugin
+and ontology versions, discovery errors, and source-walk omissions. Run
+`loomweave doctor --format json` and inspect `classifier.enumeration` and
+`classifier.tags` when classification is incomplete.
 
 **Rust emits** (ADR-054, clarion-05fdd0490e): `exported-api`, `entry-point`,
 `test`, `allow-dead-code`, `http-route`, and `cli-command` (the last two with a
@@ -94,9 +130,8 @@ than inferred — so `entity_dead_list` now **works** on a pure-Rust index.
 - `pub` methods of `pub` types in **library** targets (inherent `impl` blocks)
   are `exported-api` (same lib/bin and pub-chain gating as regular `pub` items).
 
-Not yet emitted by Rust (tracked second-pass extensions): `pub use` re-export
-resolution (a `pub(crate)` item re-exported `pub` is under-rooted — a narrow,
-fail-toward-live residual); trait-impl-method rooting (a method reached only via
+Not yet emitted by Rust (tracked second-pass extensions): trait-impl-method
+rooting (a method reached only via
 trait dispatch — `framework-handler` excludes the *handler* but not its private
 callees, the documented under-rooting residual); and the lower-prevalence
 frameworks (wasm-bindgen / napi / uniffi / cxx FFI, poem/salvo `#[handler]`,

@@ -12,6 +12,39 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Added
+
+- **Versioned classifier coverage evidence.** Completed analyses now persist
+  strict `loomweave.classifier-coverage.v1` metadata for plugin discovery,
+  source walking, declared classifier tags, and per-plugin
+  matched/analyzed/retained/degraded counts. Tag-backed MCP responses attach
+  `loomweave.classification.v1`, separating supported-zero results from
+  partial, unsupported, unavailable, or truncated enumeration.
+- **Supported external SQLite federation boundary.** Local consumers can check
+  typed `compatible`, `older_supported`, and `incompatible` results for the
+  read-only `loomweave.external-sqlite.v1` projection before issuing catalogue
+  SQL. `loomweave doctor` reports this compatibility together with classifier
+  enumeration, active tag declarations, HTTP auth posture, and project
+  instance-ID validity.
+- **Federation seam producer goldens.** Loomweave now publishes byte-pinned
+  classifier coverage/classification, capabilities, bearer/HMAC auth,
+  identity-ownership, and external-SQLite fixtures. A real Python analysis and
+  production handlers produce the coverage, classification, capabilities,
+  identity, and live auth-handler matrix. The external-SQLite cases and the
+  canonical auth signing vector are synthesized deterministically, then
+  rechecked against production compatibility/auth code. The live fixture proves
+  all four Plainweave denominator classes as supported and complete at
+  `5/5/0/0`.
+
+### Changed
+
+- **Identity responses prove project ownership.** Every successful identity
+  response, including not-alive and batch envelopes, now carries `api_version`
+  and `instance_id`. The unauthenticated capabilities probe advertises the
+  effective protected-route mode (`none`, `bearer`, or `hmac`) without exposing
+  credential names or values, so consumers can authenticate and recheck
+  ownership before joining HTTP identity to local catalogue rows.
+
 ## 1.4.2 — 2026-07-12
 
 Patch release on top of `1.4.1`. (Cargo SemVer `1.4.2`; Python wheels `1.4.2`.)

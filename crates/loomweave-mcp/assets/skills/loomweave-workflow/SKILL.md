@@ -264,6 +264,41 @@ honest-empty unless a plugin emits those tags. Likewise `entity_high_churn_list`
 and `entity_recent_change_list` are honest-empty until churn/change signals are
 populated (use `index_diff_get` for repo-level freshness).
 
+**Tag classification is declaration evidence, not a guess from observed rows.**
+`entity_tag_list` and every tag shortcut return
+`classification.schema: "loomweave.classification.v1"` with `state`,
+`complete`, `matches`, supporting/unsupported plugins, latest `run_id` /
+`run_status`, and reasons. Read it before interpreting either an empty or a
+non-empty page:
+
+- `supported`: every active source plugin declares the tag;
+- `partial`: some active plugins declare it and some do not;
+- `unsupported`: no active plugin declares it;
+- `unavailable`: latest-run coverage cannot support a decision, or no source
+  plugin matched files.
+
+The state and completeness axes are separate. `supported` + `complete` +
+`matches: 0` is a proven supported-zero result. Any other zero is not proof of
+absence. A nonzero incomplete result is real positive evidence for the returned
+entities, but the full denominator may be larger.
+
+`complete: true` requires all of the following: a completed latest run with
+valid `loomweave.classifier-coverage.v1` metadata; complete plugin discovery and
+source walking; every active plugin at status `complete` with no degraded
+files; `page.offset == 0`; `page.returned == page.total`;
+`page.truncated == false`; `scope_truncated == false`; and
+`scan_truncated == false`. Raising `limit` does not repair a nonzero `offset`, a
+truncated scope/tag scan, degraded plugin evidence, or incomplete discovery.
+`known_tags` is only a diagnostic list of tags observed in stored rows; it never
+proves support. The companion `signal.available` is true only for `supported`,
+and `signal.complete` mirrors `classification.complete`.
+
+When classification is incomplete, run
+`loomweave doctor --format json --path <project>` and inspect the stable checks
+`classifier.enumeration` and `classifier.tags`. Re-analyze after fixing plugin
+discovery, source-walk, or degraded-file failures, then request the first full
+page again.
+
 `entity_semantic_search_list` is also in the catalogue — embedding-similarity
 *ranking* for a natural-language query. It is opt-in under `semantic_search:`;
 when enabled,

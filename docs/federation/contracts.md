@@ -96,6 +96,96 @@ The latest run is selected deterministically with
 older completed run when the newest row is running, failed, skipped, or
 malformed.
 
+## Classifier Coverage and MCP Classification
+
+Loomweave publishes two related, independently versioned contracts:
+
+- `loomweave.classifier-coverage.v1` is producer evidence persisted at
+  `runs.stats.classifier_coverage`;
+- `loomweave.classification.v1` is the decision attached to every
+  `entity_tag_list` and categorisation-shortcut response.
+
+### Latest-run coverage evidence
+
+Only the deterministically latest run described above is eligible. Its
+`status` must be `completed`, `completed_at` must be present, `stats` must be a
+bounded JSON object, and `classifier_coverage` must pass the strict v1 schema.
+Any missing, malformed, unsupported, running, failed, or skipped latest row
+makes classifier support unavailable; readers do not fall back to an older
+completed run.
+
+The coverage object records:
+
+- `source_walk_complete` and `source_walk_skipped_entries`;
+- `plugin_discovery_complete`, `plugin_discovery_errors`, and bounded error
+  samples;
+- one entry per discovered plugin with its ID, plugin/ontology versions,
+  matched/analyzed/retained/degraded file counts, declared `classifier_tags`,
+  and status.
+
+Plugin status is exactly `complete`, `degraded`, `failed`, or
+`not-applicable`. An active plugin has `matched_files > 0` and is not
+`not-applicable`. A declaration decision considers every active plugin,
+including degraded or failed plugins; their incomplete evidence cannot be
+discarded to make a result look complete.
+
+### Tag classification decision
+
+The MCP response carries:
+
+```json
+{
+  "classification": {
+    "schema": "loomweave.classification.v1",
+    "tag": "http-route",
+    "state": "supported",
+    "complete": true,
+    "matches": 0,
+    "supporting_plugins": ["python"],
+    "unsupported_plugins": [],
+    "run_id": "<run-id>",
+    "run_status": "completed",
+    "reasons": []
+  }
+}
+```
+
+`state` is declaration support, independent of completeness:
+
+| State | Meaning |
+|---|---|
+| `supported` | Every active plugin declares the requested tag. |
+| `partial` | Some active plugins declare the tag and some do not. |
+| `unsupported` | No active plugin declares the tag. |
+| `unavailable` | Current validated coverage is absent, or no plugin matched source files. |
+
+`complete` is true only for `supported` when plugin discovery and the source
+walk are complete, every active plugin is `complete` with zero degraded files,
+and this response is a full enumeration: `page.offset == 0`,
+`page.returned == page.total`, `page.truncated == false`,
+`scope_truncated == false`, and `scan_truncated == false`. Missing pagination
+or truncation fields fail closed. A caller cannot turn a later page or a
+truncated scoped query into a complete denominator by raising the limit.
+
+Therefore `state: "supported"`, `complete: true`, `matches: 0` is a real
+**supported-zero** result. Zero in any other state, or with `complete: false`,
+is not evidence of absence. A nonzero incomplete response proves the returned
+matches but not the full denominator. `known_tags` remains observed-row
+diagnostics only and never establishes support. The companion
+`signal.available` is true only for `supported`; `signal.complete` mirrors the
+classification decision.
+
+The producer authorities are
+[`classifier-coverage-v1.golden.json`](../../crates/loomweave-storage/tests/fixtures/classifier-coverage-v1.golden.json)
+and
+[`classification.python.json`](./fixtures/classification.python.json), with
+their neighbouring SHA-256 sidecars. The latter contains all four Plainweave
+denominator responses and proves `cli-command=5`, `entry-point=5`,
+`http-route=0`, and `exported-api=0` as supported, complete, and untruncated.
+See the
+[golden-authority procedure](./2026-07-12-federation-seam-golden-authority.md)
+for regeneration and the read-only downstream validation command.
+
 ## HTTP Read API
 
 `loomweave serve` can expose the HTTP read API when enabled in `loomweave.yaml`:

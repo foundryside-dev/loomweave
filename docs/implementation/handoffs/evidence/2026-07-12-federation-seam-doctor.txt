@@ -1,0 +1,22 @@
+loomweave doctor
+  ✓ skill pack up to date (.claude + .agents)
+  ✓ SessionStart hook present (.claude/settings.json)
+  ✓ .mcp.json loomweave serve entry present
+  ✓ agent-orientation block present in CLAUDE.md + AGENTS.md
+  ✓ three-way integration bindings present (Loomweave + Filigree + Wardline)
+  ✓ runtime loomweave.db is not git-tracked
+  ✓ loomweave .gitignore matches the current template
+  ✓ index DB present and readable (schema v12)
+  ✓ federation.sqlite_compatibility: external SQLite schema loomweave.external-sqlite.v1 is compatible at user_version=12
+  ✓ classifier.enumeration: classifier enumeration is complete for run <run-id>
+  ✓ classifier.tags: active classifier tags: python(Complete)=[cli-command,data-model,entry-point,exported-api,framework-handler,http-route,public-surface,test]
+  ✓ http.authentication: HTTP read API is enabled on loopback without authentication
+  ✓ http.instance_id: project instance ID is valid: <instance-id>
+  ✓ index integrity: no stale entities or parent/contains mismatches
+--- llm ---
+  ✓ LLM not live (provider=openrouter); entity_summary_get is cache-only
+--- index ---
+Loomweave index: 15 entities (incl. 0 subsystems), 0 findings.
+Index is fresh (last analyzed <timestamp>). Ask Loomweave before re-exploring the tree; see the loomweave-workflow skill.
+Caveat: "fresh" reflects already-indexed files only; it will NOT detect brand-new modules in a not-yet-indexed directory. If you just added or moved source, run `loomweave analyze` before relying on graph answers (e.g. "what calls X").
+All orientation surfaces healthy.

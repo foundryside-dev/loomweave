@@ -1,0 +1,203 @@
+{
+  "ok": true,
+  "checks": [
+    {
+      "id": ".weft/loomweave.schema",
+      "status": "ok",
+      "fixed": false,
+      "message": ".weft/loomweave store database is present and readable (schema v12)"
+    },
+    {
+      "id": "federation.sqlite_compatibility",
+      "status": "ok",
+      "fixed": false,
+      "message": "external SQLite schema loomweave.external-sqlite.v1 is compatible at user_version=12",
+      "details": {
+        "application_id": 1280137046,
+        "compatibility": "compatible",
+        "database_present": true,
+        "legacy_application_id": false,
+        "max_user_version": 12,
+        "min_user_version": 5,
+        "missing_surface": [],
+        "reason": null,
+        "schema": "loomweave.external-sqlite.v1",
+        "user_version": 12
+      }
+    },
+    {
+      "id": "classifier.enumeration",
+      "status": "ok",
+      "fixed": false,
+      "message": "classifier enumeration is complete for run <run-id>",
+      "details": {
+        "available": true,
+        "plugin_discovery_complete": true,
+        "plugin_discovery_error_samples": [],
+        "plugin_discovery_errors": 0,
+        "run_id": "<run-id>",
+        "run_status": "completed",
+        "schema": "loomweave.classifier-coverage.v1",
+        "source_walk_complete": true,
+        "source_walk_skipped_entries": 0
+      }
+    },
+    {
+      "id": "classifier.tags",
+      "status": "ok",
+      "fixed": false,
+      "message": "active classifier tags: python(Complete)=[cli-command,data-model,entry-point,exported-api,framework-handler,http-route,public-surface,test]",
+      "details": {
+        "active_plugins": [
+          {
+            "analyzed_files": 5,
+            "classifier_tags": [
+              "cli-command",
+              "data-model",
+              "entry-point",
+              "exported-api",
+              "framework-handler",
+              "http-route",
+              "public-surface",
+              "test"
+            ],
+            "degraded_files": 0,
+            "matched_files": 5,
+            "ontology_version": "0.12.0",
+            "plugin_id": "python",
+            "plugin_version": "1.4.2",
+            "retained_files": 0,
+            "status": "complete"
+          }
+        ],
+        "available": true,
+        "not_applicable_plugins": [],
+        "run_id": "<run-id>",
+        "run_status": "completed",
+        "schema": "loomweave.classifier-coverage.v1"
+      }
+    },
+    {
+      "id": "index.integrity",
+      "status": "ok",
+      "fixed": false,
+      "message": "no stale entities or parent/contains mismatches"
+    },
+    {
+      "id": "index.freshness",
+      "status": "ok",
+      "fixed": false,
+      "message": "Loomweave index: 15 entities (incl. 0 subsystems), 0 findings.\nIndex is fresh (last analyzed <timestamp>). Ask Loomweave before re-exploring the tree; see the loomweave-workflow skill.\nCaveat: \"fresh\" reflects already-indexed files only; it will NOT detect brand-new modules in a not-yet-indexed directory. If you just added or moved source, run `loomweave analyze` before relying on graph answers (e.g. \"what calls X\")."
+    },
+    {
+      "id": "plugin.availability",
+      "status": "ok",
+      "fixed": false,
+      "message": "1 language plugin discovered: python"
+    },
+    {
+      "id": "skill.pack",
+      "status": "ok",
+      "fixed": false,
+      "message": "skill pack up to date (.claude + .agents)"
+    },
+    {
+      "id": "hook.session_start",
+      "status": "ok",
+      "fixed": false,
+      "message": "SessionStart hook present (.claude/settings.json)"
+    },
+    {
+      "id": "mcp.registration",
+      "status": "ok",
+      "fixed": false,
+      "message": ".mcp.json loomweave serve entry present"
+    },
+    {
+      "id": "instructions.block",
+      "status": "ok",
+      "fixed": false,
+      "message": "agent-orientation block present in CLAUDE.md + AGENTS.md"
+    },
+    {
+      "id": "http.config",
+      "status": "ok",
+      "fixed": false,
+      "message": "HTTP enabled; read-API port auto-selected and published to .weft/loomweave/ephemeral.port while serving"
+    },
+    {
+      "id": "http.authentication",
+      "status": "ok",
+      "fixed": false,
+      "message": "HTTP read API is enabled on loopback without authentication",
+      "details": {
+        "config_valid": true,
+        "http_enabled": true,
+        "loopback": true,
+        "protected_routes": "none",
+        "secret_configured": false,
+        "secret_present": false
+      }
+    },
+    {
+      "id": "http.instance_id",
+      "status": "ok",
+      "fixed": false,
+      "message": "project instance ID is valid: <instance-id>",
+      "details": {
+        "instance_id": "<instance-id>",
+        "present": true,
+        "valid": true
+      }
+    },
+    {
+      "id": "filigree.url",
+      "status": "ok",
+      "fixed": false,
+      "message": "Filigree URL configured as http://127.0.0.1:8766"
+    },
+    {
+      "id": "llm.provider",
+      "status": "ok",
+      "fixed": false,
+      "message": "LLM not live (provider=openrouter); entity_summary_get is cache-only"
+    },
+    {
+      "id": "sei.population",
+      "status": "ok",
+      "fixed": false,
+      "message": "15 alive SEI bindings"
+    },
+    {
+      "id": "wardline.taint_store",
+      "status": "ok",
+      "fixed": false,
+      "message": "Wardline taint-store write is enabled"
+    },
+    {
+      "id": "mcp.stdout_stderr_hygiene",
+      "status": "ok",
+      "fixed": false,
+      "message": "operator diagnostics are configured for stderr; MCP stdout remains protocol-only"
+    },
+    {
+      "id": "integration.bindings",
+      "status": "ok",
+      "fixed": false,
+      "message": "three-way integration bindings present (Loomweave + Filigree + Wardline)"
+    },
+    {
+      "id": "db.tracked",
+      "status": "ok",
+      "fixed": false,
+      "message": "runtime loomweave.db is not git-tracked"
+    },
+    {
+      "id": "gitignore.current",
+      "status": "ok",
+      "fixed": false,
+      "message": "loomweave .gitignore matches the current template"
+    }
+  ],
+  "next_actions": []
+}
