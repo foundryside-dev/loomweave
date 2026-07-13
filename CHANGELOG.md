@@ -12,6 +12,14 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Added
+
+- **Catalogue list lead summaries.** Finding, faceted, shortcut, and semantic
+  list responses now lead with compact totals, aggregate counts, completeness,
+  confidence, and recovery advice. Paginated responses remain explicitly
+  partial even on a short final page, and aggregate scans fail completeness
+  closed when their bounded source scan cannot cover every candidate.
+
 ### Fixed
 
 - **Doctor bootstrap-state repair.** `loomweave doctor` now warns when an

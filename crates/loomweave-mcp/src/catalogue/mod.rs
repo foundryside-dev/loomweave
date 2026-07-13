@@ -92,7 +92,7 @@ pub(crate) fn catalogue_summary(
     returned: usize,
     truncated: bool,
     confidence: &str,
-    counts: Value,
+    counts: &Value,
     partial_reason: Option<&str>,
     recovery_action: Option<&str>,
 ) -> Value {
@@ -106,13 +106,18 @@ pub(crate) fn catalogue_summary(
             "reason": "page truncated",
             "action": recovery_action.unwrap_or("request the next page with offset + returned or narrow filters"),
         })
+    } else if returned < total {
+        json!({
+            "reason": "page is a subset of the filtered result",
+            "action": recovery_action.unwrap_or("request pages starting at offset 0 or narrow filters"),
+        })
     } else {
         Value::Null
     };
     json!({
         "total": total,
         "returned": returned,
-        "completeness": if truncated || partial_reason.is_some() { "partial" } else { "complete" },
+        "completeness": if returned < total || truncated || partial_reason.is_some() { "partial" } else { "complete" },
         "confidence": confidence,
         "counts": counts,
         "advisory": advisory,
@@ -186,7 +191,7 @@ pub(crate) fn finalize_entity_page(
         } else {
             "moderate"
         },
-        counts,
+        &counts,
         partial_reason,
         recovery_action,
     );
@@ -625,7 +630,7 @@ mod tests {
             3,
             false,
             "high",
-            json!({"by_kind": {"function": 3}}),
+            &json!({"by_kind": {"function": 3}}),
             None,
             None,
         );
@@ -640,7 +645,7 @@ mod tests {
 
     #[test]
     fn catalogue_summary_reports_truncated_page_with_offset_action() {
-        let summary = catalogue_summary(10, 3, true, "moderate", json!({}), None, None);
+        let summary = catalogue_summary(10, 3, true, "moderate", &json!({}), None, None);
 
         assert_eq!(summary["completeness"], "partial");
         assert_eq!(summary["advisory"]["reason"], "page truncated");
@@ -653,13 +658,30 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_summary_reports_a_short_last_page_as_partial() {
+        let summary = catalogue_summary(10, 2, false, "moderate", &json!({}), None, None);
+
+        assert_eq!(summary["completeness"], "partial");
+        assert_eq!(
+            summary["advisory"]["reason"],
+            "page is a subset of the filtered result"
+        );
+        assert!(
+            summary["advisory"]["action"]
+                .as_str()
+                .expect("advisory action")
+                .contains("offset 0")
+        );
+    }
+
+    #[test]
     fn catalogue_summary_reports_recovery_for_low_confidence_or_withheld() {
         let summary = catalogue_summary(
             5,
             5,
             false,
             "low",
-            json!({"withheld": 2}),
+            &json!({"withheld": 2}),
             Some("briefing context withheld 2 result(s)"),
             Some("request an authorized briefing context or narrow the query to visible scopes"),
         );

@@ -148,6 +148,19 @@
           "complete": true,
           "reason": "classifier declaration and enumeration evidence are complete",
           "signal": "entity_tags"
+        },
+        "summary": {
+          "advisory": null,
+          "completeness": "complete",
+          "confidence": "moderate",
+          "counts": {
+            "by_kind": {
+              "function": 5
+            },
+            "withheld": 0
+          },
+          "returned": 5,
+          "total": 5
         }
       },
       "stats_delta": {},
@@ -272,6 +285,19 @@
           "complete": true,
           "reason": "classifier declaration and enumeration evidence are complete",
           "signal": "entity_tags"
+        },
+        "summary": {
+          "advisory": null,
+          "completeness": "complete",
+          "confidence": "moderate",
+          "counts": {
+            "by_kind": {
+              "function": 5
+            },
+            "withheld": 0
+          },
+          "returned": 5,
+          "total": 5
         }
       },
       "stats_delta": {},
@@ -320,6 +346,17 @@
           "complete": true,
           "reason": "no entity carries this categorisation tag in this index; this index does hold other categorisation tags — see known_tags; classifier declaration and enumeration evidence are complete",
           "signal": "entity_tags"
+        },
+        "summary": {
+          "advisory": null,
+          "completeness": "complete",
+          "confidence": "moderate",
+          "counts": {
+            "by_kind": {},
+            "withheld": 0
+          },
+          "returned": 0,
+          "total": 0
         }
       },
       "stats_delta": {},
@@ -368,6 +405,17 @@
           "complete": true,
           "reason": "no entity carries this categorisation tag in this index; this index does hold other categorisation tags — see known_tags; classifier declaration and enumeration evidence are complete",
           "signal": "entity_tags"
+        },
+        "summary": {
+          "advisory": null,
+          "completeness": "complete",
+          "confidence": "moderate",
+          "counts": {
+            "by_kind": {},
+            "withheld": 0
+          },
+          "returned": 0,
+          "total": 0
         }
       },
       "stats_delta": {},

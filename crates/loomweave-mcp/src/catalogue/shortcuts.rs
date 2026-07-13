@@ -236,8 +236,12 @@ impl ServerState {
                     total,
                     returned_count,
                     truncated,
-                    confidence.as_str(),
-                    json!({
+                    if scan_truncated || scope_truncated {
+                        "low"
+                    } else {
+                        confidence.as_str()
+                    },
+                    &json!({
                         "cycles": total,
                         "modules_in_cycles": modules_in_cycles,
                     }),
@@ -313,16 +317,10 @@ impl ServerState {
                 ranked.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
 
                 let total = ranked.len();
-                let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
-                let mut withheld = 0usize;
-                for (id, _, _) in &ranked {
-                    if let Some(entity) = entity_by_id(conn, id)? {
-                        *by_kind.entry(entity.kind.clone()).or_insert(0) += 1;
-                        if crate::briefing_block_reason(&entity).is_some() {
-                            withheld += 1;
-                        }
-                    }
-                }
+                let ranked_ids: HashSet<String> =
+                    ranked.iter().map(|(id, _, _)| id.clone()).collect();
+                let (by_kind, withheld, summary_counts_incomplete) =
+                    entity_kind_summary_counts(conn, &ranked_ids)?;
                 let returned: Vec<(String, i64, i64)> = ranked
                     .into_iter()
                     .skip(page.offset)
@@ -350,8 +348,12 @@ impl ServerState {
                     total,
                     returned_count,
                     truncated,
-                    confidence.as_str(),
-                    json!({
+                    if scope_truncated || summary_counts_incomplete {
+                        "low"
+                    } else {
+                        confidence.as_str()
+                    },
+                    &json!({
                         "ranked": total,
                         "returned": returned_count,
                         "by_kind": by_kind,
@@ -359,12 +361,14 @@ impl ServerState {
                     }),
                     if scope_truncated {
                         Some("scope resolution truncated")
+                    } else if summary_counts_incomplete {
+                        Some("summary aggregate scan truncated")
                     } else if withheld > 0 {
                         Some("briefing context withheld content for one or more result(s)")
                     } else {
                         None
                     },
-                    if scope_truncated {
+                    if scope_truncated || summary_counts_incomplete {
                         Some("rerun analysis with narrower scope or refresh the index")
                     } else if withheld > 0 {
                         Some("request an authorized briefing context or narrow the query to visible scopes")
@@ -1168,64 +1172,73 @@ fn rank_and_finalize_churn(
     let unresolved = response.unresolved_ref_count();
     if let Some(object) = response_json.as_object_mut() {
         mode.tag(object);
-        if unresolved > 0 {
-            object.insert(
-                "churn_unresolved".to_owned(),
-                json!({
-                    "count": unresolved,
-                    "reason": format!(
-                        "warpline could not key-match {unresolved} in-scope candidate(s) \
-                         (loomweave sent an SEI warpline has not recorded, or the locator \
-                         dialect differs); they are shown with churn_count 0 here but their real \
-                         churn is UNKNOWN, not zero — a federation keying gap, not a \
-                         never-observed 0. (recently_changed drops them entirely.)"
-                    ),
-                }),
-            );
-        }
-        if let Some((total, counted)) = partial {
-            let uncounted = total.saturating_sub(counted).max(0);
-            if let Some(summary) = object.get_mut("summary").and_then(Value::as_object_mut) {
-                summary.insert("completeness".to_owned(), json!("partial"));
-                summary.insert("confidence".to_owned(), json!("low"));
-                summary.insert(
-                    "advisory".to_owned(),
-                    json!({
-                        "reason": "warpline churn read truncated",
-                        "action": "narrow `scope` for exact counts; complete over-cap coverage requires the Warpline overflow artifact",
-                    }),
-                );
-            }
-            object.insert(
-                "churn_truncated".to_owned(),
-                json!({
-                    "truncated": true,
-                    "counted": counted,
-                    "total_candidates": total,
-                    "uncounted": uncounted,
-                    "reason": format!(
-                        "warpline truncated the churn read to its top {counted} entities by \
-                         churn_count; {uncounted} in-scope candidate(s) ranked below that are \
-                         shown with churn_count 0 here and may be undercounted — a truncation, \
-                         NOT a never-observed 0. Narrow `scope` for exact counts; complete \
-                         over-cap coverage (reading warpline's overflow dump) is a tracked \
-                         follow-up."
-                    ),
-                }),
-            );
-        }
-        if is_empty {
-            object.insert(
-                "signal".to_owned(),
-                missing_signal(
-                    "warpline_churn",
-                    "warpline reported no recorded change for any in-scope entity \
-                     (a complete answer, not an absence of code)",
-                ),
-            );
-        }
+        add_churn_disclosures(object, unresolved, partial, is_empty);
     }
     response_json
+}
+
+fn add_churn_disclosures(
+    object: &mut serde_json::Map<String, Value>,
+    unresolved: usize,
+    partial: Option<(i64, i64)>,
+    is_empty: bool,
+) {
+    if unresolved > 0 {
+        object.insert(
+            "churn_unresolved".to_owned(),
+            json!({
+                "count": unresolved,
+                "reason": format!(
+                    "warpline could not key-match {unresolved} in-scope candidate(s) \
+                     (loomweave sent an SEI warpline has not recorded, or the locator \
+                     dialect differs); they are shown with churn_count 0 here but their real \
+                     churn is UNKNOWN, not zero — a federation keying gap, not a \
+                     never-observed 0. (recently_changed drops them entirely.)"
+                ),
+            }),
+        );
+    }
+    if let Some((total, counted)) = partial {
+        let uncounted = total.saturating_sub(counted).max(0);
+        if let Some(summary) = object.get_mut("summary").and_then(Value::as_object_mut) {
+            summary.insert("completeness".to_owned(), json!("partial"));
+            summary.insert("confidence".to_owned(), json!("low"));
+            summary.insert(
+                "advisory".to_owned(),
+                json!({
+                    "reason": "warpline churn read truncated",
+                    "action": "narrow `scope` for exact counts; complete over-cap coverage requires the Warpline overflow artifact",
+                }),
+            );
+        }
+        object.insert(
+            "churn_truncated".to_owned(),
+            json!({
+                "truncated": true,
+                "counted": counted,
+                "total_candidates": total,
+                "uncounted": uncounted,
+                "reason": format!(
+                    "warpline truncated the churn read to its top {counted} entities by \
+                     churn_count; {uncounted} in-scope candidate(s) ranked below that are \
+                     shown with churn_count 0 here and may be undercounted — a truncation, \
+                     NOT a never-observed 0. Narrow `scope` for exact counts; complete \
+                     over-cap coverage (reading warpline's overflow dump) is a tracked \
+                     follow-up."
+                ),
+            }),
+        );
+    }
+    if is_empty {
+        object.insert(
+            "signal".to_owned(),
+            missing_signal(
+                "warpline_churn",
+                "warpline reported no recorded change for any in-scope entity \
+                 (a complete answer, not an absence of code)",
+            ),
+        );
+    }
 }
 
 /// Warpline churn facts grafted onto an entity in the churn surfaces. A
@@ -1592,6 +1605,28 @@ fn all_entity_rows(
         });
     }
     Ok((out, truncated))
+}
+
+/// Aggregate kind and briefing-block counts for a candidate id set with one
+/// bounded entity-table scan. The boolean is true when the scan omitted one or
+/// more requested ids, so callers can fail completeness closed.
+fn entity_kind_summary_counts(
+    conn: &rusqlite::Connection,
+    entity_ids: &HashSet<String>,
+) -> loomweave_storage::Result<(BTreeMap<String, usize>, usize, bool)> {
+    let (rows, _) = all_entity_rows(conn)?;
+    let mut by_kind = BTreeMap::new();
+    let mut withheld = 0usize;
+    let mut matched = 0usize;
+    for row in rows {
+        if !entity_ids.contains(&row.id) {
+            continue;
+        }
+        matched += 1;
+        *by_kind.entry(row.kind).or_insert(0) += 1;
+        withheld += usize::from(row.briefing_blocked.is_some());
+    }
+    Ok((by_kind, withheld, matched < entity_ids.len()))
 }
 
 /// Plugins that own an explicit reachability root: either a ROOT-tagged entity

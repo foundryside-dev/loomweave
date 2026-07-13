@@ -246,7 +246,7 @@ impl ServerState {
                     "truncated": truncated,
                 });
                 let summary =
-                    catalogue_summary(total, returned, truncated, "high", counts, None, None);
+                    catalogue_summary(total, returned, truncated, "high", &counts, None, None);
 
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
@@ -347,7 +347,7 @@ impl ServerState {
                     "truncated": truncated,
                 });
                 let summary =
-                    catalogue_summary(total, returned, truncated, "high", counts, None, None);
+                    catalogue_summary(total, returned, truncated, "high", &counts, None, None);
 
                 Ok(success_envelope(json!({
                     "findings": findings,
