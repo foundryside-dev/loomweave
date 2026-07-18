@@ -2672,6 +2672,84 @@ def test_deep_nested_class_binding_analysis_is_linear() -> None:
     assert "exported-api" in by_id["python:module:api"]["tags"]
 
 
+def test_branch_wrapped_nested_class_binding_analysis_is_linear() -> None:
+    """Nested classes separated by a branch must not recurse twice per level.
+
+    The sibling test above nests classes directly, which only ever walks each
+    body once. Interposing an ``if`` puts the nested class behind *two*
+    independent walks -- ``_nested_class_global_rebindings`` via ``visit_If``,
+    and ``_potential_control_flow_rebindings`` via the branch blocks -- and
+    each recurses, so work doubled per level. At depth 20 this took 27s for a
+    5KB file; the memo restores the sub-millisecond behaviour that predates
+    conditional-rebinding classification. Depth 20 is chosen because the
+    unmemoised cost there is ~4 orders of magnitude above the bound.
+    """
+    lines = ["flag = bool()", "replacement = object()", "def exported_fn(): pass"]
+    indent = ""
+    for depth in range(20):
+        lines.append(f"{indent}class Level{depth}:")
+        indent += "    "
+        lines.append(f"{indent}if flag:")
+        indent += "    "
+    lines.extend(
+        [
+            f"{indent}global exported_fn",
+            f"{indent}exported_fn = replacement",
+            '__all__ = ["exported_fn"]',
+        ],
+    )
+
+    started = time.perf_counter()
+    extract("\n".join(lines), "api.py")
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0, f"branch-wrapped nested class analysis took {elapsed:.3f}s"
+
+
+def test_extraction_memo_does_not_leak_between_files() -> None:
+    """The id()-keyed memo must not answer for a later file's nodes.
+
+    CPython reuses addresses once a tree is collected, so a memo retained
+    across extractions could return the previous file's rebindings for an
+    unrelated class that happens to land on the same address.
+    """
+    first = """\
+flag = bool()
+replacement = object()
+
+
+def exported_fn():
+    return 1
+
+
+class Holder:
+    if flag:
+        global exported_fn
+        exported_fn = replacement
+
+
+__all__ = ["exported_fn"]
+"""
+    second = """\
+def exported_fn():
+    return 1
+
+
+class Holder:
+    value = 1
+
+
+__all__ = ["exported_fn"]
+"""
+    for _ in range(3):
+        extract(first, "first.py")
+        entities, _ = extract(second, "second.py")
+        by_id = {e["id"]: e for e in entities}
+        # `second` has no rebinding at all, so its export must stay direct
+        # regardless of what was memoised while extracting `first`.
+        assert "exported-api" in by_id["python:function:second.exported_fn"]["tags"]
+
+
 def test_dunder_all_augmented_assignment_extends_exported_api_surface() -> None:
     source = """\
 __all__ = ["a"]

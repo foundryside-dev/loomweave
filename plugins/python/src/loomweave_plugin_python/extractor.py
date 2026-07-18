@@ -443,6 +443,11 @@ def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vo
         )
         return ExtractResult([], [], ExtractionStats())
 
+    # Drop the previous file's entries before this tree is built: the memo is
+    # keyed by `id(node)`, and CPython reuses addresses once the old tree is
+    # collected, so a stale entry could otherwise answer for a new node.
+    _CLASS_GLOBAL_REBINDING_MEMO.clear()
+
     parse_started_ns = time.perf_counter_ns()
     try:
         tree = ast.parse(source)
@@ -1893,11 +1898,34 @@ def _class_header_rebindings(node: ast.ClassDef) -> set[str]:
     return collector.names
 
 
+"""Memo for [`_class_body_global_rebindings`], keyed by AST node identity.
+
+A class body is reached by two independent walks: `_nested_class_global_rebindings`
+descends branch bodies via `visit_If`/`visit_While` into `visit_ClassDef`, and
+`_potential_control_flow_rebindings` walks the same branches into the same
+`ClassDef` via `_definition_or_import_rebindings`. Both then recurse, so an
+alternating `class`/`if` chain doubled the work per nesting level -- 2^depth,
+measured at 27s for a 5KB file at depth 20 versus under a millisecond before
+conditional rebindings were classified. Recursion is strictly into nested
+children, so there are no cycles and a plain memo collapses this to linear.
+
+Keyed by `id(node)`, which is only stable while the tree is alive, so this is
+cleared at the start of every extraction rather than persisted. The plugin
+serves one request at a time (single-threaded JSON-RPC loop in `server.py`),
+so no locking is required.
+"""
+_CLASS_GLOBAL_REBINDING_MEMO: dict[tuple[int, bool], frozenset[str]] = {}
+
+
 def _class_body_global_rebindings(
     node: ast.ClassDef,
     *,
     evaluate_annotations: bool,
 ) -> set[str]:
+    memo_key = (id(node), evaluate_annotations)
+    memoized = _CLASS_GLOBAL_REBINDING_MEMO.get(memo_key)
+    if memoized is not None:
+        return set(memoized)
     global_collector = _ClassGlobalCollector()
     for statement in node.body:
         global_collector.visit(statement)
@@ -1936,6 +1964,7 @@ def _class_body_global_rebindings(
             if potential_star_import:
                 statement_rebindings.update(global_collector.names)
         rebound.update(statement_rebindings & global_collector.names)
+    _CLASS_GLOBAL_REBINDING_MEMO[memo_key] = frozenset(rebound)
     return rebound
 
 
