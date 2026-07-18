@@ -1,0 +1,486 @@
+{
+  "schema": "loomweave.plan-review.v1",
+  "reviewed_at": "2026-07-18T12:18:28Z",
+  "current_verdict": "APPROVED",
+  "plans": [
+    "2026-07-18-worktree-indexes-1-foundation.md",
+    "2026-07-18-worktree-indexes-2-bootstrap.md",
+    "2026-07-18-worktree-indexes-3-cleanup.md"
+  ],
+  "rounds": [
+    {
+      "round": 1,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED", "blockers": 9, "warnings": 3 },
+        "architecture": { "verdict": "CHANGES_REQUESTED", "blockers": 7, "warnings": 4 },
+        "quality": { "verdict": "CHANGES_REQUESTED", "blockers": 10, "warnings": 5 },
+        "systems": { "verdict": "CHANGES_REQUESTED", "blockers": 3, "warnings": 2 }
+      },
+      "synthesis": {
+        "blockers": 18,
+        "warnings": 8,
+        "rejected_findings": 0,
+        "revision_status": "addressed_before_round_2"
+      },
+      "findings": [
+        { "id": "B1", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Owner and nonce entropy contracts are inconsistent" },
+        { "id": "B2", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Timestamp serialization and checksum bytes are underspecified" },
+        { "id": "B3", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Trusted Git and pre-dotenv process environments are conflated" },
+        { "id": "B4", "severity": "blocker", "status": "addressed_in_revision_1", "title": "ActiveIndex crosses crate layers and ServerState loses production fields" },
+        { "id": "B5", "severity": "blocker", "status": "addressed_in_revision_1", "title": "HTTP type and binary-only CLI test commands do not match the repository" },
+        { "id": "B6", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Child exit success is not an authoritative completed analysis" },
+        { "id": "B7", "severity": "blocker", "status": "addressed_in_revision_1", "title": "The runtime path audit is trivially bypassable" },
+        { "id": "B8", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Activity guards do not cover every store-touching operation" },
+        { "id": "B9", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Independent worktree concurrency lacks real barrier coverage" },
+        { "id": "B10", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Destructive GC caps and fail-closed cases are incomplete" },
+        { "id": "B11", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Capability contract and seam-golden verification are incomplete" },
+        { "id": "B12", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Production PID-reuse-safe process identity has no backend plan" },
+        { "id": "B13", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Final gates do not mirror the repository release contract" },
+        { "id": "B14", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Install force can recursively delete the managed worktree namespace" },
+        { "id": "B15", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Attached servers have no durable observer or generation-safe transition" },
+        { "id": "B16", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Runtime and database actor ownership has no shutdown protocol" },
+        { "id": "B17", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Federation API replacement omits live callers and compile-safe rollout" },
+        { "id": "B18", "severity": "blocker", "status": "addressed_in_revision_1", "title": "Durable intent rollout is not explicitly linked-only" },
+        { "id": "W1", "severity": "warning", "status": "addressed_in_revision_1", "title": "AnalyzeFlags visibility and help compatibility are not pinned" },
+        { "id": "W2", "severity": "warning", "status": "addressed_in_revision_1", "title": "Cleanup scheduling can block or disappear with a short-lived runtime" },
+        { "id": "W3", "severity": "warning", "status": "addressed_in_revision_1", "title": "Modified-suite and CLI contract checks are incomplete" },
+        { "id": "W4", "severity": "warning", "status": "addressed_in_revision_1", "title": "Live dogfood and accelerated lifecycle tests are conflated" },
+        { "id": "W5", "severity": "warning", "status": "addressed_in_revision_1", "title": "Unsupported platform behavior and native macOS verification are incomplete" },
+        { "id": "W6", "severity": "warning", "status": "addressed_in_revision_1", "title": "Repository relocation does not fully rebind ownership audit roots" },
+        { "id": "W7", "severity": "warning", "status": "addressed_in_revision_1", "title": "The plans defer tracer bullets too long" },
+        { "id": "W8", "severity": "warning", "status": "addressed_in_revision_1", "title": "A crash after rename but before tombstone record can strand state" }
+      ]
+    },
+    {
+      "round": 2,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 12,
+        "warnings": 2,
+        "rejected_as_separate": 1,
+        "revision_status": "addressed_before_round_3"
+      },
+      "findings": [
+        { "id": "R2-B1", "severity": "blocker", "status": "addressed_in_revision_2", "title": "No coherent authoritative-run probe boundary" },
+        { "id": "R2-B2", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Pre-ready semantic config still opens SQLite" },
+        { "id": "R2-B3", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Bootstrap ownership and lifetimes are incomplete" },
+        { "id": "R2-B4", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Relocation journaling lacks deterministic recovery authority" },
+        { "id": "R2-B5", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Durable record checksum envelopes are inconsistent" },
+        { "id": "R2-B6", "severity": "blocker", "status": "addressed_in_revision_2", "title": "CLI lifetime tests are assigned to a core-only target" },
+        { "id": "R2-B7", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Task file and commit manifests are incomplete" },
+        { "id": "R2-B8", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Final verification omits the authoritative Verify workflow" },
+        { "id": "R2-B9", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Capability golden regeneration exceeds generator behavior" },
+        { "id": "R2-B10", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Plan 2 requires collection before GC exists" },
+        { "id": "R2-B11", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Syntax audit dependency and visitor are underspecified" },
+        { "id": "R2-B12", "severity": "blocker", "status": "addressed_in_revision_2", "title": "Linux destructive backend can pass without a real test" },
+        { "id": "R2-W1", "severity": "warning", "status": "addressed_in_revision_2", "title": "Task RED and GREEN filters miss named tests" },
+        { "id": "R2-W2", "severity": "warning", "status": "addressed_in_revision_2", "title": "Unsupported process identity can wedge stale intents" }
+      ]
+    },
+    {
+      "round": 3,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 10,
+        "warnings": 1,
+        "revision_status": "addressed_before_round_4"
+      },
+      "findings": [
+        { "id": "R3-B1", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Authority probe excludes the commit-before-intent crash window" },
+        { "id": "R3-B2", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Bootstrap child and actor ownership paths are inconsistent" },
+        { "id": "R3-B3", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Durable JSON decoding accepts unauthenticated fields" },
+        { "id": "R3-B4", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Journal reconciliation is not gated by fresh GC capability" },
+        { "id": "R3-B5", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Doctor journal mutation semantics are ambiguous" },
+        { "id": "R3-B6", "severity": "blocker", "status": "addressed_in_revision_3", "title": "CLI behavior tests remain in core-only targets" },
+        { "id": "R3-B7", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Tracer and configuration tasks lack complete RED checkpoints" },
+        { "id": "R3-B8", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Privileged NO_XDEV test is absent from Verify CI" },
+        { "id": "R3-B9", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Plan 1 task and staging manifests remain incomplete" },
+        { "id": "R3-B10", "severity": "blocker", "status": "addressed_in_revision_3", "title": "Capability hashing depends on unavailable b3sum" },
+        { "id": "R3-W1", "severity": "warning", "status": "addressed_in_revision_3", "title": "Local dependency guard lacks fail-fast shell semantics" }
+      ]
+    },
+    {
+      "round": 4,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 7,
+        "warnings": 2,
+        "revision_status": "addressed_before_round_5"
+      },
+      "findings": [
+        { "id": "R4-B1", "severity": "blocker", "status": "addressed_in_revision_4", "title": "Authority API omits unknown-liveness recovery cause and shared activity" },
+        { "id": "R4-B2", "severity": "blocker", "status": "addressed_in_revision_4", "title": "Run authority outcomes and cause-specific mappings are underspecified" },
+        { "id": "R4-B3", "severity": "blocker", "status": "addressed_in_revision_4", "title": "Dotenv policy tests precede the commands they exercise" },
+        { "id": "R4-B4", "severity": "blocker", "status": "addressed_in_revision_4", "title": "GC state exposes a private checksum envelope and unchecked payload" },
+        { "id": "R4-B5", "severity": "blocker", "status": "addressed_in_revision_4", "title": "Capability hash helper is invoked before it exists" },
+        { "id": "R4-B6", "severity": "blocker", "status": "addressed_in_revision_4", "title": "Privileged NO_XDEV leg lacks observable RED and unavailable-privilege handling" },
+        { "id": "R4-B7", "severity": "blocker", "status": "addressed_in_revision_4", "title": "Bootstrap plan owns a cleanup scheduler defined only in the later plan" },
+        { "id": "R4-W1", "severity": "warning", "status": "addressed_in_revision_4", "title": "Tracer checkpoint has no chronological file manifest" },
+        { "id": "R4-W2", "severity": "warning", "status": "addressed_in_revision_4", "title": "Dogfood can leave worktree and repository residue" }
+      ]
+    },
+    {
+      "round": 5,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 6,
+        "warnings": 6,
+        "revision_status": "addressed_before_round_6"
+      },
+      "findings": [
+        { "id": "R5-B1", "severity": "blocker", "status": "addressed_in_revision_5", "title": "Graceful intent finish does not consume the lease that owns writer and activity" },
+        { "id": "R5-B2", "severity": "blocker", "status": "addressed_in_revision_5", "title": "Plan authority boundary omits the fourth operator-recovery probe cause" },
+        { "id": "R5-B3", "severity": "blocker", "status": "addressed_in_revision_5", "title": "MCP task mutates CLI RunHandle ownership before the control loop exists" },
+        { "id": "R5-B4", "severity": "blocker", "status": "addressed_in_revision_5", "title": "Cleanup helper cannot reconstruct the exact trusted Git executable after env_clear" },
+        { "id": "R5-B5", "severity": "blocker", "status": "addressed_in_revision_5", "title": "Privileged NO_XDEV RED evidence cannot reach CI from uncommitted state" },
+        { "id": "R5-B6", "severity": "blocker", "status": "addressed_in_revision_5", "title": "Privileged bind-mount test omits the rustix mount feature and API" },
+        { "id": "R5-W1", "severity": "warning", "status": "addressed_in_revision_5", "title": "Historical round-one findings remain marked open" },
+        { "id": "R5-W2", "severity": "warning", "status": "addressed_in_revision_5", "title": "Recovery and scheduler task manifests omit changed CLI runtime files" },
+        { "id": "R5-W3", "severity": "warning", "status": "addressed_in_revision_5", "title": "Pre-helper scheduler and spawn failures are absent from status diagnostics" },
+        { "id": "R5-W4", "severity": "warning", "status": "addressed_in_revision_5", "title": "Later public and hidden worktree commands lack help-policy regressions" },
+        { "id": "R5-W5", "severity": "warning", "status": "addressed_in_revision_5", "title": "Cleanup diagnostic lacks a typed path strict schema and deterministic tie rule" },
+        { "id": "R5-W6", "severity": "warning", "status": "addressed_in_revision_5", "title": "Design probe summary and review status contradict the current plan" }
+      ]
+    },
+    {
+      "round": 6,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 5,
+        "warnings": 11,
+        "revision_status": "addressed_before_round_7"
+      },
+      "findings": [
+        { "id": "R6-B1", "severity": "blocker", "status": "addressed_in_revision_6", "title": "Authority mapping omits skipped-no-plugins and encoded cancellation" },
+        { "id": "R6-B2", "severity": "blocker", "status": "addressed_in_revision_6", "title": "Cleanup diagnostic persistence has no core-owned pinned handle" },
+        { "id": "R6-B3", "severity": "blocker", "status": "addressed_in_revision_6", "title": "Cross-process diagnostic replacement can regress to an older event" },
+        { "id": "R6-B4", "severity": "blocker", "status": "addressed_in_revision_6", "title": "Serve runtime scheduler triggers and status do not share one sink lifetime" },
+        { "id": "R6-B5", "severity": "blocker", "status": "addressed_in_revision_6", "title": "Relocation journal and final records are visible during partial byte writes" },
+        { "id": "R6-W1", "severity": "warning", "status": "addressed_in_revision_6", "title": "Diagnostic namespace-open files and core RED GREEN targets are incomplete" },
+        { "id": "R6-W2", "severity": "warning", "status": "addressed_in_revision_6", "title": "Final service-routing task omits its scoped production file set" },
+        { "id": "R6-W3", "severity": "warning", "status": "addressed_in_revision_6", "title": "Deletion permission tests promise impossible rollback after unlink" },
+        { "id": "R6-W4", "severity": "warning", "status": "addressed_in_revision_6", "title": "Scheduler context ownership conflicts with established Arc boundaries" },
+        { "id": "R6-W5", "severity": "warning", "status": "addressed_in_revision_6", "title": "Diagnostic status rereads an unpinned path and can hide memory on read failure" },
+        { "id": "R6-W6", "severity": "warning", "status": "addressed_in_revision_6", "title": "Analysis control fake-receiver test is absent from its task manifest" },
+        { "id": "R6-W7", "severity": "warning", "status": "addressed_in_revision_6", "title": "Diagnostic bounds truncation entropy failure and limit tests are unspecified" },
+        { "id": "R6-W8", "severity": "warning", "status": "addressed_in_revision_6", "title": "Boolean trigger coalescing can lose analysis-complete throttle strength" },
+        { "id": "R6-W9", "severity": "warning", "status": "addressed_in_revision_6", "title": "Atomic journal names duplicate the wt stable-ID prefix" },
+        { "id": "R6-W10", "severity": "warning", "status": "addressed_in_revision_6", "title": "Cleanup status read warnings are absent from the public design contract" },
+        { "id": "R6-W11", "severity": "warning", "status": "addressed_in_revision_6", "title": "Task chronology exposes cleanup status before the status task" }
+      ]
+    },
+    {
+      "round": 7,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 11,
+        "warnings": 3,
+        "revision_status": "addressed_before_round_8"
+      },
+      "findings": [
+        { "id": "R7-B1", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Relocation rename and restore omit parent-directory fsync durability" },
+        { "id": "R7-B2", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Activation authority and terminal reconciliation evidence use contradictory open vocabulary" },
+        { "id": "R7-B3", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Federation golden gates omit the authoritative producer wrapper" },
+        { "id": "R7-B4", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Windows lifecycle promises have no implementable backend" },
+        { "id": "R7-B5", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Scratch-path replacement can publish attacker bytes as lifecycle authority" },
+        { "id": "R7-B6", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Dogfood removes state without reaping server or observing detached cleanup quiescence" },
+        { "id": "R7-B7", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Public cleanup diagnostic and read-warning JSON schemas are open" },
+        { "id": "R7-B8", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Terminal authority rows do not uniformly require completion timestamps" },
+        { "id": "R7-B9", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Persisted GC diagnostics lack closed codes and exact resource bounds" },
+        { "id": "R7-B10", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Persisted intent diagnostics lack exact write and read bounds" },
+        { "id": "R7-B11", "severity": "blocker", "status": "addressed_in_revision_7", "title": "Scheduler shutdown can abandon an owned in-flight cleanup helper" },
+        { "id": "R7-W1", "severity": "warning", "status": "addressed_in_revision_7", "title": "Lifecycle module task manifest omits worktree module declaration" },
+        { "id": "R7-W2", "severity": "warning", "status": "addressed_in_revision_7", "title": "Rename durability edit violates the Markdown line-length gate" },
+        { "id": "R7-W3", "severity": "warning", "status": "addressed_in_revision_7", "title": "Local Ruff gate omits the scripts directory from Verify" }
+      ]
+    },
+    {
+      "round": 8,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 9,
+        "warnings": 9,
+        "revision_status": "addressed_before_round_9"
+      },
+      "findings": [
+        { "id": "R8-B1", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Cleanup and bootstrap shutdown signal process groups that are never created or owned in CLI" },
+        { "id": "R8-B2", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Final authority name can be replaced after post-link verification" },
+        { "id": "R8-B3", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Durable authority leaves lack one no-follow regular bounded-read filesystem boundary" },
+        { "id": "R8-B4", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Managed worktree trash and quarantine inventories are unbounded" },
+        { "id": "R8-B5", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Metadata replacement can resurrect stale absence evidence after a crash" },
+        { "id": "R8-B6", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Spawn-failure intent cleanup bypasses activity-before-intent lock order" },
+        { "id": "R8-B7", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Analyzer and server both claim analysis-complete cleanup ownership" },
+        { "id": "R8-B8", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Cleanup helper can re-resolve a different config and mutate the wrong repository store" },
+        { "id": "R8-B9", "severity": "blocker", "status": "addressed_in_revision_8", "title": "Cross-crate intent diagnostic type has no public bounded constructor" },
+        { "id": "R8-W1", "severity": "warning", "status": "addressed_in_revision_8", "title": "Durable record codec has no exact byte cap or bounded file reader" },
+        { "id": "R8-W2", "severity": "warning", "status": "addressed_in_revision_8", "title": "Orphan confirmation count and timestamp admit impossible or overflowing states" },
+        { "id": "R8-W3", "severity": "warning", "status": "addressed_in_revision_8", "title": "Disabled GC reason and public JSON representation are open" },
+        { "id": "R8-W4", "severity": "warning", "status": "addressed_in_revision_8", "title": "Authority summary conflates completion with terminal failure reconciliation" },
+        { "id": "R8-W5", "severity": "warning", "status": "addressed_in_revision_8", "title": "Serve shutdown order contradicts itself around unpublish and state drain" },
+        { "id": "R8-W6", "severity": "warning", "status": "addressed_in_revision_8", "title": "Raw Git porcelain and fully enriched inventory share one type" },
+        { "id": "R8-W7", "severity": "warning", "status": "addressed_in_revision_8", "title": "Public cleanup process-start identity JSON shape is undefined" },
+        { "id": "R8-W8", "severity": "warning", "status": "addressed_in_revision_8", "title": "Config tool and signal dependency task manifests are incomplete" },
+        { "id": "R8-W9", "severity": "warning", "status": "addressed_in_revision_8", "title": "Design review status lags the recorded review round" }
+      ]
+    },
+    {
+      "round": 9,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 11,
+        "warnings": 2,
+        "revision_status": "addressed_before_round_10"
+      },
+      "findings": [
+        { "id": "R9-B1", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Post-initialization and owner-rebind GC authority is not refreshed for status schedulers and helpers" },
+        { "id": "R9-B2", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Retained two-link authority publication conflicts with the single-link durable-record boundary" },
+        { "id": "R9-B3", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Ordinary authority-record scratch names and crash reconciliation are unspecified" },
+        { "id": "R9-B4", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Hardened Git probes have byte caps but no wall-clock deadline or group reap" },
+        { "id": "R9-B5", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Per-directory and per-record limits do not provide a pass-wide resource budget" },
+        { "id": "R9-B6", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Metadata journal nesting is not closed under the universal record cap" },
+        { "id": "R9-B7", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Inventory enrichment lacks explicit managed-namespace authority for overridden stores" },
+        { "id": "R9-B8", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Garbage collection can evaluate stale metadata before journal reconciliation" },
+        { "id": "R9-B9", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Failure-path analysis cleanup lacks one terminal exactly-once epilogue" },
+        { "id": "R9-B10", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Owner election needs a narrowly validated writable durable-file open" },
+        { "id": "R9-B11", "severity": "blocker", "status": "addressed_in_revision_9", "title": "Analyzer-detached cleanup helpers inherit the analyzer process group" },
+        { "id": "R9-W1", "severity": "warning", "status": "addressed_in_revision_9", "title": "Task 6 RED and GREEN filters omit exact project-status serialization tests" },
+        { "id": "R9-W2", "severity": "warning", "status": "addressed_in_revision_9", "title": "Interrupted cleanup-diagnostic writes can accumulate unbounded temporary files" }
+      ]
+    },
+    {
+      "round": 10,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 10,
+        "warnings": 1,
+        "revision_status": "addressed_before_round_11"
+      },
+      "findings": [
+        { "id": "R10-B1", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Fixed-scratch rename publication is not bound to the retained written inode" },
+        { "id": "R10-B2", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Lifecycle pair normalization removes the sole reachable recovery anchor before destructive rename" },
+        { "id": "R10-B3", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Recovery mutation and dynamic revalidation occur before pass-wide budget reservation" },
+        { "id": "R10-B4", "severity": "blocker", "status": "addressed_in_revision_10", "title": "A hard candidate cap permanently wedges namespaces above 4096 stores" },
+        { "id": "R10-B5", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Cleanup helper can initialize or rebind the wrong store before comparing authority" },
+        { "id": "R10-B6", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Hidden analysis and cleanup children retain MCP stdin" },
+        { "id": "R10-B7", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Partial metadata-journal scratch has no safe recovery transition" },
+        { "id": "R10-B8", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Nested Git process groups and unspecified watchdog enforcement leak helper descendants" },
+        { "id": "R10-B9", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Plan 1 omits low-level filesystem and core signal dependencies required by its own gates" },
+        { "id": "R10-B10", "severity": "blocker", "status": "addressed_in_revision_10", "title": "Early repository-validation failure has no value in the closed cleanup schedule schema" },
+        { "id": "R10-W1", "severity": "warning", "status": "addressed_in_revision_10", "title": "ServerState does not explicitly receive post-open repository authority for status" }
+      ]
+    },
+    {
+      "round": 11,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED" },
+        "architecture": { "verdict": "CHANGES_REQUESTED" },
+        "quality": { "verdict": "CHANGES_REQUESTED" },
+        "systems": { "verdict": "CHANGES_REQUESTED" }
+      },
+      "synthesis": {
+        "blockers": 8,
+        "warnings": 0,
+        "revision_status": "addressed_before_round_12"
+      },
+      "findings": [
+        { "id": "R11-B1", "severity": "blocker", "status": "addressed_in_revision_11", "title": "Shared helper Git process group overclaims mandatory reap after forced kill" },
+        { "id": "R11-B2", "severity": "blocker", "status": "addressed_in_revision_11", "title": "Early failure requires both a spawn attempt and repository-unavailable without spawn" },
+        { "id": "R11-B3", "severity": "blocker", "status": "addressed_in_revision_11", "title": "Cleanup schedule JSON omits its diagnostic field and per-outcome null matrix" },
+        { "id": "R11-B4", "severity": "blocker", "status": "addressed_in_revision_11", "title": "Pending recovery conflates absent journal with malformed published journal" },
+        { "id": "R11-B5", "severity": "blocker", "status": "addressed_in_revision_11", "title": "Recovery budget does not compose root metadata relocation and final-record work" },
+        { "id": "R11-B6", "severity": "blocker", "status": "addressed_in_revision_11", "title": "Concurrent metadata writers can invalidate recovery reservation before execution" },
+        { "id": "R11-B7", "severity": "blocker", "status": "addressed_in_revision_11", "title": "Post-crash unjournaled scratch recovery can promote attacker-originated authority" },
+        { "id": "R11-B8", "severity": "blocker", "status": "addressed_in_revision_11", "title": "Cooperative TERM handler has no safe planned dependency or install barrier" }
+      ]
+    },
+    {
+      "round": 12,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED", "blockers": 3, "warnings": 3 },
+        "architecture": { "verdict": "CHANGES_REQUESTED", "blockers": 1, "warnings": 2 },
+        "quality": { "verdict": "CHANGES_REQUESTED", "blockers": 4, "warnings": 1 },
+        "systems": { "verdict": "CHANGES_REQUESTED", "blockers": 2, "warnings": 0 }
+      },
+      "synthesis": {
+        "blockers": 4,
+        "warnings": 1,
+        "revision_status": "addressed_before_round_13"
+      },
+      "findings": [
+        { "id": "R12-B1", "severity": "blocker", "status": "addressed_in_revision_12", "title": "Recovery destination discovery occurs before bounded sub-batch selection" },
+        { "id": "R12-B2", "severity": "blocker", "status": "addressed_in_revision_12", "title": "Forced worker and Git kill has neither an identity channel nor an owned descendant reaper" },
+        { "id": "R12-B3", "severity": "blocker", "status": "addressed_in_revision_12", "title": "Task 1 requires a recovery-composition test implemented only by Task 3" },
+        { "id": "R12-B4", "severity": "blocker", "status": "addressed_in_revision_12", "title": "Candidate phase can invoke mutating metadata reconciliation after plan validation" },
+        { "id": "R12-W1", "severity": "warning", "status": "addressed_in_revision_12", "title": "Recovery cursor cadence and success timestamp transitions are unspecified" }
+      ]
+    },
+    {
+      "round": 13,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED", "blockers": 4, "warnings": 2 },
+        "architecture": { "verdict": "CHANGES_REQUESTED", "blockers": 3, "warnings": 1 },
+        "quality": { "verdict": "CHANGES_REQUESTED", "blockers": 5, "warnings": 3 },
+        "systems": { "verdict": "CHANGES_REQUESTED", "blockers": 2, "warnings": 2 }
+      },
+      "synthesis": {
+        "blockers": 5,
+        "warnings": 3,
+        "revision_status": "addressed_before_round_14"
+      },
+      "findings": [
+        { "id": "R13-B1", "severity": "blocker", "status": "addressed_in_revision_13", "title": "Recovery sub-batch selection does not subtract the root base cost" },
+        { "id": "R13-B2", "severity": "blocker", "status": "addressed_in_revision_13", "title": "Cursor clear loses durable recovery continuation across a crash" },
+        { "id": "R13-B3", "severity": "blocker", "status": "addressed_in_revision_13", "title": "Consuming scheduler shutdown cannot return error while retaining reaper ownership" },
+        { "id": "R13-B4", "severity": "blocker", "status": "addressed_in_revision_13", "title": "Supervisor readiness failure cannot produce the promised exact schedule outcome" },
+        { "id": "R13-B5", "severity": "blocker", "status": "addressed_in_revision_13", "title": "Analyzer-detached supervisor itself has no Loomweave PID1 reaper" },
+        { "id": "R13-W1", "severity": "warning", "status": "addressed_in_revision_13", "title": "Supervisor TERM flag has no bounded wake or poll contract" },
+        { "id": "R13-W2", "severity": "warning", "status": "addressed_in_revision_13", "title": "PID1 reaping test has no executable namespace harness or CI leg" },
+        { "id": "R13-W3", "severity": "warning", "status": "addressed_in_revision_13", "title": "Foundation plan still delegates forced-kill Git reaping to the OS adopter" }
+      ]
+    },
+    {
+      "round": 14,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED", "blockers": 1, "warnings": 1 },
+        "architecture": { "verdict": "CHANGES_REQUESTED", "blockers": 1, "warnings": 0 },
+        "quality": { "verdict": "CHANGES_REQUESTED", "blockers": 4, "warnings": 2 },
+        "systems": { "verdict": "CHANGES_REQUESTED", "blockers": 4, "warnings": 1 }
+      },
+      "synthesis": {
+        "blockers": 4,
+        "warnings": 2,
+        "revision_status": "addressed_before_round_15"
+      },
+      "findings": [
+        { "id": "R14-B1", "severity": "blocker", "status": "addressed_in_revision_14", "title": "Detached spawn releases child ownership before the startup acknowledgement" },
+        { "id": "R14-B2", "severity": "blocker", "status": "addressed_in_revision_14", "title": "Supervisor descendant-drain retry is not representable after startup pipes close" },
+        { "id": "R14-B3", "severity": "blocker", "status": "addressed_in_revision_14", "title": "Serve PID1 analyzer handoff and shutdown can lose the supervisor owner" },
+        { "id": "R14-B4", "severity": "blocker", "status": "addressed_in_revision_14", "title": "PID1 namespace harness does not execute the production Loomweave branch" },
+        { "id": "R14-W1", "severity": "warning", "status": "addressed_in_revision_14", "title": "Outcome precedence is contradictory for non-Linux and pre-authority failure" },
+        { "id": "R14-W2", "severity": "warning", "status": "addressed_in_revision_14", "title": "Adopted reaping does not constrain process identity reuse" }
+      ]
+    },
+    {
+      "round": 15,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED", "blockers": 1, "warnings": 1 },
+        "architecture": { "verdict": "CHANGES_REQUESTED", "blockers": 1, "warnings": 1 },
+        "quality": { "verdict": "CHANGES_REQUESTED", "blockers": 4, "warnings": 5 },
+        "systems": { "verdict": "CHANGES_REQUESTED", "blockers": 2, "warnings": 3 }
+      },
+      "synthesis": {
+        "blockers": 4,
+        "warnings": 5,
+        "revision_status": "addressed_before_round_16"
+      },
+      "findings": [
+        { "id": "R15-B1", "severity": "blocker", "status": "addressed_in_revision_15", "title": "Launch acknowledgement can start a worker before kill ownership is released" },
+        { "id": "R15-B2", "severity": "blocker", "status": "addressed_in_revision_15", "title": "Targeted PID1 registration cannot reap pre-registration or independent analyzer supervisors" },
+        { "id": "R15-B3", "severity": "blocker", "status": "addressed_in_revision_15", "title": "Identity-null registration can authorize a reused bare PID wait" },
+        { "id": "R15-B4", "severity": "blocker", "status": "addressed_in_revision_15", "title": "Adopted-supervisor reaper has no bounded overlapping-child semantics" },
+        { "id": "R15-W1", "severity": "warning", "status": "addressed_in_revision_15", "title": "Shutdown leaves periodic cleanup producers open during ownership drain" },
+        { "id": "R15-W2", "severity": "warning", "status": "addressed_in_revision_15", "title": "PID1 fixture hardcodes the default Cargo target path" },
+        { "id": "R15-W3", "severity": "warning", "status": "addressed_in_revision_15", "title": "PID1 fixture is callable in ordinary release builds" },
+        { "id": "R15-W4", "severity": "warning", "status": "addressed_in_revision_15", "title": "Fixture nonce and interrupted namespace cleanup are underspecified" },
+        { "id": "R15-W5", "severity": "warning", "status": "addressed_in_revision_15", "title": "Persistent descendant-wait errors retry and log without bound" }
+      ]
+    },
+    {
+      "round": 16,
+      "verdict": "CHANGES_REQUESTED",
+      "reviewers": {
+        "reality": { "verdict": "CHANGES_REQUESTED", "blockers": 1, "warnings": 1 },
+        "architecture": { "verdict": "CHANGES_REQUESTED", "blockers": 1, "warnings": 0 },
+        "quality": { "verdict": "CHANGES_REQUESTED", "blockers": 2, "warnings": 2 },
+        "systems": { "verdict": "CHANGES_REQUESTED", "blockers": 2, "warnings": 2 }
+      },
+      "synthesis": {
+        "blockers": 2,
+        "warnings": 2,
+        "revision_status": "addressed_before_round_17"
+      },
+      "findings": [
+        { "id": "R16-B1", "severity": "blocker", "status": "addressed_in_revision_16", "title": "Armed launch state drops the synchronous pre-worker wait owner" },
+        { "id": "R16-B2", "severity": "blocker", "status": "addressed_in_revision_16", "title": "PID1 signal forwarding can bypass graceful inner-server shutdown" },
+        { "id": "R16-W1", "severity": "warning", "status": "addressed_in_revision_16", "title": "Wrapper exit and signal status mapping is unspecified" },
+        { "id": "R16-W2", "severity": "warning", "status": "addressed_in_revision_16", "title": "Permanent wrapper wait errors have no fail-closed retry policy" }
+      ]
+    },
+    {
+      "round": 17,
+      "verdict": "APPROVED",
+      "reviewers": {
+        "reality": { "verdict": "APPROVED", "blockers": 0, "warnings": 0 },
+        "architecture": { "verdict": "APPROVED", "blockers": 0, "warnings": 0 },
+        "quality": { "verdict": "APPROVED", "blockers": 0, "warnings": 0 },
+        "systems": { "verdict": "APPROVED", "blockers": 0, "warnings": 0 }
+      },
+      "synthesis": {
+        "blockers": 0,
+        "warnings": 0,
+        "revision_status": "clearance_approved"
+      },
+      "findings": []
+    }
+  ]
+}
