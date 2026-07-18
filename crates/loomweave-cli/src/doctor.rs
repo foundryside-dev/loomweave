@@ -694,9 +694,37 @@ fn repair_classifier_analysis(project_root: &Path) -> Result<()> {
         .output()
         .context("start automatic Loomweave analysis repair")?;
     if output.status.success() {
-        Ok(())
+        return Ok(());
+    }
+    // `output()` captures both streams, so without replaying them the operator
+    // sees only an exit status for a repair this command ran on their behalf --
+    // the plugin error, bad path or lock contention that actually explains the
+    // failure is discarded. Prefer stderr and fall back to stdout, since a
+    // failing `analyze` may report through either.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let diagnostics = match (stderr.trim(), stdout.trim()) {
+        ("", "") => String::from("no output"),
+        ("", out) => tail_diagnostics(out),
+        (err, _) => tail_diagnostics(err),
+    };
+    bail!(
+        "`loomweave analyze` exited with {}: {diagnostics}",
+        output.status
+    )
+}
+
+/// Keep the last [`MAX_REPAIR_DIAGNOSTIC_LINES`] lines of a failed repair's
+/// output. The cause is almost always at the end, and the whole string is
+/// embedded in a JSON check detail that should stay readable.
+fn tail_diagnostics(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(MAX_REPAIR_DIAGNOSTIC_LINES);
+    let tail = lines[start..].join("; ");
+    if start > 0 {
+        format!("(last {MAX_REPAIR_DIAGNOSTIC_LINES} lines) {tail}")
     } else {
-        bail!("`loomweave analyze` exited with {}", output.status)
+        tail
     }
 }
 
@@ -936,6 +964,22 @@ fn index_integrity_outcome(project_root: &Path, fix: bool) -> IntegrityOutcome {
     let db_path = loomweave_core::store::db_path(project_root);
 
     if fix {
+        // This repair deletes entity rows. Nothing else serialises it against
+        // a concurrent `loomweave analyze` that may be mid-way through
+        // re-linking the very rows being removed -- SQLite's busy_timeout and
+        // WAL bound that to lock contention rather than corruption, but the
+        // interleaving is still wrong. Take the same advisory lock `analyze`
+        // takes (STO-01), non-blocking, and report busy rather than racing.
+        //
+        // Deliberately scoped to this repair, NOT to all of `doctor --fix`:
+        // `repair_classifier_analysis` spawns `loomweave analyze`, which
+        // acquires this lock itself, so holding it across that repair would
+        // make doctor deadlock against its own child.
+        let loomweave_dir = loomweave_core::store::store_dir(project_root);
+        let _analyze_lock = match crate::analyze_lock::acquire_analyze_lock(&loomweave_dir) {
+            Ok(guard) => guard,
+            Err(err) => return IntegrityOutcome::Error(err.to_string()),
+        };
         match repair_index_integrity(&db_path, project_root) {
             Ok(report) => {
                 let residual = report.residual.stale_file_entities.len()
@@ -1006,6 +1050,9 @@ fn repair_index_integrity(
 
 const INTEGRITY_REBUILD_HINT: &str = "stop any running `loomweave serve`, then run `loomweave analyze --no-incremental` \
      to fully rebuild the graph";
+
+/// Lines of a failed auto-repair's output replayed into the check detail.
+const MAX_REPAIR_DIAGNOSTIC_LINES: usize = 10;
 
 /// Text-path index-integrity check.
 fn check_index_integrity(project_root: &Path, fix: bool) -> Tally {

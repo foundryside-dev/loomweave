@@ -1814,3 +1814,65 @@ fn doctor_flags_git_tracked_db_as_problem_and_fix_untracks_it() {
         "git rm --cached must keep the working-tree db file"
     );
 }
+
+/// `doctor --fix`'s index-integrity repair deletes entity rows, so it must not
+/// interleave with a concurrent `loomweave analyze` re-linking those same rows.
+/// It takes the same advisory lock `analyze` does (STO-01) and reports busy
+/// instead of racing.
+///
+/// Deliberately NOT held across all of `--fix`: `repair_classifier_analysis`
+/// spawns `loomweave analyze`, which acquires this lock itself, so a
+/// doctor-wide lock would deadlock against doctor's own child. The rest of the
+/// run must still complete while the lock is held elsewhere.
+#[test]
+fn doctor_fix_reports_busy_when_analyze_holds_the_advisory_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install"], dir.path());
+    write_healthy_db(dir.path());
+
+    // Baseline: with the lock free, the integrity check is not lock-blocked.
+    let (_, free) = doctor_json(dir.path(), true);
+    let free_status = check(&free, "index.integrity")["status"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(
+        free_status, "problem",
+        "baseline should not be lock-blocked"
+    );
+
+    // Now hold the lock the way a running `analyze` would.
+    let lock_path = dir.path().join(".weft/loomweave/loomweave.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open analyze lock");
+    held.try_lock().expect("acquire analyze lock in test");
+
+    let (_, busy) = doctor_json(dir.path(), true);
+    let integrity = check(&busy, "index.integrity");
+    assert_eq!(
+        integrity["status"], "problem",
+        "repair must refuse while analyze holds the lock; got {integrity}"
+    );
+    let message = integrity["message"].as_str().unwrap_or_default();
+    let detail = integrity.to_string();
+    assert!(
+        message.contains("already in progress") || detail.contains("already in progress"),
+        "operator needs to be told analyze holds the lock; got {integrity}"
+    );
+
+    drop(held);
+
+    // Releasing the lock restores the repair path — the refusal is transient,
+    // not a latched failure.
+    let (_, recovered) = doctor_json(dir.path(), true);
+    assert_eq!(
+        check(&recovered, "index.integrity")["status"],
+        serde_json::Value::from(free_status),
+        "repair must recover once the lock is released"
+    );
+}
