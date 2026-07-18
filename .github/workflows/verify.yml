@@ -215,7 +215,7 @@ jobs:
         run: uv run --project plugins/python --extra dev python scripts/check-b4-gate-result.py --run-b5-smoke
 
       - name: ruff check
-        run: uv run --project plugins/python --extra dev ruff check plugins/python
+        run: uv run --project plugins/python --extra dev ruff check plugins/python scripts
 
       - name: ruff format check
         run: uv run --project plugins/python --extra dev ruff format --check plugins/python
