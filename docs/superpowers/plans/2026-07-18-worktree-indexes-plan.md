@@ -250,6 +250,24 @@ Under non-blocking `gc.lock`: enumerate registered worktrees via hardened Git;
 enumerate direct children of the **pinned** `worktrees/` handle; delete any
 `wt-[0-9a-f]{64}` directory whose ID is not registered.
 
+**Deriving each registered worktree's stable ID.** `git worktree list
+--porcelain` does *not* expose an entry's administrative directory, and the
+stable ID is a hash of exactly that. Enumerate the common Git directory's own
+`worktrees/` admin entries directly and hash each name — do not probe each
+present working tree with `rev-parse --absolute-git-dir`. Reading the admin
+directory is one cheap readdir, needs no subprocess per entry, and correctly
+covers a registered-but-prunable worktree whose working path is temporarily
+gone (an unmounted volume must not read as "unregistered" and trigger
+deletion). If the admin directory cannot be enumerated, abort the sweep.
+
+**Known accepted race.** There are no activity locks in this design, so a
+worktree removed while a `serve` process holds its store open can have that
+store swept underneath it. On Linux the open inode survives the unlink, so the
+running server keeps working and the next start rebuilds — cost is one
+re-analyze. This is a deliberate simplification over the original design's
+activity/intent/writer lock ordering; do not reintroduce those locks to close
+it without re-reading the design's *"What this object is"*.
+
 Deletion uses Linux `openat2` with
 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV` via `rustix`. Other
 platforms report unsupported and delete nothing. No `remove_dir_all` on a
