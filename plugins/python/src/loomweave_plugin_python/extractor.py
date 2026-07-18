@@ -1393,24 +1393,38 @@ def _module_level_exportable_names(tree: ast.Module) -> set[str]:
     )
     nested_entity_definitions: set[str] = set()
     for statement in tree.body:
+        # Effects that execute as part of running this top-level statement --
+        # including a walrus in a consumed generator -- are proven rebindings
+        # and still evict below.
         potential_expression_rebindings = _potential_statement_expression_rebindings(
             statement,
             evaluate_annotations=evaluate_annotations,
         )
-        potential_rebindings, potential_star_import = _potential_control_flow_rebindings(
-            statement,
-            evaluate_annotations=evaluate_annotations,
-        )
-        if (
-            isinstance(statement, ast.ImportFrom)
-            and any(alias.name == "*" for alias in statement.names)
-        ) or potential_star_import:
+        # Only a *proven* top-level rebinding evicts a local definition. A
+        # conditional one (inside an if/try/while/with/for/match branch, or
+        # guarded by a walrus in such a header) must not, even though the name
+        # may well be the imported object at runtime.
+        #
+        # Eviction displaces `exported-api` onto the module as a proxy, which is
+        # right for a proven re-export — the module then owns a real `imports`
+        # edge to the name. It is wrong for a name that still has one local
+        # definition: ADR-053 defines `exported-api` as a declared *reachability
+        # root*, and the dead-code BFS seeds roots by exact entity id and walks
+        # only `calls`/`imports` edges (`contains` is excluded by design), so the
+        # module tag cannot reach the function. The local definition would be
+        # reported dead — and a false `dead` is the expensive error direction.
+        # Over-claiming provenance on a conditionally-shadowed name is the safe
+        # trade, and is what this function did before conditional rebindings
+        # were classified at all.
+        if isinstance(statement, ast.ImportFrom) and any(
+            alias.name == "*" for alias in statement.names
+        ):
             local_entities.clear()
         direct_rebindings = _direct_module_rebindings(
             statement,
             evaluate_annotations=evaluate_annotations,
         )
-        for name in direct_rebindings | potential_expression_rebindings | potential_rebindings:
+        for name in direct_rebindings | potential_expression_rebindings:
             local_entities.pop(name, None)
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
             _has_overload_decorator(statement)
