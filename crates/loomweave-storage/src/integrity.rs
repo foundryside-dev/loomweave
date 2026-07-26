@@ -204,7 +204,11 @@ fn file_entity_exists(id: &str, source_path: Option<&str>, project_root: &Path) 
     for candidate in candidates {
         match std::fs::metadata(&candidate) {
             Ok(_) => return Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
             Err(err) => {
                 metadata_error.get_or_insert(err);
             }
