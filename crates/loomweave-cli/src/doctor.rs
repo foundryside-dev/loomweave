@@ -26,7 +26,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -35,6 +34,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::Value;
 
+use loomweave_core::hardened_git_command;
 use loomweave_storage::StorageError;
 use loomweave_storage::schema::{
     CURRENT_SCHEMA_VERSION, reject_unmigrated_for_read, verify_user_version,
@@ -397,9 +397,7 @@ fn db_tracked_state(project_root: &Path) -> DbTrackedState {
         // Store dir is outside the repo — this repo cannot be tracking it.
         return DbTrackedState::Untracked;
     };
-    let tracked = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let tracked = hardened_git_command(project_root)
         .args(["ls-files", "--error-unmatch", "--"])
         .arg(rel)
         .output()
@@ -419,9 +417,7 @@ fn git_untrack_db(project_root: &Path) -> Result<()> {
     let rel = store
         .strip_prefix(project_root)
         .context("store dir is outside the project root; cannot git rm --cached")?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let status = hardened_git_command(project_root)
         .args(["rm", "--cached", "-q", "--ignore-unmatch", "--"])
         .arg(rel.join("loomweave.db"))
         .arg(rel.join("loomweave.db-wal"))
@@ -1404,6 +1400,24 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    #[cfg(unix)]
+    fn install_fsmonitor_payload(root: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let marker = root.join("fsmonitor-fired");
+        let hook = root.join("fsmonitor-hook.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf fired >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook, perms).unwrap();
+        run_git(root, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        marker
+    }
+
     fn run_git(repo: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .arg("-C")
@@ -1448,6 +1462,22 @@ mod tests {
         write_db(root);
         run_git(root, &["add", "-f", ".weft/loomweave/loomweave.db"]);
         assert_eq!(db_tracked_state(root), DbTrackedState::Tracked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_tracked_state_does_not_run_repo_fsmonitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let marker = install_fsmonitor_payload(root);
+        write_db(root);
+
+        assert_eq!(db_tracked_state(root), DbTrackedState::Untracked);
+        assert!(
+            !marker.exists(),
+            "db tracking probe must not run repo-configured fsmonitor"
+        );
     }
 
     #[test]
@@ -1706,6 +1736,25 @@ filigree tracks tasks for this project.\n\
         assert!(
             db.exists(),
             "git rm --cached must keep the working-tree file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_untrack_db_does_not_run_repo_fsmonitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let db = write_db(root);
+        run_git(root, &["add", "-f", ".weft/loomweave/loomweave.db"]);
+        let marker = install_fsmonitor_payload(root);
+
+        git_untrack_db(root).expect("untrack succeeds");
+
+        assert!(db.exists(), "git rm --cached must keep the file");
+        assert!(
+            !marker.exists(),
+            "db untrack repair must not run repo-configured fsmonitor"
         );
     }
 }
