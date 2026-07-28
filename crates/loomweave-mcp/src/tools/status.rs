@@ -212,14 +212,11 @@ impl ServerState {
         &self,
         _arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        // A linked worktree's isolated store lives under
-        // `db_path(worktree_gate)`, never under `db_path(project_root)` (the
-        // source root's own, never-written local store) — see
-        // `ServerState::worktree_gate`.
-        let db_path = self.worktree_gate.as_ref().map_or_else(
-            || loomweave_core::store::db_path(&self.project_root),
-            |gate| gate.effective_db_path.clone(),
-        );
+        // A linked worktree's isolated store lives under the gate's
+        // `store_paths.db`, never under `db_path(project_root)` (the source
+        // root's own, never-written local store) — see
+        // `ServerState::effective_db_path`.
+        let db_path = self.effective_db_path();
         let root_display = self.project_root.display().to_string();
 
         let project_root = self.project_root.clone();

@@ -1876,3 +1876,103 @@ fn doctor_fix_reports_busy_when_analyze_holds_the_advisory_lock() {
         "repair must recover once the lock is released"
     );
 }
+
+/// Materialise a migrated, empty `loomweave.db` directly at `db_path` (no
+/// `.gitignore` companion — unlike `write_healthy_db`, this is used for a
+/// worktree-isolated store nested under `worktrees/`, which never carries
+/// its own gitignore-drift concern).
+fn write_migrated_db_at(db_path: &Path) {
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let mut conn = Connection::open(db_path).expect("create SQLite DB");
+    loomweave_storage::pragma::apply_write_pragmas(&conn).expect("write pragmas");
+    loomweave_storage::schema::apply_migrations(&mut conn).expect("migrate");
+}
+
+/// worktree-indexes Task 7: `doctor` additively enumerates
+/// `<repository-store>/worktrees/` and reports per-store DB health,
+/// read-only, reusing the same `IndexDbHealth` classification the primary
+/// store's `.weft/loomweave.schema` check uses. This is purely additive —
+/// the primary store's own checks (asserted unaffected below) must not
+/// change shape or count because a worktree store happens to exist.
+#[test]
+fn doctor_reports_worktree_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install"], dir.path());
+
+    let worktrees_dir = dir.path().join(".weft/loomweave/worktrees");
+    let healthy_id = format!("wt-{}", "a".repeat(64));
+    write_migrated_db_at(&worktrees_dir.join(&healthy_id).join("loomweave.db"));
+    let unmigrated_id = format!("wt-{}", "b".repeat(64));
+    let unmigrated_db = worktrees_dir.join(&unmigrated_id).join("loomweave.db");
+    fs::create_dir_all(unmigrated_db.parent().unwrap()).unwrap();
+    Connection::open(&unmigrated_db).expect("create unmigrated SQLite DB");
+
+    let (code, json) = doctor_json(dir.path(), false);
+    let worktree_check = check(&json, "worktree_stores");
+    assert_eq!(
+        worktree_check["status"], "problem",
+        "an unmigrated worktree store must be surfaced as a problem: {worktree_check}"
+    );
+    assert_eq!(
+        code, 1,
+        "a problem-severity worktree store check must fail the doctor gate"
+    );
+    let stores = worktree_check["details"]["stores"]
+        .as_array()
+        .expect("worktree_stores check must carry a per-store details array");
+    assert_eq!(stores.len(), 2, "both worktree stores must be reported");
+    let healthy_entry = stores
+        .iter()
+        .find(|s| s["stable_id"] == healthy_id)
+        .expect("healthy store entry present");
+    assert_eq!(healthy_entry["status"], "ok");
+    let unmigrated_entry = stores
+        .iter()
+        .find(|s| s["stable_id"] == unmigrated_id)
+        .expect("unmigrated store entry present");
+    assert_eq!(unmigrated_entry["status"], "problem");
+
+    // Additive: the PRIMARY store's own health check is untouched by the
+    // worktree stores' existence or health.
+    let primary_check = check(&json, ".weft/loomweave.schema");
+    assert_eq!(primary_check["status"], "ok");
+
+    // --fix must not gain any repair power over worktree stores in this
+    // task: the unmigrated store must be left exactly as it was.
+    let (_, fixed_json) = doctor_json(dir.path(), true);
+    let fixed_worktree_check = check(&fixed_json, "worktree_stores");
+    assert_eq!(
+        fixed_worktree_check["status"], "problem",
+        "--fix must not repair a worktree store's index in this task: {fixed_worktree_check}"
+    );
+    let conn =
+        Connection::open_with_flags(&unmigrated_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("unmigrated db must still open (untouched by --fix)");
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read user_version");
+    assert_eq!(
+        user_version, 0,
+        "--fix must not migrate a worktree-isolated store's DB in this task"
+    );
+}
+
+/// A project with no worktree stores at all must not gain a
+/// `worktree_stores` check — the additive report only appears once there is
+/// something to report.
+#[test]
+fn doctor_omits_worktree_stores_check_when_none_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install"], dir.path());
+
+    let (_, json) = doctor_json(dir.path(), false);
+    assert!(
+        json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != "worktree_stores"),
+        "no worktree_stores check should appear when .weft/loomweave/worktrees/ \
+         does not exist: {json}"
+    );
+}

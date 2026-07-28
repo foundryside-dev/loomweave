@@ -116,6 +116,33 @@ fn resolve_default_config_path(path: &Path) -> Result<std::path::PathBuf> {
     Ok(ctx.config_path())
 }
 
+/// Resolve the embeddings sidecar `path` actually reads: `WorktreeContext`'s
+/// `store_paths.embeddings` (worktree-index Task 7) — never a bare
+/// `embeddings_db_path(path)`, which for a linked worktree is the *source*
+/// root's own store, a location `loomweave worktree analyze` never
+/// populates.
+///
+/// Unlike [`resolve_default_config_path`] (which propagates a resolution
+/// failure so an explicit `--config` can deliberately short-circuit before
+/// it), this always degrades: a status probe must never turn into a hard
+/// error over the one thing `WorktreeContext::resolve` can fail on (a
+/// non-UTF-8 path component) — falls back to the root-derived path with a
+/// `tracing::warn!`, the same posture `loomweave-mcp`'s
+/// `resolve_default_config_path` uses for the identical failure mode.
+fn resolve_effective_embeddings_path(path: &Path) -> std::path::PathBuf {
+    match loomweave_core::worktree::WorktreeContext::resolve(path) {
+        Ok(ctx) => ctx.store_paths.embeddings,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "resolve worktree context for embeddings sidecar status failed; falling back to \
+                 <path>/.weft/loomweave/embeddings.db"
+            );
+            loomweave_storage::embeddings_db_path(path)
+        }
+    }
+}
+
 /// Dispatch `loomweave config <subcommand>`.
 pub(crate) fn run(command: crate::cli::ConfigCommand) -> Result<()> {
     match command {
@@ -310,7 +337,10 @@ fn print_llm_edit_result(result: &LlmConfigEditResult) {
 fn print_semantic_edit_result(project_root: &Path, result: &SemanticConfigEditResult) {
     println!("Updated:                {}", result.path);
     println!("Created:                {}", result.created);
-    print_semantic_status_fields(project_root, &result.config);
+    print_semantic_status_fields(
+        &resolve_effective_embeddings_path(project_root),
+        &result.config,
+    );
     println!("Analyze required:       true");
     println!("Restart required:       true");
 }
@@ -419,7 +449,7 @@ fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
         std::process::exit(1);
     }
     println!();
-    print_semantic_status_fields(path, &config);
+    print_semantic_status_fields(&resolve_effective_embeddings_path(path), &config);
     Ok(())
 }
 
@@ -442,18 +472,17 @@ fn run_semantic_status(path: &Path, explicit_config: Option<&Path>) -> Result<()
         )
     };
     println!("loomweave.yaml:         {source}");
-    print_semantic_status_fields(path, &config);
+    print_semantic_status_fields(&resolve_effective_embeddings_path(path), &config);
     Ok(())
 }
 
-fn print_semantic_status_fields(project_root: &Path, config: &McpConfig) {
+/// `sidecar_path` must already be the resolved embeddings sidecar leaf (see
+/// [`resolve_effective_embeddings_path`]) — never re-derived from a project
+/// root here, which is exactly the re-derivation that breaks linked-worktree
+/// isolation (worktree-index Task 7).
+fn print_semantic_status_fields(sidecar_path: &Path, config: &McpConfig) {
     let semantic = &config.semantic_search;
-    // Probe the SAME path `populate_semantic_embeddings` writes to
-    // (`EmbeddingStore::open_in_store_dir`): the override-aware store helper, so a
-    // `[loomweave].store_dir` relocation does not make a populated sidecar read as
-    // "absent" here (clarion / read-vs-status parity).
-    let sidecar = loomweave_storage::embeddings_db_path(project_root);
-    let count = embedding_sidecar_count(&sidecar);
+    let count = embedding_sidecar_count(sidecar_path);
     let has_key = std::env::var(&semantic.api_key_env)
         .ok()
         .as_deref()
@@ -470,7 +499,7 @@ fn print_semantic_status_fields(project_root: &Path, config: &McpConfig) {
         semantic.api_key_env,
         if has_key { "set" } else { "unset" }
     );
-    println!("Embeddings sidecar:     {}", sidecar.display());
+    println!("Embeddings sidecar:     {}", sidecar_path.display());
     match count {
         Ok(Some(count)) => println!("Sidecar vectors:        {count}"),
         Ok(None) => println!("Sidecar vectors:        absent"),

@@ -332,6 +332,7 @@ fn run_server(
         // when it exists on disk (the McpConfig::default() fallback has no file).
         config_path.exists().then(|| config_path.to_path_buf()),
         gated,
+        worktree_ctx.store_paths.clone(),
     )?;
     supervise_stdio_with_http(stdio, http_server)
 }
@@ -402,6 +403,7 @@ fn spawn_mcp_stdio(
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
     gated: bool,
+    store_paths: loomweave_core::worktree::StorePaths,
 ) -> Result<StdioServe> {
     let (result_tx, result_rx) = mpsc::channel();
     let join = thread::Builder::new()
@@ -420,6 +422,7 @@ fn spawn_mcp_stdio(
                 tool_policy,
                 analyze_config_path,
                 gated,
+                store_paths,
             );
             let _ = result_tx.send(result);
         })
@@ -441,6 +444,7 @@ fn run_mcp_stdio(
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
     gated: bool,
+    store_paths: loomweave_core::worktree::StorePaths,
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -451,14 +455,17 @@ fn run_mcp_stdio(
         .build()
         .context("create MCP runtime")?;
     let _runtime_guard = runtime.enter();
-    // The gate needs both `db_path` (borrowed below by `Writer::spawn`) and
-    // `project_root` (moved into `ServerState::new` next) while they are both
-    // still available — hence computed up front, before either is consumed.
-    let worktree_gate_source_root = gated.then(|| project_root.clone());
+    // The gate needs both `store_paths` and `project_root` (moved into
+    // `ServerState::new` next) while they are both still available — hence
+    // computed up front, before either is consumed. `store_paths` carries
+    // every explicit leaf path (db/embeddings/runs/...) `ServerState`'s
+    // `effective_*` accessors need for a gated (linked-worktree) session
+    // (worktree-index Task 7) — not just the db path.
+    let worktree_gate = gated.then(|| (project_root.clone(), store_paths));
     let mut state =
         loomweave_mcp::ServerState::new(project_root, readers).with_tool_policy(tool_policy);
-    if let Some(source_root) = worktree_gate_source_root {
-        state = state.with_worktree_gate(db_path.to_path_buf(), &source_root);
+    if let Some((source_root, store_paths)) = worktree_gate {
+        state = state.with_worktree_gate(store_paths, &source_root);
     }
     // Forward serve's config to an analyze_start-spawned analyze so the child
     // parses the same configuration (review #12). Some only when serve was

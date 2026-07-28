@@ -58,8 +58,11 @@ const METADATA_SCHEMA: &str = "loomweave.worktree-index.v1";
 const METADATA_FILE_NAME: &str = "metadata.json";
 /// `<repository-store>/worktrees/` — shared with `crate::worktree::sweep`
 /// (the cleanup sweep enumerates the same directory this module creates
-/// stores under), so this is `pub(crate)` rather than private to this file.
-pub(crate) const WORKTREES_DIR_NAME: &str = "worktrees";
+/// stores under) and, cross-crate, with `loomweave-cli`'s bin target
+/// (`install.rs`'s `--force` guard and `doctor.rs`'s additive worktree-store
+/// report both need the same directory name; worktree-index Task 7), so this
+/// is `pub` rather than `pub(crate)`.
+pub const WORKTREES_DIR_NAME: &str = "worktrees";
 
 const ISO8601_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");

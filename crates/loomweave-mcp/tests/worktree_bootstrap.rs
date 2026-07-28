@@ -97,7 +97,7 @@ fn linked_state(ctx: &WorktreeContext) -> ServerState {
     let pool = ReaderPool::open(&ctx.store_paths.db, 4).expect("reader pool");
     ServerState::new(ctx.source_root.clone(), pool)
         .with_tool_policy(McpToolPolicy::allow_write_tools())
-        .with_worktree_gate(ctx.store_paths.db.clone(), &ctx.source_root)
+        .with_worktree_gate(ctx.store_paths.clone(), &ctx.source_root)
 }
 
 fn seed_run(db_path: &Path, id: &str, started_at: &str, status: &str) {

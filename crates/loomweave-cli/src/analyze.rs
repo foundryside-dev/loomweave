@@ -662,8 +662,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         sidecar_walk_skipped = secret_scan_sidecar_skipped,
         "secret scan file walk complete"
     );
-    let mut secret_scan_outcome =
-        crate::secret_scan::pre_ingest(&project_root, &secret_scan_files, &options.secret_scan)?;
+    let mut secret_scan_outcome = crate::secret_scan::pre_ingest(
+        &project_root,
+        &loomweave_dir,
+        &secret_scan_files,
+        &options.secret_scan,
+    )?;
     let syntax_rule_ids = plugins
         .iter()
         .map(|plugin| format!("{}SYNTAX-ERROR", plugin.manifest.ontology.rule_id_prefix))

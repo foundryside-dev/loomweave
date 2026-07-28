@@ -98,6 +98,9 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += emit_json_check_text(&check_http_authentication_json(&project_root));
     tally += emit_json_check_text(&instance_id);
     tally += check_index_integrity(&project_root, fix);
+    if let Some(check) = check_worktree_stores_json(&project_root) {
+        tally += emit_json_check_text(&check);
+    }
     println!("--- llm ---");
     tally += check_llm_provider(&project_root);
 
@@ -239,6 +242,9 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_db_tracked_json(project_root, fix),
         check_gitignore_current_json(project_root, fix),
     ];
+    if let Some(check) = check_worktree_stores_json(project_root) {
+        checks.push(check);
+    }
     let next_actions: Vec<String> = checks
         .iter()
         .filter(|check| check.status == "problem" || check.status == "warning")
@@ -340,16 +346,25 @@ enum IndexDbHealth {
 }
 
 /// Classify the index DB at the canonical store path into one of four states.
-/// Uses `Connection::open_with_flags` with `SQLITE_OPEN_READ_ONLY` so the
-/// check never creates or mutates the DB (unlike `Connection::open`, which
-/// creates the file on success).
+/// Thin wrapper over [`classify_index_db_health_at`] — kept for the many
+/// existing call sites that only ever check the current invocation's own
+/// (unrouted) `db_path(project_root)`. worktree-index Task 7's additive
+/// worktree-store report calls the `_at` form directly with each isolated
+/// store's own resolved db path.
 fn classify_index_db_health(project_root: &Path) -> IndexDbHealth {
-    let db_path = loomweave_core::store::db_path(project_root);
+    classify_index_db_health_at(&loomweave_core::store::db_path(project_root))
+}
+
+/// Classify the index DB at `db_path` into one of four states. Uses
+/// `Connection::open_with_flags` with `SQLITE_OPEN_READ_ONLY` so the check
+/// never creates or mutates the DB (unlike `Connection::open`, which creates
+/// the file on success).
+fn classify_index_db_health_at(db_path: &Path) -> IndexDbHealth {
     if !db_path.exists() {
         return IndexDbHealth::Absent;
     }
     let conn =
-        match Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        match Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
             Ok(conn) => conn,
             Err(err) => return IndexDbHealth::Unreadable(err.to_string()),
         };
@@ -374,6 +389,107 @@ fn classify_index_db_health(project_root: &Path) -> IndexDbHealth {
         Ok(()) => IndexDbHealth::Healthy,
         Err(StorageError::UnmigratedIndex) => IndexDbHealth::Unmigrated,
         Err(err) => IndexDbHealth::Unreadable(err.to_string()),
+    }
+}
+
+/// worktree-index Task 7: additive, read-only report on every
+/// worktree-isolated store under `<repository-store>/worktrees/`, reusing
+/// [`classify_index_db_health_at`] per store. `--fix` gains no new repair
+/// power here in this task — there is no `fix` parameter to wire one to;
+/// repairing a worktree-isolated store's index is out of scope.
+///
+/// `project_root` may be the primary checkout, a standalone project, or a
+/// linked worktree itself: resolved via `WorktreeContext` so this reports
+/// the SAME `<repository-store>/worktrees/` regardless of which checkout
+/// `doctor` was invoked from — unlike every other check in this module,
+/// which stays root-derived from the literal `--path` (see the worktree-index
+/// Task 7 report for the classification rationale). Returns `None` when
+/// there is nothing to report: the worktree context could not be resolved
+/// (non-UTF-8 path — vanishingly rare) or no worktree store has ever been
+/// created.
+fn check_worktree_stores_json(project_root: &Path) -> Option<DoctorJsonCheck> {
+    const ID: &str = "worktree_stores";
+
+    let ctx = loomweave_core::worktree::WorktreeContext::resolve(project_root).ok()?;
+    let worktrees_dir = ctx
+        .repository_store
+        .join(loomweave_cli::worktree::store::WORKTREES_DIR_NAME);
+    let entries = fs::read_dir(&worktrees_dir).ok()?;
+    let mut stable_ids: Vec<String> = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| loomweave_cli::worktree::confine::matches_worktree_store_grammar(name))
+        .collect();
+    if stable_ids.is_empty() {
+        return None;
+    }
+    stable_ids.sort();
+
+    let mut stores = Vec::with_capacity(stable_ids.len());
+    let mut worst = "ok";
+    for stable_id in &stable_ids {
+        let db_path = worktrees_dir.join(stable_id).join("loomweave.db");
+        let health = classify_index_db_health_at(&db_path);
+        let (status, detail) = worktree_store_health_status_detail(&health);
+        if severity_rank(status) > severity_rank(worst) {
+            worst = status;
+        }
+        stores.push(serde_json::json!({
+            "stable_id": stable_id,
+            "status": status,
+            "detail": detail,
+        }));
+    }
+
+    let message = format!(
+        "{} worktree-isolated store(s) found under .weft/loomweave/worktrees/",
+        stable_ids.len()
+    );
+    let check = match worst {
+        "problem" => DoctorJsonCheck::problem(ID, message),
+        "warning" => DoctorJsonCheck::warning(ID, message),
+        _ => DoctorJsonCheck::ok(ID, message),
+    }
+    .with_details(serde_json::json!({ "stores": stores }));
+    Some(if worst == "ok" {
+        check
+    } else {
+        check.with_next_action(
+            "Read-only report: `doctor --fix` does not repair worktree-isolated stores. \
+             Investigate the named store(s) directly, or rebuild one with \
+             `loomweave worktree analyze -- <target>`.",
+        )
+    })
+}
+
+/// `(status, detail)` for one worktree-isolated store's [`IndexDbHealth`],
+/// used only by [`check_worktree_stores_json`]'s per-store report — kept
+/// separate from [`check_loomweave_dir_json`]'s primary-store wording so
+/// neither can accidentally drift the other's exact message text (both are
+/// asserted verbatim by existing tests).
+fn worktree_store_health_status_detail(health: &IndexDbHealth) -> (&'static str, String) {
+    match health {
+        IndexDbHealth::Healthy => ("ok", "healthy".to_owned()),
+        IndexDbHealth::Absent => (
+            "warning",
+            "store directory exists but loomweave.db is absent".to_owned(),
+        ),
+        IndexDbHealth::Unreadable(detail) => ("problem", format!("unreadable: {detail}")),
+        IndexDbHealth::Unmigrated => ("problem", "unmigrated (user_version=0)".to_owned()),
+        IndexDbHealth::FutureSchema { found, current } => (
+            "problem",
+            format!("schema v{found} is newer than this build (current v{current})"),
+        ),
+    }
+}
+
+/// Ordering for picking the worst status across several per-store verdicts.
+fn severity_rank(status: &str) -> u8 {
+    match status {
+        "problem" => 2,
+        "warning" => 1,
+        _ => 0,
     }
 }
 

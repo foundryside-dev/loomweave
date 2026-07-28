@@ -1294,11 +1294,14 @@ pub struct ServerState {
 /// See [`ServerState::worktree_gate`].
 #[derive(Debug, Clone)]
 struct WorktreeGate {
-    /// The linked worktree's isolated store's `loomweave.db` — distinct from
-    /// `db_path(project_root)` (the source root's own, never-written local
-    /// store), so `project_status_get` reports the store this session is
-    /// actually reading, not a path that will never exist.
-    effective_db_path: PathBuf,
+    /// The linked worktree's isolated store's explicit leaf paths — distinct
+    /// from `db_path(project_root)`/`store_dir(project_root)`/
+    /// `embeddings_db_path(project_root)` (all re-derived from the *source*
+    /// root, a location `loomweave worktree analyze` never populates), so
+    /// every `ServerState::effective_*` accessor below reports the store
+    /// this session is actually reading, not a path that will never exist
+    /// (worktree-index Task 7).
+    store_paths: loomweave_core::worktree::StorePaths,
     /// The exact `loomweave worktree analyze -- <target>` fallback command,
     /// echoed verbatim in `index-building`/`index-build-failed` diagnostics.
     fallback_argv: Vec<String>,
@@ -1338,19 +1341,62 @@ impl ServerState {
     /// `analyze_status_get` is gated on `worktree_bootstrap::read_worktree_readiness`
     /// until a completed (or `skipped_no_plugins`) run row appears.
     ///
-    /// `effective_db_path` is the linked worktree's isolated store's
-    /// `loomweave.db` (the same path the caller opened `readers` against) —
-    /// distinct from `db_path(project_root)`, which for a linked worktree is a
-    /// path under the *source* root that this design never writes to.
+    /// `store_paths` is the linked worktree's isolated store's explicit leaf
+    /// paths (`store_paths.db` is the same path the caller opened `readers`
+    /// against) — distinct from `db_path(project_root)`/
+    /// `store_dir(project_root)`, which for a linked worktree are paths
+    /// under the *source* root that this design never writes to.
     /// `source_root` is used to build the exact `loomweave worktree analyze`
     /// fallback command surfaced in error diagnostics.
     #[must_use]
-    pub fn with_worktree_gate(mut self, effective_db_path: PathBuf, source_root: &Path) -> Self {
+    pub fn with_worktree_gate(
+        mut self,
+        store_paths: loomweave_core::worktree::StorePaths,
+        source_root: &Path,
+    ) -> Self {
         self.worktree_gate = Some(WorktreeGate {
-            effective_db_path,
+            store_paths,
             fallback_argv: worktree_bootstrap::fallback_argv(source_root),
         });
         self
+    }
+
+    /// The structural-graph store this session actually reads/writes:
+    /// `self.worktree_gate`'s isolated `store_paths.db` when active,
+    /// otherwise `db_path(self.project_root)` — today's unchanged behavior
+    /// for a standalone checkout or the main worktree (worktree-index Task
+    /// 7). Every call site that needs a db path outside `self.readers` (the
+    /// reader pool is always opened against the correct path already) must
+    /// go through this, never a bare `loomweave_core::store::db_path(&self.project_root)`.
+    fn effective_db_path(&self) -> PathBuf {
+        self.worktree_gate.as_ref().map_or_else(
+            || loomweave_core::store::db_path(&self.project_root),
+            |gate| gate.store_paths.db.clone(),
+        )
+    }
+
+    /// The embeddings sidecar this session actually reads: the gated
+    /// counterpart of [`Self::effective_db_path`] for
+    /// `embeddings_db_path(project_root)` call sites (`search_semantic`,
+    /// `semantic_config_get`/`set`'s sidecar status — worktree-index Task 7).
+    fn effective_embeddings_path(&self) -> PathBuf {
+        self.worktree_gate.as_ref().map_or_else(
+            || embeddings_db_path(&self.project_root),
+            |gate| gate.store_paths.embeddings.clone(),
+        )
+    }
+
+    /// The `runs/` directory this session actually writes progress files
+    /// into: the gated counterpart of [`Self::effective_db_path`] for
+    /// `store_dir(project_root).join("runs")` call sites (`analyze_start`'s
+    /// `--progress-file` target — worktree-index Task 7). Writing this
+    /// unrouted would create a directory *inside* a linked worktree's own
+    /// checkout — exactly what worktree-index isolation forbids.
+    fn effective_runs_dir(&self) -> PathBuf {
+        self.worktree_gate.as_ref().map_or_else(
+            || loomweave_core::store::store_dir(&self.project_root).join("runs"),
+            |gate| gate.store_paths.runs.clone(),
+        )
     }
 
     /// Override the program `analyze_start` launches (default: `current_exe()`).
@@ -1531,10 +1577,10 @@ impl ServerState {
         _arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
         let path = self.config_file_path();
-        let project_root = self.project_root.clone();
+        let sidecar_path = self.effective_embeddings_path();
         let active_write_tools = self.tool_policy.enable_write_tools;
         let read =
-            tokio::task::spawn_blocking(move || read_semantic_config_status(&path, &project_root))
+            tokio::task::spawn_blocking(move || read_semantic_config_status(&path, &sidecar_path))
                 .await;
         match read {
             Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
@@ -1567,13 +1613,13 @@ impl ServerState {
             ));
         }
         let path = self.config_file_path();
-        let project_root = self.project_root.clone();
+        let sidecar_path = self.effective_embeddings_path();
         let active_write_tools = self.tool_policy.enable_write_tools;
         let write = tokio::task::spawn_blocking(move || {
             let result = update_semantic_config_file(&path, &patch)?;
             Ok::<_, loomweave_federation::config::ConfigError>(semantic_config_status_json(
                 &path,
-                &project_root,
+                &sidecar_path,
                 result.created,
                 &result.config,
             ))
@@ -2321,7 +2367,13 @@ impl ServerState {
             }
         };
 
-        let db_path = loomweave_core::store::db_path(&self.project_root);
+        // A linked worktree's isolated store lives under `effective_db_path`,
+        // never under `db_path(project_root)` (the source root's own,
+        // never-written local store) — this write bypasses `self.readers`
+        // (it needs a write connection), so it must resolve the gate itself
+        // rather than inheriting a correctly-routed connection for free
+        // (worktree-index Task 7).
+        let db_path = self.effective_db_path();
         let project_root = self.project_root.clone();
         let sheet_id = promoted.id.clone();
         let write_result =
@@ -3603,38 +3655,40 @@ fn llm_config_status_json(path: &Path, created_or_absent: bool, config: &McpConf
 
 fn read_semantic_config_status(
     path: &Path,
-    project_root: &Path,
+    sidecar_path: &Path,
 ) -> std::result::Result<Value, loomweave_federation::config::ConfigError> {
     if path.exists() {
         let config = McpConfig::from_path(path)?;
         Ok(semantic_config_status_json(
             path,
-            project_root,
+            sidecar_path,
             false,
             &config,
         ))
     } else {
         Ok(semantic_config_status_json(
             path,
-            project_root,
+            sidecar_path,
             true,
             &McpConfig::default(),
         ))
     }
 }
 
+/// `sidecar_path` must already be the resolved embeddings sidecar leaf (the
+/// caller's `ServerState::effective_embeddings_path()`) — never re-derived
+/// from a project root here, which is exactly the re-derivation that breaks
+/// linked-worktree isolation (worktree-index Task 7). For a standalone
+/// checkout or the main worktree this is byte-identical to the former
+/// `embeddings_db_path(project_root)` derivation.
 fn semantic_config_status_json(
     path: &Path,
-    project_root: &Path,
+    sidecar_path: &Path,
     created_or_absent: bool,
     config: &McpConfig,
 ) -> Value {
     let semantic = &config.semantic_search;
-    // Probe the override-aware store path (the SAME helper `EmbeddingStore::
-    // open_in_store_dir` writes to) so a `[loomweave].store_dir` relocation does
-    // not make a populated sidecar report as absent (read-vs-status parity).
-    let sidecar_path = embeddings_db_path(project_root);
-    let sidecar_count = semantic_sidecar_count(&sidecar_path);
+    let sidecar_count = semantic_sidecar_count(sidecar_path);
     let has_key = std::env::var(&semantic.api_key_env)
         .ok()
         .as_deref()
@@ -7481,7 +7535,7 @@ mod tests {
 
         let status = super::semantic_config_status_json(
             &root.join("loomweave.yaml"),
-            root,
+            &loomweave_storage::embeddings_db_path(root),
             true,
             &loomweave_federation::config::McpConfig::default(),
         );
