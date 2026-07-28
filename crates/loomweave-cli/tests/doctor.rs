@@ -663,7 +663,9 @@ fn doctor_reports_drifted_instructions_block_as_gating_problem() {
     // Hand-edit the body inside the Loomweave span -> Drifted.
     let claude = dir.path().join("CLAUDE.md");
     let content = fs::read_to_string(&claude).unwrap();
-    let drifted = content.replace("code archaeology", "DRIFTED HEADER");
+    // Substituting the body heading (not a marker) keeps the span well-formed
+    // while changing the bytes the drift compare hashes.
+    let drifted = content.replace("## Loomweave", "## DRIFTED HEADER");
     assert_ne!(drifted, content, "test setup: substitution must apply");
     fs::write(&claude, &drifted).unwrap();
 
@@ -755,7 +757,7 @@ fn doctor_json_reports_instructions_block_check_shape() {
     let content = fs::read_to_string(&claude).unwrap();
     fs::write(
         &claude,
-        content.replace("code archaeology", "DRIFTED HEADER"),
+        content.replace("## Loomweave", "## DRIFTED HEADER"),
     )
     .unwrap();
 

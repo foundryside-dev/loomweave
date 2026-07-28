@@ -726,6 +726,31 @@ filigree tracks tasks for this project.\n\
         assert!(INSTRUCTIONS_BODY.contains("loomweave-workflow"));
     }
 
+    /// C-20 budgets the always-loaded surface by number, not by taste: the
+    /// block Loomweave writes into a consuming project's `CLAUDE.md` /
+    /// `AGENTS.md` is paid for on every session, before the first tool call.
+    ///
+    /// Measured on the **rendered block** — markers included — because that is
+    /// what actually lands in the file; the bare asset is asserted too so both
+    /// readings of the convention hold. A version bump lengthens the start
+    /// marker, so the headroom here is deliberate, not slack to spend.
+    #[test]
+    fn rendered_block_fits_the_c20_budget() {
+        let asset = INSTRUCTIONS_BODY.trim_end().chars().count();
+        assert!(
+            asset <= 800,
+            "instructions asset is {asset} chars (C-20 budget 800)"
+        );
+        let block = render_block().chars().count();
+        assert!(
+            block <= 800,
+            "rendered instructions block is {block} chars (C-20 budget 800) — it is a \
+             pointer: what Loomweave is, when to reach for it, where the full reference \
+             lives, and at most two load-bearing rules. Depth belongs in the \
+             loomweave-workflow skill."
+        );
+    }
+
     #[test]
     fn start_prefix_is_not_a_prefix_of_end_marker() {
         // Detection keys the start on START_PREFIX and the end on an exact
@@ -799,7 +824,7 @@ filigree tracks tasks for this project.\n\
         // Hand-edit the body inside the Loomweave span on one file.
         let claude = dir.path().join("CLAUDE.md");
         let content = std::fs::read_to_string(&claude).unwrap();
-        let drifted = content.replace("code archaeology", "DRIFTED HEADER");
+        let drifted = content.replace("## Loomweave", "## DRIFTED HEADER");
         assert_ne!(drifted, content, "test setup: substitution must apply");
         std::fs::write(&claude, &drifted).unwrap();
         assert_eq!(instructions_state(dir.path()), InstructionsState::Drifted);
@@ -851,7 +876,8 @@ filigree tracks tasks for this project.\n\
 
         // 2. Replace (drift): edit the Loomweave body; Filigree still survives.
         let content = std::fs::read_to_string(&claude).unwrap();
-        let drifted = content.replace("code archaeology", "EDITED");
+        let drifted = content.replace("## Loomweave", "## EDITED");
+        assert_ne!(drifted, content, "test setup: substitution must apply");
         std::fs::write(&claude, &drifted).unwrap();
         assert_eq!(instructions_state(dir.path()), InstructionsState::Drifted);
         install_instructions(dir.path()).unwrap();

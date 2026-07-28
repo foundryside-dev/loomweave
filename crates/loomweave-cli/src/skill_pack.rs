@@ -2,13 +2,15 @@
 //!
 //! The pack is compiled into the binary with `include_str!` (matching the
 //! `include_str!` migration-embedding convention in
-//! `loomweave-storage/src/schema.rs`). The asset itself is owned by
-//! `loomweave-mcp` (which this crate depends on), so the embed below reaches
-//! *down* the dependency edge rather than inverting it (clarion-04391392c7).
-//! Each entry is `(relative_path, contents)`;
-//! growing the pack with a `references/` directory is a data change here, not a
-//! logic change. The fingerprint over the pack bytes drives drift-aware
-//! re-copy (Phase 3 hook resync + `--skills` idempotency).
+//! `loomweave-storage/src/schema.rs`). The assets *and* the file manifest are
+//! owned by `loomweave-mcp` (which this crate depends on), so the re-export
+//! below reaches *down* the dependency edge rather than inverting it
+//! (clarion-04391392c7). Each entry is `(relative_path, contents)`; the
+//! `references/` files C-20 relocated the SKILL.md depth into ride along
+//! automatically, because the installer walks whatever the manifest holds.
+//! The fingerprint over the pack bytes drives drift-aware re-copy (Phase 3 hook
+//! resync + `--skills` idempotency), so adding a reference file re-syncs every
+//! already-installed copy on the next run.
 
 use std::fs;
 use std::path::Path;
@@ -16,10 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 /// `(relative_path, contents)` for every file in the bundled skill pack.
-pub const SKILL_PACK: &[(&str, &str)] = &[(
-    "SKILL.md",
-    include_str!("../../loomweave-mcp/assets/skills/loomweave-workflow/SKILL.md"),
-)];
+pub const SKILL_PACK: &[(&str, &str)] = loomweave_mcp::WORKFLOW_SKILL_FILES;
 
 /// The on-disk subdirectory name the pack installs into.
 pub const PACK_DIR_NAME: &str = "loomweave-workflow";

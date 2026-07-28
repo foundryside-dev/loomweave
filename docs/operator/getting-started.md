@@ -254,7 +254,10 @@ creates a missing `loomweave.db`.
 
 Over MCP, the same orientation is available without install: the `initialize`
 result carries an `instructions` field, the `loomweave://context` resource returns
-the live snapshot, and the `loomweave-workflow` prompt returns the skill text.
+the live snapshot, and the `loomweave-workflow` prompt returns `SKILL.md` — the
+skill's entry point. Its depth lives in `references/*.md` alongside the installed
+skill (relocated there under weft convention C-20); the prompt does not inline
+them, so `--skills` / `--codex-skills` is what puts the full reference on disk.
 
 ## 4. Ask
 
