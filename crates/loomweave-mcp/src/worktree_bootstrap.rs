@@ -50,6 +50,24 @@ pub(crate) struct ReadinessRead {
     pub(crate) run_id: Option<String>,
 }
 
+/// Classify readiness from a `runs.status` value, or `None` when no run row
+/// exists at all. The one place the `running`/`completed`/`skipped_no_plugins`/
+/// `failed` → [`WorktreeReadiness`] mapping lives, shared by
+/// [`read_worktree_readiness`] (the gate's own query) and
+/// `tool_project_status` (which reuses the row `latest_run_row` already read
+/// in the same reader closure, rather than re-querying the `runs` table a
+/// second time for the same "most recent row" answer).
+pub(crate) fn classify_readiness(status: Option<&str>) -> WorktreeReadiness {
+    match status {
+        Some("completed" | "skipped_no_plugins") => WorktreeReadiness::Ready,
+        Some("failed") => WorktreeReadiness::BuildFailed,
+        // No row, "running", or any future status this build doesn't yet
+        // know about — treat conservatively as still building rather than
+        // guess.
+        None | Some(_) => WorktreeReadiness::Building,
+    }
+}
+
 /// Read the most recent run row (by `started_at`) and classify readiness.
 ///
 /// Fail-safe on a query error: logs a warning and reports [`WorktreeReadiness::Building`]
@@ -61,20 +79,10 @@ pub(crate) fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
         [],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     ) {
-        Ok((run_id, status)) => {
-            let readiness = match status.as_str() {
-                "completed" | "skipped_no_plugins" => WorktreeReadiness::Ready,
-                "failed" => WorktreeReadiness::BuildFailed,
-                // "running", or any future status this build doesn't yet
-                // know about — treat conservatively as still building rather
-                // than guess.
-                _ => WorktreeReadiness::Building,
-            };
-            ReadinessRead {
-                readiness,
-                run_id: Some(run_id),
-            }
-        }
+        Ok((run_id, status)) => ReadinessRead {
+            readiness: classify_readiness(Some(&status)),
+            run_id: Some(run_id),
+        },
         Err(rusqlite::Error::QueryReturnedNoRows) => ReadinessRead {
             readiness: WorktreeReadiness::Building,
             run_id: None,

@@ -245,11 +245,6 @@ impl ServerState {
                 // Whether this index has any alive SEI bindings (REQ-C-04 /
                 // ADR-038). Degrades to `false` on a pre-SEI database.
                 let sei_populated = has_any_alive_binding(conn).unwrap_or(false);
-                // Worktree-indexes bootstrap gate: only consulted when this
-                // session is gating on it at all (`None` otherwise — a
-                // standalone checkout or the main worktree never runs this
-                // query, so their behavior is unchanged).
-                let readiness = crate::worktree_bootstrap::read_worktree_readiness(conn).readiness;
                 Ok((
                     snapshot,
                     edge_count,
@@ -258,7 +253,6 @@ impl ServerState {
                     latest_run,
                     data_version,
                     sei_populated,
-                    readiness,
                 ))
             })
             .await;
@@ -271,7 +265,6 @@ impl ServerState {
             latest_run,
             data_version,
             sei_populated,
-            readiness,
         ) = match storage {
             Ok(tuple) => tuple,
             Err(err) => {
@@ -284,7 +277,12 @@ impl ServerState {
         };
         // Only a linked worktree's bootstrap gate ever makes this true — a
         // standalone checkout or the main worktree keep reporting real counts
-        // exactly as before Task 5.
+        // exactly as before Task 5. Classified from the same `latest_run` row
+        // already read above (`latest_run_row`) rather than a second `runs`
+        // query for the same "most recent row" answer.
+        let readiness = crate::worktree_bootstrap::classify_readiness(
+            latest_run.get("status").and_then(Value::as_str),
+        );
         let building = self.worktree_gate.is_some()
             && !matches!(
                 readiness,
