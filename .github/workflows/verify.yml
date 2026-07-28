@@ -143,6 +143,19 @@ jobs:
       # zero tests, the step must error, not pass vacuously. Do not add
       # `--no-tests=pass` here to "fix" a red run — that would silently
       # disable this gate instead of running it.
+      #
+      # Ubuntu 24.04 (current ubuntu-latest) restricts unprivileged user
+      # namespaces via AppArmor by default (`kernel.apparmor_restrict_
+      # unprivileged_userns=1`); lift it first (ubuntu-latest has
+      # passwordless sudo) so `unshare(CLONE_NEWUSER)` can actually succeed.
+      # Do NOT remove this thinking it's stray/unexplained sudo — without
+      # it, the suite below fails loud with a capability diagnostic instead
+      # of testing confinement. The suite itself stays fail-loud exactly as
+      # designed: this only grants the *capability* to acquire a namespace,
+      # it doesn't touch how the test asserts once it has one.
+      - name: allow unprivileged user namespaces (Ubuntu 24.04 AppArmor)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: confined-deletion privileged suite
         run: cargo nextest run -p loomweave-cli --run-ignored ignored-only -E 'test(bind_mount)'
 
