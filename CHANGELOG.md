@@ -20,6 +20,32 @@ only when an incompatible change is made to that surface. See
   partial even on a short final page, and aggregate scans fail completeness
   closed when their bounded source scan cannot cover every candidate.
 
+- **Single-source instruction block on a CLAUDE.md → AGENTS.md redirect**
+  (weft convention C-20). When a project's `CLAUDE.md` carries, outside every
+  managed block, a line that is solely `@AGENTS.md` / `@./AGENTS.md`, `loomweave
+  install` now writes its block to `AGENTS.md` alone — creating it if absent —
+  and migrates any legacy `CLAUDE.md` block out under the C-4 own-namespace and
+  foreign-safe rules. Projects with no such redirect keep the existing
+  dual-write unchanged. `loomweave doctor` inverts to match: under a redirect
+  the block's *absence* from `CLAUDE.md` is the healthy state, a leftover block
+  is a gating problem, and `--fix` migrates it rather than re-injecting.
+  Detection fails safe — an absent, unreadable, non-UTF-8 or symlinked
+  `CLAUDE.md` reads as no redirect.
+
+### Changed
+
+- **The always-loaded agent-context surface is now budgeted** (weft convention
+  C-20). The instruction block injected into `CLAUDE.md`/`AGENTS.md` shrank from
+  1,731 to 789 chars and is now a pointer — what Loomweave is, when to reach for
+  it, where the full reference lives, and two load-bearing rules. The
+  `loomweave-workflow` skill's `SKILL.md` shrank from 36,249 to 3,744 chars; its
+  depth moved **verbatim** into five on-demand `references/*.md` files shipped
+  with the skill (`tools`, `catalogue`, `freshness`, `gotchas`, `entity-ids`).
+  Nothing was deleted — `loomweave install --skills` / `--codex-skills` install
+  the reference files alongside `SKILL.md`. The MCP `loomweave-workflow` prompt
+  serves `SKILL.md` only; the references are read from the installed skill
+  directory.
+
 ### Fixed
 
 - **Doctor bootstrap-state repair.** `loomweave doctor` now warns when an
