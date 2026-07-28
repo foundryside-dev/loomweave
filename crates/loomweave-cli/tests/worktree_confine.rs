@@ -6,10 +6,15 @@
 //! platform. Real confined deletion only exists on Linux (`openat2`); every
 //! other test here exercises that mechanism end to end (grammar checks
 //! included, for a coherent single suite) and is
-//! `#[cfg(target_os = "linux")]`. CI's nextest leg runs Linux only (the
-//! `rust-macos` job is clippy + build, no nextest), so this gating only
-//! matters for a local macOS dev running `cargo nextest run` directly —
-//! those tests simply won't be compiled in.
+//! `#[cfg(target_os = "linux")]`. CI's nextest leg runs Linux only, but the
+//! `rust-macos` job still *compiles* this file — it runs
+//! `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+//! and `--all-targets` includes integration tests even though nextest never
+//! executes them there. That means every top-level item this file imports
+//! or defines must still make sense under `-D warnings` on a non-Linux
+//! target, not just the `#[cfg(target_os = "linux")]` test bodies
+//! themselves — see the `RefusalReason`/`WorktreesRoot` import below, gated
+//! the same way for exactly this reason.
 //!
 //! The privileged bind-mount suite (`bind_mount_beneath_candidate_refuses_deletion`)
 //! is additionally `#[ignore]`d; see its own doc comment for how to run it
@@ -25,10 +30,17 @@
 
 use std::fs;
 
-use loomweave_cli::worktree::confine::{
-    DeleteOutcome, RefusalReason, WorktreesRoot, refuse_unsupported,
-};
+use loomweave_cli::worktree::confine::{DeleteOutcome, refuse_unsupported};
 use tempfile::TempDir;
+
+// `RefusalReason` and `WorktreesRoot` are exercised only by the
+// `#[cfg(target_os = "linux")]` tests below (real confined deletion is a
+// Linux-only mechanism — see the module doc comment). Gating the import the
+// same way keeps this file itself compiling clean on a non-Linux
+// `--all-targets` build (e.g. the `rust-macos` clippy gate), which does not
+// skip test targets just because nextest never runs them there.
+#[cfg(target_os = "linux")]
+use loomweave_cli::worktree::confine::{RefusalReason, WorktreesRoot};
 
 /// A syntactically valid `wt-[0-9a-f]{64}` name, built by repeating one hex
 /// digit — deterministic and trivially distinct across tests that need more

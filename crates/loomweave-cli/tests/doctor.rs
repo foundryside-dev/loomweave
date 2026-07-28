@@ -234,6 +234,32 @@ fn classifier_coverage(
     })
 }
 
+/// Seed a `completed` classifier-coverage run with a clean, error-free sweep
+/// (`source_walk_complete: true`, zero skipped entries, zero plugin-discovery
+/// errors, no plugins) directly into the catalogue `write_healthy_db`/`install`
+/// already created at `root`.
+///
+/// For tests whose subject is a DIFFERENT orientation surface (MCP
+/// registration, integration bindings, the instructions block, the
+/// git-tracked-db repair, ...): without a seeded run, `check_classifier_json`
+/// treats "no run exists yet" plus `--fix` as license to shell out to
+/// `loomweave analyze` (`repair_classifier_analysis`), whose plugin discovery
+/// walks the test PROCESS's real `$PATH` — harmless on a dev box with real
+/// plugins installed, but a hard failure on a CI runner whose `$PATH`
+/// includes a world-writable tool-cache directory the plugin loader's own
+/// security check refuses. Seeding a healthy run here means the classifier
+/// repair branch never fires, so these tests stop depending on what's
+/// discoverable on `$PATH` at all. Call this after `install(...)` or
+/// `write_healthy_db(...)` has created `.weft/loomweave/loomweave.db`.
+fn seed_completed_classifier_run(root: &Path) {
+    insert_run_stats(
+        root,
+        "seed-classifier-run",
+        "completed",
+        &classifier_coverage(true, 0, &serde_json::json!([])),
+    );
+}
+
 fn plugin_coverage(
     id: &str,
     status: &str,
@@ -303,6 +329,10 @@ fn doctor_fix_registers_mcp_then_reports_healthy() {
     // Materialise a healthy DB so the index health check reports ok rather than
     // the absent-DB warning, which would prevent "All orientation surfaces healthy."
     write_healthy_db(dir.path());
+    // This test's subject is MCP registration repair, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
 
     let (code, out) = doctor(dir.path(), true);
     assert_eq!(code, 0, "--fix should repair and exit 0; stdout:\n{out}");
@@ -384,6 +414,10 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
     // the absent-DB warning. A never-analysed DB and its missing identity are
     // now reported independently from the integration binding warning.
     write_healthy_db(dir.path());
+    // This test's subject is integration-binding repair, not classifier
+    // repair — seed a healthy run so `--fix` never shells out to
+    // `loomweave analyze` (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
 
     let (code, out) = doctor(dir.path(), false);
     assert_eq!(
@@ -569,6 +603,10 @@ fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
 fn doctor_flags_untrusted_mcp_command_without_clobbering_it() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is untrusted-MCP-command detection, not classifier
+    // repair — seed a healthy run so `--fix` never shells out to
+    // `loomweave analyze` (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     let canon = dir.path().canonicalize().unwrap().display().to_string();
     fs::write(
         dir.path().join(".mcp.json"),
@@ -628,6 +666,10 @@ fn doctor_flags_untrusted_mcp_command_without_clobbering_it() {
 fn doctor_reports_missing_instructions_block_as_warning() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is the instructions block, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     // Drop the Loomweave block from one target file -> aggregate is Missing.
     fs::write(dir.path().join("AGENTS.md"), "# just notes\n").unwrap();
 
@@ -660,6 +702,10 @@ fn doctor_reports_missing_instructions_block_as_warning() {
 fn doctor_reports_drifted_instructions_block_as_gating_problem() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is the instructions block, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     // Hand-edit the body inside the Loomweave span -> Drifted.
     let claude = dir.path().join("CLAUDE.md");
     let content = fs::read_to_string(&claude).unwrap();
@@ -694,6 +740,10 @@ fn doctor_reports_drifted_instructions_block_as_gating_problem() {
 fn doctor_reports_malformed_instructions_block_as_gating_problem() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is the instructions block, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     // Replace one target file's block with a dangling start marker.
     fs::write(
         dir.path().join("CLAUDE.md"),
@@ -737,6 +787,10 @@ fn doctor_reports_malformed_instructions_block_as_gating_problem() {
 fn doctor_json_reports_instructions_block_check_shape() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is the instructions block, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
 
     // Healthy: instructions.block is ok, not fixed.
     let (code, json) = doctor_json(dir.path(), false);
@@ -1783,6 +1837,10 @@ fn doctor_flags_git_tracked_db_as_problem_and_fix_untracks_it() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
     write_healthy_db(dir.path());
+    // This test's subject is the git-tracked-db repair, not classifier
+    // repair — seed a healthy run so `--fix` never shells out to
+    // `loomweave analyze` (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     run_git(dir.path(), &["init", "-q"]);
     run_git(dir.path(), &["config", "user.email", "t@t"]);
     run_git(dir.path(), &["config", "user.name", "t"]);

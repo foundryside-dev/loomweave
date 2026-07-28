@@ -55,10 +55,12 @@
 //!
 //! [`rustix::fs::openat2`]: rustix::fs::openat2
 
-use std::ffi::CStr;
 use std::fmt;
 use std::io;
 use std::path::Path;
+
+#[cfg(target_os = "linux")]
+use std::ffi::CStr;
 
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
