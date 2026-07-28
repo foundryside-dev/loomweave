@@ -1086,8 +1086,10 @@ dependencies = [
  "loomweave-plugin-fixture",
  "loomweave-scanner",
  "loomweave-storage",
+ "loomweave-worktree-confine-probe",
  "reqwest",
  "rusqlite",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serde_norway",
@@ -1230,6 +1232,14 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "loomweave-worktree-confine-probe"
+version = "1.5.0"
+dependencies = [
+ "loomweave-cli",
+ "rustix 1.1.4",
 ]
 
 [[package]]

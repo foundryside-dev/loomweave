@@ -11,6 +11,7 @@ members = [
     "crates/loomweave-plugin-fixture",
     "crates/loomweave-plugin-rust",
     "crates/loomweave-scanner",
+    "crates/loomweave-worktree-confine-probe",
 ]
 # The Rust plugin's distribution crate is DELIBERATELY excluded: its bin is
 # named on the `loomweave-plugin-*` discovery glob (for the wheel), which must
@@ -74,3 +75,4 @@ xgraph = "2.0.0"
 assert_cmd = "2"
 tempfile = "3"
 nix = { version = "0.28", default-features = false, features = ["resource"] }
+rustix = "1.1.4"
