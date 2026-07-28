@@ -180,6 +180,57 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
         return SweepOutcome::GitCommonDirUnresolvable;
     };
 
+    // ORDERING INVARIANT — candidates are read BEFORE the registered set,
+    // never the reverse. Do not swap this back without re-deriving both
+    // directions of the race below; a prior version of this function read
+    // registered first and had a real bug in the unsafe direction.
+    //
+    // `ensure_isolated_store` (Task 3) always creates a worktree's isolated
+    // store *after* `git worktree add` has already created its admin entry
+    // (see `store_created_for_a_just_registered_worktree_is_preserved` in
+    // `tests/worktree_sweep.rs`, which pins that ordering). So between this
+    // function's two reads, only two kinds of change are possible for any
+    // one worktree: it goes from "not yet registered, no store" to
+    // "registered, store exists" (a fresh `git worktree add` +
+    // `ensure_isolated_store` completing mid-sweep), or from "registered,
+    // store exists" to "unregistered, store still exists" (`git worktree
+    // remove`, which deletes the admin entry but has no idea this store
+    // directory even exists).
+    //
+    // Reading registered FIRST (the old, unsafe order) gets the first case
+    // wrong: a worktree registered and store-created entirely within the
+    // window between the two reads is captured as "not registered" by the
+    // (already-read) registered set, but its now-existing store IS captured
+    // by the (later-read) candidate set — misclassified as unregistered,
+    // and deleted: a live, just-registered worktree's store destroyed by
+    // the sweep. Reading candidates FIRST closes that direction: a store
+    // that does not exist yet at the candidate read is simply absent from
+    // the candidate set and not considered at all this cycle — the next
+    // sweep, run after the race has resolved one way or the other, sees it
+    // correctly either way.
+    //
+    // The residual direction — a worktree unregistered (`git worktree
+    // remove`) inside the window — has candidates (read first) capturing
+    // the store as present, and registered (read second, after the
+    // removal) correctly reporting it absent, so it IS deleted this cycle
+    // rather than the next. That is not a hazard: the design's accepted
+    // no-activity-lock race already treats "worktree just removed, its
+    // store swept promptly" as correct (see the module docs, "The accepted
+    // race" — nothing can rebuild that store once the worktree is gone
+    // either way, one sweep cycle earlier changes nothing).
+    let candidates = match store_candidates(&worktrees_dir) {
+        Ok(names) => names,
+        Err(err) => {
+            warn!(
+                worktrees_dir = %worktrees_dir.display(),
+                error = %err,
+                "worktree cleanup sweep: could not enumerate worktree store candidates; \
+                 aborting, nothing deleted"
+            );
+            return SweepOutcome::StoreDirUnreadable;
+        }
+    };
+
     let admin_dir = common_dir.join(WORKTREES_DIR_NAME);
     let registered = match registered_stable_ids(&admin_dir) {
         Ok(ids) => ids,
@@ -191,19 +242,6 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
                  directory; aborting, nothing deleted"
             );
             return SweepOutcome::AdminDirUnreadable;
-        }
-    };
-
-    let candidates = match store_candidates(&worktrees_dir) {
-        Ok(names) => names,
-        Err(err) => {
-            warn!(
-                worktrees_dir = %worktrees_dir.display(),
-                error = %err,
-                "worktree cleanup sweep: could not enumerate worktree store candidates; \
-                 aborting, nothing deleted"
-            );
-            return SweepOutcome::StoreDirUnreadable;
         }
     };
 
@@ -293,12 +331,54 @@ fn acquire_gc_lock(worktrees_dir: &Path) -> io::Result<GcLock> {
     }
 }
 
+/// [`loomweave_core::hardened_git::hardened_git_command`], plus one narrow
+/// guard this module needs that `hardened_git_command` itself does not
+/// (yet) provide: `GIT_DIR`, `GIT_COMMON_DIR`, and `GIT_WORK_TREE` are
+/// explicitly removed from the child's environment.
+///
+/// **The hazard.** `-C <dir>` does not override an *exported* `GIT_DIR`: if
+/// the Loomweave process inherits `GIT_DIR` from its parent — a Git hook
+/// running in a different repository, `git rebase --exec 'loomweave ...'`,
+/// a CI runner that exports it for its own purposes — `git rev-parse
+/// --git-common-dir` answers for that FOREIGN repository, not
+/// `primary_root`'s. Combined with [`registered_stable_ids`]'s
+/// `NotFound` → empty-registered-set rule (see its doc comment), a foreign
+/// repository that happens to have no `worktrees/` admin directory of its
+/// own — the common case — makes the registered set empty, so *every* real
+/// `wt-*` store under this repository reads as unregistered and gets
+/// deleted, live ones included. `GIT_COMMON_DIR` and `GIT_WORK_TREE` are
+/// stripped alongside `GIT_DIR` because either can also redirect Git's
+/// discovery away from `primary_root`.
+///
+/// `Command::env_remove` is unconditional: the child process will not see
+/// the named variable regardless of what this process's own environment
+/// contains, so this closes the hazard completely for the one `git`
+/// invocation the sweep makes — see
+/// `git_common_dir_command_strips_foreign_git_env_vars` below, which
+/// asserts exactly that on the constructed [`std::process::Command`]
+/// without needing to mutate any real environment.
+///
+/// This is a narrow, sweep-local guard, not a general fix: full
+/// Git-environment sanitization for `hardened_git_command` itself is
+/// tracked separately (clarion-9202f4acec) and is deliberately not folded
+/// in here — this module's own deletion-adjacent path needed to stop
+/// trusting the ambient environment now, independent of when that broader
+/// work lands.
+fn hardened_git_command_for_sweep(dir: &Path) -> std::process::Command {
+    let mut command = loomweave_core::hardened_git::hardened_git_command(dir);
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE");
+    command
+}
+
 /// Resolve `primary_root`'s common Git directory via one hardened `git
 /// rev-parse` — `None` on any failure (missing `git`, not a repository, a
 /// non-zero exit, or non-UTF-8 output), which every caller treats as an
 /// abort signal, never a hard error.
 fn git_common_dir(primary_root: &Path) -> Option<PathBuf> {
-    let output = loomweave_core::hardened_git::hardened_git_command(primary_root)
+    let output = hardened_git_command_for_sweep(primary_root)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
         .ok()?;
@@ -382,4 +462,51 @@ fn store_candidates(worktrees_dir: &Path) -> io::Result<Vec<String>> {
         }
     }
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The review-critical env-leakage guard (see
+    /// [`hardened_git_command_for_sweep`]'s doc comment for the hazard):
+    /// `GIT_DIR`, `GIT_COMMON_DIR`, and `GIT_WORK_TREE` must be explicit
+    /// removals on the `Command` this module hands to `git rev-parse
+    /// --git-common-dir`, so a foreign value inherited from the process
+    /// environment can never reach that invocation.
+    ///
+    /// This is a unit test, not an integration test mutating the real
+    /// process environment via `std::env::set_var`/`remove_var`, because
+    /// this workspace denies `unsafe_code` everywhere except one documented
+    /// site in the plugin host (`CLAUDE.md`), and `std::env::set_var` /
+    /// `remove_var` are `unsafe fn` on this toolchain — confirmed by
+    /// attempting exactly that in `tests/worktree_sweep.rs` and getting a
+    /// hard compiler error (`-D unsafe-code`), not just a lint warning.
+    /// `Command::env_remove` is documented to unconditionally exclude the
+    /// named variable from the child's environment regardless of what the
+    /// parent process's environment contains, so asserting the removal is
+    /// present on the constructed command is a complete, deterministic
+    /// proof of the behavioral guarantee — not merely a proxy for one —
+    /// without needing to touch any real environment variable at all.
+    #[test]
+    fn git_common_dir_command_strips_foreign_git_env_vars() {
+        let dir = Path::new("/does/not/need/to/exist/for/this/check");
+        let command = hardened_git_command_for_sweep(dir);
+
+        // `env_remove` records the key with a `None` value in the command's
+        // env-modification table; a `Some(_)` entry would be an explicit
+        // `.env(...)` SET, not a removal — only `None` entries count here.
+        let removed: std::collections::HashSet<&str> = command
+            .get_envs()
+            .filter_map(|(key, value)| (value.is_none()).then(|| key.to_str()).flatten())
+            .collect();
+
+        for hazardous in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"] {
+            assert!(
+                removed.contains(hazardous),
+                "{hazardous} must be an explicit removal on the git_common_dir \
+                 command's environment; got removed={removed:?}"
+            );
+        }
+    }
 }
