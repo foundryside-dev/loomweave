@@ -1,0 +1,31 @@
+[package]
+name = "loomweave-worktree-confine-probe"
+description = "Test-only privileged helper for the confined-deletion bind-mount suite (never published)."
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# `unshare(CLONE_NEWUSER)` requires a single-threaded process. A `#[test]`
+# harness process never is one (see the doc comment on
+# `bind_mount_beneath_candidate_refuses_deletion` in
+# `loomweave-cli/tests/worktree_confine.rs`), so that test spawns this
+# freshly-started, genuinely single-threaded binary to do the privileged
+# namespace/mount setup and run the real confinement check from inside it.
+[[bin]]
+name = "loomweave-worktree-confine-probe"
+path = "src/main.rs"
+
+[dependencies]
+# Regular (not dev) dependency: this binary's whole job is to drive the
+# real primitive. `loomweave-cli` depends back on this crate only as a
+# dev-dependency (test-only), so the cycle is entirely through a
+# dev-dependency edge — a pattern Cargo supports (see also
+# `loomweave-plugin-fixture`, depended on the same way by `loomweave-cli`).
+loomweave-cli = { path = "../loomweave-cli" }
+rustix = { workspace = true, features = ["fs", "mount", "thread", "process"] }

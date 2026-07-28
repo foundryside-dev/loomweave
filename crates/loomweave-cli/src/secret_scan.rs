@@ -241,8 +241,15 @@ impl SecretScanOutcome {
     }
 }
 
+/// `project_root` is the source tree being scanned (used to normalise
+/// finding paths); `store_root` is the resolved store the secrets baseline
+/// lives under — the caller's `WorktreeContext::effective_store`, never
+/// re-derived here from `project_root` (which, for a linked worktree, is
+/// the never-populated `.weft/loomweave/` under the worktree's own
+/// checkout — worktree-index Task 7).
 pub(crate) fn pre_ingest(
     project_root: &Path,
+    store_root: &Path,
     source_files: &[PathBuf],
     options: &SecretScanOptions,
 ) -> Result<SecretScanOutcome> {
@@ -251,7 +258,7 @@ pub(crate) fn pre_ingest(
         .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
     let project_root = project_root.as_path();
     let scanner = Scanner::new();
-    let (baseline, mut findings) = baseline::load_for_scan(project_root)?;
+    let (baseline, mut findings) = baseline::load_for_scan(project_root, store_root)?;
     let mut per_file = Vec::new();
     let mut all_allowed = Vec::new();
     let mut baseline_matches = Vec::new();
@@ -655,6 +662,7 @@ mod tests {
 
         let outcome = pre_ingest(
             tmp.path(),
+            &loomweave_core::store::store_dir(tmp.path()),
             &[clean.clone(), secret.clone()],
             &SecretScanOptions {
                 override_policy: OverridePolicy::Preconfirmed(ConfirmToken),

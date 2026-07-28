@@ -179,3 +179,61 @@ loomweave_commit: cbc433c5b350b62ad8c6033a08abae2361868add
 - regression_guard_scaled_by_ratio: max_mini_seconds=30.000, min_resolved_references=1549, observed_resolved_references=1549
 - gate_thresholds_scaled_by_ratio: green_mini_seconds=300.000, red_mini_seconds=1800.000, green_full_seconds=3600.000, red_full_seconds=21600.000
 - decision: GREEN
+## 2026-07-28T19:54:22+00:00 - GREEN
+
+date: 2026-07-28
+outcome: GREEN
+calibration_machine: Linux 6.8.0-136-generic #136-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul  1 21:53:05 UTC 2026 x86_64 GNU/Linux; Python 3.12.3
+operator_hardware_ratio: 1.0
+pyright_pin: 1.1.409
+loomweave_commit: bbf5e1a60c643bfc85a88dbdf909f9c6f5bb2851
+
+### Corpus Results
+- elspeth_mini:
+  - file_count: 80
+  - function_count: 828
+  - total_wall_ms: 8975
+  - pyright_init_ms: 155
+  - per_file_resolution_median_ms: 22
+  - per_file_resolution_p95_ms: 162
+  - parent_walk_overhead_ms: 401
+  - cli_overhead_ms: 4387
+  - outgoing_calls_requests_total: 828
+  - outgoing_calls_requests_per_file: 10.35
+  - calls_edges_total: 830
+  - ambiguous_edges_total: 4
+  - ambiguous_edge_ratio: 0.0048
+  - unresolved_call_site_count: 3744
+  - persisted_run_stats: `{"ambiguous_edges_total": 4, "classifier_coverage": {"plugin_discovery_complete": true, "plugin_discovery_error_samples": [], "plugin_discovery_errors": 0, "plugins": [{"analyzed_files": 80, "classifier_tags": ["cli-command", "data-model", "entry-point", "exported-api", "framework-handler", "http-route", "public-surface", "test"], "degraded_files": 0, "matched_files": 80, "ontology_version": "0.12.0", "plugin_id": "python", "plugin_version": "1.5.0", "retained_files": 0, "status": "complete"}, {"analyzed_files": 0, "classifier_tags": ["allow-dead-code", "cli-command", "entry-point", "exported-api", "framework-handler", "http-route", "test"], "degraded_files": 0, "matched_files": 0, "ontology_version": "0.9.0", "plugin_id": "rust", "plugin_version": "1.5.0", "retained_files": 0, "status": "not-applicable"}], "schema": "loomweave.classifier-coverage.v1", "source_walk_complete": true, "source_walk_skipped_entries": 0}, "clustering": {"algorithm": "leiden", "configured_algorithm": "leiden", "duration_ms": 9, "edge_types": ["imports", "calls"], "enabled": true, "in_subsystem_edges_inserted": 49, "max_iterations": 100, "min_cluster_size": 3, "modularity_score": 0.18311829314480496, "module_count": 80, "module_edge_count": 206, "resolution": 1.0, "seed": 42, "skipped_reason": null, "status": "completed", "subsystem_count": 8, "subsystems_inserted": 8, "weak_modularity_finding_emitted": true, "weak_modularity_threshold": 0.3, "weight_by": "reference_count"}, "dropped_edges_total": 0, "edges_inserted": 3634, "entities_inserted": 1325, "extractor_parse_latency_p95_ms": 6, "failure_findings": 0, "imports_skipped_external_total": 839, "plugin_edges_dropped_unseen_total": 0, "pyright_index_parse_latency_p95_ms": 4, "pyright_query_latency_p95_ms": 153, "reference_sites_total": 6749, "references_resolved_total": 1549, "references_skipped_cap_total": 0, "references_skipped_external_total": 4735, "skipped_files": 0, "source_walk_error_samples": [], "source_walk_errors_omitted": 0, "source_walk_skipped_entries": 0, "unresolved_call_sites_total": 3744, "unresolved_reference_sites_total": 5200}`
+- synthetic:
+  - file_count: 1
+  - function_count: 10
+  - total_wall_ms: 599
+  - pyright_init_ms: 155
+  - per_file_resolution_median_ms: 231
+  - per_file_resolution_p95_ms: 231
+  - parent_walk_overhead_ms: 2
+  - cli_overhead_ms: 211
+  - outgoing_calls_requests_total: 10
+  - outgoing_calls_requests_per_file: 10.00
+  - calls_edges_total: 3
+  - ambiguous_edges_total: 1
+  - ambiguous_edge_ratio: 0.3333
+  - unresolved_call_site_count: 2
+  - persisted_run_stats: `{"ambiguous_edges_total": 1, "classifier_coverage": {"plugin_discovery_complete": true, "plugin_discovery_error_samples": [], "plugin_discovery_errors": 0, "plugins": [{"analyzed_files": 1, "classifier_tags": ["cli-command", "data-model", "entry-point", "exported-api", "framework-handler", "http-route", "public-surface", "test"], "degraded_files": 0, "matched_files": 1, "ontology_version": "0.12.0", "plugin_id": "python", "plugin_version": "1.5.0", "retained_files": 0, "status": "complete"}, {"analyzed_files": 0, "classifier_tags": ["allow-dead-code", "cli-command", "entry-point", "exported-api", "framework-handler", "http-route", "test"], "degraded_files": 0, "matched_files": 0, "ontology_version": "0.9.0", "plugin_id": "rust", "plugin_version": "1.5.0", "retained_files": 0, "status": "not-applicable"}], "schema": "loomweave.classifier-coverage.v1", "source_walk_complete": true, "source_walk_skipped_entries": 0}, "clustering": {"algorithm": "leiden", "configured_algorithm": "leiden", "duration_ms": 1, "edge_types": ["imports", "calls"], "enabled": true, "in_subsystem_edges_inserted": 0, "max_iterations": 100, "min_cluster_size": 3, "modularity_score": null, "module_count": 1, "module_edge_count": 0, "resolution": 1.0, "seed": 42, "skipped_reason": "no_module_dependency_edges", "status": "skipped", "subsystem_count": 0, "subsystems_inserted": 0, "weak_modularity_finding_emitted": false, "weak_modularity_threshold": 0.3, "weight_by": "reference_count"}, "dropped_edges_total": 0, "edges_inserted": 25, "entities_inserted": 14, "extractor_parse_latency_p95_ms": 1, "failure_findings": 0, "imports_skipped_external_total": 4, "plugin_edges_dropped_unseen_total": 0, "pyright_index_parse_latency_p95_ms": 1, "pyright_query_latency_p95_ms": 220, "reference_sites_total": 62, "references_resolved_total": 12, "references_skipped_cap_total": 0, "references_skipped_external_total": 50, "skipped_files": 0, "source_walk_error_samples": [], "source_walk_errors_omitted": 0, "source_walk_skipped_entries": 0, "unresolved_call_sites_total": 2, "unresolved_reference_sites_total": 50}`
+
+### Extrapolation
+- formula: `T_mini x (F_target / F_mini)`
+- mini_wall_seconds: 8.975
+- mini_function_count: 828
+- elspeth_full_function_count: 9070
+- elspeth_full_projected_seconds: 98.313
+- elspeth_full_projected_minutes: 1.639
+- next_tier_function_count: 85365
+- next_tier_projected_seconds: 925.303
+- next_tier_projected_minutes: 15.422
+
+### Decision
+- regression_guard_scaled_by_ratio: max_mini_seconds=30.000, min_resolved_references=1549, observed_resolved_references=1549
+- gate_thresholds_scaled_by_ratio: green_mini_seconds=300.000, red_mini_seconds=1800.000, green_full_seconds=3600.000, red_full_seconds=21600.000
+- decision: GREEN

@@ -626,3 +626,44 @@ fn install_force_reinitialises_a_real_store() {
         "--force should re-create a fresh store at the default location"
     );
 }
+
+/// worktree-indexes Task 7: `--force`'s recursive delete must refuse when
+/// `<store>/worktrees/` holds any `wt-[0-9a-f]{64}` isolated store — those
+/// are OTHER linked worktrees' live indexes (worktree-index Task 3), not
+/// disposable scratch under the primary's own store. Wiping them blind
+/// would destroy state a concurrently-running `serve` may hold open.
+#[test]
+fn install_force_refuses_to_remove_a_populated_worktrees_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    let worktrees_dir = dir.path().join(".weft/loomweave/worktrees");
+    let stable_id = format!("wt-{}", "a".repeat(64));
+    let wt_store = worktrees_dir.join(&stable_id);
+    fs::create_dir_all(&wt_store).unwrap();
+    fs::write(wt_store.join("loomweave.db"), b"not empty").unwrap();
+
+    let assert = loomweave_bin()
+        .args(["install", "--force", "--path"])
+        .arg(dir.path())
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("loomweave worktree analyze"),
+        "refusal diagnostic must point at `loomweave worktree analyze`: {stderr}"
+    );
+    assert!(
+        wt_store.join("loomweave.db").exists(),
+        "--force must not delete a populated worktrees/ namespace: {stderr}"
+    );
+    assert!(
+        dir.path().join(".weft/loomweave/loomweave.db").exists(),
+        "the refused --force must leave the primary store itself untouched too: {stderr}"
+    );
+}

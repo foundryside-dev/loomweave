@@ -24,6 +24,14 @@ pub const PORT_BAND_BASE: u16 = 9400;
 pub const PORT_BAND_SPAN: u16 = 1000;
 
 /// Canonical path of the published port file for a project root.
+///
+/// This derives the file location from `project_root` via
+/// `loomweave_core::store::store_dir` — correct for a standalone checkout or
+/// the main worktree of a repository, but NOT for a linked `git worktree`,
+/// whose isolated store lives elsewhere
+/// (`loomweave_core::worktree::WorktreeContext::store_paths`). A caller that
+/// has already resolved a `StorePaths` should use its `port` leaf (and the
+/// `*_at` functions below) directly instead of re-deriving this path.
 #[must_use]
 pub fn published_port_path(project_root: &Path) -> PathBuf {
     loomweave_core::store::store_dir(project_root).join("ephemeral.port")
@@ -64,7 +72,16 @@ pub fn deterministic_port(project_root: &Path) -> u16 {
 /// parse already bounds `1..=65535` except `0`, which we reject explicitly.
 #[must_use]
 pub fn read_published_port(project_root: &Path) -> Option<u16> {
-    let raw = std::fs::read_to_string(published_port_path(project_root)).ok()?;
+    read_published_port_at(&published_port_path(project_root))
+}
+
+/// [`read_published_port`], reading the exact leaf path given (e.g. a
+/// resolved `StorePaths::port`) instead of re-deriving it from a project
+/// root. Use this when the caller already knows which store — the primary's
+/// own, or a linked worktree's isolated one — it means.
+#[must_use]
+pub fn read_published_port_at(port_path: &Path) -> Option<u16> {
+    let raw = std::fs::read_to_string(port_path).ok()?;
     raw.trim().parse::<u16>().ok().filter(|port| *port != 0)
 }
 
@@ -78,13 +95,29 @@ pub fn read_published_port(project_root: &Path) -> Option<u16> {
 /// Returns the underlying I/O error if the directory cannot be created or the
 /// temp file cannot be written/renamed.
 pub fn publish_port(project_root: &Path, port: u16) -> std::io::Result<()> {
-    let dir = loomweave_core::store::store_dir(project_root);
-    std::fs::create_dir_all(&dir)?;
+    publish_port_at(&published_port_path(project_root), port)
+}
+
+/// [`publish_port`], writing the exact leaf path given (e.g. a resolved
+/// `StorePaths::port`) instead of re-deriving it from a project root. The
+/// parent directory is created if absent, exactly like `publish_port`.
+///
+/// # Errors
+/// Returns the underlying I/O error if the directory cannot be created or the
+/// temp file cannot be written/renamed.
+pub fn publish_port_at(port_path: &Path, port: u16) -> std::io::Result<()> {
+    let Some(dir) = port_path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("port path {} has no parent directory", port_path.display()),
+        ));
+    };
+    std::fs::create_dir_all(dir)?;
     // One `serve` per process publishes, so the PID makes the temp name unique
     // within this directory without needing a random suffix.
     let tmp = dir.join(format!("ephemeral.port.{}.tmp", std::process::id()));
     std::fs::write(&tmp, format!("{port}\n"))?;
-    if let Err(err) = std::fs::rename(&tmp, published_port_path(project_root)) {
+    if let Err(err) = std::fs::rename(&tmp, port_path) {
         // A successful write + failed rename would otherwise strand the temp.
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
@@ -121,8 +154,15 @@ pub fn remove_published_port(project_root: &Path) {
 /// degrades, never corrupts). A missing file is a no-op (idempotent), like
 /// [`remove_published_port`].
 pub fn remove_published_port_if_matches(project_root: &Path, port: u16) {
-    if read_published_port(project_root) == Some(port) {
-        let _ = std::fs::remove_file(published_port_path(project_root));
+    remove_published_port_if_matches_at(&published_port_path(project_root), port);
+}
+
+/// [`remove_published_port_if_matches`], acting on the exact leaf path given
+/// (e.g. a resolved `StorePaths::port`) instead of re-deriving it from a
+/// project root.
+pub fn remove_published_port_if_matches_at(port_path: &Path, port: u16) {
+    if read_published_port_at(port_path) == Some(port) {
+        let _ = std::fs::remove_file(port_path);
     }
 }
 

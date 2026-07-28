@@ -126,8 +126,23 @@ local store.
 Every command and service that reads or writes runtime state receives
 `StorePaths` or an explicit leaf path rather than re-deriving from a source
 root. This covers `analyze`, MCP/HTTP reader state, embeddings, diagnostics,
-instance ID, own port, `db`, `guidance`, `doctor`, hooks, and the secret-scan
-baseline.
+instance ID, own port, `db`, `guidance`, hooks, and the secret-scan baseline.
+`doctor` is covered deliberately partially: the `.weft/loomweave.schema`
+check (both its text and JSON renderers) and the `http.instance_id` check
+redirect to worktree-aware messaging for a linked worktree, and an
+additive, read-only `worktree_stores` check reports every isolated store's
+health under its own stable ID; every other doctor check stays root-derived
+from the literal `--path`, since those surfaces (hooks, skill pack, MCP
+registration, the instructions block, integration bindings, ...) are
+properties of the invoking checkout itself, not of the isolated store. Two
+of those root-derived checks are a known, accepted exception to that
+framing rather than a clean case of it: `gitignore.current` and
+`db.tracked` inspect `<worktree>/.weft/loomweave/` directly, and `--fix`
+on `gitignore.current` will *create* that directory (with a `.gitignore`
+inside it, no store `loomweave.db`) in a linked worktree that never had
+one — a smaller version of the same decoy-materialization hazard the
+`http.instance_id` redirect exists to prevent, left unrouted here as
+out of scope for this pass.
 
 ### On-disk layout
 
@@ -198,14 +213,34 @@ deduplicated lookup list: source root, then primary root. Loomweave's own port
 and instance ID use explicit `StorePaths` leaves so concurrent servers cannot
 overwrite each other.
 
+There is no `weft.toml [filigree].url` rung in that lookup (removed on the
+1.5.0 line for a security reason that outranks discovery convenience:
+repository content may be untrusted, while Filigree clients attach
+operator-owned bearer tokens to the resolved endpoint — operator overrides
+belong in the process environment, `WEFT_FILIGREE_URL`, or private config).
+The ephemeral-port rung is the discovery mechanism, and it falls through
+source root → primary root as described above.
+
+The secret-scan baseline (`secrets-baseline.yaml`) is a per-store leaf under
+`StorePaths`, not shared or copied from the primary: a freshly created
+worktree store starts with no baseline at all, so any finding the primary's
+baseline already justified may re-fire as new in that worktree until its own
+baseline accumulates (or someone copies in) matching entries.
+
 ### Bootstrap
 
 `serve` on a linked worktree with no index:
 
 1. Resolve `WorktreeContext`; create the store directory and `metadata.json`.
-2. Spawn a **detached** `loomweave worktree analyze` for the worktree. Reuse
-   the SessionStart hook's *detachment technique* (`process_group(0)`, null
-   stdio) — **not** its argv. The hook spawns plain `loomweave analyze
+2. Spawn a **detached** `loomweave worktree analyze` for the worktree — but
+   only when no run has ever completed against this store (readiness, per
+   step 4 below, is not already `Ready`). A store that has already finished
+   at least one build is never re-spawned just because `serve` restarted;
+   keeping an already-built index fresh is the `SessionStart` hook's job
+   (plain `loomweave analyze`), not an unconditional background respawn
+   fired on every session start against a worktree that is already usable.
+   Reuse the SessionStart hook's *detachment technique* (`process_group(0)`,
+   null stdio) — **not** its argv. The hook spawns plain `loomweave analyze
    <source-root>`, and plain `analyze` must itself resolve storage through
    `WorktreeContext`, so both spellings land in the isolated store. An
    un-routed plain analyze writing a 20–30 minute index into
@@ -215,9 +250,15 @@ overwrite each other.
    envelope (`error.code` / `error.retryable` plus top-level `diagnostics`)
    with code `index-building` and the fallback command. `index-building` and
    `index-build-failed` join the pinned `McpErrorCode` wire vocabulary.
-4. When a completed run row exists, activate readers and answer normally.
-   Readiness is recomputed by consulting run state on each tool call at the
-   single dispatch chokepoint — no timer, no cached readiness state.
+4. Readiness is governed by "has any run row ever completed" (`completed`,
+   or the legitimate terminal `skipped_no_plugins`), never by "what does the
+   most recent row say": once a completed row exists, readers activate and
+   stay activated regardless of a *later* row's status — a manual rebuild
+   (`loomweave worktree analyze`) or a second `serve` racing this one that is
+   currently `running`, or one that later `failed`, never re-blocks graph
+   tools against a store that already has good data sitting in its tables.
+   Recomputed by consulting run state on each tool call at the single
+   dispatch chokepoint — no timer, no cached readiness state.
 
 Double-spawn is prevented by the existing `analyze_lock.rs` (fs2 advisory
 lock), not by a new durable-intent protocol. If analysis fails, tools return
@@ -237,17 +278,52 @@ fallback in every build-failed message.
 
 On `serve` startup and after each analysis, under a non-blocking `gc.lock`:
 
-1. Enumerate registered worktrees via `git worktree list --porcelain -z`.
-2. Enumerate direct `wt-[0-9a-f]{64}` children of the pinned `worktrees/`
-   handle.
-3. Delete any store whose stable ID is not in the registered set, confined as
-   described above.
+1. Enumerate direct `wt-[0-9a-f]{64}` children of the pinned `worktrees/`
+   handle — the **candidate** set.
+2. Resolve the repository's common Git directory (one hardened `git
+   rev-parse`, its own invocation additionally stripping
+   `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` so it cannot be redirected by
+   an ambient Git environment variable — a narrow, deletion-path-local
+   guard; general `hardened_git_command` environment sanitization remains
+   tracked separately, clarion-9202f4acec), then read that directory's own
+   `worktrees/` administrative subdirectory with a single `readdir` — the
+   **registered** set. `git worktree list` is deliberately never run for
+   this: it does not expose the administrative directory name each entry
+   corresponds to, and the stable ID is a hash of exactly that name.
+3. Delete any candidate whose stable ID is not in the registered set,
+   confined as described above.
+
+Candidates are read **before** the registered set, deliberately — never the
+reverse. Between the two reads, a worktree can only move from "unregistered,
+no store" to "registered, store exists" (a fresh `git worktree add` plus
+store creation completing mid-sweep) or from "registered, store exists" to
+"unregistered, store still exists" (`git worktree remove`). Reading
+candidates first closes the unsafe direction: a store that does not exist
+yet at the candidate read is simply absent from the candidate set this
+cycle, so a worktree registered and store-created entirely within the gap
+between the two reads is never misclassified as unregistered and deleted.
+Reading registered first would get that direction wrong — a just-registered
+worktree's store, invisible when the (now-stale) registered set was read,
+would be captured as a candidate and read as unregistered, and the sweep
+would destroy a live worktree's just-built index.
 
 Synchronous and in-process. No helper subprocess, so no supervisor, no child
 subreaper, and no PID1 wrapper around `serve`. If `gc.lock` is held, skip —
-another process is sweeping. Any Git enumeration failure aborts the sweep
-without deleting anything. Failure is logged and never affects analysis or MCP
-startup.
+another process is sweeping.
+
+The administrative `worktrees/` directory not existing at all is **not**
+treated as an enumeration failure: Git creates it lazily on the first `git
+worktree add` and deletes it again once its last entry is removed, so a
+repository with no linked worktrees (or none left) legitimately has zero
+registered worktrees — that reads as an empty registered set, and the sweep
+proceeds against it normally. Treating that `NotFound` as an abort would
+leak the very last worktree's store forever: no future sweep would ever see
+a non-empty registered set to prove it unregistered. Every *other*
+Git-enumeration failure — `git` missing, `primary_root` not inside a
+repository, a non-zero exit, non-UTF-8 output, or any other read error on
+either the admin directory or the candidate directory — aborts the sweep
+without deleting anything. Failure is logged and never affects analysis or
+MCP startup.
 
 A Git-locked worktree is registered and therefore never a candidate. The main
 store is never a candidate.

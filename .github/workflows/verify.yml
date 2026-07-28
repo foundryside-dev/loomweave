@@ -123,6 +123,42 @@ jobs:
       - name: test
         run: cargo nextest run --workspace --all-features --no-tests=pass
 
+      # Task 2 (confined worktree-index deletion primitive): the bind-mount
+      # confinement test needs an unprivileged user+mount namespace
+      # (unshare(CLONE_NEWUSER|CLONE_NEWNS)), available to unprivileged
+      # processes on ubuntu-latest but not universally, so it's #[ignore]d
+      # everywhere else and run explicitly, here, as its own step. See
+      # crates/loomweave-cli/tests/worktree_confine.rs's doc comment on
+      # `bind_mount_beneath_candidate_refuses_deletion` for why the
+      # namespace setup itself runs in a separate, freshly-spawned
+      # loomweave-worktree-confine-probe binary rather than in this test
+      # process. The preceding "build workspace bins" + "test" steps already
+      # rebuild that probe fresh, so this step (unlike a standalone local
+      # run) is not exposed to the stale-dev-dep-binary footgun documented
+      # there.
+      #
+      # Deliberately NOT `--no-tests=pass` (unlike the "test" step above):
+      # this step exists to run exactly one test, so if a future rename or
+      # `#[cfg]` change ever makes the `-E 'test(bind_mount)'` filter match
+      # zero tests, the step must error, not pass vacuously. Do not add
+      # `--no-tests=pass` here to "fix" a red run — that would silently
+      # disable this gate instead of running it.
+      #
+      # Ubuntu 24.04 (current ubuntu-latest) restricts unprivileged user
+      # namespaces via AppArmor by default (`kernel.apparmor_restrict_
+      # unprivileged_userns=1`); lift it first (ubuntu-latest has
+      # passwordless sudo) so `unshare(CLONE_NEWUSER)` can actually succeed.
+      # Do NOT remove this thinking it's stray/unexplained sudo — without
+      # it, the suite below fails loud with a capability diagnostic instead
+      # of testing confinement. The suite itself stays fail-loud exactly as
+      # designed: this only grants the *capability* to acquire a namespace,
+      # it doesn't touch how the test asserts once it has one.
+      - name: allow unprivileged user namespaces (Ubuntu 24.04 AppArmor)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: confined-deletion privileged suite
+        run: cargo nextest run -p loomweave-cli --run-ignored ignored-only -E 'test(bind_mount)'
+
       - name: doc
         run: cargo doc --workspace --no-deps --all-features
         env:

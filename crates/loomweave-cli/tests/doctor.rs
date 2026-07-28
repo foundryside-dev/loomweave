@@ -332,6 +332,32 @@ fn classifier_coverage(
     })
 }
 
+/// Seed a `completed` classifier-coverage run with a clean, error-free sweep
+/// (`source_walk_complete: true`, zero skipped entries, zero plugin-discovery
+/// errors, no plugins) directly into the catalogue `write_healthy_db`/`install`
+/// already created at `root`.
+///
+/// For tests whose subject is a DIFFERENT orientation surface (MCP
+/// registration, integration bindings, the instructions block, the
+/// git-tracked-db repair, ...): without a seeded run, `check_classifier_json`
+/// treats "no run exists yet" plus `--fix` as license to shell out to
+/// `loomweave analyze` (`repair_classifier_analysis`), whose plugin discovery
+/// walks the test PROCESS's real `$PATH` — harmless on a dev box with real
+/// plugins installed, but a hard failure on a CI runner whose `$PATH`
+/// includes a world-writable tool-cache directory the plugin loader's own
+/// security check refuses. Seeding a healthy run here means the classifier
+/// repair branch never fires, so these tests stop depending on what's
+/// discoverable on `$PATH` at all. Call this after `install(...)` or
+/// `write_healthy_db(...)` has created `.weft/loomweave/loomweave.db`.
+fn seed_completed_classifier_run(root: &Path) {
+    insert_run_stats(
+        root,
+        "seed-classifier-run",
+        "completed",
+        &classifier_coverage(true, 0, &serde_json::json!([])),
+    );
+}
+
 fn plugin_coverage(
     id: &str,
     status: &str,
@@ -490,6 +516,12 @@ fn doctor_fix_registers_mcp_then_reports_healthy() {
     // which also prevents the healthy summary line. Asserting FULL health means
     // owning every input to it, not inheriting the developer's global installs.
     let (_plugin_dir, path) = discoverable_plugin_dir();
+    // Belt AND suspenders (merged from two independent hermeticity fixes):
+    // this test's subject is MCP registration repair, not classifier repair —
+    // also seed a healthy run so `--fix` never shells out to `loomweave
+    // analyze` at all (see `seed_completed_classifier_run`), regardless of
+    // what discovery would find.
+    seed_completed_classifier_run(dir.path());
 
     let (code, out) = doctor_with_env(dir.path(), true, &[("PATH", path.as_str())], &[]);
     assert_eq!(code, 0, "--fix should repair and exit 0; stdout:\n{out}");
@@ -571,6 +603,10 @@ fn doctor_fix_repairs_missing_three_way_integration_bindings() {
     // the absent-DB warning. A never-analysed DB and its missing identity are
     // now reported independently from the integration binding warning.
     write_healthy_db(dir.path());
+    // This test's subject is integration-binding repair, not classifier
+    // repair — seed a healthy run so `--fix` never shells out to
+    // `loomweave analyze` (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
 
     let (code, out) = doctor(dir.path(), false);
     assert_eq!(
@@ -756,6 +792,10 @@ fn doctor_reports_missing_hook_and_mcp_and_prints_index_block() {
 fn doctor_flags_untrusted_mcp_command_without_clobbering_it() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is untrusted-MCP-command detection, not classifier
+    // repair — seed a healthy run so `--fix` never shells out to
+    // `loomweave analyze` (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     let canon = dir.path().canonicalize().unwrap().display().to_string();
     fs::write(
         dir.path().join(".mcp.json"),
@@ -815,6 +855,10 @@ fn doctor_flags_untrusted_mcp_command_without_clobbering_it() {
 fn doctor_reports_missing_instructions_block_as_warning() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is the instructions block, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     // Drop the Loomweave block from one target file -> aggregate is Missing.
     fs::write(dir.path().join("AGENTS.md"), "# just notes\n").unwrap();
 
@@ -847,6 +891,10 @@ fn doctor_reports_missing_instructions_block_as_warning() {
 fn doctor_reports_drifted_instructions_block_as_gating_problem() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is the instructions block, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     // Hand-edit the body inside the Loomweave span -> Drifted.
     let claude = dir.path().join("CLAUDE.md");
     let content = fs::read_to_string(&claude).unwrap();
@@ -881,6 +929,10 @@ fn doctor_reports_drifted_instructions_block_as_gating_problem() {
 fn doctor_reports_malformed_instructions_block_as_gating_problem() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is the instructions block, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     // Replace one target file's block with a dangling start marker.
     fs::write(
         dir.path().join("CLAUDE.md"),
@@ -924,6 +976,10 @@ fn doctor_reports_malformed_instructions_block_as_gating_problem() {
 fn doctor_json_reports_instructions_block_check_shape() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
+    // This test's subject is the instructions block, not classifier repair —
+    // seed a healthy run so `--fix` never shells out to `loomweave analyze`
+    // (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
 
     // Healthy: instructions.block is ok, not fixed.
     let (code, json) = doctor_json(dir.path(), false);
@@ -2052,6 +2108,10 @@ fn doctor_flags_git_tracked_db_as_problem_and_fix_untracks_it() {
     let dir = tempfile::tempdir().unwrap();
     install(&["install", "--all"], dir.path());
     write_healthy_db(dir.path());
+    // This test's subject is the git-tracked-db repair, not classifier
+    // repair — seed a healthy run so `--fix` never shells out to
+    // `loomweave analyze` (see `seed_completed_classifier_run`).
+    seed_completed_classifier_run(dir.path());
     run_git(dir.path(), &["init", "-q"]);
     run_git(dir.path(), &["config", "user.email", "t@t"]);
     run_git(dir.path(), &["config", "user.name", "t"]);
@@ -2143,5 +2203,303 @@ fn doctor_fix_reports_busy_when_analyze_holds_the_advisory_lock() {
         check(&recovered, "index.integrity")["status"],
         serde_json::Value::from(free_status),
         "repair must recover once the lock is released"
+    );
+}
+
+/// Materialise a migrated, empty `loomweave.db` directly at `db_path` (no
+/// `.gitignore` companion — unlike `write_healthy_db`, this is used for a
+/// worktree-isolated store nested under `worktrees/`, which never carries
+/// its own gitignore-drift concern).
+fn write_migrated_db_at(db_path: &Path) {
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let mut conn = Connection::open(db_path).expect("create SQLite DB");
+    loomweave_storage::pragma::apply_write_pragmas(&conn).expect("write pragmas");
+    loomweave_storage::schema::apply_migrations(&mut conn).expect("migrate");
+}
+
+/// worktree-indexes Task 7: `doctor` additively enumerates
+/// `<repository-store>/worktrees/` and reports per-store DB health,
+/// read-only, reusing the same `IndexDbHealth` classification the primary
+/// store's `.weft/loomweave.schema` check uses. This is purely additive —
+/// the primary store's own checks (asserted unaffected below) must not
+/// change shape or count because a worktree store happens to exist.
+#[test]
+fn doctor_reports_worktree_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install"], dir.path());
+
+    let worktrees_dir = dir.path().join(".weft/loomweave/worktrees");
+    let healthy_id = format!("wt-{}", "a".repeat(64));
+    write_migrated_db_at(&worktrees_dir.join(&healthy_id).join("loomweave.db"));
+    let unmigrated_id = format!("wt-{}", "b".repeat(64));
+    let unmigrated_db = worktrees_dir.join(&unmigrated_id).join("loomweave.db");
+    fs::create_dir_all(unmigrated_db.parent().unwrap()).unwrap();
+    Connection::open(&unmigrated_db).expect("create unmigrated SQLite DB");
+
+    let (code, json) = doctor_json(dir.path(), false);
+    let worktree_check = check(&json, "worktree_stores");
+    assert_eq!(
+        worktree_check["status"], "problem",
+        "an unmigrated worktree store must be surfaced as a problem: {worktree_check}"
+    );
+    assert_eq!(
+        code, 1,
+        "a problem-severity worktree store check must fail the doctor gate"
+    );
+    let stores = worktree_check["details"]["stores"]
+        .as_array()
+        .expect("worktree_stores check must carry a per-store details array");
+    assert_eq!(stores.len(), 2, "both worktree stores must be reported");
+    let healthy_entry = stores
+        .iter()
+        .find(|s| s["stable_id"] == healthy_id)
+        .expect("healthy store entry present");
+    assert_eq!(healthy_entry["status"], "ok");
+    let unmigrated_entry = stores
+        .iter()
+        .find(|s| s["stable_id"] == unmigrated_id)
+        .expect("unmigrated store entry present");
+    assert_eq!(unmigrated_entry["status"], "problem");
+
+    // Additive: the PRIMARY store's own health check is untouched by the
+    // worktree stores' existence or health.
+    let primary_check = check(&json, ".weft/loomweave.schema");
+    assert_eq!(primary_check["status"], "ok");
+
+    // --fix must not gain any repair power over worktree stores in this
+    // task: the unmigrated store must be left exactly as it was.
+    let (_, fixed_json) = doctor_json(dir.path(), true);
+    let fixed_worktree_check = check(&fixed_json, "worktree_stores");
+    assert_eq!(
+        fixed_worktree_check["status"], "problem",
+        "--fix must not repair a worktree store's index in this task: {fixed_worktree_check}"
+    );
+    let conn =
+        Connection::open_with_flags(&unmigrated_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("unmigrated db must still open (untouched by --fix)");
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read user_version");
+    assert_eq!(
+        user_version, 0,
+        "--fix must not migrate a worktree-isolated store's DB in this task"
+    );
+}
+
+/// A project with no worktree stores at all must not gain a
+/// `worktree_stores` check — the additive report only appears once there is
+/// something to report.
+#[test]
+fn doctor_omits_worktree_stores_check_when_none_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install"], dir.path());
+
+    let (_, json) = doctor_json(dir.path(), false);
+    assert!(
+        json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != "worktree_stores"),
+        "no worktree_stores check should appear when .weft/loomweave/worktrees/ \
+         does not exist: {json}"
+    );
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git {args:?} in {}: {e}", dir.display()));
+    assert!(
+        output.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A real `install`ed primary repo plus one real `git worktree add`-created
+/// linked worktree checked out from it — the fix-loop finding-3 fixture.
+/// Deliberately a REAL linked worktree (not a hand-fabricated
+/// `worktrees/<id>/` directory, as `doctor_reports_worktree_stores` above
+/// uses for its narrower per-store-health purpose): this test invokes
+/// `doctor --path <linked>` itself, so `WorktreeContext::resolve` must
+/// genuinely classify it `Linked`.
+fn setup_primary_with_linked_worktree(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    install(&["install"], &repo);
+    fs::write(repo.join("f.txt"), "hi\n").unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "feature", "../linked"],
+    );
+
+    root.join("linked")
+}
+
+/// worktree-index Task 7 fix-loop finding 3: before this fix, `doctor`
+/// invoked from inside a linked worktree checkout re-derived
+/// `db_path(project_root)` for its `.weft/loomweave.schema` check — a path
+/// `loomweave worktree analyze` never populates by design — and reported
+/// "no index — run `loomweave install` + `loomweave analyze`". Followed
+/// literally, that hint would CREATE the forbidden local store inside the
+/// worktree checkout, directly contradicting the `--- index ---` section
+/// (routed since Task 7's `hook.rs` fix), which prints healthy counts from
+/// the correct isolated store a few lines below. The schema check must
+/// instead recognize a linked worktree and redirect to `worktree_stores`
+/// without recommending `install`/`analyze` in the current checkout.
+#[test]
+fn doctor_redirects_schema_check_for_a_linked_worktree_instead_of_recommending_local_install() {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+
+    let (_, json) = doctor_json(&linked, false);
+    let schema_check = check(&json, ".weft/loomweave.schema");
+    assert_eq!(
+        schema_check["status"], "ok",
+        "a linked worktree's own checkout holding no local .weft/loomweave/ store is by \
+         design, not a defect: {schema_check}"
+    );
+    let message = schema_check["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("loomweave install"),
+        "must not recommend `loomweave install` from inside a linked worktree — that hint, \
+         followed literally, would create the forbidden local store: {schema_check}"
+    );
+    assert!(
+        message.contains("worktree_stores"),
+        "must redirect to the worktree_stores check, which reports this worktree's actual \
+         isolated index health: {schema_check}"
+    );
+
+    // Text path twin: no "run install/analyze" hint either.
+    let (_, stdout) = doctor(&linked, false);
+    assert!(
+        !stdout.contains("run `loomweave install`"),
+        "text-path doctor must not recommend install/analyze from inside a linked worktree: \
+         {stdout}"
+    );
+}
+
+// The redirect above must fire ONLY for a linked worktree, never for the
+// primary/main checkout — a standalone or main-worktree project with a
+// genuinely absent index must keep the real "no index — run install +
+// analyze" guidance verbatim. `doctor_index_health_absent_db_is_warning_gate_passes`
+// above already covers that non-linked absent-DB case end to end (unchanged
+// by this fix-loop, since `is_linked_worktree` only short-circuits when
+// `WorktreeContext::resolve` classifies the target `Linked`); no separate
+// test needed here.
+
+/// Final-review fix: `http.instance_id` had the identical bug as the
+/// `.weft/loomweave.schema` check above, just less visible — it re-derives
+/// `store_dir(project_root)/instance_id` from the literal `--path`, which for
+/// a linked worktree is never populated. Unrouted, that produced a `warning`
+/// whose JSON `next_action` read: "`Run loomweave install --path <project>
+/// before materialising a project instance ID.`" — never printed in plain
+/// stdout (the text renderer only echoes `message`, not `next_action`), but
+/// present in `--format json`'s per-report `next_actions` array. Followed
+/// literally inside a linked worktree, that instruction would CREATE the
+/// forbidden `<worktree>/.weft/loomweave/` decoy store — after which every
+/// other root-derived check in this module starts operating on the decoy
+/// instead of the worktree's real, isolated store. Assert the `http.instance_id`
+/// check itself now redirects (`ok`, no install hint on its own line or in
+/// the JSON `next_actions` aggregate) and that `--fix` materialises no
+/// `instance_id` file under the linked worktree's own `.weft/loomweave/`.
+///
+/// Scoped to this one check, deliberately: `doctor`'s `--- index ---`
+/// footer (`hook::snapshot_report`, reused verbatim per this module's docs)
+/// separately prints its own root-derived "no index ... Run `loomweave
+/// install --path <worktree>`" line for an unbuilt linked worktree — a
+/// pre-existing, out-of-scope residual of this same class, left untouched
+/// here (see the final-fixes report).
+#[test]
+fn doctor_redirects_http_instance_id_check_for_a_linked_worktree_instead_of_recommending_local_install()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+
+    let (_, json) = doctor_json(&linked, false);
+    let instance_check = check(&json, "http.instance_id");
+    assert_eq!(
+        instance_check["status"], "ok",
+        "a linked worktree's own checkout holding no local instance_id file is by design, not \
+         a defect: {instance_check}"
+    );
+    let message = instance_check["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("loomweave install"),
+        "must not recommend `loomweave install` from inside a linked worktree — that hint, \
+         followed literally, would create the forbidden local store: {instance_check}"
+    );
+    assert!(
+        message.contains("worktree_stores"),
+        "must redirect to the worktree_stores check, which reports this worktree's actual \
+         isolated index health: {instance_check}"
+    );
+
+    // The JSON report's top-level `next_actions` aggregate is where the
+    // pre-fix bug actually surfaced (per-check `next_action` is `#[serde(skip)]`
+    // and only feeds that aggregate for "problem"/"warning" checks). The
+    // pre-fix warning branch's next_action text was unique to this check
+    // ("...before materialising a project instance ID."); assert it no
+    // longer appears. (Other checks legitimately mention `loomweave install`
+    // for unrelated surfaces — e.g. `--hooks` — so this assertion targets the
+    // instance-ID-specific phrasing rather than sweeping the whole array.)
+    let next_actions = json["next_actions"]
+        .as_array()
+        .expect("doctor JSON report next_actions array");
+    assert!(
+        next_actions.iter().all(|action| {
+            !action
+                .as_str()
+                .unwrap_or_default()
+                .contains("materialising a project instance ID")
+        }),
+        "no next_action may recommend installing in this checkout to materialise the instance \
+         ID from inside a linked worktree: {json}"
+    );
+
+    // Text path: the http.instance_id line itself (not the whole report,
+    // which may legitimately mention `loomweave install` for unrelated
+    // surfaces like hooks) must carry the redirect, not an install hint.
+    let (_, stdout) = doctor(&linked, false);
+    let instance_line = stdout
+        .lines()
+        .find(|line| line.contains("http.instance_id"))
+        .unwrap_or_else(|| panic!("http.instance_id line missing from stdout: {stdout}"));
+    assert!(
+        !instance_line.contains("loomweave install"),
+        "text-path doctor must not recommend install from inside a linked worktree: {instance_line}"
+    );
+    assert!(
+        instance_line.contains("worktree_stores"),
+        "text-path doctor must redirect to worktree_stores: {instance_line}"
+    );
+
+    // --fix must not materialize anything on this check's path: the redirect
+    // must stay `ok` and no `instance_id` file must appear in the worktree's
+    // own checkout. (Other, unrelated --fix repairs — e.g. `gitignore.current`
+    // — legitimately create `<worktree>/.weft/loomweave/` for their own
+    // out-of-scope reasons, so this asserts the specific artifact this check
+    // could have materialised, not the whole directory's absence.)
+    let (_, fixed_json) = doctor_json(&linked, true);
+    let fixed_instance_check = check(&fixed_json, "http.instance_id");
+    assert_eq!(
+        fixed_instance_check["status"], "ok",
+        "--fix must not change the redirect's status: {fixed_instance_check}"
+    );
+    assert!(
+        !linked.join(".weft/loomweave/instance_id").exists(),
+        "--fix must not materialize a local instance_id file inside a linked worktree"
     );
 }
