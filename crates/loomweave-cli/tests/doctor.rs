@@ -1990,6 +1990,59 @@ fn run_git(repo: &Path, args: &[&str]) {
     assert!(ok, "git {args:?} failed");
 }
 
+/// A hostile or stale `GIT_DIR`/`GIT_WORK_TREE` in the environment must not
+/// redirect Loomweave's git probes (clarion-9202f4acec).
+///
+/// `hardened_git_command` passes `-C <project_root>`, but the repository-selector
+/// environment variables OVERRIDE `-C`. So an inherited `GIT_DIR` makes every
+/// probe answer about a different repository. Here that means doctor reads the
+/// hijacked repo's index and declares this project's untracked db "tracked" —
+/// and `--fix` would then run `git rm --cached` against that unrelated
+/// repository, mutating it.
+#[test]
+fn doctor_git_probes_ignore_a_hijacked_git_dir_in_the_environment() {
+    let project = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], project.path());
+    write_healthy_db(project.path());
+    run_git(project.path(), &["init", "-q"]);
+    run_git(project.path(), &["config", "user.email", "t@t"]);
+    run_git(project.path(), &["config", "user.name", "t"]);
+    // The db is NOT added here: in THIS repo it is untracked.
+
+    // A second repo where the very same relative path IS tracked.
+    let hostile = tempfile::tempdir().unwrap();
+    fs::create_dir_all(hostile.path().join(".weft/loomweave")).unwrap();
+    fs::write(hostile.path().join(".weft/loomweave/loomweave.db"), b"x").unwrap();
+    run_git(hostile.path(), &["init", "-q"]);
+    run_git(hostile.path(), &["config", "user.email", "t@t"]);
+    run_git(hostile.path(), &["config", "user.name", "t"]);
+    run_git(
+        hostile.path(),
+        &["add", "-f", ".weft/loomweave/loomweave.db"],
+    );
+
+    let (code, json) = doctor_json_with_env(
+        project.path(),
+        false,
+        &[
+            (
+                "GIT_DIR",
+                &hostile.path().join(".git").display().to_string(),
+            ),
+            ("GIT_WORK_TREE", &hostile.path().display().to_string()),
+        ],
+        &[],
+    );
+
+    let db = check(&json, "db.tracked");
+    assert_eq!(
+        db["status"], "ok",
+        "the probe must answer about THIS project, not the repo named by the \
+         inherited GIT_DIR: {db}"
+    );
+    assert_eq!(code, 0, "{json}");
+}
+
 /// A git-tracked runtime DB is a gate-failing problem: it mutates on every
 /// analyze/scan, dirtying the work tree and blocking legis signing. `doctor`
 /// must exit non-zero; `--fix` untracks it via `git rm --cached` and the project
