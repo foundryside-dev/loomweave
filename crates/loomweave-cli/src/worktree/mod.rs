@@ -6,9 +6,10 @@
 //!   isolated worktree store on disk.
 //! - [`cmd`] — resolves the `<name-or-path>` argument of `loomweave worktree
 //!   analyze` to a concrete filesystem path.
-//!
-//! Later tasks (bootstrap, the cleanup sweep) add sibling modules here.
+//! - [`sweep`] — the cleanup-sweep policy layer: decides which worktree
+//!   stores are unregistered and deletes them (via `confine`).
 
 pub mod cmd;
 pub mod confine;
 pub mod store;
+pub mod sweep;

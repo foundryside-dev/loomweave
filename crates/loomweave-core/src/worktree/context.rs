@@ -365,13 +365,34 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
         .ok_or_else(|| WorktreeContextError::non_utf8_path("admin-identity", admin_identity_path))?
         .to_owned();
 
-    let stable_id = format!("wt-{}", blake3::hash(admin_identity.as_bytes()).to_hex());
+    let stable_id = stable_id_for_admin_identity(&admin_identity);
 
     Ok(GitProbe::Linked {
         primary_root,
         stable_id,
         admin_identity,
     })
+}
+
+/// Compute a linked worktree's stable ID from its Git administrative
+/// identity — the path fragment under the common Git directory (e.g.
+/// `worktrees/federation-seam-followups`, see the module docs): `wt-`
+/// followed by the `BLAKE3` hex digest of `admin_identity`'s UTF-8 bytes.
+///
+/// This is the single source of truth for that hash construction.
+/// [`WorktreeContext::resolve`] calls it (via this module's private `git`
+/// probe) while resolving a live worktree relationship from `git`'s own
+/// output; the cleanup sweep
+/// (`loomweave-cli`'s `worktree::sweep`, worktree-index Task 6) calls it
+/// while re-deriving every currently-*registered* worktree's stable ID
+/// directly from the common Git directory's own `worktrees/` administrative
+/// entries (never from `git worktree list`, which does not expose an
+/// entry's administrative directory name). Both call sites must produce
+/// byte-identical IDs for the same admin identity, so this is written once
+/// here and imported, never duplicated.
+#[must_use]
+pub fn stable_id_for_admin_identity(admin_identity: &str) -> String {
+    format!("wt-{}", blake3::hash(admin_identity.as_bytes()).to_hex())
 }
 
 /// This checkout's own (canonicalized) Git directory, or `None` if `dir`

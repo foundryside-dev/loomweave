@@ -2258,6 +2258,20 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             ),
         }
     }
+
+    // Cleanup sweep (Task 6): after each analyze completes, from every
+    // worktree kind, reclaims any worktree-isolated store whose Git
+    // registration is gone (main-checkout `analyze` runs are what reclaim a
+    // store once the worktree that owned it is gone and never runs
+    // Loomweave again). Placed here — after the run's own outcome is fully
+    // settled and reported, not before — so a `bail!` earlier in this
+    // function (a genuinely failed run) does not trigger a sweep;
+    // reclamation for that case is simply deferred to the next successful
+    // `analyze` or the next `serve` startup. `sweep_best_effort` cannot fail
+    // this `analyze` run: it has no `Result` to propagate (see
+    // `loomweave_cli::worktree::sweep`).
+    loomweave_cli::worktree::sweep::sweep_best_effort(&worktree_ctx);
+
     Ok(())
 }
 

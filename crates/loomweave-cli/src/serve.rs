@@ -71,7 +71,16 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     // stays a pure function of two small values.
     let db_path = loomweave_core::store::db_path(path);
 
-    match choose_serve_route(worktree_ctx.kind, db_path.exists()) {
+    let route = choose_serve_route(worktree_ctx.kind, db_path.exists());
+    // Cleanup sweep (Task 6): every `serve` startup, from every route —
+    // main and standalone included, since main-checkout activity is what
+    // reclaims a worktree's store once the worktree itself is gone and
+    // never runs Loomweave again. `sweep_best_effort` cannot fail this
+    // `serve` invocation: it has no `Result` to propagate (see
+    // `loomweave_cli::worktree::sweep`).
+    loomweave_cli::worktree::sweep::sweep_best_effort(&worktree_ctx);
+
+    match route {
         ServeRoute::Linked => run_linked_worktree(config_path, &worktree_ctx),
         ServeRoute::NoIndex => {
             // No index yet. Rather than exiting 1 — which leaves the MCP
