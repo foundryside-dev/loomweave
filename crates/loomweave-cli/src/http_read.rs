@@ -67,14 +67,14 @@ static HTTP_ERROR_DISPATCH: LazyLock<tracing::Dispatch> = LazyLock::new(|| {
 /// would let one instance strand the *other, still-running* server's published
 /// port. See `loomweave_port::remove_published_port_if_matches`.
 struct PublishedPortGuard {
-    project_root: PathBuf,
+    port_path: PathBuf,
     port: u16,
 }
 
 impl Drop for PublishedPortGuard {
     fn drop(&mut self) {
-        loomweave_federation::loomweave_port::remove_published_port_if_matches(
-            &self.project_root,
+        loomweave_federation::loomweave_port::remove_published_port_if_matches_at(
+            &self.port_path,
             self.port,
         );
     }
@@ -217,11 +217,13 @@ struct HttpReadReady {
     readers_identity: Arc<()>,
 }
 
+#[allow(clippy::too_many_arguments)] // one-shot bootstrap inputs, mirrors run_http_read_server
 pub fn spawn(
     project_root: PathBuf,
     db_path: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
+    port_path: PathBuf,
     config: &HttpReadConfig,
 ) -> Result<Option<HttpReadServer>> {
     spawn_with_env(
@@ -229,6 +231,7 @@ pub fn spawn(
         db_path,
         readers,
         instance_id,
+        port_path,
         config,
         |name| std::env::var(name).ok(),
     )
@@ -237,11 +240,19 @@ pub fn spawn(
 /// Spawn variant that takes an explicit env lookup so tests can drive the
 /// auth-trust gate (and the resolved-bearer-token plumbing) without
 /// mutating process environment.
+#[allow(clippy::too_many_arguments)] // one-shot bootstrap inputs, mirrors run_http_read_server
 pub fn spawn_with_env<F>(
     project_root: PathBuf,
     db_path: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
+    // The published-port sidecar leaf this instance should publish the
+    // actually-bound port to (and unlink on shutdown) — the caller's resolved
+    // `StorePaths::port`, NOT re-derived from `project_root` here. A linked
+    // worktree's isolated store publishes to a different location than its own
+    // `.weft/loomweave/`; re-deriving from `project_root` would silently land
+    // there instead (design doc, "Configuration and sibling discovery").
+    port_path: PathBuf,
     config: &HttpReadConfig,
     env_lookup: F,
 ) -> Result<Option<HttpReadServer>>
@@ -303,6 +314,7 @@ where
                 wardline_taint_write,
                 readers,
                 instance_id,
+                port_path,
                 auth_token_thread,
                 identity_secret_thread,
                 bind,
@@ -359,6 +371,7 @@ fn run_http_read_server(
     wardline_taint_write: bool,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
+    port_path: PathBuf,
     auth_token: Option<Arc<String>>,
     identity_secret: Option<Arc<String>>,
     bind: std::net::SocketAddr,
@@ -408,19 +421,20 @@ fn run_http_read_server(
         // configured URL. The guard unlinks the file when this scope unwinds.
         let _published_port_guard = if local_addr.ip().is_loopback() {
             if let Err(err) =
-                loomweave_federation::loomweave_port::publish_port(&project_root, local_addr.port())
+                loomweave_federation::loomweave_port::publish_port_at(&port_path, local_addr.port())
             {
                 // Publication is best-effort enrichment: a failure to write the
                 // discovery file must not take the read API down.
                 tracing::warn!(
                     error = %err,
                     port = local_addr.port(),
-                    "failed to publish .weft/loomweave/ephemeral.port; consumers will fall back to configured URL"
+                    port_path = %port_path.display(),
+                    "failed to publish ephemeral.port; consumers will fall back to configured URL"
                 );
                 None
             } else {
                 Some(PublishedPortGuard {
-                    project_root: project_root.clone(),
+                    port_path: port_path.clone(),
                     port: local_addr.port(),
                 })
             }
@@ -980,11 +994,14 @@ mod tests {
             // tokens configured.
             let env_lookup = |_: &str| -> Option<String> { None };
 
+            let port_path =
+                loomweave_federation::loomweave_port::published_port_path(tempdir.path());
             let server = spawn_with_env(
                 tempdir.path().to_path_buf(),
                 db_path.clone(),
                 readers,
                 instance_id,
+                port_path,
                 &config,
                 env_lookup,
             )
@@ -1045,11 +1062,13 @@ mod tests {
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000006")
                 .expect("parse synthetic instance id");
 
+        let port_path = loomweave_federation::loomweave_port::published_port_path(tempdir.path());
         let server = spawn(
             tempdir.path().to_path_buf(),
             db_path.clone(),
             readers,
             instance_id,
+            port_path,
             &config,
         )
         .expect("spawn HTTP read API")
@@ -1100,11 +1119,13 @@ mod tests {
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000001")
                 .expect("parse synthetic instance id");
 
+        let port_path = loomweave_federation::loomweave_port::published_port_path(tempdir.path());
         let mut server = spawn(
             tempdir.path().to_path_buf(),
             db_path.clone(),
             readers,
             instance_id,
+            port_path,
             &config,
         )
         .expect("spawn HTTP read API")
@@ -1156,7 +1177,8 @@ mod tests {
                 ..HttpReadConfig::default()
             };
             let iid = crate::instance::parse_instance_id_for_test(id).expect("iid");
-            let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
+            let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
+            let server = spawn(dir.path().to_path_buf(), db, readers, iid, port_path, &cfg)
                 .expect("spawn")
                 .expect("enabled => Some");
             (dir, server)
@@ -1198,7 +1220,8 @@ mod tests {
         let iid =
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a3")
                 .expect("iid");
-        let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
+        let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
+        let server = spawn(dir.path().to_path_buf(), db, readers, iid, port_path, &cfg)
             .expect("spawn")
             .expect("enabled => Some");
 
@@ -1238,8 +1261,9 @@ mod tests {
         let iid =
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a4")
                 .expect("iid");
+        let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
 
-        let result = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg);
+        let result = spawn(dir.path().to_path_buf(), db, readers, iid, port_path, &cfg);
         assert!(
             result.is_err(),
             "an explicit in-use bind must fail, not silently fall back to :0"
@@ -1273,8 +1297,9 @@ mod tests {
         let iid =
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a5")
                 .expect("iid");
+        let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
 
-        let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
+        let server = spawn(dir.path().to_path_buf(), db, readers, iid, port_path, &cfg)
             .expect("spawn must succeed via ephemeral fallback")
             .expect("enabled => Some");
 

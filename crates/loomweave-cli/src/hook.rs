@@ -3,7 +3,7 @@
 //! Never returns an error to the caller: the `SessionStart` hook must never
 //! block an agent's session start. All failures degrade to a printed note.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use loomweave_mcp::snapshot::{ProjectSnapshot, Staleness, missing_db_snapshot, project_snapshot};
 use rusqlite::{Connection, OpenFlags};
@@ -118,6 +118,27 @@ enum SnapshotOutcome {
     DbUnreadable,
 }
 
+/// Resolve the store this checkout actually reads: `WorktreeContext`'s
+/// `store_paths.db` (worktree-index Task 7) — never a bare
+/// `db_path(project_root)`, which for a linked worktree is the *source*
+/// root's own store, a location `loomweave worktree analyze` never
+/// populates. Falls back to the root-derived path on the one error
+/// `WorktreeContext::resolve` can return (a non-UTF-8 path component) —
+/// this hook must never block session start on a resolution failure.
+fn resolve_effective_db_path(project_root: &Path) -> PathBuf {
+    match loomweave_core::worktree::WorktreeContext::resolve(project_root) {
+        Ok(ctx) => ctx.store_paths.db,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "resolve worktree context for session-start snapshot failed; falling back to \
+                 <project_root>/.weft/loomweave/loomweave.db"
+            );
+            loomweave_core::store::db_path(project_root)
+        }
+    }
+}
+
 fn resync_skill_if_present(project_root: &Path) {
     let installed = project_root
         .join(".claude/skills/loomweave-workflow/SKILL.md")
@@ -134,7 +155,7 @@ fn resync_skill_if_present(project_root: &Path) {
 }
 
 fn load_snapshot(project_root: &Path) -> SnapshotOutcome {
-    let db_path = loomweave_core::store::db_path(project_root);
+    let db_path = resolve_effective_db_path(project_root);
     if !db_path.exists() {
         return SnapshotOutcome::Ready(missing_db_snapshot());
     }
@@ -184,7 +205,7 @@ fn snapshot_outcome_lines(project_root: &Path, outcome: &SnapshotOutcome) -> Vec
     let snapshot = match outcome {
         SnapshotOutcome::Ready(snapshot) => snapshot,
         SnapshotOutcome::DbUnreadable => {
-            let db_path = loomweave_core::store::db_path(project_root);
+            let db_path = resolve_effective_db_path(project_root);
             lines.push(format!(
                 "Loomweave: an index exists at {} but could not be opened (it may be \
                  corrupt, locked by another process, or unreadable). Check permissions, \

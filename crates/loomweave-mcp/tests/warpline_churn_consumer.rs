@@ -429,6 +429,11 @@ async fn high_churn_discloses_warpline_overflow_truncation() {
     assert_eq!(truncated["total_candidates"], json!(3));
     assert_eq!(truncated["counted"], json!(1));
     assert_eq!(truncated["uncounted"], json!(2));
+    assert_eq!(result["summary"]["completeness"], json!("partial"));
+    assert_eq!(
+        result["summary"]["advisory"]["reason"],
+        json!("warpline churn read truncated")
+    );
     assert!(
         truncated["reason"]
             .as_str()

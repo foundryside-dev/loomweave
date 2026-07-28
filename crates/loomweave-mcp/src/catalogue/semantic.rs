@@ -9,15 +9,15 @@
 //! considered, so stale vectors never surface (freshness, like the summary
 //! cache).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Value, json};
 
-use loomweave_storage::{EmbeddingStore, embeddings_db_path, entity_by_id};
+use loomweave_storage::{EmbeddingStore, entity_by_id};
 
 use crate::ParamError;
 use crate::ServerState;
-use crate::catalogue::{Page, RawScope, missing_signal};
+use crate::catalogue::{Page, RawScope, catalogue_summary, missing_signal};
 use crate::{
     entity_json, flatten_storage_envelope_result, required_str, success_envelope,
     tool_error_envelope,
@@ -47,10 +47,20 @@ impl ServerState {
             .as_ref()
             .filter(|state| state.config.enabled)
         else {
+            let summary = catalogue_summary(
+                0,
+                0,
+                false,
+                "low",
+                &json!({"by_kind": {}, "semantic_vectors": 0}),
+                Some("semantic search is not enabled"),
+                Some("configure semantic search provider or use structural filters"),
+            );
             return Ok(success_envelope(json!({
                 "result_kind": "not_enabled",
                 "results": [],
                 "page": { "total": 0, "offset": 0, "limit": 0, "returned": 0, "truncated": false },
+                "summary": summary,
                 "signal": missing_signal(
                     "semantic_search",
                     "semantic search is not enabled (semantic_search.enabled=false) or no embedding \
@@ -88,7 +98,11 @@ impl ServerState {
         };
 
         let project_root = self.project_root.clone();
-        let sidecar_path = embeddings_db_path(&project_root);
+        // The linked worktree's isolated store's embeddings sidecar — never a
+        // bare `embeddings_db_path(&project_root)`, which for a linked
+        // worktree is the source root's own, never-written local sidecar
+        // (worktree-index Task 7).
+        let sidecar_path = self.effective_embeddings_path();
         let result = self
             .readers
             .with_reader(move |conn| {
@@ -126,9 +140,11 @@ fn rank_semantic(
     let store = EmbeddingStore::open(sidecar_path)?;
     let (rows, scan_truncated) = store.vectors_for_model(model_id, EMBED_SCAN_CAP)?;
 
-    // Cache current content_hash per entity once (freshness gate).
-    let mut current_hash: HashMap<String, Option<String>> = HashMap::new();
-    let mut scored: Vec<(String, f32)> = Vec::new();
+    // Cache current content hash + kind per entity once. The kind feeds the
+    // lead-summary aggregate without issuing a second point query for every
+    // scored candidate.
+    let mut current_entities: HashMap<String, Option<(Option<String>, String)>> = HashMap::new();
+    let mut scored: Vec<(String, String, f32)> = Vec::new();
     for row in rows {
         if !in_scope
             .as_ref()
@@ -136,30 +152,40 @@ fn rank_semantic(
         {
             continue;
         }
-        if !current_hash.contains_key(&row.entity_id) {
-            let hash = entity_by_id(conn, &row.entity_id)?.and_then(|e| e.content_hash);
-            current_hash.insert(row.entity_id.clone(), hash);
+        if !current_entities.contains_key(&row.entity_id) {
+            let entity = entity_by_id(conn, &row.entity_id)?
+                .map(|entity| (entity.content_hash, entity.kind));
+            current_entities.insert(row.entity_id.clone(), entity);
         }
         // Freshness: only embeddings of the entity's current content.
-        let fresh = current_hash.get(&row.entity_id).and_then(Option::as_deref)
-            == Some(row.content_hash.as_str());
+        let entity_state = current_entities
+            .get(&row.entity_id)
+            .and_then(Option::as_ref);
+        let fresh =
+            entity_state.and_then(|(hash, _)| hash.as_deref()) == Some(row.content_hash.as_str());
         if !fresh {
             continue;
         }
-        if let Some(score) = cosine_similarity(query_vector, &row.vector) {
-            scored.push((row.entity_id, score));
+        if let Some(score) = cosine_similarity(query_vector, &row.vector)
+            && let Some((_, kind)) = entity_state
+        {
+            scored.push((row.entity_id, kind.clone(), score));
         }
     }
 
     // Rank by score desc, ties by id for determinism.
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
+        b.2.partial_cmp(&a.2)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
 
     let total = scored.len();
-    let returned: Vec<(String, f32)> = scored
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, kind, _) in &scored {
+        *by_kind.entry(kind.clone()).or_insert(0) += 1;
+    }
+    let returned: Vec<(String, String, f32)> = scored
         .into_iter()
         .skip(page.offset)
         .take(page.limit)
@@ -169,7 +195,7 @@ fn rank_semantic(
 
     let results: Vec<Value> = returned
         .iter()
-        .map(|(id, score)| {
+        .map(|(id, _, score)| {
             let entity = match entity_by_id(conn, id) {
                 Ok(Some(entity)) => entity_json(conn, &entity),
                 _ => json!({ "id": id, "sei": Value::Null }),
@@ -177,6 +203,29 @@ fn rank_semantic(
             json!({ "entity": entity, "score": score })
         })
         .collect();
+    let confidence = format!("semantic:model:{model_id}");
+    let summary = catalogue_summary(
+        total,
+        returned_count,
+        truncated,
+        &confidence,
+        &json!({
+            "by_kind": by_kind,
+            "semantic_vectors": total,
+        }),
+        if scan_truncated {
+            Some("semantic vector scan truncated")
+        } else if scope_truncated {
+            Some("scope resolution truncated")
+        } else {
+            None
+        },
+        if scan_truncated || scope_truncated {
+            Some("rerun analyze or narrow the semantic search scope")
+        } else {
+            None
+        },
+    );
 
     Ok(success_envelope(json!({
         "result_kind": "ranked",
@@ -189,6 +238,7 @@ fn rank_semantic(
             "returned": returned_count,
             "truncated": truncated,
         },
+        "summary": summary,
         "scope_truncated": scope_truncated,
         "scan_truncated": scan_truncated,
     })))

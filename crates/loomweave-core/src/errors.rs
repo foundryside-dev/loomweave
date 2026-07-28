@@ -29,7 +29,7 @@
 //! | `storage-error`                                                        | `STORAGE_ERROR`  |
 //! | `internal`, `io-error`, `spawn-failed`                                 | `INTERNAL`       |
 //! | `entity-not-found`, `run-not-found`, `not-found`, `content-hash-missing` | `NOT_FOUND`    |
-//! | `not-a-subsystem`, `analyze-already-running`, `token-ceiling-exceeded`, `llm-disabled`, `llm-provider-error`, `llm-invalid-json`, `content-drift`, `inferred-dispatch-cancelled`, `inferred-dispatch-timeout` | *(MCP-only; no HTTP surface)* |
+//! | `not-a-subsystem`, `analyze-already-running`, `token-ceiling-exceeded`, `llm-disabled`, `llm-provider-error`, `llm-invalid-json`, `content-drift`, `inferred-dispatch-cancelled`, `inferred-dispatch-timeout`, `index-building`, `index-build-failed`, `source-root-missing` | *(MCP-only; no HTTP surface)* |
 //!
 //! HTTP-only codes (no MCP surface): `PATH_OUTSIDE_PROJECT`, `BRIEFING_BLOCKED`,
 //! `UNAUTHENTICATED`, `BATCH_TOO_LARGE`, `WRITE_DISABLED`, `PROJECT_MISMATCH`.
@@ -105,6 +105,21 @@ pub enum McpErrorCode {
     ContentHashMissing,
     InferredDispatchCancelled,
     InferredDispatchTimeout,
+    /// A linked worktree's isolated index has no completed analyze run yet —
+    /// `serve`'s bootstrap spawned `loomweave worktree analyze` and it is
+    /// still in flight (or has not yet written a `runs` row at all). The
+    /// worktree-indexes design's per-call readiness consult (not file
+    /// existence) is the source of truth for this state.
+    IndexBuilding,
+    /// A linked worktree's isolated index build ran and failed (`runs.status
+    /// = 'failed'`). Diagnostics carry the exact `loomweave worktree analyze`
+    /// fallback command to retry.
+    IndexBuildFailed,
+    /// The resolved source root for a live `serve` session no longer exists
+    /// on disk (e.g. `git worktree remove` ran under a still-running serve).
+    /// Surfaced instead of the last staleness verdict — the design's
+    /// accepted race for worktree removal under a live session.
+    SourceRootMissing,
 }
 
 impl McpErrorCode {
@@ -130,6 +145,9 @@ impl McpErrorCode {
             Self::ContentHashMissing => "content-hash-missing",
             Self::InferredDispatchCancelled => "inferred-dispatch-cancelled",
             Self::InferredDispatchTimeout => "inferred-dispatch-timeout",
+            Self::IndexBuilding => "index-building",
+            Self::IndexBuildFailed => "index-build-failed",
+            Self::SourceRootMissing => "source-root-missing",
         }
     }
 }
@@ -216,6 +234,15 @@ mod tests {
         assert_eq!(
             McpErrorCode::InferredDispatchTimeout.as_str(),
             "inferred-dispatch-timeout"
+        );
+        assert_eq!(McpErrorCode::IndexBuilding.as_str(), "index-building");
+        assert_eq!(
+            McpErrorCode::IndexBuildFailed.as_str(),
+            "index-build-failed"
+        );
+        assert_eq!(
+            McpErrorCode::SourceRootMissing.as_str(),
+            "source-root-missing"
         );
     }
 }

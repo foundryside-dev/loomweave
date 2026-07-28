@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use loomweave_core::McpErrorCode;
 use loomweave_storage::{
@@ -17,7 +17,7 @@ use loomweave_storage::{
 
 use crate::ParamError;
 use crate::ServerState;
-use crate::catalogue::{Page, missing_signal, paginate};
+use crate::catalogue::{Page, catalogue_summary, missing_signal, paginate};
 use crate::{
     entity_json, flatten_storage_envelope_result, parse_to_unix_seconds, required_str,
     success_envelope, tool_error_envelope,
@@ -213,6 +213,7 @@ impl ServerState {
                         Ok(usize::try_from(count).unwrap_or(usize::MAX))
                     },
                 )?;
+                let counts = finding_summary_counts(conn, Some(entity.id.as_str()), &filter)?;
                 let mut stmt = conn.prepare(
                     "SELECT id, tool, rule_id, kind, severity, status, message, \
                             related_entities, confidence, created_at \
@@ -235,20 +236,24 @@ impl ServerState {
                 }
 
                 let returned = page_rows.len();
+                let truncated = page.offset.saturating_add(returned) < total;
                 let findings: Vec<Value> = page_rows.iter().map(FindingRow::to_json).collect();
                 let meta = json!({
                     "total": total,
                     "offset": page.offset,
                     "limit": page.limit,
                     "returned": returned,
-                    "truncated": page.offset.saturating_add(returned) < total,
+                    "truncated": truncated,
                 });
+                let summary =
+                    catalogue_summary(total, returned, truncated, "high", &counts, None, None);
 
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
                     "findings": findings,
                     "filter": filter.to_json(),
                     "page": meta,
+                    "summary": summary,
                     "scan_truncated": false,
                 })))
             })
@@ -297,6 +302,7 @@ impl ServerState {
                         Ok(usize::try_from(count).unwrap_or(usize::MAX))
                     },
                 )?;
+                let counts = finding_summary_counts(conn, None, &filter)?;
 
                 // Page rows, joined to the anchoring entity for file:line. The FK
                 // (`findings.entity_id REFERENCES entities(id) ON DELETE CASCADE`)
@@ -324,6 +330,7 @@ impl ServerState {
                 }
 
                 let returned = page_rows.len();
+                let truncated = page.offset.saturating_add(returned) < total;
                 // Resolve each anchor's SEI while a reader connection is in scope.
                 let findings: Vec<Value> = page_rows
                     .iter()
@@ -337,13 +344,16 @@ impl ServerState {
                     "offset": page.offset,
                     "limit": page.limit,
                     "returned": returned,
-                    "truncated": page.offset.saturating_add(returned) < total,
+                    "truncated": truncated,
                 });
+                let summary =
+                    catalogue_summary(total, returned, truncated, "high", &counts, None, None);
 
                 Ok(success_envelope(json!({
                     "findings": findings,
                     "filter": filter.to_json(),
                     "page": meta,
+                    "summary": summary,
                     "scan_truncated": false,
                 })))
             })
@@ -701,6 +711,121 @@ impl FindingFilter {
             "status": self.status,
         })
     }
+}
+
+const FINDING_RULE_COUNT_LIMIT: usize = 20;
+
+fn finding_summary_counts(
+    conn: &rusqlite::Connection,
+    entity_id: Option<&str>,
+    filter: &FindingFilter,
+) -> rusqlite::Result<Value> {
+    let rule_distinct =
+        finding_distinct_count(conn, entity_id, filter, "COALESCE(rule_id, 'unknown')")?;
+    Ok(json!({
+        "by_kind": finding_group_counts(conn, entity_id, filter, "kind", usize::MAX)?,
+        "by_status": finding_group_counts(conn, entity_id, filter, "status", usize::MAX)?,
+        "by_severity": finding_group_counts(conn, entity_id, filter, "severity", usize::MAX)?,
+        "by_rule": finding_group_counts(
+            conn,
+            entity_id,
+            filter,
+            "COALESCE(rule_id, 'unknown')",
+            FINDING_RULE_COUNT_LIMIT,
+        )?,
+        "rules_truncated": rule_distinct > FINDING_RULE_COUNT_LIMIT,
+    }))
+}
+
+fn finding_group_counts(
+    conn: &rusqlite::Connection,
+    entity_id: Option<&str>,
+    filter: &FindingFilter,
+    expression: &str,
+    limit: usize,
+) -> rusqlite::Result<Map<String, Value>> {
+    let kind = filter.kind.as_deref();
+    let severity = filter.severity.as_deref();
+    let status = filter.status.as_deref();
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql = if entity_id.is_some() {
+        format!(
+            "SELECT {expression} AS key, COUNT(*) AS count \
+               FROM findings \
+              WHERE entity_id = ?1 \
+                AND (?2 IS NULL OR kind = ?2) \
+                AND (?3 IS NULL OR severity = ?3) \
+                AND (?4 IS NULL OR status = ?4) \
+              GROUP BY key \
+              ORDER BY count DESC, key \
+              LIMIT ?5"
+        )
+    } else {
+        format!(
+            "SELECT {expression} AS key, COUNT(*) AS count \
+               FROM findings \
+              WHERE (?1 IS NULL OR kind = ?1) \
+                AND (?2 IS NULL OR severity = ?2) \
+                AND (?3 IS NULL OR status = ?3) \
+              GROUP BY key \
+              ORDER BY count DESC, key \
+              LIMIT ?4"
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = if let Some(entity_id) = entity_id {
+        stmt.query(rusqlite::params![entity_id, kind, severity, status, limit])?
+    } else {
+        stmt.query(rusqlite::params![kind, severity, status, limit])?
+    };
+    let mut counts = Map::new();
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        counts.insert(key, json!(usize::try_from(count).unwrap_or(usize::MAX)));
+    }
+    Ok(counts)
+}
+
+fn finding_distinct_count(
+    conn: &rusqlite::Connection,
+    entity_id: Option<&str>,
+    filter: &FindingFilter,
+    expression: &str,
+) -> rusqlite::Result<usize> {
+    let kind = filter.kind.as_deref();
+    let severity = filter.severity.as_deref();
+    let status = filter.status.as_deref();
+    let sql = if entity_id.is_some() {
+        format!(
+            "SELECT COUNT(DISTINCT {expression}) \
+               FROM findings \
+              WHERE entity_id = ?1 \
+                AND (?2 IS NULL OR kind = ?2) \
+                AND (?3 IS NULL OR severity = ?3) \
+                AND (?4 IS NULL OR status = ?4)"
+        )
+    } else {
+        format!(
+            "SELECT COUNT(DISTINCT {expression}) \
+               FROM findings \
+              WHERE (?1 IS NULL OR kind = ?1) \
+                AND (?2 IS NULL OR severity = ?2) \
+                AND (?3 IS NULL OR status = ?3)"
+        )
+    };
+    let count: i64 = if let Some(entity_id) = entity_id {
+        conn.query_row(
+            &sql,
+            rusqlite::params![entity_id, kind, severity, status],
+            |row| row.get(0),
+        )?
+    } else {
+        conn.query_row(&sql, rusqlite::params![kind, severity, status], |row| {
+            row.get(0)
+        })?
+    };
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
 /// A finding row anchored to the queried entity.

@@ -12,8 +12,16 @@ use crate::secret_scan::findings::{
 const BASELINE_NO_JUSTIFICATION: &str = "LMWV-INFRA-SECRET-BASELINE-NO-JUSTIFICATION";
 const BASELINE_MATCH: &str = "LMWV-INFRA-SECRET-BASELINE-MATCH";
 
-pub(super) fn load_for_scan(project_root: &Path) -> Result<(Baseline, Vec<PendingFinding>)> {
-    let path = loomweave_core::store::store_dir(project_root).join("secrets-baseline.yaml");
+/// `project_root` normalises finding-anchor paths; `store_root` is the
+/// resolved store directory the baseline actually lives under — for a
+/// linked worktree that is the isolated worktree store (worktree-index Task
+/// 7), NOT `store_dir(project_root)`, which is the never-populated
+/// `.weft/loomweave/` directly under the worktree's own checkout.
+pub(super) fn load_for_scan(
+    project_root: &Path,
+    store_root: &Path,
+) -> Result<(Baseline, Vec<PendingFinding>)> {
+    let path = store_root.join("secrets-baseline.yaml");
     match loomweave_scanner::load_baseline(&path) {
         Ok(baseline) => Ok((baseline, Vec::new())),
         Err(BaselineError::MissingJustifications { entries }) => Ok((
