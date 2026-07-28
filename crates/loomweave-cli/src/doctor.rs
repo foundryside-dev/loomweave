@@ -26,6 +26,10 @@
 
 use std::fs;
 use std::path::Path;
+// The git call sites use `hardened_git_command` (clarion-9202f4acec); this is
+// for spawning our OWN binary in `repair_classifier_analysis`, which is not git
+// and must not inherit the git hardening wrapper.
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
