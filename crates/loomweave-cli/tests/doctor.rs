@@ -731,6 +731,65 @@ fn doctor_reports_malformed_instructions_block_as_gating_problem() {
     assert_eq!(code, 0, "repaired project must be healthy on re-run");
 }
 
+/// C-20 doctor inversion, end to end through the real binary: under a
+/// CLAUDE.md → AGENTS.md redirect, the block's ABSENCE from CLAUDE.md is the
+/// healthy state, a leftover block is the defect, and `--fix` MIGRATES rather
+/// than re-injecting.
+///
+/// Left un-inverted, doctor would report "block missing" forever and `--fix`
+/// would re-inject the block `loomweave install` had just migrated off — a
+/// permanent fix/re-inject churn loop.
+#[test]
+fn doctor_under_redirect_migrates_the_block_instead_of_reinjecting() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+
+    // Prepend a redirect line to the seeded (dual-written) CLAUDE.md, so the
+    // file both redirects AND carries a legacy block.
+    let claude = dir.path().join("CLAUDE.md");
+    let seeded = fs::read_to_string(&claude).unwrap();
+    fs::write(&claude, format!("# Project\n\n@AGENTS.md\n\n{seeded}")).unwrap();
+
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 1,
+        "a leftover block under a redirect must FAIL the gate without --fix:\n{out}"
+    );
+    assert!(
+        out.contains("CLAUDE.md redirects to AGENTS.md but still carries a Loomweave"),
+        "stdout:\n{out}"
+    );
+
+    let (code, out) = doctor(dir.path(), true);
+    assert_eq!(code, 0, "--fix should migrate and exit 0:\n{out}");
+    let migrated = fs::read_to_string(&claude).unwrap();
+    assert!(
+        !migrated.contains("<!-- loomweave:instructions"),
+        "--fix re-injected instead of migrating:\n{migrated}"
+    );
+    assert!(
+        migrated.contains("@AGENTS.md"),
+        "the redirect line must survive --fix:\n{migrated}"
+    );
+    assert!(
+        fs::read_to_string(dir.path().join("AGENTS.md"))
+            .unwrap()
+            .contains("<!-- loomweave:instructions"),
+        "AGENTS.md must keep the block — it is the only copy now"
+    );
+
+    // Convergence: a plain re-run is clean, and healthy reports the redirect.
+    let (code, out) = doctor(dir.path(), false);
+    assert_eq!(
+        code, 0,
+        "migrated project must be healthy on re-run:\n{out}"
+    );
+    assert!(
+        out.contains("agent-orientation block present in AGENTS.md (CLAUDE.md redirects to it)"),
+        "the healthy message must not claim a block in CLAUDE.md:\n{out}"
+    );
+}
+
 /// JSON surface: pin the `instructions.block` check shape. Healthy install ->
 /// status `ok`, `fixed: false`; a drifted block -> status `problem` and the run
 /// aggregates to `ok: false`. The healthy-install json shape test omits this

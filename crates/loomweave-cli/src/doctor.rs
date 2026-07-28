@@ -1878,11 +1878,22 @@ fn check_mcp_hygiene_json() -> DoctorJsonCheck {
     )
 }
 
+/// The healthy-state message for the instructions check, redirect-aware (C-20).
+/// Naming both files under a redirect would claim a block in CLAUDE.md that the
+/// installer deliberately keeps out of it.
+fn instructions_present_message(project_root: &Path) -> String {
+    if instructions::claude_md_redirects_to_agents_md(project_root) {
+        "agent-orientation block present in AGENTS.md (CLAUDE.md redirects to it)".to_owned()
+    } else {
+        "agent-orientation block present in CLAUDE.md + AGENTS.md".to_owned()
+    }
+}
+
 fn check_instructions_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     match instructions::instructions_state(project_root) {
         InstructionsState::UpToDate => DoctorJsonCheck::ok(
             "instructions.block",
-            "agent-orientation block present in CLAUDE.md + AGENTS.md",
+            instructions_present_message(project_root),
         ),
         InstructionsState::Missing => {
             let what = "agent-orientation block missing from CLAUDE.md / AGENTS.md";
@@ -1902,6 +1913,14 @@ fn check_instructions_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
                 }
                 InstructionsState::Duplicated => {
                     "agent-orientation block duplicated (stale split-brain copy)"
+                }
+                // C-20 inversion: under a redirect the block's ABSENCE from
+                // CLAUDE.md is health, so the defect is a leftover and the
+                // repair is migration — `install_instructions` migrates rather
+                // than re-injects, so `--fix` cannot churn here.
+                InstructionsState::RedirectStale => {
+                    "CLAUDE.md redirects to AGENTS.md but still carries a Loomweave \
+                     instruction block"
                 }
                 InstructionsState::UpToDate | InstructionsState::Missing => unreachable!(),
             };
@@ -2200,9 +2219,7 @@ fn check_mcp(project_root: &Path, fix: bool) -> Tally {
 
 fn check_instructions(project_root: &Path, fix: bool) -> Tally {
     match instructions::instructions_state(project_root) {
-        InstructionsState::UpToDate => {
-            ok("agent-orientation block present in CLAUDE.md + AGENTS.md")
-        }
+        InstructionsState::UpToDate => ok(&instructions_present_message(project_root)),
         // Optional surface: the same guidance ships via the MCP preamble and the
         // loomweave-workflow skill, so a missing block is advisory — never a gate
         // failure. Mirrors the integration-bindings severity model.
@@ -2226,6 +2243,12 @@ fn check_instructions(project_root: &Path, fix: bool) -> Tally {
                 }
                 InstructionsState::Duplicated => {
                     "agent-orientation block duplicated (stale split-brain copy)"
+                }
+                // C-20 inversion — see the JSON twin: absence in a redirecting
+                // CLAUDE.md is health, so `--fix` migrates instead of injecting.
+                InstructionsState::RedirectStale => {
+                    "CLAUDE.md redirects to AGENTS.md but still carries a Loomweave \
+                     instruction block"
                 }
                 InstructionsState::UpToDate | InstructionsState::Missing => unreachable!(),
             };
