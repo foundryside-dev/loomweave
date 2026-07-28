@@ -372,6 +372,47 @@ fn spawn_one_shot_health_server() -> (u16, std::thread::JoinHandle<()>) {
     (port, handle)
 }
 
+/// Like [`spawn_one_shot_health_server`] but answers 200 ONLY on
+/// `expected_path`, 404 otherwise — the real read API's contract.
+///
+/// The path-agnostic server above answers any request, so it cannot tell a
+/// correct probe from one aimed at a route that does not exist. That blind spot
+/// is why the liveness probe shipped pointed at `/health`, which the read API
+/// never registered. Returns the request line the probe actually sent.
+fn spawn_one_shot_routed_server(
+    expected_path: &'static str,
+) -> (u16, std::thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind routed server");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept probe");
+        let mut buf = [0_u8; 512];
+        let read = stream.read(&mut buf).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+        let request_line = request.lines().next().unwrap_or_default().to_owned();
+        let hit = request_line
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|path| path == expected_path);
+        if hit {
+            let body = r#"{"ok":true}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        } else {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"
+            );
+        }
+        request_line
+    });
+    (port, handle)
+}
+
 /// A freshly `install --all`ed project has every orientation surface, including
 /// Claude Code MCP, so `doctor` must report it healthy.
 #[test]
@@ -960,6 +1001,33 @@ fn doctor_reports_published_ephemeral_port() {
     );
 }
 
+/// The liveness probe must aim at a route the read API actually serves.
+///
+/// `/api/v1/_capabilities` is the one deliberately unauthenticated route
+/// (siblings probe it pre-auth), which makes it the only sound liveness target:
+/// every other route can legitimately answer 401/403 on a perfectly healthy
+/// server. `/health` was never registered at all, so doctor reported a LIVE
+/// server as "stale port metadata … not reachable" for every operator with the
+/// HTTP read API enabled (clarion-7ad374bac4).
+#[test]
+fn doctor_probes_a_route_the_read_api_actually_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    let (port, handle) = spawn_one_shot_routed_server("/api/v1/_capabilities");
+    let loomweave_dir = dir.path().join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).unwrap();
+    std::fs::write(loomweave_dir.join("ephemeral.port"), format!("{port}\n")).unwrap();
+
+    let (code, json) = doctor_json(dir.path(), false);
+    let request_line = handle.join().expect("routed server joins");
+    assert_eq!(code, 0, "{json}");
+    let http = check(&json, "http.config");
+    assert_eq!(
+        http["status"], "ok",
+        "a live server must not be reported unreachable; probe sent {request_line:?}: {http}"
+    );
+}
+
 #[test]
 fn doctor_warns_when_published_ephemeral_port_is_stale() {
     let dir = tempfile::tempdir().unwrap();
@@ -988,8 +1056,10 @@ fn doctor_warns_when_published_ephemeral_port_is_stale() {
         message.contains("stale HTTP read-API port metadata"),
         "{http}"
     );
+    // The message names the route that was actually probed, so an operator can
+    // reproduce the check by hand. That must stay in step with the probe itself.
     assert!(
-        message.contains(&format!("127.0.0.1:{port}/health")),
+        message.contains(&format!("127.0.0.1:{port}/api/v1/_capabilities")),
         "{http}"
     );
     assert!(

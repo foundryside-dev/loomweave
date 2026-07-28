@@ -1595,8 +1595,8 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
                 "http.config",
                 format!(
                     "stale HTTP read-API port metadata in .weft/loomweave/ephemeral.port: \
-                     {url}/health is not reachable; start `loomweave serve` or ignore this \
-                     persisted port when .mcp.json launches the stdio runtime"
+                     {url}{HTTP_LIVENESS_PATH} is not reachable; start `loomweave serve` or \
+                     ignore this persisted port when .mcp.json launches the stdio runtime"
                 ),
             );
         }
@@ -1806,6 +1806,19 @@ fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonChec
     }
 }
 
+/// The one route the read API serves unauthenticated, by design, so siblings can
+/// probe it pre-auth (`http_read/linkages.rs`). That makes it the only sound
+/// liveness target: every other route may legitimately answer 401/403 on a
+/// perfectly healthy server, and a probe that reads those as "dead" is worse
+/// than no probe at all.
+const HTTP_LIVENESS_PATH: &str = "/api/v1/_capabilities";
+
+/// Whether a Loomweave read API is answering at `base_url`.
+///
+/// This previously probed `/health`, a route the read API has never registered,
+/// so a LIVE server was reported as unreachable stale port metadata for every
+/// operator with HTTP enabled (clarion-7ad374bac4). The test fake answered any
+/// path with 200, so nothing caught it.
 fn http_health_reachable(base_url: &str) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(250))
@@ -1813,7 +1826,7 @@ fn http_health_reachable(base_url: &str) -> bool {
     else {
         return false;
     };
-    let url = format!("{}/health", base_url.trim_end_matches('/'));
+    let url = format!("{}{HTTP_LIVENESS_PATH}", base_url.trim_end_matches('/'));
     client
         .get(url)
         .send()
