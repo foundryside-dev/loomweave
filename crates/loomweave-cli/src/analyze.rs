@@ -821,12 +821,20 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // current-locator union AND re-appended to the prior-index rebuild below.
     let mut retained_locators: HashSet<String> = HashSet::new();
     let mut skipped_files_total: u64 = 0;
-    // Canonical-absolute source paths actually DISPATCHED to a plugin this run
-    // (the form `entities.source_file_path` stores). This is the exact
-    // re-examination scope for the plugins' syntax-error rule family, which the
-    // scoped stale-finding sweep below needs to retire a fixed file's finding on
-    // an incremental run — see that call site for why the general sweep cannot.
-    let mut plugin_analyzed_source_files: BTreeSet<String> = BTreeSet::new();
+    // Per-plugin syntax-error rule id → canonical-absolute source paths (the
+    // form `entities.source_file_path` stores) whose syntax classification
+    // COMPLETED this run: the file's batch was persisted, so the classifier
+    // actually saw its (possibly degraded) module evidence. This is the exact
+    // re-examination scope for the scoped stale-finding sweep below, which
+    // needs it to retire a fixed file's finding on an incremental run — see
+    // that call site for why the general sweep cannot. Two deliberate
+    // narrowings versus "files dispatched":
+    // - a file that never produced a persisted batch (e.g. the jail-safe open
+    //   failed) was NOT examined, and sweeping its prior finding would launder
+    //   a still-broken file into `complete` on the next skipped run;
+    // - the map is keyed per rule so one plugin's re-dispatch can never sweep
+    //   a co-extensioned plugin's findings on the same file.
+    let mut syntax_classified_source_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
@@ -1131,15 +1139,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             "processing plugin"
         );
 
-        // Record this plugin's dispatch scope before the blocking task consumes
-        // the list. Canonicalised the same way the skipped branch above resolves
-        // its anchor, so both halves speak the path form entities store.
-        plugin_analyzed_source_files.extend(plugin_files.iter().map(|path| {
-            crate::secret_scan::canonical_or_original(path)
-                .display()
-                .to_string()
-        }));
-
         // Run the blocking plugin work on the tokio threadpool. Completed file
         // output flows through a bounded channel so writer backpressure applies
         // during extraction rather than after the whole plugin has returned.
@@ -1235,6 +1234,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     let batch_entity_ids: Vec<String> =
                         batch.entities.iter().map(|(id, _)| id.clone()).collect();
                     let batch_edges = std::mem::take(&mut batch.edges);
+                    let batch_source_file_path = batch.source_file_path.clone();
                     match persist_plugin_file_batch(
                         &writer,
                         batch,
@@ -1249,6 +1249,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                             plugin_entity_count += effects.entity_count;
                             plugin_classifier_coverage[coverage_index]
                                 .record_completed_file(effects.degraded_source_files.clone());
+                            syntax_classified_source_files
+                                .entry(syntax_error_rule_id.clone())
+                                .or_default()
+                                .insert(batch_source_file_path);
                             seen_plugin_entity_ids.extend(batch_entity_ids);
                             pending_plugin_edges.extend(batch_edges);
                             let ready_edges = drain_ready_plugin_edges(
@@ -1342,8 +1346,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             } else {
                 // Syntax degradation without a file anchor cannot contribute
                 // a sound file count. Preserve the declaration but fail the
-                // plugin's coverage closed.
+                // plugin's coverage closed — and withhold this plugin's whole
+                // sweep scope: the degraded file is unidentifiable, so the
+                // scoped sweep could retire its still-valid prior finding as
+                // "looked, clean".
                 plugin_classifier_coverage[coverage_index].mark_failed();
+                syntax_classified_source_files.remove(&syntax_error_rule_id);
             }
         }
         let mut syntax_merges = legacy_plugin_syntax_merges(
@@ -1436,7 +1444,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 {
                     // A successful transport can still carry host-rejected
                     // enumeration evidence (ontology/path/protocol drops).
+                    // Rejection findings carry no file anchor, so the dropped
+                    // evidence cannot be attributed to a file — withhold this
+                    // plugin's whole sweep scope rather than let the scoped
+                    // sweep read an unexamined file's missing re-emission as
+                    // "looked, clean" and retire its still-valid finding.
                     plugin_classifier_coverage[coverage_index].mark_failed();
+                    syntax_classified_source_files.remove(&syntax_error_rule_id);
                 }
                 // Log findings individually (operator-facing stderr) and persist
                 // them (REQ-ANALYZE-06) so an ontology check, malformed-JSON drop,
@@ -2083,12 +2097,18 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             }
             // Rule-scoped sweep for the plugins' syntax-error rule family. Unlike
             // the secret scan this producer is NOT a full pass — a syntax finding
-            // is only re-emitted for a file the run actually dispatched — so the
-            // bound is the dispatch scope itself (`plugin_analyzed_source_files`),
-            // which is exact rather than a scope-shrinkage guard: a file the run
-            // did not dispatch is never a candidate, so a still-broken skipped
+            // is only re-emitted for a file the run actually examined — so the
+            // bound is the classification scope itself
+            // (`syntax_classified_source_files`), which is exact rather than a
+            // scope-shrinkage guard: a file whose syntax classification did not
+            // complete this run (never dispatched, or dispatched but its batch
+            // never persisted) is never a candidate, so a still-broken skipped
             // file's finding survives exactly as the general sweep's
-            // `skipped_files == 0` clause intends.
+            // `skipped_files == 0` clause intends. One sweep per rule keeps each
+            // plugin's rule paired with the files THAT plugin classified: when
+            // two plugins cover the same extension and only one re-dispatches
+            // (e.g. its version changed), the other's findings on the shared
+            // files are not sweep candidates.
             //
             // The general sweep cannot cover this: it is gated OFF whenever any
             // file was incrementally skipped, which is every routine run on a real
@@ -2105,29 +2125,32 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // subsequent run and forces `classification.complete: false` across
             // every tag read surface. Same lifecycle preservation (`open` +
             // Filigree-unlinked only) and best-effort posture as the sweeps above.
-            if !resume && !syntax_rule_ids.is_empty() {
-                let examined_source_files: Vec<String> =
-                    plugin_analyzed_source_files.iter().cloned().collect();
-                match writer
-                    .send_wait(|ack| WriterCmd::SweepStaleFindingsForRules {
-                        current_run_id: run_id.clone(),
-                        rule_ids: syntax_rule_ids.iter().cloned().collect(),
-                        examined_source_files,
-                        ack,
-                    })
-                    .await
-                {
-                    Ok(retired) if retired > 0 => tracing::info!(
-                        run_id = %run_id,
-                        stale_syntax_findings_retired = retired,
-                        "scoped sweep retired syntax findings for files that now parse cleanly"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        run_id = %run_id,
-                        error = %e,
-                        "scoped syntax-finding sweep skipped (run already committed successfully)"
-                    ),
+            if !resume {
+                for (rule_id, examined) in &syntax_classified_source_files {
+                    let examined_source_files: Vec<String> = examined.iter().cloned().collect();
+                    match writer
+                        .send_wait(|ack| WriterCmd::SweepStaleFindingsForRules {
+                            current_run_id: run_id.clone(),
+                            rule_ids: vec![rule_id.clone()],
+                            examined_source_files,
+                            ack,
+                        })
+                        .await
+                    {
+                        Ok(retired) if retired > 0 => tracing::info!(
+                            run_id = %run_id,
+                            rule_id = %rule_id,
+                            stale_syntax_findings_retired = retired,
+                            "scoped sweep retired syntax findings for files that now parse cleanly"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            run_id = %run_id,
+                            rule_id = %rule_id,
+                            error = %e,
+                            "scoped syntax-finding sweep skipped (run already committed successfully)"
+                        ),
+                    }
                 }
             }
         }
@@ -5363,6 +5386,12 @@ struct PluginFileBatch {
     /// Core file entity id for the analyzed file. Used as the authoritative
     /// replacement key for scan-time anchored edges from that source file.
     source_file_id: String,
+    /// Canonical-absolute path of the analyzed file (the form
+    /// `entities.source_file_path` stores). On successful persistence this
+    /// records the file as syntax-classified for the scoped stale-finding
+    /// sweep — a dispatched file that never yields a persisted batch was not
+    /// examined and must stay out of the sweep's bound.
+    source_file_path: String,
     /// `(entity_id_string, record)` pairs accepted from one analyzed file.
     entities: Vec<(String, EntityRecord)>,
     /// Manifest-declared semantic roles for this plugin's entity kinds.
@@ -6037,6 +6066,12 @@ fn run_plugin_blocking(
             batch_tx
                 .blocking_send(PluginBatchMessage::File(PluginFileBatch {
                     source_file_id: file_entity_id.clone(),
+                    // Canonicalised the same way the skipped branch resolves
+                    // its anchor, so both halves speak the path form entities
+                    // store.
+                    source_file_path: crate::secret_scan::canonical_or_original(file)
+                        .display()
+                        .to_string(),
                     entities: file_entities,
                     kind_roles: kind_roles.clone(),
                     edges: immediate_edges,

@@ -5453,6 +5453,13 @@ fn syntax_contract_redispatches_plugins_without_degraded_entity_roles() {
 /// file's bytes — the module entity id is stable, so no entity-deleted noise — and
 /// makes content edits drive the incremental skip/walk decision. Used by the
 /// ADR-048 stale-finding-sweep gate tests.
+///
+/// Template placeholders (`__PLUGIN_ID__`, `__VERSION__`) are substituted by
+/// `write_sweep_plugin_variant` so tests can install two co-extensioned
+/// plugins or bump one plugin's version between runs. A `MYSTERY` content
+/// marker makes the plugin emit its module entity under the undeclared kind
+/// `mystery`, which the host drops with `LMWV-INFRA-PLUGIN-UNDECLARED-KIND` —
+/// the file's batch still persists, but carries no syntax evidence.
 #[cfg(unix)]
 const SWEEP_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
 import json
@@ -5493,7 +5500,7 @@ while True:
             "id": ident,
             "result": {
                 "name": "loomweave-plugin-sweep",
-                "version": "0.1.0",
+                "version": "__VERSION__",
                 "ontology_version": "0.6.0",
                 "capabilities": {},
             },
@@ -5506,9 +5513,10 @@ while True:
         except OSError:
             content = ""
         parse_status = "syntax_error" if "BROKEN" in content else "ok"
+        kind = "mystery" if "MYSTERY" in content else "module"
         entity = {
-            "id": f"sweepfixture:module:{stem}",
-            "kind": "module",
+            "id": f"__PLUGIN_ID__:{kind}:{stem}",
+            "kind": kind,
             "qualified_name": stem,
             "source": {"file_path": path},
             "parse_status": parse_status,
@@ -5527,12 +5535,12 @@ while True:
 #[cfg(unix)]
 const SWEEP_PLUGIN_MANIFEST: &str = r#"
 [plugin]
-name = "loomweave-plugin-sweep"
-plugin_id = "sweepfixture"
-version = "0.1.0"
+name = "__EXECUTABLE__"
+plugin_id = "__PLUGIN_ID__"
+version = "__VERSION__"
 protocol_version = "1.0"
-executable = "loomweave-plugin-sweep"
-language = "sweepfixture"
+executable = "__EXECUTABLE__"
+language = "__PLUGIN_ID__"
 extensions = ["swp"]
 
 [capabilities.runtime]
@@ -5544,7 +5552,7 @@ reads_outside_project_root = false
 [ontology]
 entity_kinds = ["module"]
 edge_kinds = []
-rule_id_prefix = "LMWV-SWP-"
+rule_id_prefix = "__RULE_PREFIX__"
 ontology_version = "0.6.0"
 
 [ontology.roles]
@@ -5552,33 +5560,68 @@ file_scope = ["module"]
 syntax_degraded_module = ["module"]
 "#;
 
+/// Write one sweep-fixture plugin (script + neighbor manifest) into
+/// `plugin_dir`, substituting identity and version into both files. Distinct
+/// `executable` names let two variants coexist on `PATH`; re-invoking with a
+/// different `version` overwrites in place to simulate a plugin upgrade
+/// between runs.
 #[cfg(unix)]
-fn write_sweep_plugin(plugin_dir: &std::path::Path) {
+fn write_sweep_plugin_variant(
+    plugin_dir: &std::path::Path,
+    executable: &str,
+    plugin_id: &str,
+    rule_prefix: &str,
+    version: &str,
+) {
     use std::os::unix::fs::PermissionsExt;
 
-    let plugin_script = plugin_dir.join("loomweave-plugin-sweep");
-    std::fs::write(&plugin_script, SWEEP_PLUGIN_SCRIPT).expect("write sweep plugin script");
+    let script = SWEEP_PLUGIN_SCRIPT
+        .replace("__PLUGIN_ID__", plugin_id)
+        .replace("__VERSION__", version);
+    let plugin_script = plugin_dir.join(executable);
+    std::fs::write(&plugin_script, script).expect("write sweep plugin script");
     let mut perms = std::fs::metadata(&plugin_script)
         .expect("stat sweep plugin")
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&plugin_script, perms).expect("chmod sweep plugin");
 
-    std::fs::write(plugin_dir.join("plugin.toml"), SWEEP_PLUGIN_MANIFEST)
-        .expect("write sweep plugin manifest");
+    let manifest = SWEEP_PLUGIN_MANIFEST
+        .replace("__EXECUTABLE__", executable)
+        .replace("__PLUGIN_ID__", plugin_id)
+        .replace("__RULE_PREFIX__", rule_prefix)
+        .replace("__VERSION__", version);
+    std::fs::write(plugin_dir.join("plugin.toml"), manifest).expect("write sweep plugin manifest");
+}
+
+#[cfg(unix)]
+fn write_sweep_plugin(plugin_dir: &std::path::Path) {
+    write_sweep_plugin_variant(
+        plugin_dir,
+        "loomweave-plugin-sweep",
+        "sweepfixture",
+        "LMWV-SWP-",
+        "0.1.0",
+    );
+}
+
+/// Count the findings carrying `rule_id` in the project's store.
+#[cfg(unix)]
+fn finding_count_for_rule(project_root: &std::path::Path, rule_id: &str) -> i64 {
+    Connection::open(project_root.join(".weft/loomweave/loomweave.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = ?1",
+            [rule_id],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 /// Count the file-anchored syntax-error findings the sweep fixture produces.
 #[cfg(unix)]
 fn syntax_error_finding_count(project_root: &std::path::Path) -> i64 {
-    Connection::open(project_root.join(".weft/loomweave/loomweave.db"))
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SWP-SYNTAX-ERROR'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap()
+    finding_count_for_rule(project_root, "LMWV-SWP-SYNTAX-ERROR")
 }
 
 /// ADR-048 acceptance #1 + #3: a finding the current run no longer reproduces is
@@ -5765,6 +5808,149 @@ fn analyze_retires_fixed_syntax_finding_on_incremental_run() {
     assert_eq!(
         plugin["status"], "complete",
         "a retired syntax finding must not keep failing coverage closed on later incremental runs"
+    );
+}
+
+/// The scoped syntax sweep must retire a finding only when the file's syntax
+/// classification actually completed this run. Here the re-dispatched file's
+/// module entity is emitted under an undeclared kind, so the host DROPS it
+/// (`LMWV-INFRA-PLUGIN-UNDECLARED-KIND`): the plugin loop completes, the
+/// file's batch persists (core file entity only), but no syntax evidence was
+/// produced — "looked, found nothing" is not true, the classifier never saw
+/// the module. Sweeping the prior still-valid finding here would let the next
+/// unchanged (skipped) run report classifier coverage `complete` for a file
+/// that is still broken.
+#[cfg(unix)]
+#[test]
+fn analyze_preserves_syntax_finding_when_classification_fails() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // Run 1: mod_a broken → finding at R1; mod_b clean.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n").unwrap();
+    analyze();
+    assert_eq!(syntax_error_finding_count(project_dir.path()), 1);
+
+    // Run 2: mod_a's bytes change (→ re-dispatched) and now trip the
+    // undeclared-kind rejection; mod_b is unchanged, so this is a genuine
+    // incremental run and the scoped sweep is the only sweep that fires.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN MYSTERY\n").unwrap();
+    analyze();
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "mod_b must be incrementally skipped so the scoped sweep is exercised"
+    );
+    let plugin = stats["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(
+        plugin["status"], "failed",
+        "host-rejected classifier evidence must fail coverage closed"
+    );
+    assert_eq!(
+        syntax_error_finding_count(project_dir.path()),
+        1,
+        "a file whose syntax classification did not complete must keep its prior finding"
+    );
+}
+
+/// The scoped syntax sweep must pair each plugin's syntax rule with the files
+/// THAT plugin examined, never the union across plugins. Two plugins cover
+/// `.swp`; only plugin A is re-dispatched in run 2 (its version bumped, which
+/// forces a full re-dispatch of its files) while plugin B incrementally skips
+/// the same still-broken file. B never re-examined the file, so B's finding
+/// must survive — a combined `rules × files` sweep would delete it and let a
+/// later unchanged run report B's coverage complete.
+#[cfg(unix)]
+#[test]
+fn analyze_syntax_finding_sweep_is_scoped_per_plugin() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let upgraded_plugin_dir = tempfile::tempdir().unwrap();
+    let bystander_plugin_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin_variant(
+        upgraded_plugin_dir.path(),
+        "loomweave-plugin-sweep",
+        "sweepfixture",
+        "LMWV-SWP-",
+        "0.1.0",
+    );
+    write_sweep_plugin_variant(
+        bystander_plugin_dir.path(),
+        "loomweave-plugin-sweepb",
+        "sweepbfixture",
+        "LMWV-SWB-",
+        "0.1.0",
+    );
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path = std::env::join_paths([
+        upgraded_plugin_dir.path().to_path_buf(),
+        bystander_plugin_dir.path().to_path_buf(),
+    ])
+    .unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // Run 1: mod_a broken → one syntax finding per plugin.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n").unwrap();
+    analyze();
+    assert_eq!(
+        finding_count_for_rule(project_dir.path(), "LMWV-SWP-SYNTAX-ERROR"),
+        1
+    );
+    assert_eq!(
+        finding_count_for_rule(project_dir.path(), "LMWV-SWB-SYNTAX-ERROR"),
+        1
+    );
+
+    // Run 2: bump ONLY plugin A's version — its index contract changes, so all
+    // of A's files re-dispatch even though no bytes changed; B sees unchanged
+    // hashes and skips both files. mod_a is still broken: A re-emits its
+    // finding, B does not (it never looked).
+    write_sweep_plugin_variant(
+        upgraded_plugin_dir.path(),
+        "loomweave-plugin-sweep",
+        "sweepfixture",
+        "LMWV-SWP-",
+        "0.2.0",
+    );
+    analyze();
+    assert_eq!(
+        finding_count_for_rule(project_dir.path(), "LMWV-SWP-SYNTAX-ERROR"),
+        1,
+        "plugin A re-examined the still-broken file, so its finding persists"
+    );
+    assert_eq!(
+        finding_count_for_rule(project_dir.path(), "LMWV-SWB-SYNTAX-ERROR"),
+        1,
+        "plugin B never re-examined the file this run; its finding must not be swept"
     );
 }
 
