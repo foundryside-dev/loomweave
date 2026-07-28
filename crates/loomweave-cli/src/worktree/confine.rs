@@ -245,6 +245,14 @@ impl WorktreesRoot {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            // `handle` is otherwise read only inside `mod linux`, which
+            // doesn't exist on this platform — without this, `handle`
+            // would be flagged dead code under `-D warnings` even though
+            // it's a real field, written by `open` and load-bearing on
+            // Linux. There is nothing to do with it here; `open` already
+            // proved `worktrees_dir` was a real, non-symlinked directory,
+            // and this arm deletes nothing regardless.
+            let _ = &self.handle;
             refuse_unsupported(candidate_name, reason)
         }
     }
