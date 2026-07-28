@@ -183,13 +183,7 @@ impl WorktreeContext {
     /// [`WorktreeKind::Standalone`] rather than guessing. The only error
     /// this returns is [`WorktreeContextError::NonUtf8Path`].
     pub fn resolve(source_root: &Path) -> Result<Self, WorktreeContextError> {
-        let canonical_source = canonicalize_or_given(source_root);
-        if canonical_source.to_str().is_none() {
-            return Err(WorktreeContextError::non_utf8_path(
-                "source_root",
-                &canonical_source,
-            ));
-        }
+        let canonical_source = require_utf8("source_root", canonicalize_or_given(source_root))?;
 
         match probe_git(&canonical_source)? {
             GitProbe::Main => Ok(Self::own_store(WorktreeKind::Main, canonical_source)),
@@ -309,7 +303,12 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
         return Ok(GitProbe::Main);
     }
 
-    let primary_root = canonicalize_or_given(&primary_entry.path);
+    // `canonicalize_or_given` resolves symlinks; that can introduce
+    // non-UTF-8 path components that were never present in git's own
+    // (already-validated) reported string. Guard here too, same as
+    // `source_root` — the brief names `primary_root` explicitly among the
+    // inputs that must be rejected before any store path is built.
+    let primary_root = require_utf8("primary_root", canonicalize_or_given(&primary_entry.path))?;
 
     let Ok(admin_identity_path) = own_git_dir.strip_prefix(&common_dir) else {
         // The linked git-dir isn't nested under the common dir at all — an
@@ -382,6 +381,20 @@ fn canonicalize_or_given(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Reject `path` if it is not valid UTF-8, tagging the error with which
+/// resolution input it came from. Used for every path this resolver hands
+/// back to a caller or feeds into a hash/store-path computation
+/// (`source_root`, `primary_root`) — never only checked at the point a
+/// value first arrives from `git`, since a later filesystem operation
+/// (`canonicalize_or_given`'s symlink resolution) can introduce non-UTF-8
+/// bytes that were never in the original, already-validated string.
+fn require_utf8(field: &'static str, path: PathBuf) -> Result<PathBuf, WorktreeContextError> {
+    if path.to_str().is_none() {
+        return Err(WorktreeContextError::non_utf8_path(field, &path));
+    }
+    Ok(path)
+}
+
 /// Strictly decode a `git worktree list --porcelain -z` byte stream into its
 /// entries. `-z` NUL-delimits every line; a blank line (a lone NUL) ends one
 /// entry and starts the next, exactly like the newline-delimited blank-line
@@ -427,5 +440,63 @@ fn resolve_config_origin(source_root: &Path, primary_root: &Path) -> ConfigOrigi
         ConfigOrigin::Primary
     } else {
         ConfigOrigin::DefaultTarget
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Covers the `primary_root` non-UTF-8 gap directly on the guard
+    /// primitives rather than through a `git`-mediated fixture.
+    ///
+    /// A live `git worktree list --porcelain -z` fixture was tried first
+    /// (a UTF-8-named primary reached only through a symlink to a
+    /// non-UTF-8-named real directory) and found empirically infeasible:
+    /// `git` resolves a worktree's registered path to its real,
+    /// symlink-free form *at registration time*
+    /// (`git init`/`git worktree add`), so `git worktree list` always
+    /// reports the already-resolved path — meaning any non-UTF-8 bytes
+    /// there are already caught by `parse_worktree_list`'s strict decode,
+    /// never reaching this guard. That leaves this guard as defense against
+    /// what `canonicalize_or_given`'s own symlink resolution can introduce
+    /// (e.g. a TOCTOU-style swap between when `git` recorded a path and
+    /// when this resolver re-canonicalizes it, or platform/filesystem
+    /// differences in path resolution) — exercised here directly against
+    /// a real symlink to a real non-UTF-8-named directory, proving
+    /// `canonicalize_or_given` really does surface non-UTF-8 bytes on this
+    /// platform and that `require_utf8` rejects them.
+    #[test]
+    #[cfg(unix)]
+    fn require_utf8_rejects_a_symlink_resolving_to_a_non_utf8_target() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_target = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"real-\xFF-primary"));
+        std::fs::create_dir(&real_target).unwrap();
+        let symlink = dir.path().join("utf8-primary-link");
+        std::os::unix::fs::symlink(&real_target, &symlink).unwrap();
+
+        let canonical = canonicalize_or_given(&symlink);
+        assert!(
+            canonical.to_str().is_none(),
+            "sanity: canonicalize must actually resolve the symlink to the \
+             non-UTF-8 real path on this platform, got {canonical:?}"
+        );
+
+        let err = require_utf8("primary_root", canonical).expect_err("must reject");
+        match err {
+            WorktreeContextError::NonUtf8Path { field, .. } => {
+                assert_eq!(field, "primary_root");
+            }
+        }
+    }
+
+    #[test]
+    fn require_utf8_accepts_a_valid_utf8_path() {
+        let path = PathBuf::from("/store/primary");
+        assert_eq!(require_utf8("primary_root", path.clone()).unwrap(), path);
     }
 }
