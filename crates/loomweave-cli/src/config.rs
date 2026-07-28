@@ -351,8 +351,15 @@ fn run_example(provider: Option<&str>) -> Result<()> {
 /// provider-selection error (e.g. live provider with a missing API key) is a
 /// real misconfiguration and also exits non-zero, after printing the diagnosis.
 fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
-    let default_path = resolve_default_config_path(path)?;
-    let config_path = explicit_config.unwrap_or(&default_path);
+    // An explicit --config must short-circuit BEFORE worktree resolution is
+    // even attempted: resolve_default_config_path shells out to `git` and can
+    // fail on a non-UTF-8 project root, neither of which should matter when
+    // the caller already named the exact file to use.
+    let config_path = match explicit_config {
+        Some(explicit) => explicit.to_path_buf(),
+        None => resolve_default_config_path(path)?,
+    };
+    let config_path = config_path.as_path();
     let (config, source) = if config_path.exists() {
         let config = McpConfig::from_path(config_path)
             .with_context(|| format!("parse {}", config_path.display()))?;
@@ -417,8 +424,13 @@ fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
 }
 
 fn run_semantic_status(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
-    let default_path = resolve_default_config_path(path)?;
-    let config_path = explicit_config.unwrap_or(&default_path);
+    // See run_check's comment: an explicit --config must short-circuit before
+    // worktree resolution is even attempted.
+    let config_path = match explicit_config {
+        Some(explicit) => explicit.to_path_buf(),
+        None => resolve_default_config_path(path)?,
+    };
+    let config_path = config_path.as_path();
     let (config, source) = if config_path.exists() {
         let config = McpConfig::from_path(config_path)
             .with_context(|| format!("parse {}", config_path.display()))?;

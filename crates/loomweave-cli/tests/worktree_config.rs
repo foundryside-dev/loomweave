@@ -180,6 +180,54 @@ fn explicit_config_flag_wins_over_both() {
     );
 }
 
+/// The strongest form of `explicit_config_flag_wins_over_both`: an explicit
+/// `--config` must short-circuit BEFORE worktree resolution is even
+/// attempted, not merely win once both have been computed. Proven by making
+/// worktree resolution itself fail — `WorktreeContext::resolve` rejects a
+/// non-UTF-8 project root (`require_utf8`, before any git probing) — and
+/// showing `loomweave config check --config <path>` still succeeds. Before
+/// the fix, `run_check` called `resolve_default_config_path(path)?`
+/// unconditionally (discarding the result when `--config` was given), so
+/// this exact scenario returned a non-zero exit with a "resolve worktree
+/// context" error even though the explicit config makes worktree resolution
+/// irrelevant.
+#[cfg(unix)]
+#[test]
+fn explicit_config_flag_wins_even_when_worktree_resolution_would_fail() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let non_utf8_root = tmp
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"non-utf8-\xFF-root"));
+    std::fs::create_dir_all(&non_utf8_root).unwrap();
+    // Deliberately NOT a git repo: the non-UTF-8 canonicalized path alone is
+    // what makes `require_utf8` fail inside `WorktreeContext::resolve`,
+    // before git is ever probed.
+
+    let explicit = tmp.path().join("explicit-loomweave.yaml");
+    std::fs::write(
+        &explicit,
+        "version: 1\nllm_policy:\n  model_id: explicit-marker-model\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = config_in(
+        &non_utf8_root,
+        &["check", "--config", explicit.to_str().unwrap()],
+    );
+    assert_eq!(
+        code, 0,
+        "an explicit --config must succeed even when worktree resolution \
+         (which must never be attempted here) would fail on a non-UTF-8 \
+         project root: {stderr}"
+    );
+    assert!(
+        stdout.contains("explicit-marker-model"),
+        "expected the explicit config's model_id: {stdout}"
+    );
+}
+
 #[test]
 fn llm_config_set_writes_the_resolved_origin() {
     let tmp = tempfile::tempdir().unwrap();
