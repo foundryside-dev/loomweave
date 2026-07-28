@@ -2,9 +2,14 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.11
     hooks:
+      # `scripts/` is linted but not yet format-gated: the two federation-seam
+      # scripts added with the golden fixtures are 769 lines that no gate
+      # covered, and one of them produces normative consumer bytes. Six
+      # pre-existing check-*.py files need reformatting (~89 lines) before
+      # ruff-format can extend here, which is left as its own mechanical change.
       - id: ruff
         args: [--fix]
-        files: ^plugins/python/.*\.py$
+        files: ^(plugins/python|scripts)/.*\.py$
       - id: ruff-format
         files: ^plugins/python/.*\.py$
   - repo: https://github.com/pre-commit/mirrors-mypy

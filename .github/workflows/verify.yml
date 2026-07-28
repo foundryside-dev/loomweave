@@ -215,7 +215,7 @@ jobs:
         run: uv run --project plugins/python --extra dev python scripts/check-b4-gate-result.py --run-b5-smoke
 
       - name: ruff check
-        run: uv run --project plugins/python --extra dev ruff check plugins/python
+        run: uv run --project plugins/python --extra dev ruff check plugins/python scripts
 
       - name: ruff format check
         run: uv run --project plugins/python --extra dev ruff format --check plugins/python
@@ -265,3 +265,18 @@ jobs:
 
       - name: Phase 3 subsystems
         run: CARGO_BUILD=0 bash tests/e2e/phase3_subsystems.sh
+
+      # The federation seam fixtures are normative for consumers (Plainweave
+      # pins these bytes per docs/federation/2026-07-12-federation-seam-golden-
+      # authority.md), but nothing regenerated them from the real producer, so
+      # a routine version bump staleness them with every other guard green —
+      # bytes, .sha256 sidecars and authority-note rows all derive from the
+      # same committed file and agree with each other while disagreeing with
+      # what analyze now emits. This job is the only one with both the built
+      # binaries and the Python plugin, so the loop closes here. Mirrors the
+      # Wardline taint golden step in the `rust` job (clarion-72e1c1a07d).
+      - name: federation seam golden lockstep
+        run: |
+          python -m pip install uv==0.10.2
+          bash scripts/generate-federation-seam-goldens.sh
+          bash scripts/check-federation-seam-goldens-hermetic.sh

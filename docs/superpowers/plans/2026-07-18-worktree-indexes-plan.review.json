@@ -1,0 +1,323 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "summary": "7 blocking issues. Two are silent-failure paths that would let every unit test pass while acceptance criteria 1 and 4 fail in practice (plain `analyze` is not worktree-aware; the serve db_path gate has no owning task and the readiness-recompute mechanism is unpinned). One is a design-mandated behaviour with zero plumbing whose guarantee AC7 cannot express (store_dir override x sweep). One makes the plan non-executable in its stated order inside the safety-critical deletion task. Three are plan/design text that contradicts verified repository state. 14 warnings, 4 notes.",
+  "plan_file": "/home/john/loomweave/docs/superpowers/plans/2026-07-18-worktree-indexes-plan.md",
+  "design_file": "/home/john/loomweave/docs/superpowers/specs/2026-07-18-loomweave-worktree-indexes-design.md",
+  "reviewed_at": "2026-07-28T00:00:00Z",
+  "reviewers": ["reality", "architecture", "quality", "systems"],
+  "ratified_posture_note": "The ephemeral-cache posture (no checksums/journals/grace-periods/supervisors; fail toward deletion; accepted sweep race) is an owner decision. No finding below relitigates it; where a finding touches the posture (B7) it corrects a factual claim in the justification text, not the decision.",
+
+  "classification_rule": {
+    "priority_score": "Severity(1-4) x Likelihood(1-3) x Reversibility(1-3)",
+    "two_axis_note": "An issue is BLOCKING if EITHER (a) its priority score is high, OR (b) it is a spec-conformance / executability defect: plan text contradicts verified repo state, the plan cannot execute in its stated order, or the design mandates a behaviour for which no task supplies plumbing. Axis (b) is why B7 (score 6) outranks W1 (score 12) in blocking status. Each issue carries `classification_basis`.",
+    "ordering_note": "blocking_issues is sorted by priority_score descending, so the IDs are deliberately not sequential (B1, B2, B4, B3, B5, B6, B7). The markdown fix list uses a different, also deliberate order: plan-editor application order. Neither is a typo."
+  },
+
+  "blocking_issues": [
+    {
+      "id": "B1",
+      "sources": ["systems:S1", "reality:R2"],
+      "merged_from": "Systems S1 (BLOCKER) and Reality R2 (WARNING) are the same root cause; severity resolved upward. Systems S3's worst case is subsumed by this fix.",
+      "issue": "No task makes the plain `loomweave analyze <path>` entrypoint worktree-aware, yet both the SessionStart hook and Task 4's bootstrap depend on it.",
+      "evidence": "analyze.rs:357 run_with_options unconditionally resolves the store via store_dir(&project_root); hook.rs:88-104 spawn_detached_analyze hardcodes argv `analyze <project_root>`. analyze.rs appears in Task 2's and Task 5's file lists but not Task 6's consumer migration. Design Bootstrap step 2 (lines 198-199) says 'this is the mechanism the SessionStart hook already uses; do not reinvent it' - literal compliance writes the index to <worktree>/.weft/loomweave/, not the isolated store.",
+      "consequence": "A 20-30 minute analyze lands in the wrong location; serve's readiness poll never observes a completed run in the store it watches; the worktree is permanently stuck at `building`. analyze_lock is per-store so it does NOT prevent the resulting two-location double-analyze. Acceptance criteria 1 and 4 fail silently with all unit tests green.",
+      "priority_score": 18,
+      "severity": "High(3)", "likelihood": "Certain(3)", "reversibility": "Difficult(2)",
+      "classification_basis": "score",
+      "resolution": "Route run_with_options store resolution through WorktreeContext unconditionally, not only on the `worktree analyze` path. Add a RED test that bare `analyze <linked-worktree-path>` lands in <repository-store>/worktrees/<id>/. Add analyze.rs to Task 6's file list. Rewrite design Bootstrap step 2 to say the *detachment technique* is reused (process_group(0), Stdio::null()) while the argv is `loomweave worktree analyze`, and add a Verification bullet for the bare-analyze case.",
+      "targets": ["plan:§Task 2", "plan:§Task 6 file list", "design:§Bootstrap step 2 (L198-199)", "design:§Verification"]
+    },
+    {
+      "id": "B2",
+      "sources": ["reality:R4", "architecture:A3", "quality:Q2"],
+      "merged_from": "Reality R4 (WARNING) and Architecture A3 (BLOCKER) are the same serve.rs:24 gate; severity resolved upward. Quality Q2 is folded in because the gate fix alone does not make AC4 verifiable.",
+      "issue": "serve.rs:24-30 run() gates on db_path(path).exists() and routes to a fully-degraded serve_no_index; no task owns that gate, and the mechanism by which readiness flips mid-session is unspecified.",
+      "evidence": "serve.rs:24-30 routes to serve_no_index (a separate JSON-RPC loop with no ServerState). Task 2 creates the store with metadata.json only and no empty DB, so a fresh worktree hits serve_no_index and never reaches the new building path. serve.rs:24 is absent from Task 4's prose and from Task 6's file list. Separately, no mid-session-flip precedent exists: today's no-index mode is a static process-start fork, and RunRegistry/Notify targets supervised children, inapplicable to a detached spawn.",
+      "consequence": "Acceptance criterion 4 ('serve on an unbuilt worktree becomes usable in the same session') fails. Even with the gate made worktree-aware, session_becomes_usable_after_run_completes_without_reconnect cannot be written deterministically until the recompute mechanism is pinned - so AC4 fails silently a second way.",
+      "priority_score": 18,
+      "severity": "High(3)", "likelihood": "Certain(3)", "reversibility": "Difficult(2)",
+      "classification_basis": "score",
+      "resolution": "Three required sub-steps in Task 4: (a) make the serve.rs:24 gate worktree-aware (or have store creation eagerly touch an empty DB) and add serve.rs to Task 4's file list; (b) pin the readiness-recompute mechanism explicitly - poll the runs table at the handle_tool_call chokepoint (loomweave-mcp/src/lib.rs:1625) versus a cached value or timer - and name that chokepoint in the plan so implementers do not fork per-tool checks; (c) state which choice the session_becomes_usable RED test asserts against.",
+      "targets": ["plan:§Task 4 (prose + file list)", "plan:§Task 6 file list"]
+    },
+    {
+      "id": "B4",
+      "sources": ["architecture:A1"],
+      "issue": "The plan is not executable in its stated task order: Task 2's GREEN deletes metadata-mismatch directories 'confined - see Task 5', but Task 5 is where the confined-delete primitive and the rustix dependency are first introduced.",
+      "evidence": "Plan L129-132 (Task 2 GREEN) versus L271-274 (Task 5 GREEN: 'No remove_dir_all on a string path anywhere in this module') and L216-218 (Task 5 introduces crates/loomweave-core/Cargo.toml + workspace Cargo.toml for rustix).",
+      "consequence": "Task-by-task TDD execution forces the implementer to ship an interim string-path remove_dir_all in Task 2 that directly contradicts Task 5's own safety invariant, in a plan whose Task 5 is explicitly labelled safety-critical. If the interim survives retrofit, one automatic-deletion path is unconfined.",
+      "priority_score": 12,
+      "severity": "High(3)", "likelihood": "Likely(2)", "reversibility": "Difficult(2)",
+      "classification_basis": "score + executability",
+      "resolution": "Renumber: split Task 5 into Task 5a (confined-delete primitive, rustix dependency, and the seven confinement RED tests) inserted BEFORE Task 2, and Task 5b (sweep enumeration/policy plus the seven behaviour RED tests) staying in place. This is one coupled edit with W3 and W4 - see fix F4.",
+      "targets": ["plan:§File structure", "plan:§Task 2 GREEN", "plan:§Task 5 (renumber to 5a/5b)"]
+    },
+    {
+      "id": "B3",
+      "sources": ["architecture:A2"],
+      "issue": "The `[loomweave].store_dir` override crossed with the sweep is an unmitigated one-way door, and acceptance criterion 7 as written cannot detect it.",
+      "evidence": "store.rs:68-108 honours absolute overrides not scoped to project_root; the test at store.rs:242 proves /var/lib/loomweave-style paths resolve. Design Non-goals L243-244 REQUIRE cleanup be diagnostic-only under an override. Task 5 has zero tests, text, or plumbing for it.",
+      "consequence": "Two repositories sharing an override path means repository A's sweep deletes repository B's live wt-* stores. Worse for verification: under a shared override both repositories resolve to the SAME <repository-store>, so AC7 ('no deletion can reach outside <repository-store>/worktrees/') is literally satisfied while the cross-repository deletion happens - a conformance test written against AC7 would pass.",
+      "priority_score": 9,
+      "severity": "High(3)", "likelihood": "Possible(1)", "reversibility": "Irreversible(3)",
+      "classification_basis": "spec_conformance (design mandates a behaviour with zero plumbing) + score",
+      "resolution": "Three parts: (a) the sweep detects store_dir_override().is_some() and becomes report-only; (b) a RED test pins that (`override_store_dir_is_report_only`); (c) amend design AC7 (L299) so the confinement claim is scoped to a store the sweeping repository exclusively owns - otherwise the design keeps asserting a guarantee it does not have. Alternative acceptable path: the owner formally drops the Non-goals L243-244 exception, in which case (c) is still required.",
+      "targets": ["plan:§Task 5b", "design:§Non-goals (L243-244)", "design:§Acceptance criteria #7 (L299)"]
+    },
+    {
+      "id": "B5",
+      "sources": ["quality:Q1"],
+      "issue": "Task 5's bind-mount confinement test cites 'the same CI leg pattern used for other privileged tests' - no privileged or root-gated CI leg exists anywhere in the repository.",
+      "evidence": "All four workflow files read in full; repository-wide grep for #[ignore] / CAP_SYS_ADMIN / unshare / mount() / geteuid found no privileged leg (the two #[ignore] hits are unrelated).",
+      "consequence": "As written the instruction resolves to either a test that silently never runs, or improvised sudo wiring with no prior art - inside the suite the plan itself designates safety-critical. False assurance on the single confinement case that a symlink check cannot cover.",
+      "priority_score": 9,
+      "severity": "High(3)", "likelihood": "Certain(3)", "reversibility": "Easy(1)",
+      "classification_basis": "spec_conformance (plan text contradicts verified repo state)",
+      "resolution": "Name a concrete mechanism in Task 5a: unprivileged user + mount namespace (`unshare`) works on ubuntu-latest. Mark the test #[ignore] and add an explicit `cargo nextest run --run-ignored=ignored-only` CI step that FAILS - not skips - when the capability is absent. Alternatively, instruct the implementer to create and name the new CI leg as an explicit deliverable of Task 5a.",
+      "targets": ["plan:§Task 5a RED-confinement (L244-246)"]
+    },
+    {
+      "id": "B6",
+      "sources": ["reality:R1"],
+      "issue": "Execution preflight Step 1 branches off `main`, but the plan file does not exist on main and main's same-named design document is the stale pre-cut version.",
+      "evidence": "Verified via `git log main..fix/week-review-followups` and `git show main:docs/superpowers/plans/`. Main's design still carries the 'Independently reviewed' heading and the old three-part plans that this plan states were cut by owner directive (plan L19-24).",
+      "consequence": "The implementer's worktree contains neither this plan nor the ratified design; they would execute against the superseded three-part design whose protection posture the owner explicitly rejected.",
+      "priority_score": 9,
+      "severity": "High(3)", "likelihood": "Certain(3)", "reversibility": "Easy(1)",
+      "classification_basis": "spec_conformance + executability (preflight cannot execute as intended)",
+      "resolution": "Change Step 1 to branch off fix/week-review-followups, or land that branch's docs commits on main first and say so. While editing, fix Step 2's stale claim that the ticket is assigned to `codex` - the live assignee is `claude`.",
+      "targets": ["plan:§Execution preflight Step 1 (L41)", "plan:§Execution preflight Step 2 (L47-48)"]
+    },
+    {
+      "id": "B7",
+      "sources": ["systems:S2"],
+      "issue": "The plan's stated benign outcome for the ratified sweep race is factually wrong for `git worktree remove`, and no task supplies behavioural handling for a serve whose worktree vanished.",
+      "evidence": "Plan L266-269 asserts 'the running server keeps working and the next start rebuilds - cost is one re-analyze'. But `git worktree remove` deletes the source tree AND the registration together, so there is no source tree left to rebuild from. Compounding it, ADR-045's fail-soft (worktree_dirty: None leaves the last verdict unchanged) lets the zombie serve keep reporting `fresh` for a source tree that no longer exists.",
+      "consequence": "An agent receives confidently stale answers about a deleted tree - strictly worse than today's honest no-index failure. This is a correction to the design's justification text, NOT a challenge to the ratified race.",
+      "priority_score": 6,
+      "severity": "High(3)", "likelihood": "Likely(2)", "reversibility": "Easy(1)",
+      "classification_basis": "spec_conformance (plan/design asserts an outcome that does not hold)",
+      "resolution": "Three small edits, none of which is a lock: (a) correct the 'Known accepted race' paragraph to distinguish sweep-under-a-live-worktree (benign, rebuilds) from `git worktree remove` (source gone, nothing to rebuild); (b) add a `source-root-missing` signal surfaced at query/status time so the zombie reports honestly instead of `fresh`; (c) one RED test in Task 4. Do NOT add an activity lock - the posture stands.",
+      "targets": ["plan:§Task 5 'Known accepted race' (L266-269)", "design:§Cleanup", "plan:§Task 4 RED"]
+    }
+  ],
+
+  "warnings": [
+    {
+      "id": "W1",
+      "sources": ["architecture", "quality", "systems"],
+      "issue": "Task 6 undercounts root-derived path consumers.",
+      "evidence": "Missing from Task 6's file list: crates/loomweave-cli/src/instance.rs:45 (instance_id via store_dir), crates/loomweave-cli/src/secret_scan/baseline.rs:16 (named in design text, in no task), crates/loomweave-mcp/src/catalogue/semantic.rs:101 (embeddings_db_path). Ambiguous call sites: status.rs:215, lib.rs:2110, lib.rs:3422. (analyze.rs is tracked separately as B1 - not double-counted.)",
+      "consequence": "A missed consumer means a worktree serve reads main's embeddings, or writes main's instance_id or secrets baseline.",
+      "priority_score": 12,
+      "classification_basis": "score",
+      "recommendation": "Add the three confirmed paths to Task 6's file list and require the grep audit to adjudicate the three ambiguous call sites explicitly. Near-blocker: the fix is a pure plan-document edit, so apply it in the same pass as the blockers."
+    },
+    {
+      "id": "W2",
+      "sources": ["quality:Q7"],
+      "issue": "No RED tests pin logging at the two automatic-deletion decision points (sweep deletion; metadata delete-and-rebuild).",
+      "priority_score": 6,
+      "classification_basis": "score, elevated by synthesis",
+      "synthesis_note": "Ranked alongside W1 despite the lower score. Under a posture that deliberately removes checksums, journals, grace periods, quarantine and tombstones, the deletion log is the ONLY residual accountability mechanism for automatic deletion. Its absence is load-bearing, not cosmetic. No single reviewer was positioned to make this argument.",
+      "recommendation": "Add RED tests asserting that each deletion logs the stable ID and the reason."
+    },
+    {
+      "id": "W7",
+      "sources": ["quality:Q4"],
+      "issue": "No RED test pins the sweep-versus-new-worktree-creation ordering invariant; it is currently safe only by construction (git registers the admin entry before analyze can run).",
+      "priority_score": 9,
+      "classification_basis": "score",
+      "recommendation": "Add a RED test pinning the invariant so a future refactor cannot silently break it into a just-created-store deletion."
+    },
+    {
+      "id": "W3",
+      "sources": ["architecture"],
+      "issue": "Layering: sweep.rs (and store.rs delete logic) belongs in loomweave-cli, not loomweave-core.",
+      "evidence": "The analyze_lock.rs precedent - fs2 is a cli dependency, the sweep's only callers are cli entry points, and this keeps rustix out of the deliberately-minimal core, which already carries nix for a different syscall surface. context.rs and paths.rs correctly stay in core (shared with mcp).",
+      "priority_score": 6,
+      "classification_basis": "score",
+      "recommendation": "Move in the same coupled edit as B4 and W4 - File structure section, Task 5 file list (crates/loomweave-core/Cargo.toml becomes crates/loomweave-cli/Cargo.toml), and the rustix pin location all change together. Cheap now, expensive once tests are written against the core path."
+    },
+    {
+      "id": "W4",
+      "sources": ["reality:R5"],
+      "issue": "rustix is not yet a direct dependency and Cargo.lock already carries two transitive versions (0.38.44 and 1.1.4).",
+      "priority_score": 2,
+      "classification_basis": "score",
+      "recommendation": "Pin 1.1.4 to avoid introducing a third (deny.toml multiple-versions is warn-level). Confirmed clean otherwise: rustix::fs::openat2 is a SAFE fn - no conflict with unsafe_code = deny - and MIT/Apache-2.0 licensing passes."
+    },
+    {
+      "id": "W5",
+      "sources": ["reality:R3"],
+      "issue": "The proposed error envelope {code, retryable, details} mismatches the real convention, and the new codes require touching a closed, test-pinned enum that no task lists.",
+      "evidence": "tool_error_envelope_with_diagnostics (loomweave-mcp/src/lib.rs:3851-3874) nests code/message/retryable under 'error' with a top-level 'diagnostics' array. McpErrorCode in crates/loomweave-core/src/errors.rs:89-125 is closed and pinned by mcp_error_code_wire_strings_are_pinned; errors.rs is absent from Task 4's file list.",
+      "priority_score": 6,
+      "classification_basis": "score",
+      "recommendation": "Correct the envelope JSON in Task 4 (plan L200-203) to the real nested shape, and add crates/loomweave-core/src/errors.rs plus the pinning test to Task 4's file list. Low ship-risk - the closed enum forces compile-time discovery - but the plan text is wrong as written."
+    },
+    {
+      "id": "W6",
+      "sources": ["reality:notes"],
+      "issue": "Task 1's non_utf8_worktree_path_is_rejected_with_typed_error requires new strict-decode code that the plan's GREEN text does not acknowledge.",
+      "evidence": "hardened_git_command is capable of NUL-delimited output, but the existing NUL-output consumer uses lossy UTF-8 conversion. Task 1's GREEN (plan L91-92) says only 'via the existing hardened_git_command', which would silently lossy-convert rather than reject.",
+      "priority_score": 6,
+      "classification_basis": "score",
+      "recommendation": "State in Task 1 GREEN that strict (non-lossy) decoding of the -z output is new code written here, distinct from the existing lossy consumer."
+    },
+    {
+      "id": "W8",
+      "sources": ["systems:S4"],
+      "issue": "Mid-migration state: Task 2 lands before Task 3, so worktree analyze silently uses default configuration instead of the primary's loomweave.yaml.",
+      "priority_score": 6,
+      "classification_basis": "score",
+      "recommendation": "Acceptable as a degraded intermediate, but note it explicitly in Task 2 so an implementer does not read it as a defect - or as shipped behaviour."
+    },
+    {
+      "id": "W9",
+      "sources": ["quality:Q3"],
+      "issue": "worktree_bootstrap.rs may need a nextest test-group; serve.rs binds real ports.",
+      "evidence": "The existing serve-http group with max-threads=1 is scoped to loomweave-cli's serve binary only; the plan never touches .config/nextest.toml.",
+      "priority_score": 4,
+      "classification_basis": "score",
+      "recommendation": "Add .config/nextest.toml to Task 4's file list or state explicitly that no group is needed and why."
+    },
+    {
+      "id": "W10",
+      "sources": ["quality:Q5"],
+      "issue": "The bare-repository-plus-worktrees topology (no traditional main worktree) is undefined in both design and plan.",
+      "priority_score": 4,
+      "classification_basis": "score",
+      "recommendation": "One sentence in the design's Worktree context section: either the behaviour, or an explicit non-goal."
+    },
+    {
+      "id": "W11",
+      "sources": ["quality:Q6"],
+      "issue": "A symlinked source-root path (distinct from store-side confinement) could break the source_root mismatch comparison.",
+      "consequence": "Spurious delete-and-rebuild - benign under the posture, but 20 minutes lost per occurrence.",
+      "priority_score": 2,
+      "classification_basis": "score",
+      "recommendation": "Canonicalize the source root before comparing, and add a test."
+    },
+    {
+      "id": "W12",
+      "sources": ["quality:Q8"],
+      "issue": "No per-test cfg gating story for non-Linux.",
+      "evidence": "CI nextest is Linux-only - the rust-macos job runs clippy and build only - so this is a local-development break, not a CI break.",
+      "priority_score": 4,
+      "classification_basis": "score",
+      "recommendation": "State the cfg(target_os) gating convention for the sweep tests in Task 5a."
+    },
+    {
+      "id": "W13",
+      "sources": ["quality:Q9"],
+      "issue": "The dogfood step is prose, not the literal command sequence the plan's own preflight standard sets.",
+      "evidence": "Plan L324-327 has no literal `git worktree add`, status check, or sweep trigger. The sweep only runs on serve startup or after analysis, so 'confirm the store is reclaimed' requires an explicit second action.",
+      "priority_score": 3,
+      "classification_basis": "score",
+      "recommendation": "Replace with a literal bash block including the second action that triggers the sweep."
+    },
+    {
+      "id": "W14",
+      "sources": ["systems:S3"],
+      "issue": "A weft.toml override tracked in git compounds B1: plain analyze resolves the override against the worktree root, so the store lands where the sweep never looks. Nothing enforces ADR-046's 'operator-private' convention.",
+      "priority_score": 4,
+      "classification_basis": "score",
+      "recommendation": "The worst case is resolved by B1's fix. Residual: state the operator-private expectation in the design, or detect a tracked override and warn."
+    }
+  ],
+
+  "notes": [
+    {"id": "N1", "source": "reality", "note": "Plan Step 2's 'assigned to codex' is stale - the live assignee is claude. Fold into fix F1."},
+    {"id": "N2", "source": "systems:S5", "note": "An old-binary downgrade plus `install --force` silently wipes worktrees/ (the existing ensure_safe_to_force_remove has no knowledge of it). Acceptable per the posture; document in rollout notes."},
+    {"id": "N3", "source": "architecture", "note": "cap-std versus raw rustix for the confined delete - advisory only, no action required."},
+    {"id": "N4", "source": "architecture", "note": "Task 4's readiness chokepoint (handle_tool_call, lib.rs:1625) - folded into B2's resolution."}
+  ],
+
+  "positive_verifications": [
+    "analyze_lock.rs:53 confirmed generic (accepts an arbitrary directory) - usable per-store exactly as designed.",
+    "Git-fixture testing is an established repository pattern (8+ sites); hardened_git nulls global config, so no safe.directory hazards.",
+    "The concurrent-analyze test is feasible via loomweave-plugin-fixture (used in 5+ test files) or fast JSON-RPC fixture scripts.",
+    "snapshot.rs and index_diff.rs already accept project_root parameters - Task 6's work there is really caller wiring in lib.rs.",
+    "install.rs:338 claim verified exact.",
+    "Filigree federation lookup (source then primary fallback) is correct from any worktree.",
+    "doctor tolerates an unknown worktrees/ subdirectory on downgrade (classify_index_db_health only stats loomweave.db).",
+    "The sweep fires from main-checkout activity too, not only worktree-scoped activity, so leak coverage is correct.",
+    "rustix::fs::openat2 is a safe fn - no conflict with the workspace unsafe_code = deny lint."
+  ],
+
+  "conflicts_resolved": [
+    {
+      "issue": "Plain analyze entrypoint worktree-awareness",
+      "reality_view": "WARNING R2 - plan wording is ambiguous about what 'reuse the SessionStart hook mechanism' means",
+      "systems_view": "BLOCKER S1 - traced the full chain to a permanently-stuck worktree and silent failure of AC 1 and 4",
+      "resolution": "BLOCKING (B1). Same root cause; higher severity wins. Systems traced the consequence chain, Reality scoped only to plan wording - both fixes are the same edit."
+    },
+    {
+      "issue": "serve.rs:24 db_path gate",
+      "reality_view": "WARNING R4 - fresh worktree hits serve_no_index",
+      "architecture_view": "BLOCKER A3 - the gate has no owning task at all",
+      "quality_view": "WARNING Q2 - the readiness recompute mechanism is unspecified",
+      "resolution": "BLOCKING (B2). Merged all three: fixing the gate without pinning the recompute mechanism still leaves AC4 unverifiable, so Q2 is a required sub-step rather than a separate warning."
+    },
+    {
+      "issue": "Task 6 consumer enumeration completeness",
+      "architecture_view": "Finding (not a blocker) - file list undercounts",
+      "quality_view": "not raised",
+      "systems_view": "BLOCKER for analyze.rs specifically",
+      "resolution": "Split. analyze.rs escalates to blocking as part of B1 (it is a silent-failure path, not just an enumeration gap). The remaining consumers stay the top-ranked warning W1, respecting the originating reviewer's classification while noting the fix is a pure document edit that should ship with the blockers."
+    },
+    {
+      "issue": "Sweep module placement (core versus cli)",
+      "architecture_view": "belongs in loomweave-cli per the analyze_lock.rs precedent",
+      "reality_view": "implicitly assumed core (pinned rustix against core's Cargo.toml)",
+      "resolution": "WARNING W3, coupled with W4 and B4 into one edit. Not blocking - the plan is executable either way - but the rustix pin location follows the module, so deciding this late means editing three sections twice."
+    },
+    {
+      "issue": "Zombie serve on a removed worktree",
+      "systems_view": "BLOCKER S2",
+      "others_view": "not raised",
+      "resolution": "BLOCKING (B7) on the spec-conformance axis despite a priority score of 6. Demoting would override a reviewer finding without justification. Framed narrowly as a correction to a false claim in the plan's own justification text, with a within-posture fix (a signal, not a lock)."
+    }
+  ],
+
+  "reviewer_summaries": {
+    "reality":      {"status": "ISSUES_FOUND", "blocking_raised": 1, "warnings_raised": 4, "confidence": "High",          "risk": "Medium"},
+    "architecture": {"status": "ISSUES_FOUND", "blocking_raised": 3, "warnings_raised": 4, "confidence": "Moderate-High", "risk": "High"},
+    "quality":      {"status": "ISSUES_FOUND", "blocking_raised": 1, "warnings_raised": 8, "confidence": "Moderate",      "risk": "Medium"},
+    "systems":      {"status": "ISSUES_FOUND", "blocking_raised": 2, "warnings_raised": 3, "confidence": "Moderate",      "risk": "High"}
+  },
+
+  "overall_confidence": "Moderate-High",
+  "confidence_note": "Overall reviewer confidence is Moderate because none of the four could observe runtime behaviour - nothing is built. But confidence in the BLOCKERS specifically is High: every one is anchored to a verified file:line or an exhaustive negative search (analyze.rs:357, serve.rs:24-30, store.rs:68-108 with its test at :242, git log/git show for the branch base, a repository-wide grep for privileged CI). The Moderate ratings reflect unverifiable runtime behaviour, not doubt about the findings.",
+
+  "implementation_risk": "High",
+  "reversibility": "Irreversible",
+  "reversibility_note": "Worst case across blockers, driven by B3 (cross-repository store deletion under a shared store_dir override). Scoped honestly: the destroyed objects are 20-minute regenerable caches, consistent with the ratified posture - the irreversibility is that another repository's caches are destroyed without its consent, not that irreplaceable data is lost.",
+
+  "reviewer_confidence_aggregation": {
+    "reality": "High",
+    "architecture": "Moderate-High",
+    "quality": "Moderate",
+    "systems": "Moderate"
+  },
+
+  "information_gaps": [
+    "Reality: whether the owner intends the docs commits to land on main first, or the implementation branch to be based on fix/week-review-followups - B6 has two valid resolutions and the choice is the owner's.",
+    "Architecture: whether the owner wants the store_dir-override exception implemented (Non-goals L243-244) or formally dropped - B3 is written to accept either, but AC7 needs amending regardless.",
+    "Quality: the readiness-recompute mechanism (poll versus cached versus timer) has no existing precedent in the codebase, so the choice is unconstrained by convention - folded into B2 as a required decision.",
+    "Quality: bare-repository-plus-worktrees topology behaviour is undefined in both documents (W10).",
+    "Quality: no per-test non-Linux gating story; CI cannot reveal the gap because nextest runs Linux-only (W12).",
+    "Systems: no reviewer could confirm the runtime behaviour of a detached analyze against a worktree store, because nothing is built.",
+    "Synthesis-specific: no reviewer could verify acceptance criteria 1 or 4 end-to-end. The dogfood step is the only end-to-end check in the plan and it is prose rather than executable commands (W13) - so the two highest-scoring blockers (B1, B2) are precisely the failure modes the plan's own verification would not catch."
+  ],
+
+  "caveats": [
+    "This synthesis does NOT re-verify reviewer findings. If a reviewer hallucinated a file:line, the synthesis inherits it. Blocker anchors were spot-checked against the plan and design text but not against every cited source line.",
+    "Every blocking resolution must be confirmed to actually close the originating reviewer's finding - in particular B2, which merges three findings and could be partially applied.",
+    "Re-run the plan review after revisions. This synthesis does not carry forward, and B1's and B4's fixes materially restructure the task sequence.",
+    "The ratified ephemeral-cache posture was treated as a fixed constraint, not evaluated. If the owner later revisits it, B7 and B3 change shape.",
+    "The priority-score formula assumes this project's risk appetite. Under the ratified posture the Severity axis is deliberately compressed for cache loss, which is why spec-conformance became a second classification axis.",
+    "Scope not covered by any of the four lenses: licensing beyond the rustix check, cross-platform packaging, documentation/operator-guide impact, and the ADR question of whether this design warrants its own ADR alongside ADR-046."
+  ]
+}

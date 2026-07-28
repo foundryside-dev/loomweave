@@ -91,6 +91,24 @@ snapshot tests and contract fixtures, and coordinating consumers.
   structural check only establishes compatibility.
 - A future internal schema is deliberately rejected until this boundary is
   reviewed, even when its migration appears additive.
+- **The compatibility report is a point-in-time answer, not a lease.** It is
+  valid for the connection and read transaction on which it was performed, and
+  a consumer that holds a long-lived session across a Loomweave upgrade can
+  observe a version it already cleared being migrated underneath it. `loomweave
+  analyze` re-runs `apply_migrations` on every invocation, each migration
+  commits its own transaction, and `PRAGMA user_version` is bumped only after
+  the whole loop, so on the first `analyze` after a binary upgrade that ships a
+  new migration there is a window where a reader sees the old `user_version`
+  (reported compatible) while a newer migration has already committed. SQLite's
+  per-migration atomicity means a reader can never observe a torn migration —
+  only "some but not all" applied — so this is not corruption, but it is
+  outside what the structural check can promise.
+
+  Consumers should therefore either re-check compatibility per unit of work, or
+  wrap their reads in a single `BEGIN DEFERRED` transaction so WAL pins one
+  snapshot for the duration. Opening per call, as Plainweave's adapter does
+  today, also avoids the window — but nothing in this contract enforces that,
+  which is why it is recorded here rather than assumed.
 
 ## Alternatives Considered
 
