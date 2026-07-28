@@ -2070,3 +2070,107 @@ fn doctor_redirects_schema_check_for_a_linked_worktree_instead_of_recommending_l
 // by this fix-loop, since `is_linked_worktree` only short-circuits when
 // `WorktreeContext::resolve` classifies the target `Linked`); no separate
 // test needed here.
+
+/// Final-review fix: `http.instance_id` had the identical bug as the
+/// `.weft/loomweave.schema` check above, just less visible — it re-derives
+/// `store_dir(project_root)/instance_id` from the literal `--path`, which for
+/// a linked worktree is never populated. Unrouted, that produced a `warning`
+/// whose JSON `next_action` read: "`Run loomweave install --path <project>
+/// before materialising a project instance ID.`" — never printed in plain
+/// stdout (the text renderer only echoes `message`, not `next_action`), but
+/// present in `--format json`'s per-report `next_actions` array. Followed
+/// literally inside a linked worktree, that instruction would CREATE the
+/// forbidden `<worktree>/.weft/loomweave/` decoy store — after which every
+/// other root-derived check in this module starts operating on the decoy
+/// instead of the worktree's real, isolated store. Assert the `http.instance_id`
+/// check itself now redirects (`ok`, no install hint on its own line or in
+/// the JSON `next_actions` aggregate) and that `--fix` materialises no
+/// `instance_id` file under the linked worktree's own `.weft/loomweave/`.
+///
+/// Scoped to this one check, deliberately: `doctor`'s `--- index ---`
+/// footer (`hook::snapshot_report`, reused verbatim per this module's docs)
+/// separately prints its own root-derived "no index ... Run `loomweave
+/// install --path <worktree>`" line for an unbuilt linked worktree — a
+/// pre-existing, out-of-scope residual of this same class, left untouched
+/// here (see the final-fixes report).
+#[test]
+fn doctor_redirects_http_instance_id_check_for_a_linked_worktree_instead_of_recommending_local_install()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+
+    let (_, json) = doctor_json(&linked, false);
+    let instance_check = check(&json, "http.instance_id");
+    assert_eq!(
+        instance_check["status"], "ok",
+        "a linked worktree's own checkout holding no local instance_id file is by design, not \
+         a defect: {instance_check}"
+    );
+    let message = instance_check["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("loomweave install"),
+        "must not recommend `loomweave install` from inside a linked worktree — that hint, \
+         followed literally, would create the forbidden local store: {instance_check}"
+    );
+    assert!(
+        message.contains("worktree_stores"),
+        "must redirect to the worktree_stores check, which reports this worktree's actual \
+         isolated index health: {instance_check}"
+    );
+
+    // The JSON report's top-level `next_actions` aggregate is where the
+    // pre-fix bug actually surfaced (per-check `next_action` is `#[serde(skip)]`
+    // and only feeds that aggregate for "problem"/"warning" checks). The
+    // pre-fix warning branch's next_action text was unique to this check
+    // ("...before materialising a project instance ID."); assert it no
+    // longer appears. (Other checks legitimately mention `loomweave install`
+    // for unrelated surfaces — e.g. `--hooks` — so this assertion targets the
+    // instance-ID-specific phrasing rather than sweeping the whole array.)
+    let next_actions = json["next_actions"]
+        .as_array()
+        .expect("doctor JSON report next_actions array");
+    assert!(
+        next_actions.iter().all(|action| {
+            !action
+                .as_str()
+                .unwrap_or_default()
+                .contains("materialising a project instance ID")
+        }),
+        "no next_action may recommend installing in this checkout to materialise the instance \
+         ID from inside a linked worktree: {json}"
+    );
+
+    // Text path: the http.instance_id line itself (not the whole report,
+    // which may legitimately mention `loomweave install` for unrelated
+    // surfaces like hooks) must carry the redirect, not an install hint.
+    let (_, stdout) = doctor(&linked, false);
+    let instance_line = stdout
+        .lines()
+        .find(|line| line.contains("http.instance_id"))
+        .unwrap_or_else(|| panic!("http.instance_id line missing from stdout: {stdout}"));
+    assert!(
+        !instance_line.contains("loomweave install"),
+        "text-path doctor must not recommend install from inside a linked worktree: {instance_line}"
+    );
+    assert!(
+        instance_line.contains("worktree_stores"),
+        "text-path doctor must redirect to worktree_stores: {instance_line}"
+    );
+
+    // --fix must not materialize anything on this check's path: the redirect
+    // must stay `ok` and no `instance_id` file must appear in the worktree's
+    // own checkout. (Other, unrelated --fix repairs — e.g. `gitignore.current`
+    // — legitimately create `<worktree>/.weft/loomweave/` for their own
+    // out-of-scope reasons, so this asserts the specific artifact this check
+    // could have materialised, not the whole directory's absence.)
+    let (_, fixed_json) = doctor_json(&linked, true);
+    let fixed_instance_check = check(&fixed_json, "http.instance_id");
+    assert_eq!(
+        fixed_instance_check["status"], "ok",
+        "--fix must not change the redirect's status: {fixed_instance_check}"
+    );
+    assert!(
+        !linked.join(".weft/loomweave/instance_id").exists(),
+        "--fix must not materialize a local instance_id file inside a linked worktree"
+    );
+}

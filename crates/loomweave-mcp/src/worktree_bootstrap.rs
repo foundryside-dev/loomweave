@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_follows_the_most_recent_run_by_started_at() {
+    fn latest_row_governs_only_when_no_run_ever_completed() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = open_empty_runs_db(dir.path());
         seed_run(&db_path, "old", "2026-01-01T00:00:00.000Z", "failed");

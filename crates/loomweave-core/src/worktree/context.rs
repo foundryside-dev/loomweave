@@ -154,9 +154,12 @@ pub struct WorktreeContext {
     /// The canonicalized main-worktree path. Equals `source_root` unless
     /// `kind` is [`WorktreeKind::Linked`].
     pub primary_root: PathBuf,
-    /// `store_dir(primary_root)` — the primary checkout's store directory,
-    /// unaffected by any `[loomweave].store_dir` override composing
-    /// correctly regardless of which worktree resolved it.
+    /// `store_dir(primary_root)` — the primary checkout's store directory. A
+    /// `[loomweave].store_dir` override in `weft.toml` DOES apply here: it
+    /// composes correctly precisely because this is always anchored at
+    /// `primary_root`, so every worktree of the same repository resolves to
+    /// the same `repository_store` regardless of which checkout initiated
+    /// the resolve.
     pub repository_store: PathBuf,
     /// The store this checkout actually reads and writes:
     /// `repository_store` unless `kind` is [`WorktreeKind::Linked`], in

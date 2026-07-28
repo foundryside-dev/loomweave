@@ -1827,8 +1827,27 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
     }
 }
 
+/// Like [`check_loomweave_dir_json`], this check re-derives its path from the
+/// literal `--path` — `store_dir(project_root)/instance_id` — which for a
+/// linked worktree is a location `loomweave worktree analyze` never
+/// populates. Left unrouted, an absent file there sent an operator to the
+/// next action "Run `loomweave install --path <project>`" — which, followed
+/// literally inside a linked worktree, would CREATE the forbidden local
+/// `<worktree>/.weft/loomweave/` decoy store, after which every other
+/// root-derived check in this module would start reading and reporting on
+/// that decoy instead of the worktree's real, isolated store. See
+/// [`is_linked_worktree`] for the shared redirect this mirrors.
 fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     const ID: &str = "http.instance_id";
+    if is_linked_worktree(project_root) {
+        return DoctorJsonCheck::ok(
+            ID,
+            "linked worktree: the project instance ID lives in this worktree's isolated store \
+             (`StorePaths::instance_id`, under `.weft/loomweave/worktrees/<stable-id>/`), not \
+             this checkout's `.weft/loomweave/` — see the `worktree_stores` check for this \
+             worktree's actual isolated index health",
+        );
+    }
     let path = loomweave_core::store::store_dir(project_root).join("instance_id");
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,

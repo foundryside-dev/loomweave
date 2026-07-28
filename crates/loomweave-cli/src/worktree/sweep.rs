@@ -103,11 +103,13 @@ pub enum SweepOutcome {
     /// The common Git directory's own `worktrees/` administrative
     /// directory could not be read — aborted, nothing deleted.
     AdminDirUnreadable,
-    /// `<repository-store>/worktrees/` itself could not be enumerated (or
-    /// re-opened as a confined root) after the admin-directory read above
-    /// already succeeded — aborted, nothing deleted. Distinct from
-    /// [`Self::AdminDirUnreadable`]: this is Loomweave's own store
-    /// directory, not Git's administrative one.
+    /// `<repository-store>/worktrees/` itself could not be read — either
+    /// while enumerating store candidates (this return site fires *before*
+    /// the admin-directory read below) or while re-opening it as a confined
+    /// root right before deletion (this return site fires *after* the
+    /// admin-directory read has already succeeded) — aborted, nothing
+    /// deleted either way. Distinct from [`Self::AdminDirUnreadable`]: this
+    /// is Loomweave's own store directory, not Git's administrative one.
     StoreDirUnreadable,
     /// A `[loomweave].store_dir` override is active for `ctx.primary_root`:
     /// candidates were enumerated and logged, nothing was deleted.
