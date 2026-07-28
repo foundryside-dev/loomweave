@@ -821,6 +821,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // current-locator union AND re-appended to the prior-index rebuild below.
     let mut retained_locators: HashSet<String> = HashSet::new();
     let mut skipped_files_total: u64 = 0;
+    // Canonical-absolute source paths actually DISPATCHED to a plugin this run
+    // (the form `entities.source_file_path` stores). This is the exact
+    // re-examination scope for the plugins' syntax-error rule family, which the
+    // scoped stale-finding sweep below needs to retire a fixed file's finding on
+    // an incremental run — see that call site for why the general sweep cannot.
+    let mut plugin_analyzed_source_files: BTreeSet<String> = BTreeSet::new();
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
@@ -1124,6 +1130,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             skipped = skipped_files.len(),
             "processing plugin"
         );
+
+        // Record this plugin's dispatch scope before the blocking task consumes
+        // the list. Canonicalised the same way the skipped branch above resolves
+        // its anchor, so both halves speak the path form entities store.
+        plugin_analyzed_source_files.extend(plugin_files.iter().map(|path| {
+            crate::secret_scan::canonical_or_original(path)
+                .display()
+                .to_string()
+        }));
 
         // Run the blocking plugin work on the tokio threadpool. Completed file
         // output flows through a bounded channel so writer backpressure applies
@@ -2063,6 +2078,55 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         run_id = %run_id,
                         error = %e,
                         "scoped secret-finding sweep skipped (run already committed successfully)"
+                    ),
+                }
+            }
+            // Rule-scoped sweep for the plugins' syntax-error rule family. Unlike
+            // the secret scan this producer is NOT a full pass — a syntax finding
+            // is only re-emitted for a file the run actually dispatched — so the
+            // bound is the dispatch scope itself (`plugin_analyzed_source_files`),
+            // which is exact rather than a scope-shrinkage guard: a file the run
+            // did not dispatch is never a candidate, so a still-broken skipped
+            // file's finding survives exactly as the general sweep's
+            // `skipped_files == 0` clause intends.
+            //
+            // The general sweep cannot cover this: it is gated OFF whenever any
+            // file was incrementally skipped, which is every routine run on a real
+            // project. A file that was broken and is then FIXED is re-dispatched
+            // (its bytes changed) and stops reproducing its finding — but the row
+            // lingers, because once fixed the file is unchanged again and no later
+            // incremental run re-walks it either. Only a `--no-incremental` pass
+            // could ever clear it.
+            //
+            // That lingering row is not merely cosmetic: the skipped-file branch
+            // reads a prior syntax finding as live evidence the file is still
+            // degraded and fails the plugin's classifier coverage closed, so one
+            // stale row pins `classifier_coverage.status` to `failed` on every
+            // subsequent run and forces `classification.complete: false` across
+            // every tag read surface. Same lifecycle preservation (`open` +
+            // Filigree-unlinked only) and best-effort posture as the sweeps above.
+            if !resume && !syntax_rule_ids.is_empty() {
+                let examined_source_files: Vec<String> =
+                    plugin_analyzed_source_files.iter().cloned().collect();
+                match writer
+                    .send_wait(|ack| WriterCmd::SweepStaleFindingsForRules {
+                        current_run_id: run_id.clone(),
+                        rule_ids: syntax_rule_ids.iter().cloned().collect(),
+                        examined_source_files,
+                        ack,
+                    })
+                    .await
+                {
+                    Ok(retired) if retired > 0 => tracing::info!(
+                        run_id = %run_id,
+                        stale_syntax_findings_retired = retired,
+                        "scoped sweep retired syntax findings for files that now parse cleanly"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "scoped syntax-finding sweep skipped (run already committed successfully)"
                     ),
                 }
             }

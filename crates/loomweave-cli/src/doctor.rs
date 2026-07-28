@@ -581,9 +581,10 @@ fn validate_external_sqlite_read_gate(
     Ok(())
 }
 
+const ENUMERATION_ID: &str = "classifier.enumeration";
+const TAGS_ID: &str = "classifier.tags";
+
 fn check_classifier_json(project_root: &Path, fix: bool) -> (DoctorJsonCheck, DoctorJsonCheck) {
-    const ENUMERATION_ID: &str = "classifier.enumeration";
-    const TAGS_ID: &str = "classifier.tags";
     let db_path = loomweave_core::store::db_path(project_root);
     if !db_path.exists() {
         let details = serde_json::json!({
@@ -626,6 +627,9 @@ fn check_classifier_json(project_root: &Path, fix: bool) -> (DoctorJsonCheck, Do
             "run_status": latest.run_status(),
             "reason": reason,
         });
+        if let Some(not_applicable) = classifier_not_applicable(&latest) {
+            return not_applicable;
+        }
         if fix && latest.run_status().is_none() && latest.run_id().is_none() {
             return match repair_classifier_analysis(project_root) {
                 Ok(()) => {
@@ -1292,6 +1296,58 @@ fn check_index_freshness_json(project_root: &Path) -> DoctorJsonCheck {
     } else {
         DoctorJsonCheck::ok("index.freshness", lines.join("\n"))
     }
+}
+
+/// Classifier evidence comes from language plugins. With none installed there is
+/// nothing to classify and no repair to perform: `analyze` would only record
+/// `skipped_no_plugins`. Return the pair of warnings `plugin.availability`
+/// already implies, rather than a problem `--fix` can never clear — which would
+/// otherwise pin `doctor --fix` to exit 1 on every plugin-less machine (CI
+/// runners, and fresh installs before the operator adds a plugin).
+///
+/// `None` when the missing plugin does not explain the state. Only two states
+/// qualify: no run at all, or a run that skipped for want of plugins. A `failed`
+/// run, or a `completed` run whose coverage is missing or malformed, is real
+/// broken evidence and must keep failing closed — uninstalling a plugin must not
+/// launder it into "not applicable".
+fn classifier_not_applicable(
+    latest: &LatestClassifierCoverage,
+) -> Option<(DoctorJsonCheck, DoctorJsonCheck)> {
+    if !matches!(latest.run_status(), None | Some("skipped_no_plugins"))
+        || any_language_plugin_discovered()
+    {
+        return None;
+    }
+    let reason = "no language plugin is installed, so no classifier evidence can exist";
+    let details = serde_json::json!({
+        "available": false,
+        "run_id": latest.run_id(),
+        "run_status": latest.run_status(),
+        "reason": reason,
+    });
+    Some((
+        classifier_unavailable_check(
+            ENUMERATION_ID,
+            "warning",
+            format!("classifier enumeration is not applicable: {reason}"),
+            details.clone(),
+        ),
+        classifier_unavailable_check(
+            TAGS_ID,
+            "warning",
+            format!("active classifier declarations are not applicable: {reason}"),
+            details,
+        ),
+    ))
+}
+
+/// Whether any language plugin is visible to the same discovery path `analyze`
+/// uses. Errors are treated as "not discovered": a plugin that cannot be loaded
+/// cannot produce classifier evidence either.
+fn any_language_plugin_discovered() -> bool {
+    loomweave_core::plugin::discover()
+        .into_iter()
+        .any(|result| result.is_ok())
 }
 
 fn check_plugin_availability_json() -> DoctorJsonCheck {

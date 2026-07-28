@@ -5699,6 +5699,75 @@ fn analyze_stale_finding_sweep_skipped_on_incremental_run() {
     );
 }
 
+/// The complement of the gate test above, and the case an unbounded
+/// `skipped_files == 0` gate cannot serve: the run DID re-walk the broken file
+/// and it now parses cleanly, but some OTHER file was incrementally skipped.
+/// "Looked, fixed" must retire the finding even on an incremental run — otherwise
+/// the row lingers forever (a fixed file goes back to being skipped, so no later
+/// incremental run re-walks it either, and only a `--no-incremental` pass can ever
+/// clear it).
+///
+/// Run 3 is the real cost of that lingering row: the skipped-file branch in
+/// `analyze.rs` reads a prior syntax finding as live evidence that the file is
+/// still degraded and fails the plugin's classifier coverage closed. A stale row
+/// therefore pins `classifier_coverage.status` to `failed` on EVERY subsequent
+/// incremental run, which forces `classification.complete: false` on every tag
+/// read surface (`entity_tag_list`, `entity_dead_list`, the tag shortcuts).
+#[cfg(unix)]
+#[test]
+fn analyze_retires_fixed_syntax_finding_on_incremental_run() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin(plugin_dir.path());
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let analyze = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success();
+    };
+
+    // Run 1: mod_a broken → finding at R1; mod_b clean.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+    std::fs::write(project_dir.path().join("mod_b.swp"), b"ok\n").unwrap();
+    analyze();
+    assert_eq!(syntax_error_finding_count(project_dir.path()), 1);
+
+    // Run 2: FIX mod_a (byte change → re-dispatched). mod_b is unchanged, so the
+    // run is incremental and the general sweep's `skipped_files == 0` gate is off.
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"ok\n").unwrap();
+    analyze();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(1),
+        "mod_b must be incrementally skipped so this is a genuine incremental run"
+    );
+    assert_eq!(
+        syntax_error_finding_count(project_dir.path()),
+        0,
+        "the run re-walked mod_a and it parses cleanly, so its finding must retire"
+    );
+
+    // Run 3: nothing changed → both files skipped. With the stale row gone, the
+    // plugin's classifier coverage must report the retained files as complete.
+    analyze();
+    let plugin = latest_run_stats(project_dir.path())["classifier_coverage"]["plugins"][0].clone();
+    assert_eq!(plugin["analyzed_files"], 0);
+    assert_eq!(plugin["retained_files"], 2);
+    assert_eq!(
+        plugin["status"], "complete",
+        "a retired syntax finding must not keep failing coverage closed on later incremental runs"
+    );
+}
+
 /// A plugin that crashes mid-`analyze_file`. Initializes cleanly, then exits
 /// non-zero on the first analyze request — exercising the host's crash path.
 #[cfg(unix)]
