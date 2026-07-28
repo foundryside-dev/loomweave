@@ -27,14 +27,15 @@
 //!
 //! The on-disk metadata shape mirrors the design doc's `On-disk layout` /
 //! `Metadata` sections (`docs/superpowers/specs/2026-07-18-loomweave-worktree-indexes-design.md`)
-//! with one deliberate reduction: [`WorktreeContext`] does not expose the raw
-//! Git administrative identity string (only its one-way `BLAKE3` hash, as
-//! `stable_id`), so `metadata.json` here omits the doc's illustrative
-//! `git_admin_identity` field rather than fabricate one. `schema`,
-//! `stable_id`, `source_root`, and `created_at` are the fields this module
-//! actually reads back to answer "is this store still describing the
-//! worktree I think it is?" — which is all the design doc says the file
-//! exists to answer.
+//! exactly: `schema`, `stable_id`, `git_admin_identity`, `source_root`,
+//! `created_at`. `git_admin_identity` is informational only — recorded for
+//! operator/debugging visibility, never read back into a validity or
+//! mismatch decision. The only question this file answers programmatically
+//! is "is this store still describing the worktree I think it is?", and
+//! that question is answered entirely by `source_root` (compared
+//! canonicalized); `stable_id` is derived directly from the `BLAKE3` hash
+//! the resolver already computed, not re-derived from the recorded
+//! `git_admin_identity` string.
 
 use std::fs;
 use std::io;
@@ -70,11 +71,14 @@ fn iso8601_now() -> String {
 ///
 /// Plain `serde_json`, no checksum, no journal — see the module docs. Any
 /// field this fails to deserialize is treated identically to a completely
-/// unreadable file.
+/// unreadable file. `git_admin_identity` is informational only: read back
+/// into this struct like every other field (an unreadable file is still
+/// unreadable), but never compared against anything — see the module docs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Metadata {
     schema: String,
     stable_id: String,
+    git_admin_identity: String,
     source_root: String,
     created_at: String,
 }
@@ -204,13 +208,21 @@ pub enum StoreError {
 /// construction, and [`WorktreeContext::resolve`] already rejects a
 /// non-UTF-8 `source_root` before a `WorktreeContext` can exist, so the
 /// internal `.expect()` on `source_root.to_str()` cannot fail for any `ctx`
-/// obtained the normal way.
+/// obtained the normal way. Likewise, `WorktreeContext::resolve` only ever
+/// sets `stable_id` and `git_admin_identity` together (both `Some` for
+/// [`WorktreeKind::Linked`][kind], both `None` otherwise), so the internal
+/// `.expect()` on `git_admin_identity` after already matching `stable_id` as
+/// `Some` cannot fail for any `ctx` obtained the normal way.
 ///
 /// [kind]: loomweave_core::worktree::WorktreeKind::Linked
 pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, StoreError> {
     let Some(stable_id) = ctx.stable_id.as_deref() else {
         return Ok(StoreOutcome::NotIsolated);
     };
+    let admin_identity = ctx
+        .git_admin_identity
+        .as_deref()
+        .expect("WorktreeContext sets git_admin_identity whenever stable_id is set");
 
     let worktrees_dir = ctx.repository_store.join(WORKTREES_DIR_NAME);
     fs::create_dir_all(&worktrees_dir).map_err(|source| StoreError::CreateWorktreesDir {
@@ -234,7 +246,7 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
 
     let reason = match read_metadata(&candidate) {
         MetadataState::Absent => {
-            create_fresh(&candidate, stable_id, &source_root)?;
+            create_fresh(&candidate, stable_id, admin_identity, &source_root)?;
             return Ok(StoreOutcome::Created);
         }
         MetadataState::Valid(meta)
@@ -271,7 +283,7 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
         }
     }
 
-    create_fresh(&candidate, stable_id, &source_root)?;
+    create_fresh(&candidate, stable_id, admin_identity, &source_root)?;
     Ok(StoreOutcome::Rebuilt { reason })
 }
 
@@ -307,7 +319,12 @@ fn read_metadata(candidate: &Path) -> MetadataState {
 /// empty-initialized `loomweave.db` (schema applied, no data) — see the
 /// module docs for why the database is touched eagerly rather than left for
 /// `analyze`'s own migration step to create.
-fn create_fresh(candidate: &Path, stable_id: &str, source_root: &str) -> Result<(), StoreError> {
+fn create_fresh(
+    candidate: &Path,
+    stable_id: &str,
+    admin_identity: &str,
+    source_root: &str,
+) -> Result<(), StoreError> {
     fs::create_dir_all(candidate).map_err(|source| StoreError::CreateStoreDir {
         path: candidate.to_path_buf(),
         source,
@@ -316,6 +333,7 @@ fn create_fresh(candidate: &Path, stable_id: &str, source_root: &str) -> Result<
     let metadata = Metadata {
         schema: METADATA_SCHEMA.to_owned(),
         stable_id: stable_id.to_owned(),
+        git_admin_identity: admin_identity.to_owned(),
         source_root: source_root.to_owned(),
         created_at: iso8601_now(),
     };
@@ -415,6 +433,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
         assert_eq!(value["schema"], "loomweave.worktree-index.v1");
         assert_eq!(value["stable_id"], ctx.stable_id.clone().unwrap());
+        assert_eq!(
+            value["git_admin_identity"],
+            ctx.git_admin_identity.clone().unwrap(),
+            "metadata.json must record the Git administrative identity per the design's v1 schema"
+        );
         assert_eq!(
             value["source_root"],
             ctx.source_root.to_str().unwrap().to_owned()

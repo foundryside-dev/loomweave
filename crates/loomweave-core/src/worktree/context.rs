@@ -169,6 +169,17 @@ pub struct WorktreeContext {
     /// `wt-<BLAKE3 hex of the Git administrative identity>`, present only
     /// when `kind` is [`WorktreeKind::Linked`].
     pub stable_id: Option<String>,
+    /// The Git administrative identity `stable_id` is a `BLAKE3` hash of —
+    /// the path fragment under the common Git directory (e.g.
+    /// `worktrees/federation-seam-followups`), present only when `kind` is
+    /// [`WorktreeKind::Linked`]. Informational only (persisted into a linked
+    /// worktree's `metadata.json` for operator/debugging visibility per the
+    /// design's on-disk schema): nothing in this module or its callers
+    /// derives `stable_id` from this field, or uses it in any
+    /// mismatch/validity check — `stable_id` is computed directly from the
+    /// hash the resolver already took, and `source_root` (compared
+    /// canonicalized) remains the sole store-identity check.
+    pub git_admin_identity: Option<String>,
 }
 
 impl WorktreeContext {
@@ -190,10 +201,12 @@ impl WorktreeContext {
             GitProbe::Linked {
                 primary_root,
                 stable_id,
+                admin_identity,
             } => Ok(Self::linked_store(
                 canonical_source,
                 primary_root,
                 stable_id,
+                admin_identity,
             )),
             GitProbe::Unresolvable => {
                 Ok(Self::own_store(WorktreeKind::Standalone, canonical_source))
@@ -214,12 +227,18 @@ impl WorktreeContext {
             repository_store,
             config_origin,
             stable_id: None,
+            git_admin_identity: None,
             source_root,
         }
     }
 
     /// Build a context for a positively identified linked worktree.
-    fn linked_store(source_root: PathBuf, primary_root: PathBuf, stable_id: String) -> Self {
+    fn linked_store(
+        source_root: PathBuf,
+        primary_root: PathBuf,
+        stable_id: String,
+        admin_identity: String,
+    ) -> Self {
         let repository_store = store_dir(&primary_root);
         let effective_store = repository_store.join("worktrees").join(&stable_id);
         let config_origin = resolve_config_origin(&source_root, &primary_root);
@@ -232,6 +251,7 @@ impl WorktreeContext {
             effective_store,
             config_origin,
             stable_id: Some(stable_id),
+            git_admin_identity: Some(admin_identity),
         }
     }
 }
@@ -245,6 +265,7 @@ enum GitProbe {
     Linked {
         primary_root: PathBuf,
         stable_id: String,
+        admin_identity: String,
     },
     /// No Git repository, a bare primary, or the primary could not be
     /// positively identified. Callers fall back to `Standalone`.
@@ -326,6 +347,7 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
     Ok(GitProbe::Linked {
         primary_root,
         stable_id,
+        admin_identity,
     })
 }
 
