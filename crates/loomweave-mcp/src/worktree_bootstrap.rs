@@ -28,17 +28,23 @@ use rusqlite::Connection;
 
 /// Readiness of a linked worktree's isolated index, recomputed from the
 /// `runs` table on every gated tool call — never cached, never timed.
+///
+/// **Governed by "does a completed row exist at all," not "the most recent
+/// row"**: once any run has completed, readiness is `Ready` regardless of
+/// what a *later* run row says — see [`read_worktree_readiness`] for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorktreeReadiness {
-    /// No run row yet, or the most recent run (by `started_at`) is still
-    /// `running`.
+    /// No run has ever completed: either no run row exists yet, or the most
+    /// recent row (by `started_at`) is `running` (or an unrecognized future
+    /// status).
     Building,
-    /// The most recent run completed successfully, or completed with
+    /// At least one run row has `completed`, or completed with
     /// `skipped_no_plugins` (a legitimate terminal state — no plugins
     /// installed is not a build failure, and gating on it forever would wedge
-    /// the session with no way out).
+    /// the session with no way out) — regardless of any later row's status.
     Ready,
-    /// The most recent run's status is `failed`.
+    /// No run has ever completed, and the most recent row's status is
+    /// `failed`.
     BuildFailed,
 }
 
@@ -50,13 +56,16 @@ pub(crate) struct ReadinessRead {
     pub(crate) run_id: Option<String>,
 }
 
-/// Classify readiness from a `runs.status` value, or `None` when no run row
-/// exists at all. The one place the `running`/`completed`/`skipped_no_plugins`/
-/// `failed` → [`WorktreeReadiness`] mapping lives, shared by
-/// [`read_worktree_readiness`] (the gate's own query) and
-/// `tool_project_status` (which reuses the row `latest_run_row` already read
-/// in the same reader closure, rather than re-querying the `runs` table a
-/// second time for the same "most recent row" answer).
+/// Classify readiness from a single `runs.status` value, or `None` when no
+/// run row exists at all. The one place the
+/// `running`/`completed`/`skipped_no_plugins`/`failed` → [`WorktreeReadiness`]
+/// mapping lives — used by [`read_worktree_readiness`] to interpret whichever
+/// row its priority-ordered query selects (see that function's docs for why
+/// the row it selects is not simply "the most recent one"). `tool_project_status`
+/// (`crates/loomweave-mcp/src/tools/status.rs`) calls `read_worktree_readiness`
+/// directly for its own gating decision — deliberately a separate query from
+/// the `latest_run` row it reads for display, since the two answer different
+/// questions once readiness stops tracking "the most recent row".
 pub(crate) fn classify_readiness(status: Option<&str>) -> WorktreeReadiness {
     match status {
         Some("completed" | "skipped_no_plugins") => WorktreeReadiness::Ready,
@@ -122,7 +131,7 @@ pub(crate) fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
 
 /// Whether `serve`'s bootstrap should spawn `loomweave worktree analyze` for
 /// this store: only when it has never finished a build (`read_worktree_readiness`
-/// is not [`WorktreeReadiness::Ready`]) — per the design, "serve on a linked
+/// is not `WorktreeReadiness::Ready`) — per the design, "serve on a linked
 /// worktree WITH NO INDEX ... spawn". A worktree that has already completed a
 /// run — even if a later rebuild attempt is currently running or previously
 /// failed — is not this function's concern: keeping an already-built index
