@@ -1210,6 +1210,28 @@ pub struct LlmDiagnostics {
     pub cache_max_age_days: u32,
 }
 
+/// The `loomweave.yaml` path a fresh `ServerState` should read/write absent an
+/// explicit `--config` — its `default_config_path` field.
+/// `WorktreeContext::resolve` only fails on a non-UTF-8 path component; that
+/// failure is logged and folds to today's unchanged
+/// `project_root.join("loomweave.yaml")` rather than propagating, since
+/// `ServerState::new` is infallible and 30+ call sites (production and test)
+/// depend on that.
+fn resolve_default_config_path(project_root: &Path) -> PathBuf {
+    match loomweave_core::worktree::WorktreeContext::resolve(project_root) {
+        Ok(ctx) => ctx.config_path(),
+        Err(err) => {
+            tracing::warn!(
+                project_root = %project_root.display(),
+                error = %err,
+                "could not resolve worktree context for the default loomweave.yaml path; \
+                 falling back to <project_root>/loomweave.yaml"
+            );
+            project_root.join("loomweave.yaml")
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     project_root: PathBuf,
@@ -1244,11 +1266,26 @@ pub struct ServerState {
     /// same configuration (review #12). `None` → the child uses its default
     /// config discovery (serve was started without an explicit `--config`).
     analyze_config_path: Option<PathBuf>,
+    /// The `loomweave.yaml` path `llm_config_set`/`semantic_config_set` write
+    /// (and `llm_config_get`/`semantic_config_get` read) when `serve` was
+    /// launched with no explicit `--config` (i.e. `analyze_config_path` is
+    /// `None`) — `WorktreeContext::resolve(project_root)`'s resolved
+    /// `ConfigOrigin` path (design doc, "Configuration and sibling
+    /// discovery": "The resolver records the selected path as `ConfigOrigin`;
+    /// `llm_config_set` and `semantic_config_set` update exactly that file").
+    ///
+    /// Computed once at construction and cached rather than re-resolved (via
+    /// `git`) on every tool call. Falls back to
+    /// `project_root.join("loomweave.yaml")` — today's unchanged behavior —
+    /// on the one error `WorktreeContext::resolve` can return (a non-UTF-8
+    /// path), which is logged rather than silently swallowed.
+    default_config_path: PathBuf,
 }
 
 impl ServerState {
     #[must_use]
     pub fn new(project_root: PathBuf, readers: ReaderPool) -> Self {
+        let default_config_path = resolve_default_config_path(&project_root);
         Self {
             project_root,
             readers,
@@ -1269,6 +1306,7 @@ impl ServerState {
             cancellation_notify: Arc::new(Notify::new()),
             analyze_program: None,
             analyze_config_path: None,
+            default_config_path,
         }
     }
 
@@ -1520,7 +1558,7 @@ impl ServerState {
     fn config_file_path(&self) -> PathBuf {
         self.analyze_config_path
             .clone()
-            .unwrap_or_else(|| self.project_root.join("loomweave.yaml"))
+            .unwrap_or_else(|| self.default_config_path.clone())
     }
 
     pub async fn handle_json_rpc(&self, request: &Value) -> Option<Value> {
@@ -6701,6 +6739,97 @@ mod tests {
         assert_eq!(
             err.message,
             "confidence must be one of resolved, ambiguous, inferred"
+        );
+    }
+
+    /// Minimal `git` fixture helper for the `default_config_path` tests below —
+    /// only what's needed to produce a linked worktree, mirroring the pattern in
+    /// `crates/loomweave-cli/tests/worktree_analyze.rs`.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn git {args:?} in {}: {e}", dir.display()));
+        assert!(
+            output.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+    }
+
+    fn server_state_for(project_root: &std::path::Path) -> ServerState {
+        let db = project_root.join("loomweave.db");
+        let mut conn = rusqlite::Connection::open(&db).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+        drop(conn);
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        ServerState::new(project_root.to_path_buf(), readers)
+    }
+
+    /// `ServerState` should carry the resolved `ConfigOrigin` path (Task 4):
+    /// `config_file_path()` reads/writes the linked worktree's own
+    /// `loomweave.yaml` when one exists there, falling back to the primary
+    /// checkout's — never re-deriving `<project_root>/loomweave.yaml` from the
+    /// linked worktree's own root the way pre-Task-4 code did.
+    #[test]
+    fn default_config_path_prefers_source_root_over_primary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("README.md"), "primary\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feature-x", "../linked"],
+        );
+        let linked = tmp.path().join("linked");
+
+        std::fs::write(repo.join("loomweave.yaml"), "version: 1\n").unwrap();
+        std::fs::write(linked.join("loomweave.yaml"), "version: 1\n").unwrap();
+
+        let state = server_state_for(&linked);
+        assert_eq!(
+            state.config_file_path(),
+            linked.canonicalize().unwrap().join("loomweave.yaml"),
+            "the linked worktree's own loomweave.yaml must win when it exists"
+        );
+    }
+
+    /// Same fixture, but only the primary root has a `loomweave.yaml` — the
+    /// resolved default must fall back there.
+    #[test]
+    fn default_config_path_falls_back_to_primary_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("README.md"), "primary\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feature-y", "../linked2"],
+        );
+        let linked = tmp.path().join("linked2");
+
+        std::fs::write(repo.join("loomweave.yaml"), "version: 1\n").unwrap();
+
+        let state = server_state_for(&linked);
+        assert_eq!(
+            state.config_file_path(),
+            repo.canonicalize().unwrap().join("loomweave.yaml"),
+            "must fall back to the primary root's loomweave.yaml when the source root has none"
         );
     }
 

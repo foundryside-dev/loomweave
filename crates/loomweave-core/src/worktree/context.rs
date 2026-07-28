@@ -232,6 +232,29 @@ impl WorktreeContext {
         }
     }
 
+    /// The effective `loomweave.yaml` path per [`Self::config_origin`]: the
+    /// file `loomweave config check`/`llm status`/`semantic status` should
+    /// treat as active, and the file `llm set`/`semantic set` should write,
+    /// whenever the caller has no explicit `--config` override of its own.
+    ///
+    /// A caller that *does* have an explicit `--config` path should use that
+    /// path directly and never call this method — [`ConfigOrigin::Explicit`]
+    /// has no associated path on this struct (nothing here ever learns the
+    /// explicit path a caller was given), so that arm falls back to the same
+    /// primary-root write target as [`ConfigOrigin::DefaultTarget`] rather
+    /// than panicking. [`WorktreeContext::resolve`] never produces
+    /// `Explicit` itself (see the enum's docs), so in practice this method
+    /// only ever returns the `Source` or `Primary`/`DefaultTarget` path.
+    #[must_use]
+    pub fn config_path(&self) -> PathBuf {
+        match self.config_origin {
+            ConfigOrigin::Source => self.source_root.join(CONFIG_FILE_NAME),
+            ConfigOrigin::Primary | ConfigOrigin::DefaultTarget | ConfigOrigin::Explicit => {
+                self.primary_root.join(CONFIG_FILE_NAME)
+            }
+        }
+    }
+
     /// Build a context for a positively identified linked worktree.
     fn linked_store(
         source_root: PathBuf,
@@ -520,5 +543,38 @@ mod tests {
     fn require_utf8_accepts_a_valid_utf8_path() {
         let path = PathBuf::from("/store/primary");
         assert_eq!(require_utf8("primary_root", path.clone()).unwrap(), path);
+    }
+
+    #[test]
+    fn config_path_follows_origin() {
+        let source_root = PathBuf::from("/worktrees/feature");
+        let primary_root = PathBuf::from("/primary");
+        let base = WorktreeContext::linked_store(
+            source_root.clone(),
+            primary_root.clone(),
+            "wt-deadbeef".to_owned(),
+            "worktrees/feature".to_owned(),
+        );
+
+        let source = WorktreeContext {
+            config_origin: ConfigOrigin::Source,
+            ..base.clone()
+        };
+        assert_eq!(source.config_path(), source_root.join("loomweave.yaml"));
+
+        let primary = WorktreeContext {
+            config_origin: ConfigOrigin::Primary,
+            ..base.clone()
+        };
+        assert_eq!(primary.config_path(), primary_root.join("loomweave.yaml"));
+
+        let default_target = WorktreeContext {
+            config_origin: ConfigOrigin::DefaultTarget,
+            ..base
+        };
+        assert_eq!(
+            default_target.config_path(),
+            primary_root.join("loomweave.yaml")
+        );
     }
 }

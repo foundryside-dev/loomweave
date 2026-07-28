@@ -21,6 +21,16 @@ use loomweave_llm::{
 use loomweave_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
 
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
+    // NOTE (Task 4 / Task 5 boundary): `db_path` and the no-index gate below
+    // are deliberately left routed through the plain project root, NOT
+    // `worktree_ctx.store_paths.db` — making serve read/write a linked
+    // worktree's ISOLATED store (rather than its own unwritten local
+    // `.weft/loomweave/`) requires the bootstrap orchestration (detached
+    // `loomweave worktree analyze` spawn, `index-building`/`index-build-failed`
+    // tool responses) that is Task 5's scope, not this one. Today, `serve` on a
+    // linked worktree with no local `.weft/loomweave/loomweave.db` still
+    // degrades to `serve_no_index` even if the isolated store already has a
+    // completed index — see the design doc's "Bootstrap" section.
     let db_path = loomweave_core::store::db_path(path);
     if !db_path.exists() {
         // No index yet. Rather than exiting 1 — which leaves the MCP client
@@ -33,9 +43,17 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let project_root = path
         .canonicalize()
         .with_context(|| format!("canonicalize project path {}", path.display()))?;
-    let instance_id = crate::instance::load_or_create(&project_root)
+    // Resolved once for config precedence, this instance's own port/instance-ID
+    // sidecar leaves, and sibling (Filigree) discovery roots — see the design
+    // doc's "Configuration and sibling discovery" section. For a standalone
+    // checkout or the main worktree this is byte-identical to today's
+    // `project_root`-derived behavior (`source_root == primary_root`); it only
+    // diverges for a linked worktree.
+    let worktree_ctx = loomweave_core::worktree::WorktreeContext::resolve(&project_root)
+        .with_context(|| format!("resolve worktree context for {}", project_root.display()))?;
+    let instance_id = crate::instance::load_or_create(&worktree_ctx.store_paths.instance_id)
         .context("load Loomweave project instance ID")?;
-    let default_config_path = path.join("loomweave.yaml");
+    let default_config_path = worktree_ctx.config_path();
     let config_path = config_path.unwrap_or(&default_config_path);
     let config = if config_path.exists() {
         McpConfig::from_path(config_path)
@@ -67,28 +85,39 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     let embedding_provider =
         build_embedding_provider(&config.semantic_search, |name| std::env::var(name).ok())?;
 
+    // Sibling (Filigree) local-state discovery: source root first, then
+    // primary root, deduplicated — a linked worktree may run its own
+    // worktree-scoped Filigree instance, but the common case is one Filigree
+    // scoped to the repository as a whole at the primary root. Collapses to
+    // the single `project_root` list for a standalone checkout or the main
+    // worktree, so behavior there is unchanged.
+    let sibling_roots = loomweave_federation::filigree_url::dedup_candidate_roots(
+        &worktree_ctx.source_root,
+        &worktree_ctx.primary_root,
+    );
+
     // Resolve where Filigree actually listens — prefer the live ethereal port
     // published in `.weft/filigree/ephemeral.port` over the static configured
     // port (which goes stale, the dogfood bug) — then build the client against the
     // resolved URL so `issues_for` reaches the running dashboard. The same
     // resolution is surfaced by `project_status`.
-    let filigree_resolution = loomweave_federation::filigree_url::resolve_filigree_url(
+    let filigree_resolution = loomweave_federation::filigree_url::resolve_filigree_url_with_roots(
         &config.integrations.filigree,
-        &project_root,
+        &sibling_roots,
         |name| std::env::var(name).ok(),
     );
     let mut filigree_config = config.integrations.filigree.clone();
     if let Some(resolved) = &filigree_resolution.resolved_url {
         filigree_config.base_url.clone_from(resolved);
     }
-    // Pass the project root so token resolution can reach the daemon's
-    // auto-minted `.weft/filigree/federation_token` — the serve path runs with an
-    // empty env in `.mcp.json`, and without the file rung every weft-gated read
-    // (the wardline-findings joins) 401s (dogfood-4 A5).
-    let filigree_client = FiligreeHttpClient::from_config_with_project_root(
+    // Pass the sibling-discovery roots so token resolution can reach the
+    // daemon's auto-minted `.weft/filigree/federation_token` — the serve path
+    // runs with an empty env in `.mcp.json`, and without the file rung every
+    // weft-gated read (the wardline-findings joins) 401s (dogfood-4 A5).
+    let filigree_client = FiligreeHttpClient::from_config_with_project_roots(
         &filigree_config,
         |name| std::env::var(name).ok(),
-        Some(&project_root),
+        &sibling_roots,
     )
     .context("build Filigree HTTP client")?;
 
@@ -114,6 +143,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         db_path.clone(),
         readers.clone(),
         instance_id,
+        worktree_ctx.store_paths.port.clone(),
         &config.serve.http,
     )
     .context("start HTTP read API")?;

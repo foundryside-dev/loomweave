@@ -1675,7 +1675,7 @@ fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonChec
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if fix && loomweave_core::store::db_path(project_root).exists() {
-                return match crate::instance::load_or_create(project_root) {
+                return match crate::instance::load_or_create(&path) {
                     Ok(instance_id) => DoctorJsonCheck::fixed(
                         ID,
                         format!("project instance ID materialised: {instance_id}"),

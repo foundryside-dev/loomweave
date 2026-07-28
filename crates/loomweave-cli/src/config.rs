@@ -103,6 +103,19 @@ serve:
     # serving. Set `bind:` explicitly only to pin a fixed port (ADR-044).
 ";
 
+/// The `loomweave.yaml` path a caller should read/write when it has no
+/// explicit `--config` override: `WorktreeContext::resolve`'s precedence
+/// ladder (explicit > source-root > primary-root > default-targeting-primary;
+/// `--config` is handled by the caller before this is ever consulted). For a
+/// standalone checkout or the main worktree of a repository this is
+/// byte-identical to today's `<path>/loomweave.yaml` (`source_root ==
+/// primary_root` there); it only diverges for a linked Git worktree.
+fn resolve_default_config_path(path: &Path) -> Result<std::path::PathBuf> {
+    let ctx = loomweave_core::worktree::WorktreeContext::resolve(path)
+        .with_context(|| format!("resolve worktree context for {}", path.display()))?;
+    Ok(ctx.config_path())
+}
+
 /// Dispatch `loomweave config <subcommand>`.
 pub(crate) fn run(command: crate::cli::ConfigCommand) -> Result<()> {
     match command {
@@ -134,7 +147,10 @@ fn run_llm(command: crate::cli::LlmConfigCommand) -> Result<()> {
             openrouter_api_key_env,
             openrouter_endpoint_url,
         } => {
-            let config_path = config.unwrap_or_else(|| path.join("loomweave.yaml"));
+            let config_path = match config {
+                Some(explicit) => explicit,
+                None => resolve_default_config_path(&path)?,
+            };
             let patch = LlmConfigPatch {
                 enabled: bool_patch(enable, disable, "--enable", "--disable")?,
                 provider: provider
@@ -188,7 +204,10 @@ fn run_semantic(command: crate::cli::SemanticConfigCommand) -> Result<()> {
             timeout_seconds,
             session_token_ceiling,
         } => {
-            let config_path = config.unwrap_or_else(|| path.join("loomweave.yaml"));
+            let config_path = match config {
+                Some(explicit) => explicit,
+                None => resolve_default_config_path(&path)?,
+            };
             let patch = SemanticConfigPatch {
                 enabled: bool_patch(enable, disable, "--enable", "--disable")?,
                 provider: provider
@@ -332,7 +351,7 @@ fn run_example(provider: Option<&str>) -> Result<()> {
 /// provider-selection error (e.g. live provider with a missing API key) is a
 /// real misconfiguration and also exits non-zero, after printing the diagnosis.
 fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
-    let default_path = path.join("loomweave.yaml");
+    let default_path = resolve_default_config_path(path)?;
     let config_path = explicit_config.unwrap_or(&default_path);
     let (config, source) = if config_path.exists() {
         let config = McpConfig::from_path(config_path)
@@ -398,7 +417,7 @@ fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
 }
 
 fn run_semantic_status(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
-    let default_path = path.join("loomweave.yaml");
+    let default_path = resolve_default_config_path(path)?;
     let config_path = explicit_config.unwrap_or(&default_path);
     let (config, source) = if config_path.exists() {
         let config = McpConfig::from_path(config_path)
