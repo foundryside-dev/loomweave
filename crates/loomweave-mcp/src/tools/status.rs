@@ -245,6 +245,17 @@ impl ServerState {
                 // Whether this index has any alive SEI bindings (REQ-C-04 /
                 // ADR-038). Degrades to `false` on a pre-SEI database.
                 let sei_populated = has_any_alive_binding(conn).unwrap_or(false);
+                // Worktree-indexes bootstrap gate. Deliberately a *separate*
+                // query from `latest_run` above, not derived from it:
+                // `latest_run` reports the single most-recent row (for
+                // display — "what happened last"), while readiness answers a
+                // different question ("is there a completed row at all,
+                // regardless of what a later row did") per
+                // `read_worktree_readiness`'s doc — a rebuild-in-progress or
+                // a rebuild-that-failed after an earlier completed run must
+                // still read as `Ready`, which `latest_run`'s status alone
+                // cannot tell you.
+                let readiness = crate::worktree_bootstrap::read_worktree_readiness(conn).readiness;
                 Ok((
                     snapshot,
                     edge_count,
@@ -253,6 +264,7 @@ impl ServerState {
                     latest_run,
                     data_version,
                     sei_populated,
+                    readiness,
                 ))
             })
             .await;
@@ -265,6 +277,7 @@ impl ServerState {
             latest_run,
             data_version,
             sei_populated,
+            readiness,
         ) = match storage {
             Ok(tuple) => tuple,
             Err(err) => {
@@ -277,12 +290,7 @@ impl ServerState {
         };
         // Only a linked worktree's bootstrap gate ever makes this true — a
         // standalone checkout or the main worktree keep reporting real counts
-        // exactly as before Task 5. Classified from the same `latest_run` row
-        // already read above (`latest_run_row`) rather than a second `runs`
-        // query for the same "most recent row" answer.
-        let readiness = crate::worktree_bootstrap::classify_readiness(
-            latest_run.get("status").and_then(Value::as_str),
-        );
+        // exactly as before Task 5.
         let building = self.worktree_gate.is_some()
             && !matches!(
                 readiness,

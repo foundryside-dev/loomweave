@@ -68,14 +68,37 @@ pub(crate) fn classify_readiness(status: Option<&str>) -> WorktreeReadiness {
     }
 }
 
-/// Read the most recent run row (by `started_at`) and classify readiness.
+/// Read the readiness-governing run row and classify readiness.
+///
+/// **Not** simply "the most recent row" — a completed (or
+/// `skipped_no_plugins`) run row, once it exists, governs readiness
+/// regardless of a *later* `running` row: the design's "When a completed run
+/// row exists, activate readers and answer normally" is unconditional on
+/// what happens afterward. A manual `loomweave worktree analyze` rebuild (or
+/// a second `serve` racing this one) started against an already-built store
+/// must not re-block graph tools for the rebuild's duration — the previously
+/// completed data is still sitting in the same tables and still safe to
+/// read.
+///
+/// One query implements the priority: order candidate rows so any
+/// completed/`skipped_no_plugins` row sorts first (ties broken by
+/// `started_at DESC`, so the *most recent* completed row wins among several),
+/// and only when none exists at all does the ordering fall through to the
+/// single most recent row overall — which is exactly the row that
+/// distinguishes `Building` (a fresh or in-flight, never-yet-successful
+/// build) from `BuildFailed` (the only attempt so far, and it failed). No
+/// generation versioning, no cached state, no second query.
 ///
 /// Fail-safe on a query error: logs a warning and reports [`WorktreeReadiness::Building`]
 /// rather than risk answering `Ready` (and unblocking graph tools) against a
 /// read that could not actually be verified.
 pub(crate) fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
     match conn.query_row(
-        "SELECT id, status FROM runs ORDER BY started_at DESC LIMIT 1",
+        "SELECT id, status FROM runs \
+         ORDER BY \
+             CASE WHEN status IN ('completed', 'skipped_no_plugins') THEN 0 ELSE 1 END, \
+             started_at DESC \
+         LIMIT 1",
         [],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     ) {
@@ -95,6 +118,24 @@ pub(crate) fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
             }
         }
     }
+}
+
+/// Whether `serve`'s bootstrap should spawn `loomweave worktree analyze` for
+/// this store: only when it has never finished a build (`read_worktree_readiness`
+/// is not [`WorktreeReadiness::Ready`]) — per the design, "serve on a linked
+/// worktree WITH NO INDEX ... spawn". A worktree that has already completed a
+/// run — even if a later rebuild attempt is currently running or previously
+/// failed — is not this function's concern: keeping an already-built index
+/// fresh is the `SessionStart` hook's job (`loomweave analyze`, plain, on the
+/// primary or the worktree as the hook is invoked), not an unconditional
+/// background respawn fired on every single `serve` restart of an
+/// already-built worktree, which would otherwise launch a redundant
+/// 20-30 minute re-analyze every time an agent session starts.
+pub fn should_spawn_bootstrap_analyze(conn: &Connection) -> bool {
+    !matches!(
+        read_worktree_readiness(conn).readiness,
+        WorktreeReadiness::Ready
+    )
 }
 
 /// The exact fallback command diagnostics carry: `loomweave worktree analyze
@@ -246,6 +287,86 @@ mod tests {
         let read = read_worktree_readiness(&conn);
         assert_eq!(read.readiness, WorktreeReadiness::Building);
         assert_eq!(read.run_id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_completed_row_reads_as_ready_even_when_a_later_row_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = open_empty_runs_db(dir.path());
+        seed_run(&db_path, "done", "2026-01-01T00:00:00.000Z", "completed");
+        // A rebuild kicked off after the completed run — must not re-block
+        // graph tools for the rebuild's duration; the completed data is
+        // still there.
+        seed_run(&db_path, "rebuild", "2026-02-01T00:00:00.000Z", "running");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let read = read_worktree_readiness(&conn);
+        assert_eq!(read.readiness, WorktreeReadiness::Ready, "{read:?}");
+        assert_eq!(read.run_id.as_deref(), Some("done"), "{read:?}");
+    }
+
+    #[test]
+    fn a_completed_row_reads_as_ready_even_when_a_later_row_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = open_empty_runs_db(dir.path());
+        seed_run(&db_path, "done", "2026-01-01T00:00:00.000Z", "completed");
+        seed_run(
+            &db_path,
+            "rebuild-failed",
+            "2026-02-01T00:00:00.000Z",
+            "failed",
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        let read = read_worktree_readiness(&conn);
+        assert_eq!(read.readiness, WorktreeReadiness::Ready, "{read:?}");
+        assert_eq!(read.run_id.as_deref(), Some("done"), "{read:?}");
+    }
+
+    #[test]
+    fn the_most_recent_of_several_completed_rows_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = open_empty_runs_db(dir.path());
+        seed_run(&db_path, "first", "2026-01-01T00:00:00.000Z", "completed");
+        seed_run(&db_path, "second", "2026-02-01T00:00:00.000Z", "completed");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let read = read_worktree_readiness(&conn);
+        assert_eq!(read.readiness, WorktreeReadiness::Ready, "{read:?}");
+        assert_eq!(read.run_id.as_deref(), Some("second"), "{read:?}");
+    }
+
+    #[test]
+    fn should_spawn_is_false_once_a_completed_row_exists_regardless_of_a_later_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = open_empty_runs_db(dir.path());
+        seed_run(&db_path, "done", "2026-01-01T00:00:00.000Z", "completed");
+        seed_run(&db_path, "rebuild", "2026-02-01T00:00:00.000Z", "running");
+
+        let conn = Connection::open(&db_path).unwrap();
+        assert!(
+            !should_spawn_bootstrap_analyze(&conn),
+            "a built worktree must not trigger an unconditional respawn on every serve restart"
+        );
+    }
+
+    #[test]
+    fn should_spawn_is_true_when_unbuilt_or_only_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = open_empty_runs_db(dir.path());
+        let conn = Connection::open(&db_path).unwrap();
+        assert!(
+            should_spawn_bootstrap_analyze(&conn),
+            "no runs at all -> unbuilt -> must spawn"
+        );
+        drop(conn);
+
+        seed_run(&db_path, "r-fail", "2026-01-01T00:00:00.000Z", "failed");
+        let conn = Connection::open(&db_path).unwrap();
+        assert!(
+            should_spawn_bootstrap_analyze(&conn),
+            "only a failed attempt so far -> still unbuilt -> must spawn"
+        );
     }
 
     #[test]

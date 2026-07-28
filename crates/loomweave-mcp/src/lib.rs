@@ -2062,6 +2062,20 @@ impl ServerState {
     }
 
     async fn context_snapshot_json(&self) -> String {
+        // Consult the same worktree-bootstrap gate `handle_tool_call` does,
+        // BEFORE reading the store. `loomweave://context` is a second door
+        // into the same schema-initialized-but-empty (or mid-rebuild) store
+        // `consult_worktree_gate` protects tool calls from — CLAUDE.md points
+        // agents at this resource directly ("live counts:
+        // `loomweave://context`"), so answering with real-looking zero counts
+        // through this door would be exactly the fabricated-answer confusion
+        // the gate exists to prevent. Unlike the tool-call gate there is no
+        // `project_status_get`/`analyze_status_get` exemption to apply — this
+        // is the only resource, so every non-`Ready` state degrades.
+        if let Some(reason) = self.worktree_gate_block_reason().await {
+            return degraded_snapshot_json_with_reason(reason);
+        }
+
         // Single fallback used by both the reader-error and serialize-error
         // branches: serialize a real `ProjectSnapshot` so the shape stays in
         // lock-step with the type as it gains fields. `degraded: true` — this
@@ -2084,6 +2098,37 @@ impl ServerState {
                 tracing::warn!(error = %err, "loomweave://context snapshot failed");
                 fallback()
             }
+        }
+    }
+
+    /// Sibling of `consult_worktree_gate`, for `context_snapshot_json`
+    /// (the `loomweave://context` resource) rather than a tool call: the same
+    /// worktree-bootstrap gate (`self.worktree_gate` is `None` — no gate
+    /// active at all — for a standalone checkout or the main worktree, so
+    /// this returns `None` immediately with no query, matching
+    /// `consult_worktree_gate`'s zero-cost-when-inactive contract), but with
+    /// no tool-name exemption to check, since there is only one resource.
+    /// Returns the machine-readable reason (the same wire spellings as
+    /// `McpErrorCode`) or `None` when the resource should read the store
+    /// normally.
+    async fn worktree_gate_block_reason(&self) -> Option<&'static str> {
+        self.worktree_gate.as_ref()?;
+        if !self.project_root.exists() {
+            return Some("source-root-missing");
+        }
+        let read = self
+            .readers
+            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .await;
+        let Ok(read) = read else {
+            // A storage-layer failure is not this gate's to report — fall
+            // through and let the normal read path hit (and report) it.
+            return None;
+        };
+        match read.readiness {
+            worktree_bootstrap::WorktreeReadiness::Ready => None,
+            worktree_bootstrap::WorktreeReadiness::Building => Some("index-building"),
+            worktree_bootstrap::WorktreeReadiness::BuildFailed => Some("index-build-failed"),
         }
     }
 
@@ -3940,6 +3985,24 @@ fn latest_run_row(conn: &rusqlite::Connection) -> Value {
             Value::Null
         }
     }
+}
+
+/// `loomweave://context` while the worktree-bootstrap gate is blocking reads
+/// (`worktree_gate_block_reason` returned `Some`): the same wire shape as
+/// `unreadable_db_snapshot()` (`db_present: true`, all counts `0`,
+/// `Staleness::Unknown`, `degraded: true` — never a zeros-as-real payload),
+/// with an extra top-level `reason` key naming which gated state produced it
+/// (`"index-building"` / `"index-build-failed"` / `"source-root-missing"`).
+/// `ProjectSnapshot`'s own type/serialization is untouched — this only
+/// augments the JSON `unreadable_db_snapshot()` already produces, so
+/// `loomweave hook session-start` (the type's other consumer) is unaffected.
+fn degraded_snapshot_json_with_reason(reason: &str) -> String {
+    let snap = crate::snapshot::unreadable_db_snapshot();
+    let mut value = serde_json::to_value(&snap).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("reason".to_owned(), Value::String(reason.to_owned()));
+    }
+    serde_json::to_string(&value).unwrap_or_default()
 }
 
 fn flatten_storage_envelope_result(result: Result<Value, StorageError>) -> Value {

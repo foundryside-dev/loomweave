@@ -20,6 +20,40 @@ use loomweave_llm::{
 };
 use loomweave_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
 
+/// Which of the three `serve` behaviors a resolved [`WorktreeContext`] and
+/// the source root's own `db_path` existence select — pinned decision 1's
+/// routing decision, extracted as a pure function so it is directly
+/// unit-assertable (see `tests::linked_context_routes_to_linked_not_no_index`
+/// below) without spinning up a full `serve` session. `db_exists` is only
+/// consulted for a non-`Linked` context; a linked worktree always routes to
+/// [`ServeRoute::Linked`] regardless of it, since Task 3's eager,
+/// schema-initialized store means file existence is never the readiness
+/// signal there.
+///
+/// [`WorktreeContext`]: loomweave_core::worktree::WorktreeContext
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeRoute {
+    /// No index yet (and not a linked worktree) — degrade to
+    /// `serve_no_index`.
+    NoIndex,
+    /// A linked worktree — always the full `ServerState` path with the
+    /// bootstrap gate active, never `serve_no_index`.
+    Linked,
+    /// Main worktree or standalone checkout with an existing index — the
+    /// full `ServerState` path, gate inactive.
+    Full,
+}
+
+fn choose_serve_route(kind: loomweave_core::worktree::WorktreeKind, db_exists: bool) -> ServeRoute {
+    if kind == loomweave_core::worktree::WorktreeKind::Linked {
+        ServeRoute::Linked
+    } else if db_exists {
+        ServeRoute::Full
+    } else {
+        ServeRoute::NoIndex
+    }
+}
+
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     // Resolved once, before any gate (pinned decision 1, Task 5): a linked
     // worktree always routes to the full `ServerState` path with a `building`
@@ -31,34 +65,58 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
     // `loomweave_mcp::worktree_bootstrap`).
     let worktree_ctx = loomweave_core::worktree::WorktreeContext::resolve(path)
         .with_context(|| format!("resolve worktree context for {}", path.display()))?;
-
-    if worktree_ctx.kind == loomweave_core::worktree::WorktreeKind::Linked {
-        return run_linked_worktree(config_path, &worktree_ctx);
-    }
-
-    // Main/standalone: today's gate, byte-for-byte unchanged from before Task
-    // 5 — routed through the plain project root, exactly as always.
+    // Main/standalone's own gate, byte-for-byte unchanged from before Task 5
+    // — routed through the plain project root, exactly as always. Computed
+    // unconditionally (a cheap `.exists()` stat) so `choose_serve_route`
+    // stays a pure function of two small values.
     let db_path = loomweave_core::store::db_path(path);
-    if !db_path.exists() {
-        // No index yet. Rather than exiting 1 — which leaves the MCP client
-        // staring at a server that died at startup with the reason buried in
-        // stderr — serve a degraded stdio session that answers `initialize` and
-        // chirps "run analyze" from every tool call. clarion-ac36f51c2b.
-        return serve_no_index(path, &db_path);
+
+    match choose_serve_route(worktree_ctx.kind, db_path.exists()) {
+        ServeRoute::Linked => run_linked_worktree(config_path, &worktree_ctx),
+        ServeRoute::NoIndex => {
+            // No index yet. Rather than exiting 1 — which leaves the MCP
+            // client staring at a server that died at startup with the
+            // reason buried in stderr — serve a degraded stdio session that
+            // answers `initialize` and chirps "run analyze" from every tool
+            // call. clarion-ac36f51c2b.
+            serve_no_index(path, &db_path)
+        }
+        ServeRoute::Full => run_server(db_path, config_path, &worktree_ctx, false),
     }
-    run_server(db_path, config_path, &worktree_ctx, false)
 }
 
 /// Bootstrap and serve a linked worktree's isolated index (worktree-indexes
 /// design, "Bootstrap"): ensure the isolated store exists (Task 3), spawn a
-/// **detached** `loomweave worktree analyze` for it, then serve the full
-/// `ServerState` path immediately with the bootstrap gate active. Graph tools
-/// answer `index-building` (or `index-build-failed`) until a completed run
-/// row appears — no waiting here, no reconnect required once it does
+/// **detached** `loomweave worktree analyze` for it if (and only if) it has
+/// never finished a build, then serve the full `ServerState` path
+/// immediately with the bootstrap gate active. Graph tools answer
+/// `index-building` (or `index-build-failed`) until a completed run row
+/// appears — no waiting here, no reconnect required once it does
 /// (`loomweave_mcp::worktree_bootstrap`'s per-call readiness consult).
 fn run_linked_worktree(
     config_path: Option<&Path>,
     worktree_ctx: &loomweave_core::worktree::WorktreeContext,
+) -> Result<()> {
+    bootstrap_linked_worktree(worktree_ctx, None)?;
+    let db_path = worktree_ctx.store_paths.db.clone();
+    run_server(db_path, config_path, worktree_ctx, true)
+}
+
+/// Ensure the isolated store exists, then spawn `loomweave worktree analyze`
+/// for it **only when it has never finished a build** — per the design,
+/// "serve on a linked worktree WITH NO INDEX ... spawn". A worktree that
+/// already has a completed run is not respawned on every `serve` restart
+/// (that would fire a redundant 20-30 minute re-analyze every time an agent
+/// session starts against an already-built worktree); keeping a built index
+/// fresh is the `SessionStart` hook's job, not this one.
+///
+/// `analyze_program` overrides the launcher (`None` -> `current_exe()`);
+/// tests inject a stub so the spawn (whether it happens at all, and its
+/// exact argv) is assertable without a real multi-minute analyze — see
+/// `tests` below.
+fn bootstrap_linked_worktree(
+    worktree_ctx: &loomweave_core::worktree::WorktreeContext,
+    analyze_program: Option<&Path>,
 ) -> Result<()> {
     // `ensure_isolated_store`'s own contract: an un-`install`ed primary is
     // this caller's error to diagnose, not something it silently half-creates
@@ -81,6 +139,33 @@ fn run_linked_worktree(
             )
         })?;
 
+    let should_spawn = match rusqlite::Connection::open_with_flags(
+        &worktree_ctx.store_paths.db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(conn) => loomweave_mcp::worktree_bootstrap::should_spawn_bootstrap_analyze(&conn),
+        Err(err) => {
+            // Ambiguous — fail toward spawning rather than risk leaving the
+            // operator stuck with an unbuilt store and no automatic recovery.
+            tracing::warn!(
+                error = %err,
+                db = %worktree_ctx.store_paths.db.display(),
+                "worktree bootstrap: could not read the store to check build status; \
+                 spawning `loomweave worktree analyze` to be safe"
+            );
+            true
+        }
+    };
+
+    if !should_spawn {
+        tracing::info!(
+            source_root = %worktree_ctx.source_root.display(),
+            "worktree bootstrap: a completed run already exists; skipping the bootstrap spawn \
+             (staleness refresh is the SessionStart hook's job)"
+        );
+        return Ok(());
+    }
+
     // Fire-and-forget: a spawn failure (e.g. the executable vanished) is
     // logged and swallowed inside `spawn_detached_worktree_analyze` — serve
     // must keep running in the `building` state either way, with
@@ -89,7 +174,11 @@ fn run_linked_worktree(
     // tolerated by the existing per-store `analyze_lock.rs` fs2 lock the
     // spawned child acquires before writing any run row — nothing here needs
     // to check or wait for it.
-    match std::env::current_exe() {
+    let resolved_program = match analyze_program {
+        Some(program) => Ok(program.to_path_buf()),
+        None => std::env::current_exe(),
+    };
+    match resolved_program {
         Ok(program) => loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
             &program,
             &worktree_ctx.source_root,
@@ -101,9 +190,7 @@ fn run_linked_worktree(
              is run manually"
         ),
     }
-
-    let db_path = worktree_ctx.store_paths.db.clone();
-    run_server(db_path, config_path, worktree_ctx, true)
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -638,6 +725,9 @@ fn load_recording_fixture(config: &McpConfig, project_root: &Path) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loomweave_core::worktree::{WorktreeContext, WorktreeKind};
+    use std::process::Command as StdCommand;
+    use std::time::{Duration as StdDuration, Instant};
 
     #[test]
     fn finish_supervised_result_preserves_stdio_error_over_shutdown_error() {
@@ -650,6 +740,202 @@ mod tests {
         assert!(
             format!("{err:#}").contains("stdio failed first"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // pinned decision 1's routing branch (review finding 2): deleting
+    // `ServeRoute::Linked`'s arm, or the `run_linked_worktree` call it
+    // selects, must fail a test here.
+    // ---------------------------------------------------------------
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn git {args:?} in {}: {e}", dir.display()));
+        assert!(
+            output.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path, branch: &str) {
+        fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", branch]);
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+        fs::write(dir.join("f.txt"), "hi\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "init"]);
+    }
+
+    /// A real primary repo with one linked worktree, resolved.
+    fn linked_context(root: &Path) -> WorktreeContext {
+        let repo = root.join("repo");
+        init_repo(&repo, "main");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feature", "../linked"],
+        );
+        let linked = root.join("linked");
+        let ctx = WorktreeContext::resolve(&linked).expect("resolves as Linked");
+        assert_eq!(ctx.kind, WorktreeKind::Linked, "fixture must be Linked");
+        ctx
+    }
+
+    /// `loomweave install`'s one load-bearing effect this module's own
+    /// `bootstrap_linked_worktree` depends on: `repository_store` exists.
+    fn install_primary(ctx: &WorktreeContext) {
+        fs::create_dir_all(&ctx.repository_store).expect("create repository store");
+    }
+
+    #[test]
+    fn linked_context_routes_to_linked_not_no_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        // No `.weft/loomweave/` under the linked worktree's own source root
+        // at all — exactly the "unbuilt" state `serve` bootstraps from. If
+        // `choose_serve_route` (or its caller) ever fell back to treating
+        // this like a plain missing-index checkout, this would assert
+        // `NoIndex` and the whole no-reconnect design breaks.
+        let db_exists = loomweave_core::store::db_path(&ctx.source_root).exists();
+        assert!(
+            !db_exists,
+            "fixture sanity: no local store should exist yet"
+        );
+        assert_eq!(
+            choose_serve_route(ctx.kind, db_exists),
+            ServeRoute::Linked,
+            "a linked worktree must never route to serve_no_index"
+        );
+    }
+
+    #[test]
+    fn main_worktree_without_an_index_routes_to_no_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        let ctx = WorktreeContext::resolve(&repo).expect("resolves as Main");
+        assert_eq!(ctx.kind, WorktreeKind::Main);
+
+        assert_eq!(
+            choose_serve_route(ctx.kind, false),
+            ServeRoute::NoIndex,
+            "main/standalone with no index must keep routing to serve_no_index"
+        );
+        assert_eq!(
+            choose_serve_route(ctx.kind, true),
+            ServeRoute::Full,
+            "main/standalone with an index must keep routing to the full server"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // `bootstrap_linked_worktree`'s spawn decision + exact argv.
+    // ---------------------------------------------------------------
+
+    /// A stub standing in for `loomweave` itself: dumps its full argv (one
+    /// arg per line) to `argv_dump`, mirroring the pattern in
+    /// `loomweave-mcp`'s own `analyze_runs.rs` / `worktree_bootstrap.rs`
+    /// tests.
+    #[cfg(unix)]
+    fn write_argv_dump_stub(dir: &Path, argv_dump: &Path) -> PathBuf {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = dir.join("argv-stub.sh");
+        let mut file = fs::File::create(&script).unwrap();
+        writeln!(
+            file,
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{}\"\n",
+            argv_dump.display()
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Poll `path` until it exists or `deadline` elapses — the spawn is
+    /// fire-and-forget, so the stub writing its argv dump races this test.
+    /// Bounded, no unbounded sleep loop.
+    fn wait_for_file(path: &Path, deadline: StdDuration) {
+        let start = Instant::now();
+        while !path.exists() {
+            assert!(
+                start.elapsed() <= deadline,
+                "{} was not written within {deadline:?}",
+                path.display()
+            );
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bootstrap_spawns_worktree_analyze_with_exact_argv_when_unbuilt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        install_primary(&ctx);
+
+        let argv_dump = tmp.path().join("argv.txt");
+        let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
+
+        bootstrap_linked_worktree(&ctx, Some(&stub)).expect("bootstrap on an unbuilt worktree");
+
+        wait_for_file(&argv_dump, StdDuration::from_secs(5));
+        let argv = fs::read_to_string(&argv_dump).expect("stub wrote argv");
+        let forwarded: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            forwarded,
+            vec![
+                "worktree",
+                "analyze",
+                "--",
+                ctx.source_root.to_str().unwrap()
+            ],
+            "the bootstrap spawn's argv must be exactly `worktree analyze -- <target>`, not the \
+             hook's plain-analyze argv"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bootstrap_spawns_nothing_when_a_completed_run_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        install_primary(&ctx);
+
+        // Build the store once for real (no stub needed — `ensure_isolated_store`
+        // is the same function `bootstrap_linked_worktree` itself calls), then
+        // seed a completed run directly, simulating a worktree `serve` has
+        // already successfully bootstrapped in an earlier session.
+        loomweave_cli::worktree::store::ensure_isolated_store(&ctx).expect("ensure store");
+        let conn = rusqlite::Connection::open(&ctx.store_paths.db).expect("open store db");
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r1', '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', '{}', '{}', \
+             'completed')",
+            [],
+        )
+        .expect("seed completed run");
+        drop(conn);
+
+        let argv_dump = tmp.path().join("argv.txt");
+        let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
+
+        bootstrap_linked_worktree(&ctx, Some(&stub)).expect("bootstrap on a built worktree");
+
+        // Deterministic, no wait needed: `bootstrap_linked_worktree` decides
+        // whether to spawn synchronously, inside this call, before returning
+        // — if it decided not to spawn, `Command::spawn` was never invoked.
+        assert!(
+            !argv_dump.exists(),
+            "a worktree with a completed run must not be respawned on every serve restart"
         );
     }
 }

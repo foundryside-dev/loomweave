@@ -475,3 +475,51 @@ async fn main_and_standalone_keep_existing_no_index_behavior() {
     // Real, non-null zero counts (not nulled — there is no gate active).
     assert_eq!(status["result"]["counts"]["entities"], 0, "{status:?}");
 }
+
+/// `loomweave://context` is a second door into the same store the tool-call
+/// gate protects (CLAUDE.md points agents at it directly: "live counts:
+/// `loomweave://context`"). While building it must report the same
+/// `degraded: true` shape `unreadable_db_snapshot()` already uses for a
+/// broken read — never `entity_count: 0` presented as a real, trustworthy
+/// count — and once a run completes it must report real counts again, in the
+/// same session, no reconnect.
+#[tokio::test]
+async fn context_resource_reports_degraded_while_building_then_real_counts_after_completion() {
+    async fn read_context(state: &ServerState) -> Value {
+        let response = state
+            .handle_json_rpc(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {"uri": "loomweave://context"}
+            }))
+            .await
+            .expect("resources/read returns a response");
+        let text = response["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("resource content text");
+        serde_json::from_str(text).expect("snapshot JSON")
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    let state = linked_state(&ctx);
+
+    let building = read_context(&state).await;
+    assert_eq!(building["degraded"], true, "{building:?}");
+    assert_eq!(building["reason"], "index-building", "{building:?}");
+    // The zero counts are the same shape `unreadable_db_snapshot()` already
+    // produces for a broken read — present, but disclaimed by `degraded`.
+    assert_eq!(building["entity_count"], 0, "{building:?}");
+    assert_eq!(building["db_present"], true, "{building:?}");
+
+    seed_completed_run(&ctx.store_paths.db, "r1");
+
+    let ready = read_context(&state).await;
+    assert_eq!(ready["degraded"], false, "{ready:?}");
+    assert!(
+        ready.get("reason").is_none(),
+        "an ordinary (non-gated) snapshot must not carry a `reason` key: {ready:?}"
+    );
+}
