@@ -1109,6 +1109,7 @@ dependencies = [
 name = "loomweave-core"
 version = "1.5.0"
 dependencies = [
+ "blake3",
  "nix",
  "serde",
  "serde_json",
