@@ -1,6 +1,8 @@
 # Worktree-Scoped Loomweave Indexes Design
 
-**Date:** 2026-07-18 (rewritten after owner scope reduction)
+**Date:** 2026-07-18 (rewritten after owner scope reduction); amended
+2026-07-28 after four-lens implementation review
+(`../plans/2026-07-18-worktree-indexes-plan.review.json`)
 
 **Status:** Approved for implementation
 
@@ -113,7 +115,13 @@ moving the repository does not mint a new ID.
 
 For a main worktree or non-Git project the resolver returns the current store
 path unchanged. Failing to prove a checkout is linked falls back to existing
-behavior; it never guesses a primary root and writes elsewhere.
+behavior; it never guesses a primary root and writes elsewhere. The source
+root is canonicalized before any identity comparison, so a checkout reached
+through a symlink resolves to the same store as its target rather than
+triggering a spurious `source_root` mismatch. A bare primary (a worktree hub
+whose common Git directory has no main working tree) is out of scope for
+isolation: the resolver classifies those checkouts as standalone and uses the
+local store.
 
 Every command and service that reads or writes runtime state receives
 `StorePaths` or an explicit leaf path rather than re-deriving from a source
@@ -195,11 +203,21 @@ overwrite each other.
 `serve` on a linked worktree with no index:
 
 1. Resolve `WorktreeContext`; create the store directory and `metadata.json`.
-2. Spawn a **detached** `loomweave analyze` for the worktree source root. This
-   is the mechanism the SessionStart hook already uses; do not reinvent it.
-3. Serve immediately. Graph tools return the normal structured error envelope
-   with `code: "index-building"`, `retryable: true`, and the fallback command.
+2. Spawn a **detached** `loomweave worktree analyze` for the worktree. Reuse
+   the SessionStart hook's *detachment technique* (`process_group(0)`, null
+   stdio) — **not** its argv. The hook spawns plain `loomweave analyze
+   <source-root>`, and plain `analyze` must itself resolve storage through
+   `WorktreeContext`, so both spellings land in the isolated store. An
+   un-routed plain analyze writing a 20–30 minute index into
+   `<worktree>/.weft/loomweave/` — a store serve's readiness poll never
+   observes — is the silent failure this step exists to prevent.
+3. Serve immediately. Graph tools return the existing structured tool-error
+   envelope (`error.code` / `error.retryable` plus top-level `diagnostics`)
+   with code `index-building` and the fallback command. `index-building` and
+   `index-build-failed` join the pinned `McpErrorCode` wire vocabulary.
 4. When a completed run row exists, activate readers and answer normally.
+   Readiness is recomputed by consulting run state on each tool call at the
+   single dispatch chokepoint — no timer, no cached readiness state.
 
 Double-spawn is prevented by the existing `analyze_lock.rs` (fs2 advisory
 lock), not by a new durable-intent protocol. If analysis fails, tools return
@@ -233,6 +251,24 @@ startup.
 
 A Git-locked worktree is registered and therefore never a candidate. The main
 store is never a candidate.
+
+When a `[loomweave].store_dir` override is active the sweep is **report-only**:
+it logs would-be candidates and deletes nothing (the Non-goals entry below is
+a hard requirement, not advice — an absolute override can be shared between
+unrelated repositories, and repository A's registered-worktree set must never
+authorize deleting repository B's stores). Every deletion the sweep performs
+is logged with the store's stable ID and the reason, as is every
+delete-and-rebuild triggered by unreadable or mismatched metadata: under this
+posture the log line is the only audit trail an automatic deletion leaves.
+
+Removal semantics deserve one distinction. A store swept while its worktree
+still exists costs one re-analyze — the open inode keeps a live `serve`
+working, and the next start rebuilds. But `git worktree remove` deletes the
+working tree *and* its registration together, so for that store there is no
+source tree left to rebuild from and "the next start rebuilds" does not
+apply. A `serve` whose resolved source root no longer exists surfaces a
+distinct `source-root-missing` state on graph and status tools instead of
+continuing to report the last staleness verdict for a tree that is gone.
 
 ## Non-goals
 
@@ -269,17 +305,23 @@ protecting data worth 20 minutes of compute.
 
 - **Resolver:** linked/main/standalone classification; primary identified by
   Git directory not branch name; stable ID invariant across branch switch and
-  repository move; non-UTF-8 path rejection.
+  repository move; non-UTF-8 path rejection; symlinked source root resolves to
+  the same identity as its target; a bare primary classifies as standalone.
 - **Isolation:** two worktrees on divergent branches produce different graphs;
   concurrent analyze in both succeeds; neither touches the main store.
 - **Bootstrap:** serve on a fresh worktree returns `index-building`, then
   answers in the same session once the run completes; `analyze_lock.rs`
   prevents a second spawn; failure surfaces `index-build-failed` with the exact
-  fallback command.
+  fallback command; bare `loomweave analyze <linked-worktree-path>` writes into
+  the isolated store, never `<worktree>/.weft/loomweave/`.
 - **Config:** source-root `loomweave.yaml` wins over primary; setters write the
   resolved origin; sibling port/token discovery falls back source → primary.
 - **Cleanup:** an unregistered store is deleted; a registered one is not; a
-  Git-locked worktree is preserved; Git enumeration failure deletes nothing.
+  Git-locked worktree is preserved; Git enumeration failure deletes nothing;
+  an active `[loomweave].store_dir` override makes the sweep report-only;
+  every automatic deletion logs stable ID and reason.
+- **Removal under serve:** after `git worktree remove`, a still-running serve
+  surfaces `source-root-missing` rather than the last staleness verdict.
 - **Confinement (the safety-critical suite):** a symlinked `worktrees/`
   component refuses; a symlink inside a candidate refuses; a bind mount beneath
   a candidate refuses; a non-matching directory name is never a candidate; a
@@ -296,4 +338,7 @@ protecting data worth 20 minutes of compute.
 4. `serve` on an unbuilt worktree becomes usable in the same session.
 5. `loomweave worktree analyze` builds or rebuilds explicitly.
 6. A removed worktree's store is reclaimed on the next sweep.
-7. No deletion can reach outside `<repository-store>/worktrees/`.
+7. No deletion can reach outside `<repository-store>/worktrees/`; under a
+   `[loomweave].store_dir` override the sweep deletes nothing (report-only).
+   Confinement guarantees are claimed only for a store namespace the sweeping
+   repository exclusively owns.
