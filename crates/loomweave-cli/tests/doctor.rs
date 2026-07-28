@@ -74,6 +74,104 @@ fn write_healthy_db(root: &Path) {
     fs::write(store.join(".gitignore"), canonical).unwrap();
 }
 
+/// A do-nothing language plugin: it completes the handshake and is never asked
+/// to analyze anything (the temp projects hold no `.lwdoc` files). Its only job
+/// is to make plugin discovery — and therefore `plugin.availability` and the
+/// classifier checks — DETERMINISTIC.
+///
+/// Without it a doctor test that asserts full health silently depends on whether
+/// the machine running it happens to have a language plugin installed globally:
+/// green on a developer box, red on a CI runner. That environment coupling is
+/// what pinned CI red (clarion-40132c951e).
+#[cfg(unix)]
+const DOCTOR_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {
+            "name": "loomweave-plugin-lwdoc",
+            "version": "0.1.0",
+            "ontology_version": "0.1.0",
+            "capabilities": {},
+        }})
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const DOCTOR_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "loomweave-plugin-lwdoc"
+plugin_id = "lwdoc"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "loomweave-plugin-lwdoc"
+language = "lwdoc"
+extensions = ["lwdoc"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 64
+expected_entities_per_file = 10
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = []
+rule_id_prefix = "LMWV-DOC-"
+ontology_version = "0.1.0"
+classifier_tags = ["entry-point"]
+
+[ontology.roles]
+file_scope = ["module"]
+"#;
+
+/// Materialise the fixture plugin in a fresh dir and return it, plus the `PATH`
+/// value that makes it (and nothing else) discoverable.
+#[cfg(unix)]
+fn discoverable_plugin_dir() -> (TempDir, String) {
+    let dir = tempfile::tempdir().expect("plugin dir");
+    let script = dir.path().join("loomweave-plugin-lwdoc");
+    fs::write(&script, DOCTOR_PLUGIN_SCRIPT).expect("write plugin script");
+    let mut perms = fs::metadata(&script).expect("stat plugin").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod plugin");
+    fs::write(dir.path().join("plugin.toml"), DOCTOR_PLUGIN_MANIFEST).expect("write manifest");
+
+    let path = format!("{}:/usr/bin:/bin", dir.path().display());
+    (dir, path)
+}
+
 /// Run `doctor` (optionally with `--fix`) and return `(exit_code, stdout)`.
 fn doctor(dir: &Path, fix: bool) -> (i32, String) {
     doctor_with_env(dir, fix, &[], &[])
@@ -291,8 +389,51 @@ fn doctor_reports_plain_install_healthy() {
     );
 }
 
+/// Classifier evidence is produced by LANGUAGE PLUGINS. With none installed
+/// there is nothing to classify and nothing `--fix` can do about it: running
+/// `analyze` yields `skipped_no_plugins`, so reporting the classifier checks as
+/// repairable `problem`s makes `doctor --fix` exit non-zero forever on any
+/// plugin-less machine — which is every CI runner that does not install a
+/// language plugin, and every fresh install before the operator adds one.
+///
+/// `plugin.availability` already warns about the missing plugin; the classifier
+/// checks must degrade to the same warning rather than claim a failed repair.
+#[test]
+fn doctor_fix_exits_zero_when_no_language_plugin_is_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--skills", "--hooks"], dir.path());
+    write_healthy_db(dir.path());
+
+    // A PATH with no `loomweave-plugin-*` on it — the CI runner's shape.
+    let (code, doc) = doctor_json_with_env(dir.path(), true, &[("PATH", "/usr/bin:/bin")], &[]);
+
+    let status = |id: &str| -> String {
+        doc["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("check {id} missing from {doc:#}"))["status"]
+            .as_str()
+            .expect("status string")
+            .to_owned()
+    };
+
+    assert_eq!(
+        code, 0,
+        "a plugin-less project has nothing to classify, so --fix must not report an \
+         unrepairable problem; doctor:\n{doc:#}"
+    );
+    // Not applicable, not broken — and the missing plugin is still surfaced once,
+    // by the check that owns it.
+    assert_eq!(status("classifier.enumeration"), "warning");
+    assert_eq!(status("classifier.tags"), "warning");
+    assert_eq!(status("plugin.availability"), "warning");
+}
+
 /// `doctor --fix` registers the MCP entry; a subsequent plain `doctor` is then
 /// fully healthy and exits 0. The `.mcp.json` gains a `loomweave` serve entry.
+#[cfg(unix)]
 #[test]
 fn doctor_fix_registers_mcp_then_reports_healthy() {
     let dir = tempfile::tempdir().unwrap();
@@ -303,8 +444,13 @@ fn doctor_fix_registers_mcp_then_reports_healthy() {
     // Materialise a healthy DB so the index health check reports ok rather than
     // the absent-DB warning, which would prevent "All orientation surfaces healthy."
     write_healthy_db(dir.path());
+    // ...and pin plugin discovery, for the same reason: a machine with no
+    // language plugin warns on `plugin.availability` + the classifier checks,
+    // which also prevents the healthy summary line. Asserting FULL health means
+    // owning every input to it, not inheriting the developer's global installs.
+    let (_plugin_dir, path) = discoverable_plugin_dir();
 
-    let (code, out) = doctor(dir.path(), true);
+    let (code, out) = doctor_with_env(dir.path(), true, &[("PATH", path.as_str())], &[]);
     assert_eq!(code, 0, "--fix should repair and exit 0; stdout:\n{out}");
     assert!(
         out.contains("All orientation surfaces healthy."),
