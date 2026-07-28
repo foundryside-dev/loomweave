@@ -40,7 +40,13 @@ impl ServerState {
         };
 
         let run_id = uuid::Uuid::new_v4().to_string();
-        let runs_dir = loomweave_core::store::store_dir(&self.project_root).join("runs");
+        // The linked worktree's isolated store's `runs/` directory — never a
+        // bare `store_dir(&self.project_root).join("runs")`, which for a
+        // linked worktree would create a directory *inside the worktree's
+        // own checkout* (a location `loomweave worktree analyze` never
+        // populates and worktree-index isolation forbids writing to;
+        // worktree-index Task 7).
+        let runs_dir = self.effective_runs_dir();
         if let Err(err) = std::fs::create_dir_all(&runs_dir) {
             return Ok(tool_error_envelope(
                 McpErrorCode::IoError,
@@ -219,7 +225,11 @@ impl ServerState {
 
         match outcome {
             CancelOutcome::Cancelled => {
-                let db_path = loomweave_core::store::db_path(&self.project_root);
+                // The store the cancelled run actually wrote its row into —
+                // never a bare `db_path(&self.project_root)` (worktree-index
+                // Task 7; see `tool_analyze_start`'s identical `runs_dir` fix
+                // above).
+                let db_path = self.effective_db_path();
                 crate::analyze_runs::mark_run_cancelled_in_db(&db_path, &run_id, &now);
                 Ok(success_envelope(json!({
                     "run_id": run_id,

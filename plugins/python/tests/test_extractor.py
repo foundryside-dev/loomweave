@@ -1780,6 +1780,39 @@ __all__ = ["exported_fn"]
     assert "tags" not in module or "exported-api" not in module["tags"]
 
 
+def test_conditional_rebinding_keeps_local_export_as_reachability_root() -> None:
+    """The optional-accelerator idiom must not strand the local definition.
+
+    ADR-053 defines ``exported-api`` as a *declared reachability root*. The
+    dead-code BFS seeds roots by exact entity id and walks only ``calls`` and
+    ``imports`` edges — ``contains`` is deliberately excluded — so moving the
+    tag onto the module gives the module liveness it already had as a
+    container and gives this function nothing. Displacing here would report a
+    live, exported function as dead.
+
+    Displacing to the module stays correct for a *proven* top-level rebinding
+    (the module then owns a real ``imports`` edge to the re-exported name);
+    the distinction is a single local definition that is only *conditionally*
+    shadowed, where over-claiming provenance is the safe direction.
+    """
+    source = """\
+def slow_impl():
+    return 1
+
+
+try:
+    from pkg.fast import slow_impl
+except ImportError:
+    pass
+
+__all__ = ["slow_impl"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.slow_impl"]["tags"]
+
+
 @pytest.mark.parametrize(
     "conditional_rebinding",
     [
@@ -1788,8 +1821,6 @@ __all__ = ["exported_fn"]
         "while flag:\n    exported_fn = object()",
         "try:\n    from pkg.impl import exported_fn\nexcept ImportError:\n    pass",
         "for replacement in replacements:\n    exported_fn = replacement",
-        "for exported_fn in replacements:\n    pass",
-        "with manager() as exported_fn:\n    pass",
         "try:\n    pass\nexcept Exception as exported_fn:\n    pass",
         "try:\n    pass\nexcept* Exception as exported_fn:\n    pass",
         'match token:\n    case "replace":\n        exported_fn = object()',
@@ -1798,9 +1829,22 @@ __all__ = ["exported_fn"]
         "if flag:\n    from pkg.impl import *",
     ],
 )
-def test_potential_control_flow_rebinding_uses_module_proxy(
+def test_branch_conditional_rebinding_keeps_local_export_as_reachability_root(
     conditional_rebinding: str,
 ) -> None:
+    """A rebinding confined to a branch must not displace the local definition.
+
+    These all *may* rebind ``exported_fn`` at runtime, so displacing the tag
+    onto the module reads as the conservative choice. It is not: per ADR-053
+    ``exported-api`` is a declared reachability root, and the dead-code BFS
+    seeds roots by exact entity id over ``calls``/``imports`` edges only, so a
+    module tag never reaches the function. Displacing here reports a live
+    exported function as dead. Over-claiming provenance is the safe direction.
+
+    Contrast ``test_top_level_rebinding_uses_module_proxy``: a rebinding that
+    is *proven* to execute still displaces, because the module then genuinely
+    owns the exported name.
+    """
     source = f"""\
 def exported_fn():
     return 1
@@ -1812,6 +1856,39 @@ token = object()
 
 
 {conditional_rebinding}
+
+__all__ = ["exported_fn"]
+"""
+    entities, _ = extract(source, "api.py")
+    by_id = {e["id"]: e for e in entities}
+
+    assert "exported-api" in by_id["python:function:api.exported_fn"]["tags"]
+
+
+@pytest.mark.parametrize(
+    "direct_rebinding",
+    [
+        "for exported_fn in replacements:\n    pass",
+        "with manager() as exported_fn:\n    pass",
+    ],
+)
+def test_top_level_binding_target_uses_module_proxy(direct_rebinding: str) -> None:
+    """A top-level binding target is classified direct, so it still displaces."""
+    source = f"""\
+def exported_fn():
+    return 1
+
+
+flag = bool()
+replacements = []
+token = object()
+
+
+def manager():
+    return None
+
+
+{direct_rebinding}
 
 __all__ = ["exported_fn"]
 """
@@ -2593,6 +2670,84 @@ def test_deep_nested_class_binding_analysis_is_linear() -> None:
 
     assert elapsed < 1.0, f"nested class binding analysis took {elapsed:.3f}s"
     assert "exported-api" in by_id["python:module:api"]["tags"]
+
+
+def test_branch_wrapped_nested_class_binding_analysis_is_linear() -> None:
+    """Nested classes separated by a branch must not recurse twice per level.
+
+    The sibling test above nests classes directly, which only ever walks each
+    body once. Interposing an ``if`` puts the nested class behind *two*
+    independent walks -- ``_nested_class_global_rebindings`` via ``visit_If``,
+    and ``_potential_control_flow_rebindings`` via the branch blocks -- and
+    each recurses, so work doubled per level. At depth 20 this took 27s for a
+    5KB file; the memo restores the sub-millisecond behaviour that predates
+    conditional-rebinding classification. Depth 20 is chosen because the
+    unmemoised cost there is ~4 orders of magnitude above the bound.
+    """
+    lines = ["flag = bool()", "replacement = object()", "def exported_fn(): pass"]
+    indent = ""
+    for depth in range(20):
+        lines.append(f"{indent}class Level{depth}:")
+        indent += "    "
+        lines.append(f"{indent}if flag:")
+        indent += "    "
+    lines.extend(
+        [
+            f"{indent}global exported_fn",
+            f"{indent}exported_fn = replacement",
+            '__all__ = ["exported_fn"]',
+        ],
+    )
+
+    started = time.perf_counter()
+    extract("\n".join(lines), "api.py")
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0, f"branch-wrapped nested class analysis took {elapsed:.3f}s"
+
+
+def test_extraction_memo_does_not_leak_between_files() -> None:
+    """The id()-keyed memo must not answer for a later file's nodes.
+
+    CPython reuses addresses once a tree is collected, so a memo retained
+    across extractions could return the previous file's rebindings for an
+    unrelated class that happens to land on the same address.
+    """
+    first = """\
+flag = bool()
+replacement = object()
+
+
+def exported_fn():
+    return 1
+
+
+class Holder:
+    if flag:
+        global exported_fn
+        exported_fn = replacement
+
+
+__all__ = ["exported_fn"]
+"""
+    second = """\
+def exported_fn():
+    return 1
+
+
+class Holder:
+    value = 1
+
+
+__all__ = ["exported_fn"]
+"""
+    for _ in range(3):
+        extract(first, "first.py")
+        entities, _ = extract(second, "second.py")
+        by_id = {e["id"]: e for e in entities}
+        # `second` has no rebinding at all, so its export must stay direct
+        # regardless of what was memoised while extracting `first`.
+        assert "exported-api" in by_id["python:function:second.exported_fn"]["tags"]
 
 
 def test_dunder_all_augmented_assignment_extends_exported_api_surface() -> None:

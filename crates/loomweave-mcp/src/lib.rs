@@ -11,6 +11,7 @@ pub mod snapshot;
 mod tools;
 pub mod wardline_reconcile;
 pub mod warpline;
+pub mod worktree_bootstrap;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -1253,6 +1254,28 @@ pub struct LlmDiagnostics {
     pub cache_max_age_days: u32,
 }
 
+/// The `loomweave.yaml` path a fresh `ServerState` should read/write absent an
+/// explicit `--config` — its `default_config_path` field.
+/// `WorktreeContext::resolve` only fails on a non-UTF-8 path component; that
+/// failure is logged and folds to today's unchanged
+/// `project_root.join("loomweave.yaml")` rather than propagating, since
+/// `ServerState::new` is infallible and 30+ call sites (production and test)
+/// depend on that.
+fn resolve_default_config_path(project_root: &Path) -> PathBuf {
+    match loomweave_core::worktree::WorktreeContext::resolve(project_root) {
+        Ok(ctx) => ctx.config_path(),
+        Err(err) => {
+            tracing::warn!(
+                project_root = %project_root.display(),
+                error = %err,
+                "could not resolve worktree context for the default loomweave.yaml path; \
+                 falling back to <project_root>/loomweave.yaml"
+            );
+            project_root.join("loomweave.yaml")
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     project_root: PathBuf,
@@ -1287,11 +1310,50 @@ pub struct ServerState {
     /// same configuration (review #12). `None` → the child uses its default
     /// config discovery (serve was started without an explicit `--config`).
     analyze_config_path: Option<PathBuf>,
+    /// The `loomweave.yaml` path `llm_config_set`/`semantic_config_set` write
+    /// (and `llm_config_get`/`semantic_config_get` read) when `serve` was
+    /// launched with no explicit `--config` (i.e. `analyze_config_path` is
+    /// `None`) — `WorktreeContext::resolve(project_root)`'s resolved
+    /// `ConfigOrigin` path (design doc, "Configuration and sibling
+    /// discovery": "The resolver records the selected path as `ConfigOrigin`;
+    /// `llm_config_set` and `semantic_config_set` update exactly that file").
+    ///
+    /// Computed once at construction and cached rather than re-resolved (via
+    /// `git`) on every tool call. Falls back to
+    /// `project_root.join("loomweave.yaml")` — today's unchanged behavior —
+    /// on the one error `WorktreeContext::resolve` can return (a non-UTF-8
+    /// path), which is logged rather than silently swallowed.
+    default_config_path: PathBuf,
+    /// Present only for a linked worktree's isolated-index `serve` session
+    /// (worktree-indexes design, "Bootstrap"): gates every tool call except
+    /// `project_status_get`/`analyze_status_get` on `worktree_bootstrap::read_worktree_readiness`,
+    /// recomputed fresh on each `handle_tool_call` — never cached, no
+    /// background timer. `None` for a standalone checkout or the main
+    /// worktree, which take today's unchanged `db_path(project_root).exists()`
+    /// gate in `serve.rs` and never reach the bootstrap gate at all.
+    worktree_gate: Option<WorktreeGate>,
+}
+
+/// See [`ServerState::worktree_gate`].
+#[derive(Debug, Clone)]
+struct WorktreeGate {
+    /// The linked worktree's isolated store's explicit leaf paths — distinct
+    /// from `db_path(project_root)`/`store_dir(project_root)`/
+    /// `embeddings_db_path(project_root)` (all re-derived from the *source*
+    /// root, a location `loomweave worktree analyze` never populates), so
+    /// every `ServerState::effective_*` accessor below reports the store
+    /// this session is actually reading, not a path that will never exist
+    /// (worktree-index Task 7).
+    store_paths: loomweave_core::worktree::StorePaths,
+    /// The exact `loomweave worktree analyze -- <target>` fallback command,
+    /// echoed verbatim in `index-building`/`index-build-failed` diagnostics.
+    fallback_argv: Vec<String>,
 }
 
 impl ServerState {
     #[must_use]
     pub fn new(project_root: PathBuf, readers: ReaderPool) -> Self {
+        let default_config_path = resolve_default_config_path(&project_root);
         Self {
             project_root,
             readers,
@@ -1312,7 +1374,89 @@ impl ServerState {
             cancellation_notify: Arc::new(Notify::new()),
             analyze_program: None,
             analyze_config_path: None,
+            default_config_path,
+            worktree_gate: None,
         }
+    }
+
+    /// Activate the linked-worktree bootstrap gate (worktree-indexes design,
+    /// "Bootstrap"): every tool call except `project_status_get`/
+    /// `analyze_status_get` is gated on `worktree_bootstrap::read_worktree_readiness`
+    /// until a completed (or `skipped_no_plugins`) run row appears.
+    ///
+    /// `store_paths` is the linked worktree's isolated store's explicit leaf
+    /// paths (`store_paths.db` is the same path the caller opened `readers`
+    /// against) — distinct from `db_path(project_root)`/
+    /// `store_dir(project_root)`, which for a linked worktree are paths
+    /// under the *source* root that this design never writes to.
+    /// `source_root` is used to build the exact `loomweave worktree analyze`
+    /// fallback command surfaced in error diagnostics.
+    #[must_use]
+    pub fn with_worktree_gate(
+        mut self,
+        store_paths: loomweave_core::worktree::StorePaths,
+        source_root: &Path,
+    ) -> Self {
+        self.worktree_gate = Some(WorktreeGate {
+            store_paths,
+            fallback_argv: worktree_bootstrap::fallback_argv(source_root),
+        });
+        self
+    }
+
+    /// The structural-graph store this session actually reads/writes:
+    /// `self.worktree_gate`'s isolated `store_paths.db` when active,
+    /// otherwise `db_path(self.project_root)` — today's unchanged behavior
+    /// for a standalone checkout or the main worktree (worktree-index Task
+    /// 7). Every call site that needs a db path outside `self.readers` (the
+    /// reader pool is always opened against the correct path already) must
+    /// go through this, never a bare `loomweave_core::store::db_path(&self.project_root)`.
+    fn effective_db_path(&self) -> PathBuf {
+        self.worktree_gate.as_ref().map_or_else(
+            || loomweave_core::store::db_path(&self.project_root),
+            |gate| gate.store_paths.db.clone(),
+        )
+    }
+
+    /// The embeddings sidecar this session actually reads: the gated
+    /// counterpart of [`Self::effective_db_path`] for
+    /// `embeddings_db_path(project_root)` call sites (`search_semantic`,
+    /// `semantic_config_get`/`set`'s sidecar status — worktree-index Task 7).
+    fn effective_embeddings_path(&self) -> PathBuf {
+        self.worktree_gate.as_ref().map_or_else(
+            || embeddings_db_path(&self.project_root),
+            |gate| gate.store_paths.embeddings.clone(),
+        )
+    }
+
+    /// The `runs/` directory this session actually writes progress files
+    /// into: the gated counterpart of [`Self::effective_db_path`] for
+    /// `store_dir(project_root).join("runs")` call sites (`analyze_start`'s
+    /// `--progress-file` target — worktree-index Task 7). Writing this
+    /// unrouted would create a directory *inside* a linked worktree's own
+    /// checkout — exactly what worktree-index isolation forbids.
+    fn effective_runs_dir(&self) -> PathBuf {
+        self.worktree_gate.as_ref().map_or_else(
+            || loomweave_core::store::store_dir(&self.project_root).join("runs"),
+            |gate| gate.store_paths.runs.clone(),
+        )
+    }
+
+    /// The published-port file this session's `serve` actually writes to
+    /// (when its HTTP read API is up): the gated counterpart of
+    /// [`Self::effective_db_path`] for
+    /// `loomweave_federation::loomweave_port::published_port_path(project_root)`
+    /// call sites (`loomweave_read_api_json`'s ADR-044 status report —
+    /// worktree-index Task 7 fix-loop finding 2). `http_read::spawn` already
+    /// publishes to `store_paths.port` for a linked worktree
+    /// (`serve.rs`); a status reader that instead re-derived
+    /// `published_port_path(project_root)` would check a file `serve` never
+    /// writes and report the live HTTP API as absent.
+    fn effective_port_path(&self) -> PathBuf {
+        self.worktree_gate.as_ref().map_or_else(
+            || loomweave_federation::loomweave_port::published_port_path(&self.project_root),
+            |gate| gate.store_paths.port.clone(),
+        )
     }
 
     /// Override the program `analyze_start` launches (default: `current_exe()`).
@@ -1493,10 +1637,10 @@ impl ServerState {
         _arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
         let path = self.config_file_path();
-        let project_root = self.project_root.clone();
+        let sidecar_path = self.effective_embeddings_path();
         let active_write_tools = self.tool_policy.enable_write_tools;
         let read =
-            tokio::task::spawn_blocking(move || read_semantic_config_status(&path, &project_root))
+            tokio::task::spawn_blocking(move || read_semantic_config_status(&path, &sidecar_path))
                 .await;
         match read {
             Ok(Ok(status)) => Ok(success_envelope(with_active_session_policy(
@@ -1529,13 +1673,13 @@ impl ServerState {
             ));
         }
         let path = self.config_file_path();
-        let project_root = self.project_root.clone();
+        let sidecar_path = self.effective_embeddings_path();
         let active_write_tools = self.tool_policy.enable_write_tools;
         let write = tokio::task::spawn_blocking(move || {
             let result = update_semantic_config_file(&path, &patch)?;
             Ok::<_, loomweave_federation::config::ConfigError>(semantic_config_status_json(
                 &path,
-                &project_root,
+                &sidecar_path,
                 result.created,
                 &result.config,
             ))
@@ -1563,7 +1707,7 @@ impl ServerState {
     fn config_file_path(&self) -> PathBuf {
         self.analyze_config_path
             .clone()
-            .unwrap_or_else(|| self.project_root.join("loomweave.yaml"))
+            .unwrap_or_else(|| self.default_config_path.clone())
     }
 
     pub async fn handle_json_rpc(&self, request: &Value) -> Option<Value> {
@@ -1662,6 +1806,91 @@ impl ServerState {
         }
     }
 
+    /// The single readiness/gate chokepoint for a linked worktree's isolated
+    /// index (worktree-indexes design, "Bootstrap"). Recomputes fresh on
+    /// every call from `self.worktree_gate` (`None` for a standalone checkout
+    /// or the main worktree — this returns `None` immediately, no query, no
+    /// behavior change) — no cached flag, no background timer, no per-tool
+    /// forking across `graph.rs`/`orientation.rs`/`catalogue/*`.
+    ///
+    /// `source-root-missing` is checked first and applies to *every* tool,
+    /// including `project_status_get`/`analyze_status_get`: once the worktree
+    /// itself is gone there is no "remain available while building" case
+    /// left to serve — the design's accepted race for `git worktree remove`
+    /// under a live `serve`. Building/build-failed then exempts exactly
+    /// `project_status_get` and `analyze_status_get` so an agent can still
+    /// observe progress and the failure diagnostics while every other tool
+    /// (which would otherwise read a schema-initialized-but-empty, or
+    /// partially-written, store) is blocked.
+    async fn consult_worktree_gate(&self, id: &Value, canonical_name: &str) -> Option<Value> {
+        let gate = self.worktree_gate.as_ref()?;
+
+        if !self.project_root.exists() {
+            let envelope = tool_error_envelope_with_diagnostics(
+                McpErrorCode::SourceRootMissing,
+                &format!(
+                    "the worktree source root {} no longer exists (it may have been removed \
+                     via `git worktree remove`); this serve session cannot answer for a tree \
+                     that is gone — start a new `loomweave serve` against a live worktree",
+                    self.project_root.display()
+                ),
+                false,
+                json!({}),
+                vec![json!({"source_root": self.project_root.display().to_string()})],
+            );
+            return Some(tool_json_rpc_response(id, &envelope));
+        }
+
+        if matches!(canonical_name, "project_status_get" | "analyze_status_get") {
+            return None;
+        }
+
+        let read = self
+            .readers
+            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .await;
+        // A storage-layer read failure here is not this gate's to report —
+        // fall through to normal dispatch, which will hit the same failure
+        // and surface its own `storage-error` envelope.
+        let Ok(read) = read else {
+            return None;
+        };
+
+        match read.readiness {
+            worktree_bootstrap::WorktreeReadiness::Ready => None,
+            worktree_bootstrap::WorktreeReadiness::Building => Some(tool_json_rpc_response(
+                id,
+                &tool_error_envelope_with_diagnostics(
+                    McpErrorCode::IndexBuilding,
+                    "this linked worktree's isolated index is still building (no completed \
+                     analyze run yet); graph and catalogue tools are unavailable until it \
+                     finishes. project_status_get and analyze_status_get remain available to \
+                     check progress in this same session — no reconnect needed.",
+                    true,
+                    json!({}),
+                    vec![json!({
+                        "run_id": read.run_id,
+                        "fallback_command": gate.fallback_argv,
+                    })],
+                ),
+            )),
+            worktree_bootstrap::WorktreeReadiness::BuildFailed => Some(tool_json_rpc_response(
+                id,
+                &tool_error_envelope_with_diagnostics(
+                    McpErrorCode::IndexBuildFailed,
+                    "this linked worktree's isolated index build failed; run the fallback \
+                     command to retry.",
+                    false,
+                    json!({}),
+                    vec![json!({
+                        "run_id": read.run_id,
+                        "fallback_command": gate.fallback_argv,
+                    })],
+                ),
+            )),
+        }
+    }
+
     // A flat dispatch table over every tool; length tracks the tool count by
     // design (mirrors the `#[allow]` on `list_tools`).
     #[allow(clippy::too_many_lines)]
@@ -1703,6 +1932,9 @@ impl ServerState {
                 -32602,
                 "confidence=inferred/all is disabled by MCP tool policy because it may call an LLM and write inferred-edge cache rows",
             );
+        }
+        if let Some(gate_response) = self.consult_worktree_gate(id, canonical_name).await {
+            return gate_response;
         }
 
         let envelope = match canonical_name {
@@ -1936,6 +2168,20 @@ impl ServerState {
     }
 
     async fn context_snapshot_json(&self) -> String {
+        // Consult the same worktree-bootstrap gate `handle_tool_call` does,
+        // BEFORE reading the store. `loomweave://context` is a second door
+        // into the same schema-initialized-but-empty (or mid-rebuild) store
+        // `consult_worktree_gate` protects tool calls from — CLAUDE.md points
+        // agents at this resource directly ("live counts:
+        // `loomweave://context`"), so answering with real-looking zero counts
+        // through this door would be exactly the fabricated-answer confusion
+        // the gate exists to prevent. Unlike the tool-call gate there is no
+        // `project_status_get`/`analyze_status_get` exemption to apply — this
+        // is the only resource, so every non-`Ready` state degrades.
+        if let Some(reason) = self.worktree_gate_block_reason().await {
+            return degraded_snapshot_json_with_reason(reason);
+        }
+
         // Single fallback used by both the reader-error and serialize-error
         // branches: serialize a real `ProjectSnapshot` so the shape stays in
         // lock-step with the type as it gains fields. `degraded: true` — this
@@ -1958,6 +2204,37 @@ impl ServerState {
                 tracing::warn!(error = %err, "loomweave://context snapshot failed");
                 fallback()
             }
+        }
+    }
+
+    /// Sibling of `consult_worktree_gate`, for `context_snapshot_json`
+    /// (the `loomweave://context` resource) rather than a tool call: the same
+    /// worktree-bootstrap gate (`self.worktree_gate` is `None` — no gate
+    /// active at all — for a standalone checkout or the main worktree, so
+    /// this returns `None` immediately with no query, matching
+    /// `consult_worktree_gate`'s zero-cost-when-inactive contract), but with
+    /// no tool-name exemption to check, since there is only one resource.
+    /// Returns the machine-readable reason (the same wire spellings as
+    /// `McpErrorCode`) or `None` when the resource should read the store
+    /// normally.
+    async fn worktree_gate_block_reason(&self) -> Option<&'static str> {
+        self.worktree_gate.as_ref()?;
+        if !self.project_root.exists() {
+            return Some("source-root-missing");
+        }
+        let read = self
+            .readers
+            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .await;
+        let Ok(read) = read else {
+            // A storage-layer failure is not this gate's to report — fall
+            // through and let the normal read path hit (and report) it.
+            return None;
+        };
+        match read.readiness {
+            worktree_bootstrap::WorktreeReadiness::Ready => None,
+            worktree_bootstrap::WorktreeReadiness::Building => Some("index-building"),
+            worktree_bootstrap::WorktreeReadiness::BuildFailed => Some("index-build-failed"),
         }
     }
 
@@ -2150,7 +2427,13 @@ impl ServerState {
             }
         };
 
-        let db_path = loomweave_core::store::db_path(&self.project_root);
+        // A linked worktree's isolated store lives under `effective_db_path`,
+        // never under `db_path(project_root)` (the source root's own,
+        // never-written local store) — this write bypasses `self.readers`
+        // (it needs a write connection), so it must resolve the gate itself
+        // rather than inheriting a correctly-routed connection for free
+        // (worktree-index Task 7).
+        let db_path = self.effective_db_path();
         let project_root = self.project_root.clone();
         let sheet_id = promoted.id.clone();
         let write_result =
@@ -3432,38 +3715,40 @@ fn llm_config_status_json(path: &Path, created_or_absent: bool, config: &McpConf
 
 fn read_semantic_config_status(
     path: &Path,
-    project_root: &Path,
+    sidecar_path: &Path,
 ) -> std::result::Result<Value, loomweave_federation::config::ConfigError> {
     if path.exists() {
         let config = McpConfig::from_path(path)?;
         Ok(semantic_config_status_json(
             path,
-            project_root,
+            sidecar_path,
             false,
             &config,
         ))
     } else {
         Ok(semantic_config_status_json(
             path,
-            project_root,
+            sidecar_path,
             true,
             &McpConfig::default(),
         ))
     }
 }
 
+/// `sidecar_path` must already be the resolved embeddings sidecar leaf (the
+/// caller's `ServerState::effective_embeddings_path()`) — never re-derived
+/// from a project root here, which is exactly the re-derivation that breaks
+/// linked-worktree isolation (worktree-index Task 7). For a standalone
+/// checkout or the main worktree this is byte-identical to the former
+/// `embeddings_db_path(project_root)` derivation.
 fn semantic_config_status_json(
     path: &Path,
-    project_root: &Path,
+    sidecar_path: &Path,
     created_or_absent: bool,
     config: &McpConfig,
 ) -> Value {
     let semantic = &config.semantic_search;
-    // Probe the override-aware store path (the SAME helper `EmbeddingStore::
-    // open_in_store_dir` writes to) so a `[loomweave].store_dir` relocation does
-    // not make a populated sidecar report as absent (read-vs-status parity).
-    let sidecar_path = embeddings_db_path(project_root);
-    let sidecar_count = semantic_sidecar_count(&sidecar_path);
+    let sidecar_count = semantic_sidecar_count(sidecar_path);
     let has_key = std::env::var(&semantic.api_key_env)
         .ok()
         .as_deref()
@@ -3814,6 +4099,24 @@ fn latest_run_row(conn: &rusqlite::Connection) -> Value {
             Value::Null
         }
     }
+}
+
+/// `loomweave://context` while the worktree-bootstrap gate is blocking reads
+/// (`worktree_gate_block_reason` returned `Some`): the same wire shape as
+/// `unreadable_db_snapshot()` (`db_present: true`, all counts `0`,
+/// `Staleness::Unknown`, `degraded: true` — never a zeros-as-real payload),
+/// with an extra top-level `reason` key naming which gated state produced it
+/// (`"index-building"` / `"index-build-failed"` / `"source-root-missing"`).
+/// `ProjectSnapshot`'s own type/serialization is untouched — this only
+/// augments the JSON `unreadable_db_snapshot()` already produces, so
+/// `loomweave hook session-start` (the type's other consumer) is unaffected.
+fn degraded_snapshot_json_with_reason(reason: &str) -> String {
+    let snap = crate::snapshot::unreadable_db_snapshot();
+    let mut value = serde_json::to_value(&snap).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("reason".to_owned(), Value::String(reason.to_owned()));
+    }
+    serde_json::to_string(&value).unwrap_or_default()
 }
 
 fn flatten_storage_envelope_result(result: Result<Value, StorageError>) -> Value {
@@ -6829,6 +7132,97 @@ mod tests {
         );
     }
 
+    /// Minimal `git` fixture helper for the `default_config_path` tests below —
+    /// only what's needed to produce a linked worktree, mirroring the pattern in
+    /// `crates/loomweave-cli/tests/worktree_analyze.rs`.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn git {args:?} in {}: {e}", dir.display()));
+        assert!(
+            output.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+    }
+
+    fn server_state_for(project_root: &std::path::Path) -> ServerState {
+        let db = project_root.join("loomweave.db");
+        let mut conn = rusqlite::Connection::open(&db).unwrap();
+        pragma::apply_write_pragmas(&conn).unwrap();
+        schema::apply_migrations(&mut conn).unwrap();
+        drop(conn);
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        ServerState::new(project_root.to_path_buf(), readers)
+    }
+
+    /// `ServerState` should carry the resolved `ConfigOrigin` path (Task 4):
+    /// `config_file_path()` reads/writes the linked worktree's own
+    /// `loomweave.yaml` when one exists there, falling back to the primary
+    /// checkout's — never re-deriving `<project_root>/loomweave.yaml` from the
+    /// linked worktree's own root the way pre-Task-4 code did.
+    #[test]
+    fn default_config_path_prefers_source_root_over_primary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("README.md"), "primary\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feature-x", "../linked"],
+        );
+        let linked = tmp.path().join("linked");
+
+        std::fs::write(repo.join("loomweave.yaml"), "version: 1\n").unwrap();
+        std::fs::write(linked.join("loomweave.yaml"), "version: 1\n").unwrap();
+
+        let state = server_state_for(&linked);
+        assert_eq!(
+            state.config_file_path(),
+            linked.canonicalize().unwrap().join("loomweave.yaml"),
+            "the linked worktree's own loomweave.yaml must win when it exists"
+        );
+    }
+
+    /// Same fixture, but only the primary root has a `loomweave.yaml` — the
+    /// resolved default must fall back there.
+    #[test]
+    fn default_config_path_falls_back_to_primary_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("README.md"), "primary\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feature-y", "../linked2"],
+        );
+        let linked = tmp.path().join("linked2");
+
+        std::fs::write(repo.join("loomweave.yaml"), "version: 1\n").unwrap();
+
+        let state = server_state_for(&linked);
+        assert_eq!(
+            state.config_file_path(),
+            repo.canonicalize().unwrap().join("loomweave.yaml"),
+            "must fall back to the primary root's loomweave.yaml when the source root has none"
+        );
+    }
+
     #[tokio::test]
     async fn stateful_initialize_advertises_prompts_and_resources() {
         let dir = tempfile::tempdir().unwrap();
@@ -7283,7 +7677,7 @@ mod tests {
 
         let status = super::semantic_config_status_json(
             &root.join("loomweave.yaml"),
-            root,
+            &loomweave_storage::embeddings_db_path(root),
             true,
             &loomweave_federation::config::McpConfig::default(),
         );

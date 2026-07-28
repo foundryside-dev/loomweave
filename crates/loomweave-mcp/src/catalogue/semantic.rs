@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Value, json};
 
-use loomweave_storage::{EmbeddingStore, embeddings_db_path, entity_by_id};
+use loomweave_storage::{EmbeddingStore, entity_by_id};
 
 use crate::ParamError;
 use crate::ServerState;
@@ -98,7 +98,11 @@ impl ServerState {
         };
 
         let project_root = self.project_root.clone();
-        let sidecar_path = embeddings_db_path(&project_root);
+        // The linked worktree's isolated store's embeddings sidecar — never a
+        // bare `embeddings_db_path(&project_root)`, which for a linked
+        // worktree is the source root's own, never-written local sidecar
+        // (worktree-index Task 7).
+        let sidecar_path = self.effective_embeddings_path();
         let result = self
             .readers
             .with_reader(move |conn| {

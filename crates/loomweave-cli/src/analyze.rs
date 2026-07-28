@@ -354,14 +354,34 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let project_root = project_path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise path {}", project_path.display()))?;
-    let loomweave_dir = loomweave_core::store::store_dir(&project_root);
-    if !loomweave_dir.exists() {
+
+    // Route storage through the typed worktree resolver UNCONDITIONALLY —
+    // not only under `loomweave worktree analyze`. For a standalone checkout
+    // or the main worktree this resolves to today's unchanged
+    // `store_dir(project_root)` (byte-identical behavior). For a *linked*
+    // worktree it resolves to the isolated per-worktree store nested under
+    // the primary's own store; this is the routing that makes a bare
+    // `loomweave analyze <linked-worktree-path>` — the exact argv the
+    // SessionStart hook spawns — land in that isolated store instead of
+    // silently writing a 20-30 minute index to `<worktree>/.weft/loomweave/`,
+    // a location `serve`'s readiness poll never observes.
+    let worktree_ctx = loomweave_core::worktree::WorktreeContext::resolve(&project_root)
+        .with_context(|| format!("resolve worktree context for {}", project_root.display()))?;
+    if !worktree_ctx.repository_store.exists() {
         bail!(
             "{} has no .weft/loomweave/ store. Run `loomweave install` first.",
-            project_root.display()
+            worktree_ctx.primary_root.display()
         );
     }
-    let db_path = loomweave_dir.join("loomweave.db");
+    // A no-op for a standalone/main context; for a linked worktree this
+    // creates, reuses, or (on a stale/mismatched metadata.json) deletes via
+    // the confined primitive and rebuilds the isolated store — see
+    // `crate::worktree::store` for the full contract.
+    loomweave_cli::worktree::store::ensure_isolated_store(&worktree_ctx)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("ensure worktree-isolated store")?;
+    let loomweave_dir = worktree_ctx.effective_store.clone();
+    let db_path = worktree_ctx.store_paths.db.clone();
 
     // Cross-process advisory lock (STO-01). Must outlive the writer-actor's
     // `handle.await` at the bottom of this function — see the drop-order
@@ -642,8 +662,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         sidecar_walk_skipped = secret_scan_sidecar_skipped,
         "secret scan file walk complete"
     );
-    let mut secret_scan_outcome =
-        crate::secret_scan::pre_ingest(&project_root, &secret_scan_files, &options.secret_scan)?;
+    let mut secret_scan_outcome = crate::secret_scan::pre_ingest(
+        &project_root,
+        &loomweave_dir,
+        &secret_scan_files,
+        &options.secret_scan,
+    )?;
     let syntax_rule_ids = plugins
         .iter()
         .map(|plugin| format!("{}SYNTAX-ERROR", plugin.manifest.ontology.rule_id_prefix))
@@ -1841,7 +1865,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 std::env::var(name).ok()
             }) {
                 Ok(Some(provider)) => match populate_semantic_embeddings(
-                    &project_root,
+                    &worktree_ctx.store_paths.embeddings,
                     &db_path,
                     &mcp_config.semantic_search,
                     provider,
@@ -2238,6 +2262,20 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             ),
         }
     }
+
+    // Cleanup sweep (Task 6): after each analyze completes, from every
+    // worktree kind, reclaims any worktree-isolated store whose Git
+    // registration is gone (main-checkout `analyze` runs are what reclaim a
+    // store once the worktree that owned it is gone and never runs
+    // Loomweave again). Placed here — after the run's own outcome is fully
+    // settled and reported, not before — so a `bail!` earlier in this
+    // function (a genuinely failed run) does not trigger a sweep;
+    // reclamation for that case is simply deferred to the next successful
+    // `analyze` or the next `serve` startup. `sweep_best_effort` cannot fail
+    // this `analyze` run: it has no `Result` to propagate (see
+    // `loomweave_cli::worktree::sweep`).
+    loomweave_cli::worktree::sweep::sweep_best_effort(&worktree_ctx);
+
     Ok(())
 }
 
@@ -4527,7 +4565,7 @@ struct SemanticEmbeddingCandidate {
 }
 
 async fn populate_semantic_embeddings(
-    project_root: &Path,
+    embeddings_path: &Path,
     db_path: &Path,
     config: &SemanticSearchConfig,
     provider: Arc<dyn EmbeddingProvider>,
@@ -4546,7 +4584,7 @@ async fn populate_semantic_embeddings(
 
     let conn = Connection::open(db_path)
         .with_context(|| format!("open Loomweave database {}", db_path.display()))?;
-    let store = EmbeddingStore::open_in_store_dir(project_root)
+    let store = EmbeddingStore::open(embeddings_path)
         .map_err(|err| anyhow::anyhow!("{err}"))
         .context("open semantic embedding sidecar")?;
     let pending = semantic_embedding_candidates(&conn, &store, &model_id, &mut stats)?;
@@ -8948,7 +8986,7 @@ mod tests {
             Vec::<EmbeddingRecording>::new(),
         ));
         let stats = populate_semantic_embeddings(
-            project.path(),
+            &loomweave_storage::embeddings_db_path(project.path()),
             &db_path,
             &SemanticSearchConfig {
                 enabled: true,
@@ -9002,7 +9040,7 @@ mod tests {
             Vec::<EmbeddingRecording>::new(),
         ));
         let stats = populate_semantic_embeddings(
-            project.path(),
+            &loomweave_storage::embeddings_db_path(project.path()),
             &db_path,
             &SemanticSearchConfig {
                 enabled: true,

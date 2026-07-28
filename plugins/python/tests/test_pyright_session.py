@@ -1256,6 +1256,10 @@ def test_pyright_session_queries_implicit_module_name(tmp_path: Path) -> None:
     assert result.unresolved_reference_sites_total == 0
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 type parameter syntax requires Python 3.12",
+)
 def test_pyright_session_queries_builtin_named_type_parameter(tmp_path: Path) -> None:
     source = "def identity[str](value: str) -> str:\n    return value\n"
     module = _write_module(tmp_path, source)

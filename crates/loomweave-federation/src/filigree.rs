@@ -299,15 +299,23 @@ pub trait FiligreeLookup: Send + Sync {
 /// resolver's tier 2; mirrored by wardline's credential loader). The file is
 /// loopback deconfliction plumbing, not a secret — absence or unreadability
 /// just means the rung resolves to None and auth stays off.
-fn read_minted_federation_token(root: &Path) -> Option<String> {
-    let path = root.join(".weft").join("filigree").join("federation_token");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let token = raw.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_owned())
-    }
+/// Checks each of `roots` in order and returns the first hit. Mirrors
+/// [`crate::filigree_url::resolve_filigree_url_with_roots`]'s ordered,
+/// deduplicated candidate-list contract: for a linked Git worktree,
+/// `[source_root, primary_root]`, so a worktree-local Filigree instance's
+/// minted token is preferred but a repository-wide one is still found. A
+/// single-element list is byte-identical to today's behavior.
+fn read_minted_federation_token_from_roots(roots: &[&Path]) -> Option<String> {
+    roots.iter().find_map(|root| {
+        let path = root.join(".weft").join("filigree").join("federation_token");
+        let raw = std::fs::read_to_string(path).ok()?;
+        let token = raw.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token.to_owned())
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +349,32 @@ impl FiligreeHttpClient {
     where
         F: Fn(&str) -> Option<String>,
     {
+        match project_root {
+            Some(root) => Self::from_config_with_project_roots(config, env_lookup, &[root]),
+            None => Self::from_config_with_project_roots(config, env_lookup, &[]),
+        }
+    }
+
+    /// [`from_config_with_project_root`], with an ordered, deduplicated
+    /// candidate-root list for the minted-federation-token fallback rung
+    /// instead of a single project root. Mirrors
+    /// [`crate::filigree_url::resolve_filigree_url_with_roots`]'s contract:
+    /// for a linked Git worktree, `[source_root, primary_root]`; an empty or
+    /// single-element list is byte-identical to today's behavior.
+    ///
+    /// `roots.first()` is stored as this client's own `project_root` (used
+    /// for `resolve_filigree_mcp_command`'s `{project}` placeholder), the
+    /// same single-root role the old `project_root` parameter played.
+    ///
+    /// [`from_config_with_project_root`]: Self::from_config_with_project_root
+    pub fn from_config_with_project_roots<F>(
+        config: &FiligreeConfig,
+        env_lookup: F,
+        roots: &[&Path],
+    ) -> Result<Option<Self>, FiligreeClientError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         if !config.enabled {
             return Ok(None);
         }
@@ -359,14 +393,14 @@ impl FiligreeHttpClient {
         let token = env_lookup(&config.token_env)
             .filter(|value| !value.trim().is_empty())
             .or_else(|| env_lookup("FILIGREE_API_TOKEN").filter(|value| !value.trim().is_empty()))
-            .or_else(|| project_root.and_then(read_minted_federation_token));
+            .or_else(|| read_minted_federation_token_from_roots(roots));
         Ok(Some(Self {
             base_url: config.base_url.clone(),
             project: config.project.clone(),
             actor: config.actor.clone(),
             token,
             client,
-            project_root: project_root.map(Path::to_path_buf),
+            project_root: roots.first().map(|root| root.to_path_buf()),
         }))
     }
 
@@ -1106,6 +1140,41 @@ mod tests {
         assert_eq!(resolved_token_with_root(&[], dir.path()), None);
         mint_token_file(dir.path(), "   \n");
         assert_eq!(resolved_token_with_root(&[], dir.path()), None);
+    }
+
+    #[test]
+    fn multi_root_token_resolution_prefers_source_root_over_primary() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let primary = tempfile::tempdir().expect("tempdir");
+        mint_token_file(source.path(), "source-secret\n");
+        mint_token_file(primary.path(), "primary-secret\n");
+
+        let config = token_resolution_config();
+        let client = FiligreeHttpClient::from_config_with_project_roots(
+            &config,
+            |_: &str| None,
+            &[source.path(), primary.path()],
+        )
+        .expect("build client")
+        .expect("enabled client");
+        assert_eq!(client.token, Some("source-secret".to_owned()));
+    }
+
+    #[test]
+    fn multi_root_token_resolution_falls_back_to_primary_root_when_source_has_none() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let primary = tempfile::tempdir().expect("tempdir");
+        mint_token_file(primary.path(), "primary-secret\n");
+
+        let config = token_resolution_config();
+        let client = FiligreeHttpClient::from_config_with_project_roots(
+            &config,
+            |_: &str| None,
+            &[source.path(), primary.path()],
+        )
+        .expect("build client")
+        .expect("enabled client");
+        assert_eq!(client.token, Some("primary-secret".to_owned()));
     }
 
     #[test]

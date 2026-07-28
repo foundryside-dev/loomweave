@@ -13,6 +13,7 @@ pub mod hardened_git;
 pub mod ontology;
 pub mod plugin;
 pub mod store;
+pub mod worktree;
 
 pub use classifier_coverage::{
     CLASSIFIER_COVERAGE_SCHEMA, ClassifierCoverage, ClassifierCoverageError,

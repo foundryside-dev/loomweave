@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use crate::loomweave_port::read_published_port;
+use crate::loomweave_port::{published_port_path, read_published_port_at};
 
 /// The runtime environment override `WEFT_LOOMWEAVE_URL` (C-9 §2.2 rung-2
 /// `WEFT_<X>_URL`) — a per-process operator declaration above every durable source.
@@ -62,10 +62,41 @@ pub struct LoomweaveUrlResolution {
 /// `getenv` is injected for testability; production passes
 /// `|name| std::env::var(name).ok()`. Every rung is fail-soft: a blank/absent
 /// value falls through to the next.
+///
+/// Rung 3 re-derives `.weft/loomweave/ephemeral.port` from `project_root` via
+/// `published_port_path` — correct for a standalone checkout or the main
+/// worktree, but NOT for a linked `git worktree`, whose `serve` publishes to
+/// its isolated `StorePaths::port` instead (`http_read.rs`'s `spawn`). A
+/// caller that has already resolved a `WorktreeContext` must call
+/// [`resolve_loomweave_url_at`] with `store_paths.port` instead of this
+/// function — see `loomweave-mcp/src/tools/status.rs`'s
+/// `loomweave_read_api_json` and `loomweave-cli/src/doctor.rs`.
 #[must_use]
 pub fn resolve_loomweave_url(
     configured_url: Option<&str>,
     project_root: &Path,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> LoomweaveUrlResolution {
+    resolve_loomweave_url_at(
+        configured_url,
+        project_root,
+        &published_port_path(project_root),
+        getenv,
+    )
+}
+
+/// [`resolve_loomweave_url`], but rung 3 reads the *given* port-file path
+/// directly instead of re-deriving `.weft/loomweave/ephemeral.port` from
+/// `project_root`. Rung 2 (`weft.toml [loomweave].url`) still reads from
+/// `project_root` unconditionally — `weft.toml` is a checked-in repo config
+/// file every worktree checkout of a repository shares byte-for-byte, not a
+/// per-store artifact, so re-deriving it from `project_root` is correct even
+/// for a linked worktree.
+#[must_use]
+pub fn resolve_loomweave_url_at(
+    configured_url: Option<&str>,
+    project_root: &Path,
+    port_path: &Path,
     getenv: impl Fn(&str) -> Option<String>,
 ) -> LoomweaveUrlResolution {
     // Rung 1: WEFT_LOOMWEAVE_URL env, verbatim.
@@ -85,7 +116,7 @@ pub fn resolve_loomweave_url(
         };
     }
     // Rung 3: live published port.
-    if let Some(port) = read_published_port(project_root) {
+    if let Some(port) = read_published_port_at(port_path) {
         return LoomweaveUrlResolution {
             resolved_url: Some(format!("http://127.0.0.1:{port}")),
             source: SOURCE_EPHEMERAL_PORT,
@@ -116,6 +147,54 @@ mod tests {
         let res = resolve_loomweave_url(Some("http://127.0.0.1:9111"), dir.path(), |_| None);
         assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:9412"));
         assert_eq!(res.source, SOURCE_EPHEMERAL_PORT);
+    }
+
+    /// worktree-index Task 7 fix-loop finding 2: `resolve_loomweave_url_at`'s
+    /// whole reason to exist is that rung 3 must check an EXPLICIT port
+    /// path, not one re-derived from `project_root` — the exact bug that
+    /// made `loomweave_read_api_json` report `null` for a linked worktree's
+    /// live HTTP API (`serve` publishes to `StorePaths::port`, an isolated
+    /// path with no fixed relationship to `published_port_path(project_root)`).
+    /// This proves the decoupling directly: publish to an arbitrary path
+    /// that shares no prefix with `project_root`, and confirm it still wins
+    /// over the configured fallback.
+    #[test]
+    fn resolve_loomweave_url_at_reads_the_given_port_path_not_project_root() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let isolated_port_path = elsewhere.path().join("isolated").join("ephemeral.port");
+        crate::loomweave_port::publish_port_at(&isolated_port_path, 9777).unwrap();
+
+        // Sanity: project_root's own (default) port path is untouched.
+        assert!(!published_port_path(project_dir.path()).exists());
+
+        let res = resolve_loomweave_url_at(
+            Some("http://127.0.0.1:9111"),
+            project_dir.path(),
+            &isolated_port_path,
+            |_| None,
+        );
+        assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:9777"));
+        assert_eq!(res.source, SOURCE_EPHEMERAL_PORT);
+    }
+
+    /// `resolve_loomweave_url` (the unrouted convenience wrapper, still used
+    /// by main/standalone call sites) must be byte-identical to
+    /// `resolve_loomweave_url_at` given `published_port_path(project_root)`
+    /// — i.e. wrapping introduced no behavior change for existing callers.
+    #[test]
+    fn resolve_loomweave_url_wrapper_matches_resolve_loomweave_url_at_default_port_path() {
+        let dir = tempfile::tempdir().unwrap();
+        publish_port(dir.path(), 9413).unwrap();
+        let via_wrapper =
+            resolve_loomweave_url(Some("http://127.0.0.1:9111"), dir.path(), |_| None);
+        let via_at = resolve_loomweave_url_at(
+            Some("http://127.0.0.1:9111"),
+            dir.path(),
+            &published_port_path(dir.path()),
+            |_| None,
+        );
+        assert_eq!(via_wrapper, via_at);
     }
 
     #[test]

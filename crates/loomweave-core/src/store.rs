@@ -86,9 +86,28 @@ pub fn db_path(project_root: &Path) -> PathBuf {
 /// artifact (C-9: a member writes only its own `.weft/<member>/` subtree) —
 /// the original `.loomweave/diagnostics/` literal predated the Weft store
 /// cutover (weft-ac59e8e730).
+///
+/// This re-derives `store_dir(project_root)`, so it is only correct for a
+/// Standalone or Main checkout. A linked-worktree caller must resolve
+/// `WorktreeContext` and call [`llm_traffic_log_path_at`] with
+/// `worktree_ctx.effective_store` instead — see
+/// `loomweave-cli/src/serve.rs`'s `build_llm_provider`.
 #[must_use]
 pub fn llm_traffic_log_path(project_root: &Path) -> PathBuf {
-    store_dir(project_root)
+    llm_traffic_log_path_at(&store_dir(project_root))
+}
+
+/// `<effective_store>/diagnostics/llm-traffic.jsonl` — same layout as
+/// [`llm_traffic_log_path`], but rooted at an already-resolved effective
+/// store (main/standalone's `store_dir(project_root)`, or a linked
+/// worktree's isolated `effective_store`) rather than re-deriving it from a
+/// project root. Callers that have already resolved a `WorktreeContext`
+/// should call this directly instead of `llm_traffic_log_path`, which would
+/// silently re-derive the wrong (checkout-local) path for a linked
+/// worktree.
+#[must_use]
+pub fn llm_traffic_log_path_at(effective_store: &Path) -> PathBuf {
+    effective_store
         .join("diagnostics")
         .join("llm-traffic.jsonl")
 }
@@ -97,7 +116,17 @@ pub fn llm_traffic_log_path(project_root: &Path) -> PathBuf {
 /// any. Returns `None` (fail-soft, never an error) when the file is absent or
 /// malformed, the `[loomweave]` table or `store_dir` key is absent, or the value
 /// is blank.
-fn store_dir_override(project_root: &Path) -> Option<PathBuf> {
+///
+/// Exposed (not merely module-private) so a caller outside this module can
+/// ask "is an override active for this project root?" without re-deriving
+/// `store_dir`'s own precedence logic — the worktree-index cleanup sweep
+/// (`loomweave-cli`'s `worktree::sweep`) is the first such caller: an
+/// absolute override is not scoped to one repository (two repositories can
+/// share the same override path), so the sweep must run report-only
+/// whenever this returns `Some`, never authorize a cross-repository
+/// deletion under the shared namespace.
+#[must_use]
+pub fn store_dir_override(project_root: &Path) -> Option<PathBuf> {
     let store_dir = parse_weft_toml(project_root)?.loomweave?.store_dir?;
     let trimmed = store_dir.trim();
     if trimmed.is_empty() {

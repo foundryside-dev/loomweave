@@ -10,6 +10,11 @@ const PRODUCER_GOLDEN_SHA256: &str =
     include_str!("fixtures/classifier-coverage-v1.golden.json.sha256");
 const AUTHORITY_NOTE: &str =
     include_str!("../../../docs/federation/2026-07-12-federation-seam-golden-authority.md");
+/// The producer manifest the golden's `plugin_version`/`ontology_version` are
+/// copied from. Embedded so a routine version bump that leaves the golden
+/// behind fails here instead of shipping bytes Plainweave would then pin
+/// (the golden is normative for consumers per [`AUTHORITY_NOTE`]).
+const PYTHON_PLUGIN_MANIFEST: &str = include_str!("../../../plugins/python/plugin.toml");
 
 fn database() -> Connection {
     let mut conn = Connection::open_in_memory().expect("open database");
@@ -42,6 +47,30 @@ fn producer_golden_is_strict_valid_5_file_python_coverage_and_byte_pinned() {
                 .any(|declared| declared == tag)
         );
     }
+
+    // The golden copies both versions from the producer manifest, but nothing
+    // regenerates it on a version bump, so without this the next routine bump
+    // staleness the golden with every other assertion still green.
+    let manifest: toml::Value =
+        toml::from_str(PYTHON_PLUGIN_MANIFEST).expect("parse python plugin manifest");
+    let manifest_plugin_version = manifest["plugin"]["version"]
+        .as_str()
+        .expect("[plugin].version");
+    let manifest_ontology_version = manifest["ontology"]["ontology_version"]
+        .as_str()
+        .expect("[ontology].ontology_version");
+    assert_eq!(
+        plugin.plugin_version(),
+        manifest_plugin_version,
+        "producer golden plugin_version drifted from plugins/python/plugin.toml; \
+         regenerate with scripts/generate-federation-seam-goldens.sh"
+    );
+    assert_eq!(
+        plugin.ontology_version(),
+        manifest_ontology_version,
+        "producer golden ontology_version drifted from plugins/python/plugin.toml; \
+         regenerate with scripts/generate-federation-seam-goldens.sh"
+    );
 
     let expected = PRODUCER_GOLDEN_SHA256
         .split_whitespace()

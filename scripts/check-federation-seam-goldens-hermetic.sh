@@ -27,3 +27,18 @@ WEFT_TOKEN=poison-must-not-affect-goldens \
 after="$(sha256sum "${files[@]}")"
 test "$after" = "$before"
 printf 'federation seam goldens ignore inherited WEFT_TOKEN: ok\n'
+
+# Run-to-run equality above proves generation is hermetic; it does NOT prove the
+# committed bytes still match what the producer emits. Both regenerations
+# overwrite the fixtures in place, so a generator that has drifted from HEAD
+# leaves the tree dirty and every other guard still passes: the bytes, the
+# .sha256 sidecars and the authority-note rows are all derived from the same
+# regenerated files, so they agree with each other while disagreeing with the
+# committed golden. Assert tree cleanliness to close that loop.
+if ! git diff --exit-code -- "${files[@]}"; then
+  printf '\nfederation seam goldens are stale: the generator no longer reproduces\n'
+  printf 'the committed bytes (diff above). Commit the regenerated fixtures, or\n'
+  printf 'fix the producer if the change was unintended.\n' >&2
+  exit 1
+fi
+printf 'federation seam goldens match the producer: ok\n'

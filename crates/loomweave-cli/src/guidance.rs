@@ -813,11 +813,31 @@ fn render_sheet(sheet: &GuidanceSheet) -> String {
 
 // ── I/O helpers ───────────────────────────────────────────────────────────────
 
+/// Resolve the store `project_root` actually reads: `WorktreeContext`'s
+/// `store_paths.db` (worktree-index Task 7) — never a bare
+/// `db_path(project_root)`, which for a linked worktree is the *source*
+/// root's own store, a location `loomweave worktree analyze` never
+/// populates. Falls back to the root-derived path on the one error
+/// `WorktreeContext::resolve` can return (a non-UTF-8 path component).
+fn resolve_effective_db_path(project_root: &Path) -> std::path::PathBuf {
+    match loomweave_core::worktree::WorktreeContext::resolve(project_root) {
+        Ok(ctx) => ctx.store_paths.db,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "resolve worktree context for guidance db failed; falling back to \
+                 <project_root>/.weft/loomweave/loomweave.db"
+            );
+            loomweave_core::store::db_path(project_root)
+        }
+    }
+}
+
 /// Open a read-write connection to `.weft/loomweave/loomweave.db` with a generous busy
 /// timeout so a concurrently-running `serve` writer does not cause an immediate
 /// lock error.
 fn open_db(project_root: &Path) -> Result<Connection> {
-    let db_path = loomweave_core::store::db_path(project_root);
+    let db_path = resolve_effective_db_path(project_root);
     if !db_path.exists() {
         bail!(
             "Loomweave database not found at {}; run `loomweave analyze` first",
