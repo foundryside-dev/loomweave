@@ -1399,6 +1399,23 @@ impl ServerState {
         )
     }
 
+    /// The published-port file this session's `serve` actually writes to
+    /// (when its HTTP read API is up): the gated counterpart of
+    /// [`Self::effective_db_path`] for
+    /// `loomweave_federation::loomweave_port::published_port_path(project_root)`
+    /// call sites (`loomweave_read_api_json`'s ADR-044 status report —
+    /// worktree-index Task 7 fix-loop finding 2). `http_read::spawn` already
+    /// publishes to `store_paths.port` for a linked worktree
+    /// (`serve.rs`); a status reader that instead re-derived
+    /// `published_port_path(project_root)` would check a file `serve` never
+    /// writes and report the live HTTP API as absent.
+    fn effective_port_path(&self) -> PathBuf {
+        self.worktree_gate.as_ref().map_or_else(
+            || loomweave_federation::loomweave_port::published_port_path(&self.project_root),
+            |gate| gate.store_paths.port.clone(),
+        )
+    }
+
     /// Override the program `analyze_start` launches (default: `current_exe()`).
     /// Tests inject a stub binary so the lifecycle can be exercised without a
     /// full analyze run.

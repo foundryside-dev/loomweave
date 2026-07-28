@@ -523,3 +523,60 @@ async fn context_resource_reports_degraded_while_building_then_real_counts_after
         "an ordinary (non-gated) snapshot must not carry a `reason` key: {ready:?}"
     );
 }
+
+#[cfg(unix)]
+fn write_noop_analyze_stub(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("noop-analyze-stub.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write stub");
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+/// worktree-index Task 7 fix-loop finding 5: `analyze_start`'s `runs_dir`
+/// (`ServerState::effective_runs_dir`) must resolve to the linked worktree's
+/// isolated `store_paths.runs`, never a bare
+/// `store_dir(project_root).join("runs")` — which for a linked worktree
+/// would create a `runs/` directory *inside the worktree's own checkout*,
+/// exactly the local-store materialization worktree-index isolation
+/// forbids. `analyze_start` is itself gated (unlike `project_status_get`/
+/// `analyze_status_get`), so this seeds a completed run first to clear the
+/// bootstrap gate, then starts a second (stubbed, near-instant) run and
+/// asserts both halves of the dogfood invariant: the reported
+/// `progress_file` lives under `ctx.store_paths.runs`, and
+/// `ctx.source_root.join(".weft/loomweave")` never comes into existence.
+#[tokio::test]
+#[cfg(unix)]
+async fn analyze_start_writes_progress_under_effective_runs_dir_not_worktree_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    seed_completed_run(&ctx.store_paths.db, "r0");
+
+    let stub = write_noop_analyze_stub(tmp.path());
+    let state = linked_state(&ctx).with_analyze_command(stub);
+
+    let started = call_tool(&state, "analyze_start", json!({})).await;
+    assert_eq!(started["ok"], true, "{started:?}");
+    let progress_file = started["result"]["progress_file"]
+        .as_str()
+        .expect("progress_file field");
+    assert!(
+        Path::new(progress_file).starts_with(&ctx.store_paths.runs),
+        "progress_file must live under the isolated store_paths.runs, not a root-derived \
+         path: {progress_file} (expected under {})",
+        ctx.store_paths.runs.display()
+    );
+    assert!(
+        ctx.store_paths.runs.is_dir(),
+        "effective_runs_dir must have been created under the isolated store"
+    );
+    assert!(
+        !ctx.source_root.join(".weft/loomweave").exists(),
+        "analyze_start must never materialize .weft/loomweave/ inside the linked worktree's \
+         own checkout — that is exactly the local-store creation worktree-index isolation \
+         forbids"
+    );
+}

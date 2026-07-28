@@ -1976,3 +1976,97 @@ fn doctor_omits_worktree_stores_check_when_none_exist() {
          does not exist: {json}"
     );
 }
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git {args:?} in {}: {e}", dir.display()));
+    assert!(
+        output.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A real `install`ed primary repo plus one real `git worktree add`-created
+/// linked worktree checked out from it — the fix-loop finding-3 fixture.
+/// Deliberately a REAL linked worktree (not a hand-fabricated
+/// `worktrees/<id>/` directory, as `doctor_reports_worktree_stores` above
+/// uses for its narrower per-store-health purpose): this test invokes
+/// `doctor --path <linked>` itself, so `WorktreeContext::resolve` must
+/// genuinely classify it `Linked`.
+fn setup_primary_with_linked_worktree(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    install(&["install"], &repo);
+    fs::write(repo.join("f.txt"), "hi\n").unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "feature", "../linked"],
+    );
+
+    root.join("linked")
+}
+
+/// worktree-index Task 7 fix-loop finding 3: before this fix, `doctor`
+/// invoked from inside a linked worktree checkout re-derived
+/// `db_path(project_root)` for its `.weft/loomweave.schema` check — a path
+/// `loomweave worktree analyze` never populates by design — and reported
+/// "no index — run `loomweave install` + `loomweave analyze`". Followed
+/// literally, that hint would CREATE the forbidden local store inside the
+/// worktree checkout, directly contradicting the `--- index ---` section
+/// (routed since Task 7's `hook.rs` fix), which prints healthy counts from
+/// the correct isolated store a few lines below. The schema check must
+/// instead recognize a linked worktree and redirect to `worktree_stores`
+/// without recommending `install`/`analyze` in the current checkout.
+#[test]
+fn doctor_redirects_schema_check_for_a_linked_worktree_instead_of_recommending_local_install() {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+
+    let (_, json) = doctor_json(&linked, false);
+    let schema_check = check(&json, ".weft/loomweave.schema");
+    assert_eq!(
+        schema_check["status"], "ok",
+        "a linked worktree's own checkout holding no local .weft/loomweave/ store is by \
+         design, not a defect: {schema_check}"
+    );
+    let message = schema_check["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("loomweave install"),
+        "must not recommend `loomweave install` from inside a linked worktree — that hint, \
+         followed literally, would create the forbidden local store: {schema_check}"
+    );
+    assert!(
+        message.contains("worktree_stores"),
+        "must redirect to the worktree_stores check, which reports this worktree's actual \
+         isolated index health: {schema_check}"
+    );
+
+    // Text path twin: no "run install/analyze" hint either.
+    let (_, stdout) = doctor(&linked, false);
+    assert!(
+        !stdout.contains("run `loomweave install`"),
+        "text-path doctor must not recommend install/analyze from inside a linked worktree: \
+         {stdout}"
+    );
+}
+
+// The redirect above must fire ONLY for a linked worktree, never for the
+// primary/main checkout — a standalone or main-worktree project with a
+// genuinely absent index must keep the real "no index — run install +
+// analyze" guidance verbatim. `doctor_index_health_absent_db_is_warning_gate_passes`
+// above already covers that non-linked absent-DB case end to end (unchanged
+// by this fix-loop, since `is_linked_worktree` only short-circuits when
+// `WorktreeContext::resolve` classifies the target `Linked`); no separate
+// test needed here.

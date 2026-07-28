@@ -240,7 +240,12 @@ fn run_server(
     for warning in config.llm_warnings() {
         tracing::warn!("loomweave.yaml: {warning}");
     }
-    let llm_provider = build_llm_provider(&config, provider_selection, &project_root)?;
+    let llm_provider = build_llm_provider(
+        &config,
+        provider_selection,
+        &project_root,
+        &worktree_ctx.effective_store,
+    )?;
     let embedding_provider =
         build_embedding_provider(&config.semantic_search, |name| std::env::var(name).ok())?;
 
@@ -660,6 +665,7 @@ fn build_llm_provider(
     config: &McpConfig,
     selection: ProviderSelection,
     project_root: &Path,
+    effective_store: &Path,
 ) -> Result<Option<Arc<dyn LlmProvider>>> {
     let provider: Option<Arc<dyn LlmProvider>> = match selection {
         ProviderSelection::Disabled => None,
@@ -717,7 +723,7 @@ fn build_llm_provider(
     Ok(provider.map(|provider| {
         Arc::new(TrafficLoggingProvider::new(
             provider,
-            loomweave_core::store::llm_traffic_log_path(project_root),
+            loomweave_core::store::llm_traffic_log_path_at(effective_store),
         )) as Arc<dyn LlmProvider>
     }))
 }
@@ -952,6 +958,63 @@ mod tests {
         assert!(
             !argv_dump.exists(),
             "a worktree with a completed run must not be respawned on every serve restart"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // worktree-index Task 7 fix-loop finding 1: `build_llm_provider`'s
+    // `TrafficLoggingProvider` must log under the linked worktree's
+    // isolated `effective_store`, never re-derive
+    // `llm_traffic_log_path(project_root)` — which for a linked worktree
+    // would materialize `<worktree checkout>/.weft/loomweave/diagnostics/`
+    // on the first live LLM call, violating worktree-index isolation.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn linked_worktree_llm_traffic_log_lands_under_effective_store_not_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        install_primary(&ctx);
+
+        let config = McpConfig::default();
+        let provider = build_llm_provider(
+            &config,
+            ProviderSelection::Recording,
+            &ctx.source_root,
+            &ctx.effective_store,
+        )
+        .expect("build_llm_provider must succeed for ProviderSelection::Recording")
+        .expect("Recording selection always yields a provider");
+
+        // No recordings were seeded, so this errors — but `TrafficLoggingProvider`
+        // logs both outcomes (`llm_traffic_success_event`/`llm_traffic_error_event`),
+        // so the append still happens.
+        let request = loomweave_llm::LlmRequest {
+            purpose: loomweave_llm::LlmPurpose::Summary,
+            model_id: "anthropic/claude-sonnet-4.6".to_owned(),
+            prompt_id: "test-prompt".to_owned(),
+            prompt: "irrelevant".to_owned(),
+            max_output_tokens: 64,
+        };
+        let _ = provider.invoke(request).await;
+
+        let correct_log = ctx
+            .effective_store
+            .join("diagnostics")
+            .join("llm-traffic.jsonl");
+        assert!(
+            correct_log.exists(),
+            "the traffic log must be written under the worktree's isolated effective_store: {}",
+            correct_log.display()
+        );
+
+        let forbidden_log = loomweave_core::store::llm_traffic_log_path(&ctx.source_root);
+        assert!(
+            !forbidden_log.exists(),
+            "the traffic log must NOT be written under the worktree checkout's own \
+             re-derived .weft/loomweave/diagnostics/ — that is exactly the local-store \
+             materialization worktree-index isolation forbids: {}",
+            forbidden_log.display()
         );
     }
 }

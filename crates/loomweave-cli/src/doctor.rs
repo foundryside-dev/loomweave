@@ -493,11 +493,46 @@ fn severity_rank(status: &str) -> u8 {
     }
 }
 
+/// `.weft/loomweave.schema`'s check is meaningless — worse, actively
+/// misleading — for a linked worktree: `db_path(project_root)` re-derives a
+/// path *inside the worktree checkout* that `loomweave worktree analyze`
+/// never populates by design (worktree-index isolation), so it always reads
+/// `Absent` there regardless of how healthy the worktree's real, isolated
+/// store is. Left unrouted, that produced the fix-loop finding-3
+/// self-contradiction: `doctor` printed a hint recommending `loomweave
+/// install` and `loomweave analyze` — which, followed literally, would
+/// CREATE the forbidden local store — immediately above a `--- index ---`
+/// section reporting healthy counts from the correct isolated store one
+/// line below.
+///
+/// Rather than teach every `IndexDbHealth` branch's hint text to be
+/// worktree-aware (the other candidate fix — rejected: it would smear
+/// worktree-specific wording across five branches whose text is asserted
+/// verbatim by existing tests, for a state this function can already name
+/// directly), a linked worktree short-circuits both `check_loomweave_dir`
+/// and `check_loomweave_dir_json` to a single neutral redirect to the
+/// `worktree_stores` check, which already reports this worktree's real
+/// index health under its own stable ID. Resolution failure (non-UTF-8
+/// path) falls through to the unrouted check, matching every other
+/// `WorktreeContext::resolve`-fallback call site in this codebase.
+fn is_linked_worktree(project_root: &Path) -> bool {
+    loomweave_core::worktree::WorktreeContext::resolve(project_root)
+        .is_ok_and(|ctx| ctx.kind == loomweave_core::worktree::WorktreeKind::Linked)
+}
+
 /// JSON-path check for tracked-index DB health.  Expands the former
 /// existence-only check with five distinct states: absent (warning),
 /// unreadable (problem), unmigrated (problem), future-schema (problem),
-/// healthy (ok).
+/// healthy (ok). See [`is_linked_worktree`] for the linked-worktree redirect.
 fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
+    if is_linked_worktree(project_root) {
+        return DoctorJsonCheck::ok(
+            ".weft/loomweave.schema",
+            "linked worktree: this checkout holds no local .weft/loomweave/ store by design \
+             (worktree-index isolation) — see the `worktree_stores` check for this worktree's \
+             actual isolated index health",
+        );
+    }
     match classify_index_db_health(project_root) {
         IndexDbHealth::Healthy => DoctorJsonCheck::ok(
             ".weft/loomweave.schema",
@@ -530,8 +565,16 @@ fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
 }
 
 /// Text-path twin of [`check_loomweave_dir_json`]: contributes to the `Tally`
-/// so problems fail the gate and warnings are surfaced.
+/// so problems fail the gate and warnings are surfaced. See
+/// [`is_linked_worktree`] for the linked-worktree redirect.
 fn check_loomweave_dir(project_root: &Path) -> Tally {
+    if is_linked_worktree(project_root) {
+        return ok(
+            "linked worktree: this checkout holds no local .weft/loomweave/ store by design \
+             (worktree-index isolation) — see the worktree_stores check for this worktree's \
+             actual isolated index health",
+        );
+    }
     match classify_index_db_health(project_root) {
         IndexDbHealth::Healthy => ok(&format!(
             "index DB present and readable (schema v{CURRENT_SCHEMA_VERSION})"

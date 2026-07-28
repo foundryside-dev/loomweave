@@ -84,6 +84,45 @@ fn workspace_root() -> PathBuf {
 /// sufficient here" instruction.
 const PATTERNS: &[&str] = &["store_dir(", "db_path(", "embeddings_db_path("];
 
+/// worktree-index Task 7 fix-loop finding 4: `PATTERNS` above audits only
+/// DIRECT calls to `store_dir`/`db_path`/`embeddings_db_path` — a "one-hop"
+/// wrapper (a function that itself calls one of those three exactly once,
+/// correctly, as its own implementation) is invisible under its own name.
+/// `llm_traffic_log_path(project_root)`, `read_published_port(project_root)`,
+/// `publish_port(project_root, ..)`, and `resolve_loomweave_url(.., project_root, ..)`
+/// are exactly this shape: each internally re-derives `store_dir`/`db_path`
+/// once (so THEIR OWN definition satisfies `PATTERNS`), but a CALLER of the
+/// wrapper does not, because the caller's line contains none of `PATTERNS`'
+/// three substrings. This is exactly how fix-loop findings 1 and 2 escaped
+/// the original Task 7 audit: `serve.rs`'s `build_llm_provider` called
+/// `llm_traffic_log_path(project_root)`, and `tools/status.rs`'s
+/// `loomweave_read_api_json` called `resolve_loomweave_url(None, project_root, ..)`
+/// — neither line contains `store_dir(`, `db_path(`, or
+/// `embeddings_db_path(`, so neither was ever a candidate hit under
+/// `PATTERNS` alone. (An earlier draft of this module's docs claimed
+/// `loomweave_url.rs` was covered "per its own entry in this table" — false:
+/// no such entry existed or could exist under `PATTERNS`, since
+/// `read_published_port(` matches none of the three tracked substrings.
+/// `WRAPPER_PATTERNS` below is what actually closes that gap.)
+///
+/// `open_in_store_dir(` is deliberately NOT added to `WRAPPER_PATTERNS`: it
+/// already matches `PATTERNS`' `store_dir(` as a literal substring (see the
+/// module docs' false-positive note above), so adding it again would just
+/// double-count the same hits under a second pattern list.
+///
+/// Still not exhaustive: a *second*-hop wrapper (a function that calls one
+/// of these four, rather than one of the original three) would evade both
+/// pattern lists the same way. The brief's "a syn AST gate ... is not
+/// warranted" holds for the same reason it did originally — this audit is a
+/// grep, not a call-graph; each newly-found blind spot gets closed by naming
+/// it explicitly here, not by chasing arbitrary call depth.
+const WRAPPER_PATTERNS: &[&str] = &[
+    "llm_traffic_log_path(",
+    "read_published_port(",
+    "publish_port(",
+    "resolve_loomweave_url(",
+];
+
 /// The two files where `store_dir`/`db_path`/`embeddings_db_path` are
 /// themselves defined — excluded by name (see the module docs).
 const DEFINITION_FILES: &[&str] = &[
@@ -173,6 +212,12 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(project_root);", count: 2, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(root);", count: 1, classification: Classification::TestExempt },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "std::fs::read_to_string(loomweave_core::store::store_dir(root).join(\".gitignore\"))", count: 1, classification: Classification::TestExempt },
+    // `check_http_config_json`'s ADR-044 status read — one of the same
+    // declared-scope-gap checks as the entries above (not
+    // `loomweave_read_api_json`, the MCP tool this fix-loop routed via
+    // `resolve_loomweave_url_at`/`effective_port_path` — that is a
+    // different call site, in `loomweave-mcp/src/tools/status.rs`).
+    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "loomweave_federation::loomweave_url::resolve_loomweave_url(None, project_root, |name| {", count: 1, classification: Classification::IntentionalRootDerived },
 
     // ---- crates/loomweave-cli/src/guidance.rs ----
     AllowedHit { file: "crates/loomweave-cli/src/guidance.rs", text: "fn resolve_effective_db_path(project_root: &Path) -> std::path::PathBuf {", count: 1, classification: Classification::Route },
@@ -183,6 +228,18 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     AllowedHit { file: "crates/loomweave-cli/src/hook.rs", text: "fn resolve_effective_db_path(project_root: &Path) -> PathBuf {", count: 1, classification: Classification::Route },
     AllowedHit { file: "crates/loomweave-cli/src/hook.rs", text: "let db_path = resolve_effective_db_path(project_root);", count: 2, classification: Classification::Route },
     AllowedHit { file: "crates/loomweave-cli/src/hook.rs", text: "loomweave_core::store::db_path(project_root)", count: 1, classification: Classification::Route },
+
+    // ---- crates/loomweave-cli/src/http_read.rs (test module) ----
+    // `spawn`'s own port-path routing is already correct — it takes an
+    // explicit `port_path: PathBuf` argument from its caller
+    // (`serve.rs` passes `worktree_ctx.store_paths.port.clone()`), so
+    // `http_read.rs` has no production `WRAPPER_PATTERNS` hit at all. These
+    // four are all `read_published_port(dir.path())` reads inside its own
+    // `#[cfg(test)] mod tests`, verifying what got published.
+    AllowedHit { file: "crates/loomweave-cli/src/http_read.rs", text: "let port_a = read_published_port(dir_a.path()).expect(\"a published a port\");", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-cli/src/http_read.rs", text: "let port_b = read_published_port(dir_b.path()).expect(\"b published a port\");", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-cli/src/http_read.rs", text: "let published = read_published_port(dir.path()).expect(\"published a port\");", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-cli/src/http_read.rs", text: "read_published_port(dir.path()).is_some(),", count: 1, classification: Classification::TestExempt },
 
     // ---- crates/loomweave-cli/src/install.rs ----
     // `install` initialises AT the literal given path by definition — there
@@ -201,6 +258,9 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     // Test-only fixture sanity check (asserts the linked-worktree fixture's
     // SOURCE root genuinely has no local store, before asserting the route).
     AllowedHit { file: "crates/loomweave-cli/src/serve.rs", text: "let db_exists = loomweave_core::store::db_path(&ctx.source_root).exists();", count: 1, classification: Classification::TestExempt },
+    // fix-loop finding 1's regression test: proves the traffic log is NOT
+    // written under this (deliberately unrouted) re-derived path.
+    AllowedHit { file: "crates/loomweave-cli/src/serve.rs", text: "let forbidden_log = loomweave_core::store::llm_traffic_log_path(&ctx.source_root);", count: 1, classification: Classification::TestExempt },
 
     // ---- crates/loomweave-core/src/worktree/context.rs ----
     // The canonical resolution point: this IS where `repository_store` is
@@ -212,15 +272,58 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     // ---- crates/loomweave-federation/src/loomweave_port.rs ----
     AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "assert!(!loomweave_core::store::store_dir(dir.path()).exists());", count: 1, classification: Classification::TestExempt },
     // The project-root-keyed fallback Task 4 kept for callers with no
-    // resolved `StorePaths` (doctor.rs, install.rs, integration_bindings.rs,
-    // loomweave_url.rs) — each of those callers is itself
-    // `IntentionalRootDerived`/out of scope per its own entry in this table,
-    // so this helper is not a residual bug.
+    // resolved `StorePaths` (doctor.rs, install.rs, integration_bindings.rs).
+    // `resolve_loomweave_url`/`loomweave_url.rs` used to be named here too —
+    // wrong (fix-loop finding 4): that caller's own line never matched
+    // `PATTERNS` at all, so it was never actually covered by "its own entry
+    // in this table" the way this comment used to claim. It is now a real
+    // `WRAPPER_PATTERNS` entry below, and its own callers were fixed
+    // (findings 1/2) or are the declared doctor.rs scope gap.
     AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "loomweave_core::store::store_dir(project_root).join(\"ephemeral.port\")", count: 1, classification: Classification::AlreadyRouted },
     AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "std::fs::create_dir_all(loomweave_core::store::store_dir(dir.path())).unwrap();", count: 2, classification: Classification::TestExempt },
+    // `WRAPPER_PATTERNS` hits (fix-loop finding 4): `publish_port`/
+    // `read_published_port`'s own definitions each legitimately re-derive
+    // `published_port_path(project_root)` once, by design — the accepted
+    // root-taking convenience form for main/standalone; `publish_port_at`/
+    // `read_published_port_at` are what a linked-worktree caller uses
+    // instead (both already existed before this fix-loop).
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "pub fn publish_port(project_root: &Path, port: u16) -> std::io::Result<()> {", count: 1, classification: Classification::IntentionalRootDerived },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "pub fn read_published_port(project_root: &Path) -> Option<u16> {", count: 1, classification: Classification::IntentionalRootDerived },
+    // The rest are this module's own `#[cfg(test)] mod tests` exercising the
+    // root-taking wrappers directly.
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "assert_eq!(read_published_port(dir.path()), None);", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "assert_eq!(read_published_port(dir.path()), Some(10000));", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "assert_eq!(read_published_port(dir.path()), Some(9412));", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "assert_eq!(read_published_port(dir.path()), Some(9500));", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "assert_eq!(read_published_port(dir.path()), Some(9999));", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "publish_port(dir.path(), 10000).expect(\"publish creates .weft/loomweave/\");", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "publish_port(dir.path(), 9412).expect(\"publish\");", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "publish_port(dir.path(), 9412).unwrap();", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "publish_port(dir.path(), 9999).unwrap();", count: 2, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "read_published_port(dir.path()),", count: 2, classification: Classification::TestExempt },
 
-    // ---- crates/loomweave-federation/src/loomweave_url.rs (test module) ----
+    // ---- crates/loomweave-federation/src/loomweave_url.rs ----
     AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "let store = loomweave_core::store::store_dir(dir.path());", count: 1, classification: Classification::TestExempt },
+    // `resolve_loomweave_url`'s own definition: the accepted root-taking
+    // convenience form (rung 2's `weft.toml` lookup is legitimately
+    // root-derived even for a linked worktree — see its doc comment).
+    // `resolve_loomweave_url_at` (fix-loop finding 2) is what a caller with
+    // an already-resolved port path — `loomweave-mcp`'s
+    // `loomweave_read_api_json` — uses instead.
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "pub fn resolve_loomweave_url(", count: 1, classification: Classification::IntentionalRootDerived },
+    // The rest are this module's own `#[cfg(test)] mod tests`.
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "let res = resolve_loomweave_url(None, dir.path(), |_| None);", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "let res = resolve_loomweave_url(None, dir.path(), |_| Some(\"  \".to_owned()));", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "let res = resolve_loomweave_url(Some(\"   \"), dir.path(), |_| None);", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "let res = resolve_loomweave_url(Some(\"http://127.0.0.1:9111\"), dir.path(), |_| None);", count: 4, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "let res = resolve_loomweave_url(Some(\"http://127.0.0.1:9111\"), dir.path(), |name| {", count: 1, classification: Classification::TestExempt },
+    // fix-loop finding 2's regression test: proves the wrapper and
+    // `resolve_loomweave_url_at` agree given the default port path.
+    // rustfmt wraps the assignment across two lines (100-col limit), so the
+    // call itself is the hit, not the `let via_wrapper =` line above it.
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "resolve_loomweave_url(Some(\"http://127.0.0.1:9111\"), dir.path(), |_| None);", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "publish_port(dir.path(), 9412).unwrap();", count: 4, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-federation/src/loomweave_url.rs", text: "publish_port(dir.path(), 9413).unwrap();", count: 1, classification: Classification::TestExempt },
 
     // ---- crates/loomweave-mcp/src/lib.rs ----
     AllowedHit { file: "crates/loomweave-mcp/src/lib.rs", text: "&loomweave_storage::embeddings_db_path(root),", count: 1, classification: Classification::TestExempt },
@@ -261,8 +364,9 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Scan every `crates/*/src/**/*.rs` file (excluding [`DEFINITION_FILES`])
-/// for [`PATTERNS`], skipping comment lines. Returns the hit map plus the
-/// number of files actually scanned (for the floor assertion).
+/// for [`PATTERNS`] and [`WRAPPER_PATTERNS`], skipping comment lines.
+/// Returns the hit map plus the number of files actually scanned (for the
+/// floor assertion).
 fn scan_production_src(workspace_root: &Path) -> (HitMap, usize) {
     let mut all_files = Vec::new();
     for entry in std::fs::read_dir(workspace_root.join("crates")).expect("read crates/") {
@@ -296,7 +400,11 @@ fn scan_production_src(workspace_root: &Path) -> (HitMap, usize) {
             if trimmed.starts_with("//") {
                 continue;
             }
-            if PATTERNS.iter().any(|pattern| trimmed.contains(pattern)) {
+            if PATTERNS
+                .iter()
+                .chain(WRAPPER_PATTERNS)
+                .any(|pattern| trimmed.contains(pattern))
+            {
                 *hits.entry((rel.clone(), trimmed.to_owned())).or_insert(0) += 1;
             }
         }
