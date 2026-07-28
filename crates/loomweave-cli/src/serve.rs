@@ -5,7 +5,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use loomweave_federation::config::{
     LlmConfig, McpConfig, ProviderSelection, SemanticProviderKind, SemanticSearchConfig,
     select_provider_with_env,
@@ -21,16 +21,23 @@ use loomweave_llm::{
 use loomweave_storage::{DEFAULT_BATCH_SIZE, DEFAULT_CHANNEL_CAPACITY, ReaderPool, Writer};
 
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
-    // NOTE (Task 4 / Task 5 boundary): `db_path` and the no-index gate below
-    // are deliberately left routed through the plain project root, NOT
-    // `worktree_ctx.store_paths.db` — making serve read/write a linked
-    // worktree's ISOLATED store (rather than its own unwritten local
-    // `.weft/loomweave/`) requires the bootstrap orchestration (detached
-    // `loomweave worktree analyze` spawn, `index-building`/`index-build-failed`
-    // tool responses) that is Task 5's scope, not this one. Today, `serve` on a
-    // linked worktree with no local `.weft/loomweave/loomweave.db` still
-    // degrades to `serve_no_index` even if the isolated store already has a
-    // completed index — see the design doc's "Bootstrap" section.
+    // Resolved once, before any gate (pinned decision 1, Task 5): a linked
+    // worktree always routes to the full `ServerState` path with a `building`
+    // readiness gate, never to `serve_no_index` — Task 3's eager,
+    // schema-initialized empty DB means the effective store's `db_path`
+    // already exists before any analyze completes, so file existence can no
+    // longer be the readiness signal for a linked worktree; the gate's
+    // per-call readiness consult carries the state instead (see
+    // `loomweave_mcp::worktree_bootstrap`).
+    let worktree_ctx = loomweave_core::worktree::WorktreeContext::resolve(path)
+        .with_context(|| format!("resolve worktree context for {}", path.display()))?;
+
+    if worktree_ctx.kind == loomweave_core::worktree::WorktreeKind::Linked {
+        return run_linked_worktree(config_path, &worktree_ctx);
+    }
+
+    // Main/standalone: today's gate, byte-for-byte unchanged from before Task
+    // 5 — routed through the plain project root, exactly as always.
     let db_path = loomweave_core::store::db_path(path);
     if !db_path.exists() {
         // No index yet. Rather than exiting 1 — which leaves the MCP client
@@ -39,18 +46,74 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         // chirps "run analyze" from every tool call. clarion-ac36f51c2b.
         return serve_no_index(path, &db_path);
     }
+    run_server(db_path, config_path, &worktree_ctx, false)
+}
 
-    let project_root = path
-        .canonicalize()
-        .with_context(|| format!("canonicalize project path {}", path.display()))?;
-    // Resolved once for config precedence, this instance's own port/instance-ID
-    // sidecar leaves, and sibling (Filigree) discovery roots — see the design
-    // doc's "Configuration and sibling discovery" section. For a standalone
-    // checkout or the main worktree this is byte-identical to today's
-    // `project_root`-derived behavior (`source_root == primary_root`); it only
-    // diverges for a linked worktree.
-    let worktree_ctx = loomweave_core::worktree::WorktreeContext::resolve(&project_root)
-        .with_context(|| format!("resolve worktree context for {}", project_root.display()))?;
+/// Bootstrap and serve a linked worktree's isolated index (worktree-indexes
+/// design, "Bootstrap"): ensure the isolated store exists (Task 3), spawn a
+/// **detached** `loomweave worktree analyze` for it, then serve the full
+/// `ServerState` path immediately with the bootstrap gate active. Graph tools
+/// answer `index-building` (or `index-build-failed`) until a completed run
+/// row appears — no waiting here, no reconnect required once it does
+/// (`loomweave_mcp::worktree_bootstrap`'s per-call readiness consult).
+fn run_linked_worktree(
+    config_path: Option<&Path>,
+    worktree_ctx: &loomweave_core::worktree::WorktreeContext,
+) -> Result<()> {
+    // `ensure_isolated_store`'s own contract: an un-`install`ed primary is
+    // this caller's error to diagnose, not something it silently half-creates
+    // (its `create_dir_all` would otherwise happily materialize the
+    // primary's `.weft/loomweave/` tree, bypassing `install`'s own
+    // initialization). Mirrors the identical check `analyze.rs` already runs
+    // before calling the same function.
+    if !worktree_ctx.repository_store.exists() {
+        bail!(
+            "{} has no .weft/loomweave/ store. Run `loomweave install` first.",
+            worktree_ctx.primary_root.display()
+        );
+    }
+    loomweave_cli::worktree::store::ensure_isolated_store(worktree_ctx)
+        .map_err(|err| anyhow!("{err}"))
+        .with_context(|| {
+            format!(
+                "ensure isolated store for linked worktree {}",
+                worktree_ctx.source_root.display()
+            )
+        })?;
+
+    // Fire-and-forget: a spawn failure (e.g. the executable vanished) is
+    // logged and swallowed inside `spawn_detached_worktree_analyze` — serve
+    // must keep running in the `building` state either way, with
+    // `loomweave worktree analyze` as the documented manual fallback.
+    // Double-spawn (e.g. two `serve` processes racing the same worktree) is
+    // tolerated by the existing per-store `analyze_lock.rs` fs2 lock the
+    // spawned child acquires before writing any run row — nothing here needs
+    // to check or wait for it.
+    match std::env::current_exe() {
+        Ok(program) => loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
+            &program,
+            &worktree_ctx.source_root,
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "worktree bootstrap: cannot resolve the loomweave executable to launch \
+             `loomweave worktree analyze`; the index will stay in the building state until it \
+             is run manually"
+        ),
+    }
+
+    let db_path = worktree_ctx.store_paths.db.clone();
+    run_server(db_path, config_path, worktree_ctx, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_server(
+    db_path: PathBuf,
+    config_path: Option<&Path>,
+    worktree_ctx: &loomweave_core::worktree::WorktreeContext,
+    gated: bool,
+) -> Result<()> {
+    let project_root = worktree_ctx.source_root.clone();
     let instance_id = crate::instance::load_or_create(&worktree_ctx.store_paths.instance_id)
         .context("load Loomweave project instance ID")?;
     let default_config_path = worktree_ctx.config_path();
@@ -172,6 +235,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
         // review #12: forward serve's resolved config to analyze_start, but only
         // when it exists on disk (the McpConfig::default() fallback has no file).
         config_path.exists().then(|| config_path.to_path_buf()),
+        gated,
     )?;
     supervise_stdio_with_http(stdio, http_server)
 }
@@ -241,6 +305,7 @@ fn spawn_mcp_stdio(
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
+    gated: bool,
 ) -> Result<StdioServe> {
     let (result_tx, result_rx) = mpsc::channel();
     let join = thread::Builder::new()
@@ -258,6 +323,7 @@ fn spawn_mcp_stdio(
                 diagnostics,
                 tool_policy,
                 analyze_config_path,
+                gated,
             );
             let _ = result_tx.send(result);
         })
@@ -278,6 +344,7 @@ fn run_mcp_stdio(
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
+    gated: bool,
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -288,8 +355,15 @@ fn run_mcp_stdio(
         .build()
         .context("create MCP runtime")?;
     let _runtime_guard = runtime.enter();
+    // The gate needs both `db_path` (borrowed below by `Writer::spawn`) and
+    // `project_root` (moved into `ServerState::new` next) while they are both
+    // still available — hence computed up front, before either is consumed.
+    let worktree_gate_source_root = gated.then(|| project_root.clone());
     let mut state =
         loomweave_mcp::ServerState::new(project_root, readers).with_tool_policy(tool_policy);
+    if let Some(source_root) = worktree_gate_source_root {
+        state = state.with_worktree_gate(db_path.to_path_buf(), &source_root);
+    }
     // Forward serve's config to an analyze_start-spawned analyze so the child
     // parses the same configuration (review #12). Some only when serve was
     // launched with an on-disk config — the McpConfig::default() fallback has

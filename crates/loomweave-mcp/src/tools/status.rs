@@ -212,7 +212,14 @@ impl ServerState {
         &self,
         _arguments: &serde_json::Map<String, Value>,
     ) -> std::result::Result<Value, ParamError> {
-        let db_path = loomweave_core::store::db_path(&self.project_root);
+        // A linked worktree's isolated store lives under
+        // `db_path(worktree_gate)`, never under `db_path(project_root)` (the
+        // source root's own, never-written local store) — see
+        // `ServerState::worktree_gate`.
+        let db_path = self.worktree_gate.as_ref().map_or_else(
+            || loomweave_core::store::db_path(&self.project_root),
+            |gate| gate.effective_db_path.clone(),
+        );
         let root_display = self.project_root.display().to_string();
 
         let project_root = self.project_root.clone();
@@ -238,6 +245,11 @@ impl ServerState {
                 // Whether this index has any alive SEI bindings (REQ-C-04 /
                 // ADR-038). Degrades to `false` on a pre-SEI database.
                 let sei_populated = has_any_alive_binding(conn).unwrap_or(false);
+                // Worktree-indexes bootstrap gate: only consulted when this
+                // session is gating on it at all (`None` otherwise — a
+                // standalone checkout or the main worktree never runs this
+                // query, so their behavior is unchanged).
+                let readiness = crate::worktree_bootstrap::read_worktree_readiness(conn).readiness;
                 Ok((
                     snapshot,
                     edge_count,
@@ -246,6 +258,7 @@ impl ServerState {
                     latest_run,
                     data_version,
                     sei_populated,
+                    readiness,
                 ))
             })
             .await;
@@ -258,6 +271,7 @@ impl ServerState {
             latest_run,
             data_version,
             sei_populated,
+            readiness,
         ) = match storage {
             Ok(tuple) => tuple,
             Err(err) => {
@@ -268,6 +282,14 @@ impl ServerState {
                 ));
             }
         };
+        // Only a linked worktree's bootstrap gate ever makes this true — a
+        // standalone checkout or the main worktree keep reporting real counts
+        // exactly as before Task 5.
+        let building = self.worktree_gate.is_some()
+            && !matches!(
+                readiness,
+                crate::worktree_bootstrap::WorktreeReadiness::Ready
+            );
 
         // The on-disk size, paired with data_version, exposes a swapped or
         // truncated DB the server may still be serving from a stale handle.
@@ -329,7 +351,7 @@ impl ServerState {
             _ => None,
         };
 
-        let result = json!({
+        let mut result = json!({
             "project_root": root_display,
             "db_path": db_path.display().to_string(),
             "db_present": snapshot.db_present(),
@@ -369,6 +391,9 @@ impl ServerState {
             "filigree": self.filigree_diagnostics_json(),
             "loomweave_read_api": self.loomweave_read_api_json(),
         });
+        if building {
+            null_corpus_derived_fields_while_building(&mut result);
+        }
 
         Ok(success_envelope(result))
     }
@@ -511,5 +536,51 @@ impl ServerState {
                 }))
             })
             .await
+    }
+}
+
+/// Null every `project_status_get` field derived from reading the store's
+/// *corpus* (entity/edge/finding counts, freshness, plugin coverage, SEI
+/// population) while a linked worktree's isolated index has no completed run
+/// yet (worktree-indexes design, "Bootstrap"). A schema-initialized-but-empty
+/// store would otherwise report these as real zeros — indistinguishable from
+/// a genuinely empty completed analysis, which is exactly the confusion this
+/// gate exists to prevent.
+///
+/// Left untouched: `project_root`/`db_path` (configuration, not corpus data),
+/// `db_present`/`db_identity` (real, honest facts about the store *file* —
+/// Task 3's eager schema-init means the file genuinely is present, sized, and
+/// versioned; nulling them would be less accurate, not more), `latest_run`
+/// (the one signal that lets an agent observe build progress without a
+/// reconnect), and the `llm`/`filigree`/`loomweave_read_api` diagnostics
+/// blocks (unrelated to this store's corpus).
+fn null_corpus_derived_fields_while_building(result: &mut Value) {
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    if let Some(counts) = object.get_mut("counts").and_then(Value::as_object_mut) {
+        for key in [
+            "entities",
+            "subsystems",
+            "edges",
+            "findings",
+            "briefing_blocked",
+        ] {
+            counts.insert(key.to_owned(), Value::Null);
+        }
+    }
+    for key in [
+        "staleness",
+        "staleness_note",
+        "worktree_dirty",
+        "scan_truncated",
+        "last_analyzed_at",
+        "git_sha",
+        "plugins",
+    ] {
+        object.insert(key.to_owned(), Value::Null);
+    }
+    if let Some(sei) = object.get_mut("sei").and_then(Value::as_object_mut) {
+        sei.insert("populated".to_owned(), Value::Null);
     }
 }

@@ -11,6 +11,7 @@ pub mod snapshot;
 mod tools;
 pub mod wardline_reconcile;
 pub mod warpline;
+pub mod worktree_bootstrap;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -1280,6 +1281,27 @@ pub struct ServerState {
     /// on the one error `WorktreeContext::resolve` can return (a non-UTF-8
     /// path), which is logged rather than silently swallowed.
     default_config_path: PathBuf,
+    /// Present only for a linked worktree's isolated-index `serve` session
+    /// (worktree-indexes design, "Bootstrap"): gates every tool call except
+    /// `project_status_get`/`analyze_status_get` on `worktree_bootstrap::read_worktree_readiness`,
+    /// recomputed fresh on each `handle_tool_call` — never cached, no
+    /// background timer. `None` for a standalone checkout or the main
+    /// worktree, which take today's unchanged `db_path(project_root).exists()`
+    /// gate in `serve.rs` and never reach the bootstrap gate at all.
+    worktree_gate: Option<WorktreeGate>,
+}
+
+/// See [`ServerState::worktree_gate`].
+#[derive(Debug, Clone)]
+struct WorktreeGate {
+    /// The linked worktree's isolated store's `loomweave.db` — distinct from
+    /// `db_path(project_root)` (the source root's own, never-written local
+    /// store), so `project_status_get` reports the store this session is
+    /// actually reading, not a path that will never exist.
+    effective_db_path: PathBuf,
+    /// The exact `loomweave worktree analyze -- <target>` fallback command,
+    /// echoed verbatim in `index-building`/`index-build-failed` diagnostics.
+    fallback_argv: Vec<String>,
 }
 
 impl ServerState {
@@ -1307,7 +1329,28 @@ impl ServerState {
             analyze_program: None,
             analyze_config_path: None,
             default_config_path,
+            worktree_gate: None,
         }
+    }
+
+    /// Activate the linked-worktree bootstrap gate (worktree-indexes design,
+    /// "Bootstrap"): every tool call except `project_status_get`/
+    /// `analyze_status_get` is gated on `worktree_bootstrap::read_worktree_readiness`
+    /// until a completed (or `skipped_no_plugins`) run row appears.
+    ///
+    /// `effective_db_path` is the linked worktree's isolated store's
+    /// `loomweave.db` (the same path the caller opened `readers` against) —
+    /// distinct from `db_path(project_root)`, which for a linked worktree is a
+    /// path under the *source* root that this design never writes to.
+    /// `source_root` is used to build the exact `loomweave worktree analyze`
+    /// fallback command surfaced in error diagnostics.
+    #[must_use]
+    pub fn with_worktree_gate(mut self, effective_db_path: PathBuf, source_root: &Path) -> Self {
+        self.worktree_gate = Some(WorktreeGate {
+            effective_db_path,
+            fallback_argv: worktree_bootstrap::fallback_argv(source_root),
+        });
+        self
     }
 
     /// Override the program `analyze_start` launches (default: `current_exe()`).
@@ -1657,6 +1700,91 @@ impl ServerState {
         }
     }
 
+    /// The single readiness/gate chokepoint for a linked worktree's isolated
+    /// index (worktree-indexes design, "Bootstrap"). Recomputes fresh on
+    /// every call from `self.worktree_gate` (`None` for a standalone checkout
+    /// or the main worktree — this returns `None` immediately, no query, no
+    /// behavior change) — no cached flag, no background timer, no per-tool
+    /// forking across `graph.rs`/`orientation.rs`/`catalogue/*`.
+    ///
+    /// `source-root-missing` is checked first and applies to *every* tool,
+    /// including `project_status_get`/`analyze_status_get`: once the worktree
+    /// itself is gone there is no "remain available while building" case
+    /// left to serve — the design's accepted race for `git worktree remove`
+    /// under a live `serve`. Building/build-failed then exempts exactly
+    /// `project_status_get` and `analyze_status_get` so an agent can still
+    /// observe progress and the failure diagnostics while every other tool
+    /// (which would otherwise read a schema-initialized-but-empty, or
+    /// partially-written, store) is blocked.
+    async fn consult_worktree_gate(&self, id: &Value, canonical_name: &str) -> Option<Value> {
+        let gate = self.worktree_gate.as_ref()?;
+
+        if !self.project_root.exists() {
+            let envelope = tool_error_envelope_with_diagnostics(
+                McpErrorCode::SourceRootMissing,
+                &format!(
+                    "the worktree source root {} no longer exists (it may have been removed \
+                     via `git worktree remove`); this serve session cannot answer for a tree \
+                     that is gone — start a new `loomweave serve` against a live worktree",
+                    self.project_root.display()
+                ),
+                false,
+                json!({}),
+                vec![json!({"source_root": self.project_root.display().to_string()})],
+            );
+            return Some(tool_json_rpc_response(id, &envelope));
+        }
+
+        if matches!(canonical_name, "project_status_get" | "analyze_status_get") {
+            return None;
+        }
+
+        let read = self
+            .readers
+            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .await;
+        // A storage-layer read failure here is not this gate's to report —
+        // fall through to normal dispatch, which will hit the same failure
+        // and surface its own `storage-error` envelope.
+        let Ok(read) = read else {
+            return None;
+        };
+
+        match read.readiness {
+            worktree_bootstrap::WorktreeReadiness::Ready => None,
+            worktree_bootstrap::WorktreeReadiness::Building => Some(tool_json_rpc_response(
+                id,
+                &tool_error_envelope_with_diagnostics(
+                    McpErrorCode::IndexBuilding,
+                    "this linked worktree's isolated index is still building (no completed \
+                     analyze run yet); graph and catalogue tools are unavailable until it \
+                     finishes. project_status_get and analyze_status_get remain available to \
+                     check progress in this same session — no reconnect needed.",
+                    true,
+                    json!({}),
+                    vec![json!({
+                        "run_id": read.run_id,
+                        "fallback_command": gate.fallback_argv,
+                    })],
+                ),
+            )),
+            worktree_bootstrap::WorktreeReadiness::BuildFailed => Some(tool_json_rpc_response(
+                id,
+                &tool_error_envelope_with_diagnostics(
+                    McpErrorCode::IndexBuildFailed,
+                    "this linked worktree's isolated index build failed; run the fallback \
+                     command to retry.",
+                    false,
+                    json!({}),
+                    vec![json!({
+                        "run_id": read.run_id,
+                        "fallback_command": gate.fallback_argv,
+                    })],
+                ),
+            )),
+        }
+    }
+
     // A flat dispatch table over every tool; length tracks the tool count by
     // design (mirrors the `#[allow]` on `list_tools`).
     #[allow(clippy::too_many_lines)]
@@ -1698,6 +1826,9 @@ impl ServerState {
                 -32602,
                 "confidence=inferred/all is disabled by MCP tool policy because it may call an LLM and write inferred-edge cache rows",
             );
+        }
+        if let Some(gate_response) = self.consult_worktree_gate(id, canonical_name).await {
+            return gate_response;
         }
 
         let envelope = match canonical_name {
