@@ -333,54 +333,23 @@ fn acquire_gc_lock(worktrees_dir: &Path) -> io::Result<GcLock> {
     }
 }
 
-/// [`loomweave_core::hardened_git::hardened_git_command`], plus one narrow
-/// guard this module needs that `hardened_git_command` itself does not
-/// (yet) provide: `GIT_DIR`, `GIT_COMMON_DIR`, and `GIT_WORK_TREE` are
-/// explicitly removed from the child's environment.
-///
-/// **The hazard.** `-C <dir>` does not override an *exported* `GIT_DIR`: if
-/// the Loomweave process inherits `GIT_DIR` from its parent — a Git hook
-/// running in a different repository, `git rebase --exec 'loomweave ...'`,
-/// a CI runner that exports it for its own purposes — `git rev-parse
-/// --git-common-dir` answers for that FOREIGN repository, not
-/// `primary_root`'s. Combined with [`registered_stable_ids`]'s
-/// `NotFound` → empty-registered-set rule (see its doc comment), a foreign
-/// repository that happens to have no `worktrees/` admin directory of its
-/// own — the common case — makes the registered set empty, so *every* real
-/// `wt-*` store under this repository reads as unregistered and gets
-/// deleted, live ones included. `GIT_COMMON_DIR` and `GIT_WORK_TREE` are
-/// stripped alongside `GIT_DIR` because either can also redirect Git's
-/// discovery away from `primary_root`.
-///
-/// `Command::env_remove` is unconditional: the child process will not see
-/// the named variable regardless of what this process's own environment
-/// contains, so this closes the hazard completely for the one `git`
-/// invocation the sweep makes — see
-/// `git_common_dir_command_strips_foreign_git_env_vars` below, which
-/// asserts exactly that on the constructed [`std::process::Command`]
-/// without needing to mutate any real environment.
-///
-/// This is a narrow, sweep-local guard, not a general fix: full
-/// Git-environment sanitization for `hardened_git_command` itself is
-/// tracked separately (clarion-9202f4acec) and is deliberately not folded
-/// in here — this module's own deletion-adjacent path needed to stop
-/// trusting the ambient environment now, independent of when that broader
-/// work lands.
-fn hardened_git_command_for_sweep(dir: &Path) -> std::process::Command {
-    let mut command = loomweave_core::hardened_git::hardened_git_command(dir);
-    command
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE");
-    command
-}
-
 /// Resolve `primary_root`'s common Git directory via one hardened `git
 /// rev-parse` — `None` on any failure (missing `git`, not a repository, a
 /// non-zero exit, or non-UTF-8 output), which every caller treats as an
 /// abort signal, never a hard error.
+///
+/// Deletion-path safety note: `-C <dir>` does not override an *exported*
+/// `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE`, and a foreign `GIT_DIR`
+/// here — combined with [`registered_stable_ids`]'s `NotFound` →
+/// empty-registered-set rule — would read every real `wt-*` store as
+/// unregistered and delete it. That hazard is closed inside
+/// [`loomweave_core::hardened_git::hardened_git_command`] itself, which
+/// `env_clear()`s the child environment before re-adding an allowlist
+/// (see its "repository-selector variables" comment); this module
+/// previously carried its own three-variable strip and retired it when
+/// the shared helper's clear landed on the 1.5.0 line.
 fn git_common_dir(primary_root: &Path) -> Option<PathBuf> {
-    let output = hardened_git_command_for_sweep(primary_root)
+    let output = loomweave_core::hardened_git::hardened_git_command(primary_root)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
         .ok()?;
@@ -464,51 +433,4 @@ fn store_candidates(worktrees_dir: &Path) -> io::Result<Vec<String>> {
         }
     }
     Ok(names)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The review-critical env-leakage guard (see
-    /// [`hardened_git_command_for_sweep`]'s doc comment for the hazard):
-    /// `GIT_DIR`, `GIT_COMMON_DIR`, and `GIT_WORK_TREE` must be explicit
-    /// removals on the `Command` this module hands to `git rev-parse
-    /// --git-common-dir`, so a foreign value inherited from the process
-    /// environment can never reach that invocation.
-    ///
-    /// This is a unit test, not an integration test mutating the real
-    /// process environment via `std::env::set_var`/`remove_var`, because
-    /// this workspace denies `unsafe_code` everywhere except one documented
-    /// site in the plugin host (`CLAUDE.md`), and `std::env::set_var` /
-    /// `remove_var` are `unsafe fn` on this toolchain — confirmed by
-    /// attempting exactly that in `tests/worktree_sweep.rs` and getting a
-    /// hard compiler error (`-D unsafe-code`), not just a lint warning.
-    /// `Command::env_remove` is documented to unconditionally exclude the
-    /// named variable from the child's environment regardless of what the
-    /// parent process's environment contains, so asserting the removal is
-    /// present on the constructed command is a complete, deterministic
-    /// proof of the behavioral guarantee — not merely a proxy for one —
-    /// without needing to touch any real environment variable at all.
-    #[test]
-    fn git_common_dir_command_strips_foreign_git_env_vars() {
-        let dir = Path::new("/does/not/need/to/exist/for/this/check");
-        let command = hardened_git_command_for_sweep(dir);
-
-        // `env_remove` records the key with a `None` value in the command's
-        // env-modification table; a `Some(_)` entry would be an explicit
-        // `.env(...)` SET, not a removal — only `None` entries count here.
-        let removed: std::collections::HashSet<&str> = command
-            .get_envs()
-            .filter_map(|(key, value)| (value.is_none()).then(|| key.to_str()).flatten())
-            .collect();
-
-        for hazardous in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"] {
-            assert!(
-                removed.contains(hazardous),
-                "{hazardous} must be an explicit removal on the git_common_dir \
-                 command's environment; got removed={removed:?}"
-            );
-        }
-    }
 }

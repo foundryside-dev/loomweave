@@ -281,11 +281,12 @@ On `serve` startup and after each analysis, under a non-blocking `gc.lock`:
 1. Enumerate direct `wt-[0-9a-f]{64}` children of the pinned `worktrees/`
    handle — the **candidate** set.
 2. Resolve the repository's common Git directory (one hardened `git
-   rev-parse`, its own invocation additionally stripping
-   `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` so it cannot be redirected by
-   an ambient Git environment variable — a narrow, deletion-path-local
-   guard; general `hardened_git_command` environment sanitization remains
-   tracked separately, clarion-9202f4acec), then read that directory's own
+   rev-parse`; `hardened_git_command` itself `env_clear()`s the child
+   environment — landed on the 1.5.0 line — so an ambient
+   `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` cannot redirect this
+   deletion-adjacent invocation to a foreign repository; the sweep briefly
+   carried its own three-variable strip and retired it in favor of the
+   shared clear), then read that directory's own
    `worktrees/` administrative subdirectory with a single `readdir` — the
    **registered** set. `git worktree list` is deliberately never run for
    this: it does not expose the administrative directory name each entry
