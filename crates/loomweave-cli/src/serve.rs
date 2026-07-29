@@ -44,6 +44,12 @@ enum ServeRoute {
     Full,
 }
 
+#[derive(Debug, Clone)]
+struct WorktreeServeGate {
+    fallback_argv: Vec<String>,
+    bootstrap_spawn_failed: bool,
+}
+
 fn choose_serve_route(kind: loomweave_core::worktree::WorktreeKind, db_exists: bool) -> ServeRoute {
     if kind == loomweave_core::worktree::WorktreeKind::Linked {
         ServeRoute::Linked
@@ -96,8 +102,8 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
 
 /// Bootstrap and serve a linked worktree's isolated index (worktree-indexes
 /// design, "Bootstrap"): ensure the isolated store exists (Task 3), spawn a
-/// **detached** `loomweave worktree analyze` for it if (and only if) it has
-/// never finished a build, then serve the full `ServerState` path
+/// **detached** `loomweave worktree analyze` for it if (and only if) no prior
+/// analyze attempt has written a run row, then serve the full `ServerState` path
 /// immediately with the bootstrap gate active. Graph tools answer
 /// `index-building` (or `index-build-failed`) until a completed run row
 /// appears — no waiting here, no reconnect required once it does
@@ -125,17 +131,23 @@ fn run_linked_worktree(
         db_path,
         config_path,
         worktree_ctx,
-        Some(bootstrap_spawn_failed),
+        Some(WorktreeServeGate {
+            fallback_argv: loomweave_mcp::worktree_bootstrap::fallback_argv(
+                &worktree_ctx.source_root,
+                config_path,
+            ),
+            bootstrap_spawn_failed,
+        }),
     )
 }
 
 /// Ensure the isolated store exists, then spawn `loomweave worktree analyze`
-/// for it **only when it has never finished a build** — per the design,
-/// "serve on a linked worktree WITH NO INDEX ... spawn". A worktree that
-/// already has a completed run is not respawned on every `serve` restart
-/// (that would fire a redundant 20-30 minute re-analyze every time an agent
-/// session starts against an already-built worktree); keeping a built index
-/// fresh is the `SessionStart` hook's job, not this one.
+/// for it **only when no analyze attempt has written a run row** — per the
+/// design, "serve on a linked worktree WITH NO INDEX ... spawn". A worktree
+/// with a completed or running row is not given redundant background work;
+/// keeping it fresh is the `SessionStart` hook's job. A failed row likewise
+/// requires the surfaced explicit recovery command instead of a doomed retry
+/// on every `serve` restart.
 ///
 /// `analyze_program` overrides the launcher (`None` -> `current_exe()`);
 /// tests inject a stub so the spawn (whether it happens at all, and its
@@ -167,32 +179,73 @@ fn bootstrap_linked_worktree(
             worktree_ctx.primary_root.display()
         );
     }
-    loomweave_cli::worktree::store::ensure_isolated_store(worktree_ctx)
-        .map_err(|err| anyhow!("{err}"))
-        .with_context(|| {
-            format!(
-                "ensure isolated store for linked worktree {}",
-                worktree_ctx.source_root.display()
-            )
-        })?;
+    let should_spawn =
+        match crate::analyze_lock::try_acquire_analyze_lock_for_context(worktree_ctx)? {
+            crate::analyze_lock::TryAnalyzeLock::Acquired(_initialization_guard) => {
+                loomweave_cli::worktree::store::ensure_isolated_store(worktree_ctx)
+                    .map_err(|err| anyhow!("{err}"))
+                    .with_context(|| {
+                        format!(
+                            "ensure isolated store for linked worktree {}",
+                            worktree_ctx.source_root.display()
+                        )
+                    })?;
 
-    let should_spawn = match rusqlite::Connection::open_with_flags(
-        &worktree_ctx.store_paths.db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
-        Ok(conn) => loomweave_mcp::worktree_bootstrap::should_spawn_bootstrap_analyze(&conn),
-        Err(err) => {
-            // Ambiguous — fail toward spawning rather than risk leaving the
-            // operator stuck with an unbuilt store and no automatic recovery.
-            tracing::warn!(
-                error = %err,
-                db = %worktree_ctx.store_paths.db.display(),
-                "worktree bootstrap: could not read the store to check build status; \
-                 spawning `loomweave worktree analyze` to be safe"
-            );
-            true
-        }
-    };
+                match rusqlite::Connection::open_with_flags(
+                    &worktree_ctx.store_paths.db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                ) {
+                    Ok(conn) => {
+                        loomweave_mcp::worktree_bootstrap::should_spawn_bootstrap_analyze(&conn)
+                    }
+                    Err(err) => {
+                        // Ambiguous — fail toward spawning rather than risk leaving the
+                        // operator stuck with an unbuilt store and no automatic recovery.
+                        tracing::warn!(
+                            error = %err,
+                            db = %worktree_ctx.store_paths.db.display(),
+                            "worktree bootstrap: could not read the store to check build status; \
+                             spawning `loomweave worktree analyze` to be safe"
+                        );
+                        true
+                    }
+                }
+            }
+            crate::analyze_lock::TryAnalyzeLock::Held { .. } => {
+                // A SessionStart/manual analyze owns the stable lock. It is the
+                // initializer and builder; never race it with ensure/migrations or
+                // launch a redundant child. The store schema is published near the
+                // start of that process, so wait only for that bounded bootstrap
+                // milestone before opening the reader pool below.
+                let start = std::time::Instant::now();
+                loop {
+                    let ready = rusqlite::Connection::open_with_flags(
+                        &worktree_ctx.store_paths.db,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .and_then(|conn| {
+                        conn.query_row(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'",
+                            [],
+                            |_row| Ok(()),
+                        )
+                    })
+                    .is_ok();
+                    if ready {
+                        break;
+                    }
+                    if start.elapsed() > std::time::Duration::from_secs(5) {
+                        bail!(
+                            "another analyze holds the worktree lock, but its isolated store at {} \
+                         did not finish initialization within 5 seconds",
+                            worktree_ctx.store_paths.db.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                false
+            }
+        };
 
     if !should_spawn {
         tracing::info!(
@@ -220,6 +273,7 @@ fn bootstrap_linked_worktree(
             &program,
             &worktree_ctx.source_root,
             explicit_config,
+            &worktree_ctx.store_paths.db,
         ),
         Err(err) => {
             tracing::warn!(
@@ -242,7 +296,7 @@ fn run_server(
     // `None` = ungated (main/standalone). `Some(spawn_failed)` = a linked
     // worktree with the bootstrap gate active; the bool records whether the
     // bootstrap spawn failed (clarion-917df0e1ad).
-    worktree_gate: Option<bool>,
+    worktree_gate: Option<WorktreeServeGate>,
 ) -> Result<()> {
     let project_root = worktree_ctx.source_root.clone();
     let instance_id = crate::instance::load_or_create(&worktree_ctx.store_paths.instance_id)
@@ -346,9 +400,13 @@ fn run_server(
     // well-formed empty federation answers over the still-building store.
     // Same fallback argv as `with_worktree_gate` so both surfaces name one
     // recovery command.
-    let http_worktree_gate = worktree_gate.map(|_| crate::http_read::WorktreeHttpGate {
-        fallback_argv: loomweave_mcp::worktree_bootstrap::fallback_argv(&project_root),
-    });
+    let http_worktree_gate =
+        worktree_gate
+            .as_ref()
+            .map(|gate| crate::http_read::WorktreeHttpGate {
+                fallback_argv: gate.fallback_argv.clone(),
+                bootstrap_spawn_failed: gate.bootstrap_spawn_failed,
+            });
     let http_server = crate::http_read::spawn(
         http_project_root,
         db_path.clone(),
@@ -455,7 +513,7 @@ fn spawn_mcp_stdio(
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
-    worktree_gate: Option<bool>,
+    worktree_gate: Option<WorktreeServeGate>,
     store_paths: loomweave_core::worktree::StorePaths,
 ) -> Result<StdioServe> {
     let (result_tx, result_rx) = mpsc::channel();
@@ -496,7 +554,7 @@ fn run_mcp_stdio(
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
-    worktree_gate: Option<bool>,
+    worktree_gate: Option<WorktreeServeGate>,
     store_paths: loomweave_core::worktree::StorePaths,
 ) -> Result<()> {
     let stdin = std::io::stdin();
@@ -514,12 +572,12 @@ fn run_mcp_stdio(
     // every explicit leaf path (db/embeddings/runs/...) `ServerState`'s
     // `effective_*` accessors need for a gated (linked-worktree) session
     // (worktree-index Task 7) — not just the db path.
-    let worktree_gate =
-        worktree_gate.map(|spawn_failed| (project_root.clone(), store_paths, spawn_failed));
+    let worktree_gate = worktree_gate.map(|gate| (store_paths, gate));
     let mut state =
         loomweave_mcp::ServerState::new(project_root, readers).with_tool_policy(tool_policy);
-    if let Some((source_root, store_paths, bootstrap_spawn_failed)) = worktree_gate {
-        state = state.with_worktree_gate(store_paths, &source_root, bootstrap_spawn_failed);
+    if let Some((store_paths, gate)) = worktree_gate {
+        state =
+            state.with_worktree_gate(store_paths, gate.fallback_argv, gate.bootstrap_spawn_failed);
     }
     // Forward serve's config to an analyze_start-spawned analyze so the child
     // parses the same configuration (review #12). Some only when serve was
@@ -1046,6 +1104,39 @@ mod tests {
             !argv_dump.exists(),
             "a worktree with a completed run must not be respawned on every serve restart"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bootstrap_child_failure_before_begin_run_becomes_a_persisted_failed_attempt() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        install_primary(&ctx);
+        let stub = tmp.path().join("failing-analyze.sh");
+        let mut file = fs::File::create(&stub).unwrap();
+        writeln!(file, "#!/bin/sh\nexit 17").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(file);
+
+        bootstrap_linked_worktree(&ctx, Some(&stub), None)
+            .expect("serve remains available after the child exits");
+
+        let start = Instant::now();
+        loop {
+            let conn = rusqlite::Connection::open(&ctx.store_paths.db).unwrap();
+            let read = loomweave_mcp::worktree_bootstrap::read_worktree_readiness(&conn);
+            if read.readiness == loomweave_mcp::worktree_bootstrap::WorktreeReadiness::BuildFailed {
+                break;
+            }
+            assert!(
+                start.elapsed() <= StdDuration::from_secs(5),
+                "the reaper must record an early child failure instead of leaving readiness at Building: {read:?}"
+            );
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
     }
 
     // -----------------------------------------------------------------

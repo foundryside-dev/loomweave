@@ -537,6 +537,48 @@ mod tests {
     }
 
     #[test]
+    fn shared_override_does_not_delete_another_repositorys_live_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_store = tmp.path().join("shared-store");
+        let mut contexts = Vec::new();
+
+        for parent in ["a", "b"] {
+            let repo = tmp.path().join(parent).join("repo");
+            init_repo(&repo, "main");
+            std::fs::write(
+                repo.join("weft.toml"),
+                format!(
+                    "[loomweave]\nstore_dir = {:?}\n",
+                    shared_store.to_str().unwrap()
+                ),
+            )
+            .unwrap();
+            git(&repo, &["add", "weft.toml"]);
+            git(&repo, &["commit", "-qm", "configure shared store"]);
+            git(
+                &repo,
+                &["worktree", "add", "-q", "-b", "feature", "../linked"],
+            );
+            contexts.push(
+                WorktreeContext::resolve(&tmp.path().join(parent).join("linked"))
+                    .expect("resolve linked worktree"),
+            );
+        }
+        std::fs::create_dir_all(&shared_store).unwrap();
+
+        ensure_isolated_store(&contexts[0]).expect("create first repository store");
+        let marker = contexts[0].effective_store.join("first-repository.marker");
+        std::fs::write(&marker, "live\n").unwrap();
+        ensure_isolated_store(&contexts[1]).expect("create second repository store");
+
+        assert!(
+            marker.is_file(),
+            "initializing the second repository must not rebuild-delete the first repository's live index"
+        );
+        assert_ne!(contexts[0].effective_store, contexts[1].effective_store);
+    }
+
+    #[test]
     fn removed_and_readded_worktree_name_rebuilds_not_reuses() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");

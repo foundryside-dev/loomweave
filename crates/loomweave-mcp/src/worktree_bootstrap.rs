@@ -1,7 +1,7 @@
 //! Serve bootstrap for a linked worktree's isolated index (worktree-indexes
 //! design, "Bootstrap" section).
 //!
-//! `serve` on a linked worktree with no completed analyze run does not
+//! `serve` on a linked worktree with no analyze attempt does not
 //! degrade to the no-index stdio loop (`serve_stdio_no_index`): Task 3's
 //! eager, schema-initialized `loomweave.db` means the effective store's DB
 //! path already exists, so file existence can no longer be the readiness
@@ -12,26 +12,29 @@
 //! against the same `runs` table every graph-tool call until a terminal run
 //! row appears.
 //!
-//! **Double-spawn is guarded by the pre-existing `analyze_lock.rs` fs2 lock**
-//! that the spawned `loomweave worktree analyze` child acquires for itself
-//! before writing any `runs` row (`crates/loomweave-cli/src/analyze.rs`) —
-//! not by anything in this module. A second `serve` racing the same worktree
-//! spawns its own child unconditionally; the loser fails fast on the lock
-//! and exits having written nothing. This module never waits on, inspects,
-//! or tracks the spawned child (no run registry, no owner-pid probe — the
-//! design's ephemeral posture).
+//! **Concurrent initialization and double-spawn are guarded by the stable
+//! `analyze_lock.rs` fs2 lock.** `serve` acquires it before initializing the
+//! store, and every spawned `loomweave worktree analyze` child reacquires it
+//! before its own store validation or writes (`crates/loomweave-cli/src/analyze.rs`).
+//! If two launchers still reach the spawn edge together, the losing child
+//! fails fast on that same lock and exits having written nothing. A reaper
+//! thread owns every spawned
+//! [`Child`], waits it to completion, and records a synthetic failed run when
+//! a non-zero child exits before `BeginRun`; this prevents zombie processes
+//! and a permanently ambiguous no-row `Building` state.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
 /// Readiness of a linked worktree's isolated index, recomputed from the
 /// `runs` table on every gated tool call — never cached, never timed.
 ///
-/// **Governed by "does a completed row exist at all," not "the most recent
-/// row"**: once any run has completed, readiness is `Ready` regardless of
-/// what a *later* run row says — see [`read_worktree_readiness`] for why.
+/// Governed by the most recent run row: analyze rebuilds tables in place, so
+/// an older completed row is not a stable snapshot while a newer run is
+/// writing or after that rebuild failed.
 /// Public (not `pub(crate)`): `loomweave-cli`'s HTTP read API gates on the
 /// same readiness consult as the MCP tools (clarion-ecf882f230), so the
 /// classification and the query live here exactly once.
@@ -41,10 +44,10 @@ pub enum WorktreeReadiness {
     /// recent row (by `started_at`) is `running` (or an unrecognized future
     /// status).
     Building,
-    /// At least one run row has `completed`, or completed with
+    /// The most recent run row has `completed`, or completed with
     /// `skipped_no_plugins` (a legitimate terminal state — no plugins
     /// installed is not a build failure, and gating on it forever would wedge
-    /// the session with no way out) — regardless of any later row's status.
+    /// the session with no way out).
     Ready,
     /// No run has ever completed, and the most recent row's status is
     /// `failed`.
@@ -63,12 +66,9 @@ pub struct ReadinessRead {
 /// run row exists at all. The one place the
 /// `running`/`completed`/`skipped_no_plugins`/`failed` → [`WorktreeReadiness`]
 /// mapping lives — used by [`read_worktree_readiness`] to interpret whichever
-/// row its priority-ordered query selects (see that function's docs for why
-/// the row it selects is not simply "the most recent one"). `tool_project_status`
-/// (`crates/loomweave-mcp/src/tools/status.rs`) calls `read_worktree_readiness`
-/// directly for its own gating decision — deliberately a separate query from
-/// the `latest_run` row it reads for display, since the two answer different
-/// questions once readiness stops tracking "the most recent row".
+/// most recent row. `tool_project_status`
+/// (`crates/loomweave-mcp/src/tools/status.rs`) calls
+/// `read_worktree_readiness` directly for its gating decision.
 pub(crate) fn classify_readiness(status: Option<&str>) -> WorktreeReadiness {
     match status {
         Some("completed" | "skipped_no_plugins") => WorktreeReadiness::Ready,
@@ -82,24 +82,11 @@ pub(crate) fn classify_readiness(status: Option<&str>) -> WorktreeReadiness {
 
 /// Read the readiness-governing run row and classify readiness.
 ///
-/// **Not** simply "the most recent row" — a completed (or
-/// `skipped_no_plugins`) run row, once it exists, governs readiness
-/// regardless of a *later* `running` row: the design's "When a completed run
-/// row exists, activate readers and answer normally" is unconditional on
-/// what happens afterward. A manual `loomweave worktree analyze` rebuild (or
-/// a second `serve` racing this one) started against an already-built store
-/// must not re-block graph tools for the rebuild's duration — the previously
-/// completed data is still sitting in the same tables and still safe to
-/// read.
-///
-/// One query implements the priority: order candidate rows so any
-/// completed/`skipped_no_plugins` row sorts first (ties broken by
-/// `started_at DESC`, so the *most recent* completed row wins among several),
-/// and only when none exists at all does the ordering fall through to the
-/// single most recent row overall — which is exactly the row that
-/// distinguishes `Building` (a fresh or in-flight, never-yet-successful
-/// build) from `BuildFailed` (the only attempt so far, and it failed). No
-/// generation versioning, no cached state, no second query.
+/// The most recent row always governs. Analyze mutates the same tables in
+/// place and commits bounded batches, so serving through a newer `running`
+/// row would expose a partial graph; serving after a newer `failed` row would
+/// retain that partial state. There is no separate immutable generation that
+/// would make the older completed row safe to select.
 ///
 /// Fail-safe on a query error: logs a warning and reports [`WorktreeReadiness::Building`]
 /// rather than risk answering `Ready` (and unblocking graph tools) against a
@@ -107,9 +94,7 @@ pub(crate) fn classify_readiness(status: Option<&str>) -> WorktreeReadiness {
 pub fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
     match conn.query_row(
         "SELECT id, status FROM runs \
-         ORDER BY \
-             CASE WHEN status IN ('completed', 'skipped_no_plugins') THEN 0 ELSE 1 END, \
-             started_at DESC \
+         ORDER BY started_at DESC, rowid DESC \
          LIMIT 1",
         [],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -133,34 +118,31 @@ pub fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
 }
 
 /// Whether `serve`'s bootstrap should spawn `loomweave worktree analyze` for
-/// this store: only when it has never finished a build (`read_worktree_readiness`
-/// is not `WorktreeReadiness::Ready`) — per the design, "serve on a linked
-/// worktree WITH NO INDEX ... spawn". A worktree that has already completed a
-/// run — even if a later rebuild attempt is currently running or previously
-/// failed — is not this function's concern: keeping an already-built index
-/// fresh is the `SessionStart` hook's job (`loomweave analyze`, plain, on the
-/// primary or the worktree as the hook is invoked), not an unconditional
-/// background respawn fired on every single `serve` restart of an
-/// already-built worktree, which would otherwise launch a redundant
-/// 20-30 minute re-analyze every time an agent session starts.
+/// this store: only when no analyze attempt has written a run row — per the
+/// design, "serve on a linked worktree WITH NO INDEX ... spawn". Completed or
+/// in-flight rows must not trigger redundant background work, and a failed row
+/// requires the surfaced explicit recovery command rather than another doomed
+/// automatic retry on every `serve` restart.
 pub fn should_spawn_bootstrap_analyze(conn: &Connection) -> bool {
-    !matches!(
-        read_worktree_readiness(conn).readiness,
-        WorktreeReadiness::Ready
-    )
+    read_worktree_readiness(conn).run_id.is_none()
 }
 
 /// The exact fallback command diagnostics carry: `loomweave worktree analyze
 /// -- <target>`, the documented recovery path from every `index-building` /
 /// `index-build-failed` response.
-pub fn fallback_argv(target: &Path) -> Vec<String> {
-    vec![
+pub fn fallback_argv(target: &Path, explicit_config: Option<&Path>) -> Vec<String> {
+    let mut argv = vec![
         "loomweave".to_owned(),
         "worktree".to_owned(),
         "analyze".to_owned(),
-        "--".to_owned(),
-        target.display().to_string(),
-    ]
+    ];
+    if let Some(config) = explicit_config {
+        argv.push("--config".to_owned());
+        argv.push(config.display().to_string());
+    }
+    argv.push("--".to_owned());
+    argv.push(target.display().to_string());
+    argv
 }
 
 /// Spawn `loomweave worktree analyze -- <target>` as a new process-group
@@ -168,10 +150,9 @@ pub fn fallback_argv(target: &Path) -> Vec<String> {
 /// it.
 ///
 /// This is the low-level primitive: production callers use
-/// [`spawn_detached_worktree_analyze`], which drops the `Child` immediately
-/// (true fire-and-forget, mirroring `hook.rs::spawn_detached_analyze`'s
-/// detachment technique). Tests use this function directly so they can
-/// deterministically `wait()` on the child instead of polling.
+/// [`spawn_detached_worktree_analyze`], whose reaper thread owns and waits on
+/// the child. Tests use this function directly so they can deterministically
+/// `wait()` on the child instead of polling.
 pub(crate) fn spawn_worktree_analyze(
     program: &Path,
     target: &Path,
@@ -218,9 +199,10 @@ pub fn spawn_detached_worktree_analyze(
     program: &Path,
     target: &Path,
     explicit_config: Option<&Path>,
+    db_path: &Path,
 ) -> bool {
     match spawn_worktree_analyze(program, target, explicit_config) {
-        Ok(_child) => true,
+        Ok(child) => supervise_bootstrap_child(child, db_path),
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -231,6 +213,79 @@ pub fn spawn_detached_worktree_analyze(
             );
             false
         }
+    }
+}
+
+fn supervise_bootstrap_child(child: Child, db_path: &Path) -> bool {
+    let child = Arc::new(Mutex::new(Some(child)));
+    let child_for_thread = Arc::clone(&child);
+    let db_path = db_path.to_path_buf();
+    match std::thread::Builder::new()
+        .name("loomweave-worktree-bootstrap-reaper".to_owned())
+        .spawn(move || {
+            let mut child = child_for_thread
+                .lock()
+                .expect("bootstrap child mutex poisoned")
+                .take()
+                .expect("bootstrap child consumed once");
+            match child.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => record_early_bootstrap_failure(
+                    &db_path,
+                    &format!("bootstrap analyze exited with {status}"),
+                ),
+                Err(err) => record_early_bootstrap_failure(
+                    &db_path,
+                    &format!("wait for bootstrap analyze failed: {err}"),
+                ),
+            }
+        }) {
+        Ok(_join) => true,
+        Err(err) => {
+            if let Some(mut child) = child.lock().expect("bootstrap child mutex poisoned").take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            tracing::warn!(
+                error = %err,
+                "worktree bootstrap: could not start child reaper; killed the unsupervised \
+                 analyze process"
+            );
+            false
+        }
+    }
+}
+
+fn record_early_bootstrap_failure(db_path: &Path, reason: &str) {
+    let Ok(conn) = Connection::open(db_path) else {
+        tracing::warn!(db = %db_path.display(), reason, "could not record early bootstrap failure");
+        return;
+    };
+    let run_id = format!("bootstrap-spawn-{}", uuid::Uuid::new_v4());
+    let stats = serde_json::json!({
+        "bootstrap_spawn_failed": true,
+        "reason": reason,
+    })
+    .to_string();
+    match conn.execute(
+        "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+         SELECT ?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                '{\"bootstrap\":true}', ?2, 'failed' \
+          WHERE NOT EXISTS (SELECT 1 FROM runs)",
+        rusqlite::params![run_id, stats],
+    ) {
+        Ok(1) => tracing::warn!(reason, "worktree bootstrap child failed before BeginRun"),
+        Ok(_) => {
+            // Another analyze published a real row while this losing child
+            // exited (the normal double-spawn race). Its row governs.
+        }
+        Err(err) => tracing::warn!(
+            error = %err,
+            db = %db_path.display(),
+            reason,
+            "could not persist early bootstrap failure"
+        ),
     }
 }
 
@@ -322,23 +377,23 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_row_reads_as_ready_even_when_a_later_row_is_running() {
+    fn a_later_running_rebuild_blocks_reads_despite_an_older_completed_row() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = open_empty_runs_db(dir.path());
         seed_run(&db_path, "done", "2026-01-01T00:00:00.000Z", "completed");
-        // A rebuild kicked off after the completed run — must not re-block
-        // graph tools for the rebuild's duration; the completed data is
-        // still there.
+        // Analyze rebuilds the same tables in place and commits in batches,
+        // so the older completed row is not a stable snapshot while this run
+        // is mutating the database.
         seed_run(&db_path, "rebuild", "2026-02-01T00:00:00.000Z", "running");
 
         let conn = Connection::open(&db_path).unwrap();
         let read = read_worktree_readiness(&conn);
-        assert_eq!(read.readiness, WorktreeReadiness::Ready, "{read:?}");
-        assert_eq!(read.run_id.as_deref(), Some("done"), "{read:?}");
+        assert_eq!(read.readiness, WorktreeReadiness::Building, "{read:?}");
+        assert_eq!(read.run_id.as_deref(), Some("rebuild"), "{read:?}");
     }
 
     #[test]
-    fn a_completed_row_reads_as_ready_even_when_a_later_row_failed() {
+    fn a_later_failed_rebuild_blocks_reads_despite_an_older_completed_row() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = open_empty_runs_db(dir.path());
         seed_run(&db_path, "done", "2026-01-01T00:00:00.000Z", "completed");
@@ -351,8 +406,8 @@ mod tests {
 
         let conn = Connection::open(&db_path).unwrap();
         let read = read_worktree_readiness(&conn);
-        assert_eq!(read.readiness, WorktreeReadiness::Ready, "{read:?}");
-        assert_eq!(read.run_id.as_deref(), Some("done"), "{read:?}");
+        assert_eq!(read.readiness, WorktreeReadiness::BuildFailed, "{read:?}");
+        assert_eq!(read.run_id.as_deref(), Some("rebuild-failed"), "{read:?}");
     }
 
     #[test]
@@ -369,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn should_spawn_is_false_once_a_completed_row_exists_regardless_of_a_later_row() {
+    fn should_spawn_is_false_while_a_rebuild_row_is_running() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = open_empty_runs_db(dir.path());
         seed_run(&db_path, "done", "2026-01-01T00:00:00.000Z", "completed");
@@ -383,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn should_spawn_is_true_when_unbuilt_or_only_failed() {
+    fn should_spawn_only_when_no_attempt_has_written_a_run_row() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = open_empty_runs_db(dir.path());
         let conn = Connection::open(&db_path).unwrap();
@@ -396,21 +451,24 @@ mod tests {
         seed_run(&db_path, "r-fail", "2026-01-01T00:00:00.000Z", "failed");
         let conn = Connection::open(&db_path).unwrap();
         assert!(
-            should_spawn_bootstrap_analyze(&conn),
-            "only a failed attempt so far -> still unbuilt -> must spawn"
+            !should_spawn_bootstrap_analyze(&conn),
+            "a recorded failure requires explicit recovery, not an automatic doomed respawn on every serve restart"
         );
     }
 
     #[test]
     fn fallback_argv_names_the_exact_recovery_command() {
         let target = Path::new("/repos/primary/../linked");
-        let argv = fallback_argv(target);
+        let config = Path::new("/configs/custom.yaml");
+        let argv = fallback_argv(target, Some(config));
         assert_eq!(
             argv,
             vec![
                 "loomweave".to_owned(),
                 "worktree".to_owned(),
                 "analyze".to_owned(),
+                "--config".to_owned(),
+                config.display().to_string(),
                 "--".to_owned(),
                 target.display().to_string(),
             ]

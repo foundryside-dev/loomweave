@@ -216,13 +216,6 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(project_root);", count: 2, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(root);", count: 1, classification: Classification::TestExempt },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "std::fs::read_to_string(loomweave_core::store::store_dir(root).join(\".gitignore\"))", count: 1, classification: Classification::TestExempt },
-    // `check_http_config_json`'s ADR-044 status read — one of the same
-    // declared-scope-gap checks as the entries above (not
-    // `loomweave_read_api_json`, the MCP tool this fix-loop routed via
-    // `resolve_loomweave_url_at`/`effective_port_path` — that is a
-    // different call site, in `loomweave-mcp/src/tools/status.rs`).
-    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "loomweave_federation::loomweave_url::resolve_loomweave_url(None, project_root, |name| {", count: 1, classification: Classification::IntentionalRootDerived },
-
     // ---- crates/loomweave-cli/src/guidance.rs ----
     AllowedHit { file: "crates/loomweave-cli/src/guidance.rs", text: "fn resolve_effective_db_path(project_root: &Path) -> std::path::PathBuf {", count: 1, classification: Classification::Route },
     AllowedHit { file: "crates/loomweave-cli/src/guidance.rs", text: "let db_path = resolve_effective_db_path(project_root);", count: 1, classification: Classification::Route },

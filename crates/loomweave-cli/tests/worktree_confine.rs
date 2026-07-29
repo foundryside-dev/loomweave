@@ -325,6 +325,22 @@ fn deletion_is_rooted_at_pinned_handle_not_resolved_path() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn opening_worktrees_root_rejects_a_symlink_in_the_store_prefix() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let foreign_store = tmp.path().join("foreign-store");
+    fs::create_dir_all(foreign_store.join("worktrees")).expect("mkdir foreign worktrees");
+    let repository = tmp.path().join("repository");
+    fs::create_dir(&repository).expect("mkdir repository");
+    symlink(&foreign_store, repository.join("loomweave")).expect("symlink store prefix");
+
+    let _err = WorktreesRoot::open(&repository.join("loomweave/worktrees"))
+        .expect_err("a pinned deletion root must not traverse an intermediate symlink");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn deletion_logs_stable_id_and_reason() {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -367,9 +383,9 @@ fn deletion_logs_stable_id_and_reason() {
     fs::create_dir(worktrees_dir.join(&name)).expect("mkdir candidate");
     let root = WorktreesRoot::open(&worktrees_dir).expect("open worktrees/");
 
-    let outcome = tracing::subscriber::with_default(subscriber, || {
-        root.delete_worktree_store(&name, "worktree no longer registered")
-    });
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("this integration test binary installs one process-wide capture subscriber");
+    let outcome = root.delete_worktree_store(&name, "worktree no longer registered");
 
     assert_eq!(outcome, DeleteOutcome::Deleted);
     let log =

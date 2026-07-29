@@ -30,11 +30,13 @@
 //! | `internal`, `io-error`, `spawn-failed`                                 | `INTERNAL`       |
 //! | `entity-not-found`, `run-not-found`, `not-found`, `content-hash-missing` | `NOT_FOUND`    |
 //! | `index-building`                                                        | `INDEX_BUILDING` |
-//! | `index-build-failed`                                                    | `INDEX_BUILD_FAILED` |
-//! | `not-a-subsystem`, `analyze-already-running`, `token-ceiling-exceeded`, `llm-disabled`, `llm-provider-error`, `llm-invalid-json`, `content-drift`, `inferred-dispatch-cancelled`, `inferred-dispatch-timeout`, `source-root-missing` | *(MCP-only; no HTTP surface)* |
+//! | `index-build-failed`                                                    | `INDEX_BUILD_FAILED` / `BOOTSTRAP_SPAWN_FAILED` |
+//! | `source-root-missing`                                                   | `SOURCE_ROOT_MISSING` |
+//! | `not-a-subsystem`, `analyze-already-running`, `token-ceiling-exceeded`, `llm-disabled`, `llm-provider-error`, `llm-invalid-json`, `content-drift`, `inferred-dispatch-cancelled`, `inferred-dispatch-timeout` | *(MCP-only; no HTTP surface)* |
 //!
 //! HTTP-only codes (no MCP surface): `PATH_OUTSIDE_PROJECT`, `BRIEFING_BLOCKED`,
-//! `UNAUTHENTICATED`, `BATCH_TOO_LARGE`, `WRITE_DISABLED`, `PROJECT_MISMATCH`.
+//! `UNAUTHENTICATED`, `BATCH_TOO_LARGE`, `WRITE_DISABLED`, `PROJECT_MISMATCH`,
+//! and `BOOTSTRAP_SPAWN_FAILED` (a narrower transport diagnostic).
 
 use serde::Serialize;
 
@@ -72,6 +74,14 @@ pub enum HttpErrorCode {
     /// retryable without operator action (the response body names the
     /// fallback command).
     IndexBuildFailed,
+    /// `serve` could not launch the linked worktree's bootstrap analyzer at
+    /// all. Carried with HTTP 503 and non-retryable until the surfaced
+    /// fallback command is run manually.
+    BootstrapSpawnFailed,
+    /// The linked worktree source root disappeared while `serve` remained
+    /// alive. Carried with HTTP 410; stale graph rows are never served for a
+    /// source tree that no longer exists.
+    SourceRootMissing,
     Internal,
 }
 
@@ -91,6 +101,8 @@ impl HttpErrorCode {
             Self::ProjectMismatch => "PROJECT_MISMATCH",
             Self::IndexBuilding => "INDEX_BUILDING",
             Self::IndexBuildFailed => "INDEX_BUILD_FAILED",
+            Self::BootstrapSpawnFailed => "BOOTSTRAP_SPAWN_FAILED",
+            Self::SourceRootMissing => "SOURCE_ROOT_MISSING",
             Self::Internal => "INTERNAL",
         }
     }
@@ -186,6 +198,8 @@ mod tests {
             HttpErrorCode::ProjectMismatch,
             HttpErrorCode::IndexBuilding,
             HttpErrorCode::IndexBuildFailed,
+            HttpErrorCode::BootstrapSpawnFailed,
+            HttpErrorCode::SourceRootMissing,
             HttpErrorCode::Internal,
         ];
         for code in all {
@@ -214,6 +228,14 @@ mod tests {
         assert_eq!(
             HttpErrorCode::IndexBuildFailed.as_str(),
             "INDEX_BUILD_FAILED"
+        );
+        assert_eq!(
+            HttpErrorCode::BootstrapSpawnFailed.as_str(),
+            "BOOTSTRAP_SPAWN_FAILED"
+        );
+        assert_eq!(
+            HttpErrorCode::SourceRootMissing.as_str(),
+            "SOURCE_ROOT_MISSING"
         );
         assert_eq!(HttpErrorCode::Internal.as_str(), "INTERNAL");
     }

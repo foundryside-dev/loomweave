@@ -1402,12 +1402,12 @@ impl ServerState {
     pub fn with_worktree_gate(
         mut self,
         store_paths: loomweave_core::worktree::StorePaths,
-        source_root: &Path,
+        fallback_argv: Vec<String>,
         bootstrap_spawn_failed: bool,
     ) -> Self {
         self.worktree_gate = Some(WorktreeGate {
             store_paths,
-            fallback_argv: worktree_bootstrap::fallback_argv(source_root),
+            fallback_argv,
             bootstrap_spawn_failed,
         });
         self
@@ -1867,22 +1867,39 @@ impl ServerState {
 
         match read.readiness {
             worktree_bootstrap::WorktreeReadiness::Ready => None,
-            worktree_bootstrap::WorktreeReadiness::Building => Some(tool_json_rpc_response(
-                id,
-                &tool_error_envelope_with_diagnostics(
-                    McpErrorCode::IndexBuilding,
-                    "this linked worktree's isolated index is still building (no completed \
-                     analyze run yet); graph and catalogue tools are unavailable until it \
-                     finishes. project_status_get and analyze_status_get remain available to \
-                     check progress in this same session — no reconnect needed.",
-                    true,
-                    json!({}),
-                    vec![json!({
-                        "run_id": read.run_id,
-                        "fallback_command": gate.fallback_argv,
-                    })],
-                ),
-            )),
+            worktree_bootstrap::WorktreeReadiness::Building => {
+                let (code, message, retryable) = if gate.bootstrap_spawn_failed {
+                    (
+                        McpErrorCode::IndexBuildFailed,
+                        "the linked-worktree bootstrap process could not be spawned; run the \
+                         fallback command manually.",
+                        false,
+                    )
+                } else {
+                    (
+                        McpErrorCode::IndexBuilding,
+                        "this linked worktree's isolated index is still building (no completed \
+                         analyze run yet); graph and catalogue tools are unavailable until it \
+                         finishes. project_status_get and analyze_status_get remain available to \
+                         check progress in this same session — no reconnect needed.",
+                        true,
+                    )
+                };
+                Some(tool_json_rpc_response(
+                    id,
+                    &tool_error_envelope_with_diagnostics(
+                        code,
+                        message,
+                        retryable,
+                        json!({}),
+                        vec![json!({
+                            "run_id": read.run_id,
+                            "bootstrap_state": gate.bootstrap_spawn_failed.then_some("bootstrap-spawn-failed"),
+                            "fallback_command": gate.fallback_argv,
+                        })],
+                    ),
+                ))
+            }
             worktree_bootstrap::WorktreeReadiness::BuildFailed => Some(tool_json_rpc_response(
                 id,
                 &tool_error_envelope_with_diagnostics(
@@ -2242,7 +2259,17 @@ impl ServerState {
         };
         match read.readiness {
             worktree_bootstrap::WorktreeReadiness::Ready => None,
-            worktree_bootstrap::WorktreeReadiness::Building => Some("index-building"),
+            worktree_bootstrap::WorktreeReadiness::Building => {
+                if self
+                    .worktree_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.bootstrap_spawn_failed)
+                {
+                    Some("index-build-failed")
+                } else {
+                    Some("index-building")
+                }
+            }
             worktree_bootstrap::WorktreeReadiness::BuildFailed => Some("index-build-failed"),
         }
     }

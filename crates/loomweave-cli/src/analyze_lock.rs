@@ -15,10 +15,11 @@
 //! guard's `Drop` releases the OS-level lock.
 
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use loomweave_core::worktree::WorktreeContext;
 
 const LOCK_FILE_NAME: &str = "loomweave.lock";
 
@@ -37,6 +38,45 @@ pub(crate) struct AnalyzeLockGuard {
     _file: File,
 }
 
+#[derive(Debug)]
+pub(crate) enum TryAnalyzeLock {
+    Acquired(AnalyzeLockGuard),
+    Held { lock_path: PathBuf },
+}
+
+fn lock_path_for_context(ctx: &WorktreeContext) -> Result<PathBuf> {
+    if let Some(stable_id) = ctx.stable_id.as_deref() {
+        let namespace = ctx.repository_store.join("worktrees");
+        std::fs::create_dir_all(&namespace).with_context(|| {
+            format!(
+                "create worktree analyze-lock namespace {}",
+                namespace.display()
+            )
+        })?;
+        Ok(namespace.join(format!("{stable_id}.lock")))
+    } else {
+        Ok(ctx.effective_store.join(LOCK_FILE_NAME))
+    }
+}
+
+pub(crate) fn try_acquire_analyze_lock_for_context(
+    ctx: &WorktreeContext,
+) -> Result<TryAnalyzeLock> {
+    let lock_path = lock_path_for_context(ctx)?;
+    try_acquire_lock_path(&lock_path)
+}
+
+pub(crate) fn acquire_analyze_lock_for_context(ctx: &WorktreeContext) -> Result<AnalyzeLockGuard> {
+    match try_acquire_analyze_lock_for_context(ctx)? {
+        TryAnalyzeLock::Acquired(guard) => Ok(guard),
+        TryAnalyzeLock::Held { lock_path } => bail!(
+            "another `loomweave analyze` is already in progress against this project \
+             (lock held on {}). Wait for it to finish.",
+            lock_path.display()
+        ),
+    }
+}
+
 /// Acquire an exclusive cross-process lock on `<loomweave_dir>/loomweave.lock`.
 ///
 /// `loomweave_dir` is the `.weft/loomweave/` directory inside the project root. The
@@ -52,16 +92,27 @@ pub(crate) struct AnalyzeLockGuard {
 ///   the conflict.
 pub(crate) fn acquire_analyze_lock(loomweave_dir: &Path) -> Result<AnalyzeLockGuard> {
     let lock_path = loomweave_dir.join(LOCK_FILE_NAME);
+    match try_acquire_lock_path(&lock_path)? {
+        TryAnalyzeLock::Acquired(guard) => Ok(guard),
+        TryAnalyzeLock::Held { lock_path } => bail!(
+            "another `loomweave analyze` is already in progress against this project \
+             (lock held on {}). Wait for it to finish.",
+            lock_path.display()
+        ),
+    }
+}
+
+fn try_acquire_lock_path(lock_path: &Path) -> Result<TryAnalyzeLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)
+        .open(lock_path)
         .with_context(|| format!("open analyze lock file {}", lock_path.display()))?;
 
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(AnalyzeLockGuard { _file: file }),
+        Ok(()) => Ok(TryAnalyzeLock::Acquired(AnalyzeLockGuard { _file: file })),
         Err(err) => {
             // fs2 returns ErrorKind::WouldBlock when another process holds
             // the lock; anything else is a real IO failure (e.g. NFS
@@ -69,12 +120,9 @@ pub(crate) fn acquire_analyze_lock(loomweave_dir: &Path) -> Result<AnalyzeLockGu
             // identify the conflict.
             let kind = err.kind();
             if kind == std::io::ErrorKind::WouldBlock {
-                bail!(
-                    "another `loomweave analyze` is already in progress against this project \
-                     (lock held on {}). Wait for it to finish, or remove the lock file if \
-                     no other process is running.",
-                    lock_path.display()
-                );
+                return Ok(TryAnalyzeLock::Held {
+                    lock_path: lock_path.to_path_buf(),
+                });
             }
             Err(err).with_context(|| {
                 format!(

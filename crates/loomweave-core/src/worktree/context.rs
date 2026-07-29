@@ -26,14 +26,17 @@
 //! failing to prove "linked" is always the safe, local fallback.
 //!
 //! The stable ID that isolates a linked worktree's store
-//! (`wt-<BLAKE3 hex>`) is derived from the Git *administrative* identity —
+//! (`wt-<BLAKE3 hex>`) is normally derived from the Git *administrative* identity —
 //! the path fragment under the common Git directory (e.g.
 //! `worktrees/federation-seam-followups`) — never from the branch, `HEAD`,
 //! dirty state, or absolute filesystem path. That is what lets the ID
 //! survive a branch switch ([`resolve`]'s own admin identity is keyed by
 //! worktree *directory* name, which `git worktree add`/`move` controls, not
 //! `git checkout`) and, once `git worktree repair` has restored the
-//! administrative links, a repository relocation.
+//! administrative links, a repository relocation. When an explicit
+//! `store_dir` override can be shared by unrelated projects, the corresponding
+//! primary project root is also domain-separated into the hash so identical
+//! Git administrative names cannot route two repositories to one directory.
 //!
 //! [`resolve`]: WorktreeContext::resolve
 
@@ -151,8 +154,10 @@ pub struct WorktreeContext {
     /// target here, so a checkout reached through a symlink gets the same
     /// identity as one reached directly).
     pub source_root: PathBuf,
-    /// The canonicalized main-worktree path. Equals `source_root` unless
-    /// `kind` is [`WorktreeKind::Linked`].
+    /// The canonicalized corresponding project path in the main worktree.
+    /// Equals `source_root` unless `kind` is [`WorktreeKind::Linked`]. For a
+    /// nested project resolved at `services/api`, this is the primary
+    /// checkout's `services/api`, not the Git checkout root.
     pub primary_root: PathBuf,
     /// `store_dir(primary_root)` — the primary checkout's store directory. A
     /// `[loomweave].store_dir` override in `weft.toml` DOES apply here: it
@@ -180,7 +185,8 @@ pub struct WorktreeContext {
     pub store_paths: StorePaths,
     /// Which `loomweave.yaml` precedence rung applies.
     pub config_origin: ConfigOrigin,
-    /// `wt-<BLAKE3 hex of the Git administrative identity>`, present only
+    /// `wt-<BLAKE3 hex>` of the Git administrative identity (plus the primary
+    /// project identity under a shared `store_dir` override), present only
     /// when `kind` is [`WorktreeKind::Linked`].
     pub stable_id: Option<String>,
     /// The Git administrative identity `stable_id` is a `BLAKE3` hash of —
@@ -274,10 +280,13 @@ impl WorktreeContext {
     fn linked_store(
         source_root: PathBuf,
         primary_root: PathBuf,
-        stable_id: String,
+        mut stable_id: String,
         admin_identity: String,
     ) -> Self {
         let (repository_store, store_dir_overridden) = store_dir_resolution(&primary_root);
+        if store_dir_overridden {
+            stable_id = stable_id_for_shared_store_project(&primary_root, &admin_identity);
+        }
         let effective_store = repository_store.join("worktrees").join(&stable_id);
         let config_origin = resolve_config_origin(&source_root, &primary_root);
         Self {
@@ -340,13 +349,16 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
     // git-dir — never by directory or branch name (a linked worktree may be
     // misleadingly named "main").
     let mut primary_entry = None;
+    let mut own_entry_path = None;
     for entry in entries {
         let Some(entry_git_dir) = git_dir_of(&entry.path)? else {
             continue;
         };
+        if entry_git_dir == own_git_dir {
+            own_entry_path = Some(entry.path.clone());
+        }
         if entry_git_dir == common_dir {
             primary_entry = Some(entry);
-            break;
         }
     }
 
@@ -368,7 +380,18 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
     // (already-validated) reported string. Guard here too, same as
     // `source_root` — the brief names `primary_root` explicitly among the
     // inputs that must be rejected before any store path is built.
-    let primary_root = require_utf8("primary_root", canonicalize_or_given(&primary_entry.path))?;
+    let Some(own_entry_path) = own_entry_path else {
+        return Ok(GitProbe::Unresolvable);
+    };
+    let own_checkout_root = canonicalize_or_given(&own_entry_path);
+    let Ok(project_suffix) = source.strip_prefix(&own_checkout_root) else {
+        return Ok(GitProbe::Unresolvable);
+    };
+    let primary_checkout_root = canonicalize_or_given(&primary_entry.path);
+    let primary_root = require_utf8(
+        "primary_root",
+        canonicalize_or_given(&primary_checkout_root.join(project_suffix)),
+    )?;
 
     let Ok(admin_identity_path) = own_git_dir.strip_prefix(&common_dir) else {
         // The linked git-dir isn't nested under the common dir at all — an
@@ -419,6 +442,18 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
 #[must_use]
 pub fn stable_id_for_admin_identity(admin_identity: &str) -> String {
     format!("wt-{}", blake3::hash(admin_identity.as_bytes()).to_hex())
+}
+
+fn stable_id_for_shared_store_project(primary_root: &Path, admin_identity: &str) -> String {
+    let primary_root = primary_root
+        .to_str()
+        .expect("WorktreeContext rejects non-UTF-8 primary roots before store routing");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"loomweave.shared-store-project.v1\0");
+    hasher.update(primary_root.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(admin_identity.as_bytes());
+    format!("wt-{}", hasher.finalize().to_hex())
 }
 
 /// This checkout's own (canonicalized) Git directory, or `None` if `dir`

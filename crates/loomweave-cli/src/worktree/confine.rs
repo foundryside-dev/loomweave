@@ -64,6 +64,8 @@ use std::ffi::CStr;
 
 #[cfg(unix)]
 use rustix::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use rustix::fs::{CWD, ResolveFlags, openat2};
 #[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
 use tracing::warn;
@@ -210,18 +212,29 @@ impl WorktreesRoot {
     /// Pin a handle to `worktrees_dir` (normally
     /// `<repository-store>/worktrees/`).
     ///
-    /// The final path component is opened with `O_NOFOLLOW`: if
-    /// `worktrees_dir` itself is a symlink, this refuses rather than
-    /// opening the symlink's target. This step is portable — only
-    /// [`delete_worktree_store`](Self::delete_worktree_store)'s traversal
-    /// beneath the pinned handle is Linux-only.
+    /// On Linux the entire path is opened with `openat2(RESOLVE_NO_SYMLINKS)`,
+    /// so neither the final `worktrees` component nor an intermediate store
+    /// prefix can be substituted with a symlink before the handle is pinned.
+    /// Other Unix targets retain a final-component `O_NOFOLLOW` check and
+    /// subsequently refuse deletion as unsupported.
     ///
     /// # Errors
     ///
     /// Returns an error if `worktrees_dir` cannot be opened as a directory
     /// (missing, not a directory, or a symlink).
     pub fn open(worktrees_dir: &Path) -> io::Result<Self> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            let handle = openat2(
+                CWD,
+                worktrees_dir,
+                OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            )?;
+            Ok(Self { handle })
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             let handle = rustix::fs::open(
                 worktrees_dir,

@@ -121,6 +121,72 @@ fn linked_worktree_resolves_under_primary_store() {
 }
 
 #[test]
+fn linked_nested_project_preserves_its_path_under_the_primary_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    init_repo(&repo, "main");
+    let primary_project = repo.join("services/api");
+    std::fs::create_dir_all(&primary_project).unwrap();
+    std::fs::write(primary_project.join("api.py"), "pass\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "add nested project"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "feature", "../linked"],
+    );
+    let linked_project = dir.path().join("linked/services/api");
+
+    let ctx = WorktreeContext::resolve(&linked_project).expect("resolves nested project");
+
+    assert_eq!(ctx.kind, WorktreeKind::Linked);
+    assert_eq!(
+        ctx.primary_root,
+        std::fs::canonicalize(&primary_project).unwrap(),
+        "the corresponding nested project path in the primary checkout must be retained"
+    );
+    assert_eq!(ctx.repository_store, store_dir(&primary_project));
+}
+
+#[test]
+fn shared_absolute_store_override_namespaces_identical_admin_names_by_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared_store = dir.path().join("shared-store");
+    let mut contexts = Vec::new();
+
+    for parent in ["a", "b"] {
+        let repo = dir.path().join(parent).join("repo");
+        init_repo(&repo, "main");
+        std::fs::write(
+            repo.join("weft.toml"),
+            format!(
+                "[loomweave]\nstore_dir = {:?}\n",
+                shared_store.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        git(&repo, &["add", "weft.toml"]);
+        git(&repo, &["commit", "-qm", "configure shared store"]);
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feature", "../linked"],
+        );
+        contexts.push(
+            WorktreeContext::resolve(&dir.path().join(parent).join("linked"))
+                .expect("resolve linked worktree"),
+        );
+    }
+
+    assert!(contexts.iter().all(|ctx| ctx.store_dir_overridden));
+    assert_eq!(contexts[0].repository_store, shared_store);
+    assert_eq!(contexts[1].repository_store, shared_store);
+    assert_ne!(
+        contexts[0].stable_id, contexts[1].stable_id,
+        "unrelated projects sharing an override must not route the same Git admin name to one store"
+    );
+    assert_ne!(contexts[0].effective_store, contexts[1].effective_store);
+}
+
+#[test]
 fn primary_is_identified_by_git_dir_not_branch_name() {
     let dir = tempfile::tempdir().unwrap();
     // The primary lives in a directory that is NOT named "main" or

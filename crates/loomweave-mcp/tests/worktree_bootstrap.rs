@@ -106,7 +106,7 @@ fn linked_state_with_spawn_outcome(
         .with_tool_policy(McpToolPolicy::allow_write_tools())
         .with_worktree_gate(
             ctx.store_paths.clone(),
-            &ctx.source_root,
+            loomweave_mcp::worktree_bootstrap::fallback_argv(&ctx.source_root, None),
             bootstrap_spawn_failed,
         )
 }
@@ -293,10 +293,21 @@ fn second_serve_does_not_spawn_a_duplicate_analyze() {
     let coord = dir.path().to_path_buf();
     let script = write_lock_race_stub(&coord);
     let target = dir.path().join("target-worktree");
+    let monitor_db = dir.path().join("unused-monitor.db");
     std::fs::create_dir_all(&target).unwrap();
 
-    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(&script, &target, None);
-    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(&script, &target, None);
+    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
+        &script,
+        &target,
+        None,
+        &monitor_db,
+    );
+    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
+        &script,
+        &target,
+        None,
+        &monitor_db,
+    );
 
     wait_until(Duration::from_secs(5), || {
         count_matching(&coord, "done-") == 2

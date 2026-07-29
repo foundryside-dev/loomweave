@@ -1725,7 +1725,19 @@ fn check_mcp_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
 }
 
 fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
-    let Some(config) = read_loomweave_yaml(project_root) else {
+    // `serve` resolves both the inherited config and the published port through
+    // the worktree context. Mirror that routing here: a linked checkout reads
+    // its primary project's config and publishes under its isolated store.
+    let worktree_ctx = loomweave_core::worktree::WorktreeContext::resolve(project_root).ok();
+    let config_path = worktree_ctx.as_ref().map_or_else(
+        || project_root.join("loomweave.yaml"),
+        loomweave_core::worktree::WorktreeContext::config_path,
+    );
+    let port_path = worktree_ctx.as_ref().map_or_else(
+        || project_root.join(".weft/loomweave/ephemeral.port"),
+        |ctx| ctx.store_paths.port.clone(),
+    );
+    let Some(config) = read_loomweave_yaml_at(&config_path) else {
         return DoctorJsonCheck::warning("http.config", "loomweave.yaml is absent or unparseable");
     };
     let enabled = config
@@ -1743,7 +1755,7 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     // ADR-044: prefer the live published port over the (now usually absent)
     // static bind. A running serve publishes .weft/loomweave/ephemeral.port.
     let resolution =
-        loomweave_federation::loomweave_url::resolve_loomweave_url(None, project_root, |name| {
+        loomweave_federation::loomweave_url::resolve_loomweave_url_at(None, &port_path, |name| {
             std::env::var(name).ok()
         });
     if let Some(url) = resolution.resolved_url {
@@ -1753,9 +1765,10 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
             return DoctorJsonCheck::warning(
                 "http.config",
                 format!(
-                    "stale HTTP read-API port metadata in .weft/loomweave/ephemeral.port: \
+                    "stale HTTP read-API port metadata in {}: \
                      {url}{HTTP_LIVENESS_PATH} is not reachable; start `loomweave serve` or \
-                     ignore this persisted port when .mcp.json launches the stdio runtime"
+                     ignore this persisted port when .mcp.json launches the stdio runtime",
+                    port_path.display()
                 ),
             );
         }
@@ -1773,7 +1786,10 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     if bind.trim().is_empty() {
         DoctorJsonCheck::ok(
             "http.config",
-            "HTTP enabled; read-API port auto-selected and published to .weft/loomweave/ephemeral.port while serving",
+            format!(
+                "HTTP enabled; read-API port auto-selected and published to {} while serving",
+                port_path.display()
+            ),
         )
     } else {
         DoctorJsonCheck::ok(
@@ -2299,7 +2315,11 @@ fn check_integration_bindings_json(project_root: &Path, fix: bool) -> DoctorJson
 }
 
 fn read_loomweave_yaml(project_root: &Path) -> Option<Value> {
-    let raw = fs::read_to_string(project_root.join("loomweave.yaml")).ok()?;
+    read_loomweave_yaml_at(&project_root.join("loomweave.yaml"))
+}
+
+fn read_loomweave_yaml_at(config_path: &Path) -> Option<Value> {
+    let raw = fs::read_to_string(config_path).ok()?;
     serde_norway::from_str(&raw).ok()
 }
 

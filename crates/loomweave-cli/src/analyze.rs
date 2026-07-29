@@ -22,7 +22,7 @@ use serde::Serialize;
 use time::{OffsetDateTime, macros::format_description};
 use uuid::Uuid;
 
-use loomweave_core::plugin::host::FINDING_PLUGIN_ABORTED;
+use loomweave_core::plugin::{FINDING_MALFORMED_FINDING, host::FINDING_PLUGIN_ABORTED};
 use loomweave_core::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, CrashLoopBreaker, CrashLoopState,
     DiscoveredPlugin, FINDING_DISABLED_CRASH_LOOP, HostError, HostFinding, UnresolvedCallSite,
@@ -373,6 +373,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             worktree_ctx.primary_root.display()
         );
     }
+    // The lock path for a linked worktree is stable in the repository-level
+    // `worktrees/` namespace, so it exists before the candidate store does and
+    // remains the same even if validation rebuilds that candidate. Holding it
+    // before `ensure_isolated_store` prevents first-use serve/SessionStart
+    // races from deleting half-written metadata or migrating one SQLite file
+    // concurrently. It remains held through the writer actor's final join.
+    let _analyze_lock = crate::analyze_lock::acquire_analyze_lock_for_context(&worktree_ctx)?;
     // A no-op for a standalone/main context; for a linked worktree this
     // creates, reuses, or (on a stale/mismatched metadata.json) deletes via
     // the confined primitive and rebuilds the isolated store — see
@@ -414,11 +421,6 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     .collect();
     let loomweave_dir = worktree_ctx.effective_store.clone();
     let db_path = worktree_ctx.store_paths.db.clone();
-
-    // Cross-process advisory lock (STO-01). Must outlive the writer-actor's
-    // `handle.await` at the bottom of this function — see the drop-order
-    // note on `AnalyzeLockGuard`. Drop on function exit releases the lock.
-    let _analyze_lock = crate::analyze_lock::acquire_analyze_lock(&loomweave_dir)?;
 
     // Apply any pending schema migrations before opening the writer. `install`
     // is the usual migrator, but a binary upgrade that adds a migration the run
@@ -540,25 +542,24 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // classifier coverage); if that empties the set, the run fails via the
     // discovery-error path below rather than reporting `skipped_no_plugins`.
     {
-        let mut prefix_counts: std::collections::BTreeMap<&str, usize> =
-            std::collections::BTreeMap::new();
-        for plugin in &plugins {
-            *prefix_counts
-                .entry(plugin.manifest.ontology.rule_id_prefix.as_str())
-                .or_insert(0) += 1;
+        let mut colliding = BTreeSet::new();
+        for (left, left_plugin) in plugins.iter().enumerate() {
+            let left_prefix = &left_plugin.manifest.ontology.rule_id_prefix;
+            for right_plugin in plugins.iter().skip(left + 1) {
+                let right_prefix = &right_plugin.manifest.ontology.rule_id_prefix;
+                if left_prefix.starts_with(right_prefix) || right_prefix.starts_with(left_prefix) {
+                    colliding.insert(left_prefix.clone());
+                    colliding.insert(right_prefix.clone());
+                }
+            }
         }
-        let colliding: Vec<String> = prefix_counts
-            .iter()
-            .filter(|(_, count)| **count > 1)
-            .map(|(prefix, _)| (*prefix).to_owned())
-            .collect();
         plugins.retain(|plugin| {
             let prefix = &plugin.manifest.ontology.rule_id_prefix;
-            if colliding.iter().any(|c| c == prefix) {
+            if colliding.contains(prefix) {
                 let msg = format!(
-                    "plugin {:?} dropped: rule_id_prefix {prefix:?} is also declared by another \
-                     discovered plugin — prefixes must be unique per plugin, or findings and the \
-                     syntax-finding sweep cannot be safely attributed",
+                    "plugin {:?} dropped: rule_id_prefix {prefix:?} equals or overlaps another \
+                     discovered plugin's prefix — prefixes must be disjoint per plugin, or \
+                     starts_with validation and syntax-finding sweeps cannot be safely attributed",
                     plugin.manifest.plugin.plugin_id
                 );
                 tracing::error!(error = %msg, "skipping plugin: rule_id_prefix collision");
@@ -671,6 +672,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         println!("analyze complete: run {run_id} skipped_no_plugins");
         return Ok(());
     }
+
+    let plugin_discovery_complete = discovery_errors.is_empty();
 
     // ── Build extension union for the tree walk ───────────────────────────────
     let mut wanted_extensions: BTreeSet<String> = BTreeSet::new();
@@ -1755,7 +1758,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             // `mark_unseen=true` — which Filigree rejects 400 ("requires at least
             // one finding or scanned path"). `--resume` never sweeps
             // (REQ-FINDING-05).
-            !resume && skipped_files_total == 0,
+            !resume && skipped_files_total == 0 && plugin_discovery_complete,
             // Final/only completing batch for the during-run findings; the
             // Phase-8c follow-up (if any) is additive (`complete_scan_run=false`).
             true,
@@ -2052,7 +2055,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &run_id,
                 // Runs that skipped files do not sweep (see Phase-8 note); only a
                 // run that examined the whole corpus may mark findings unseen.
-                !resume && skipped_files_total == 0,
+                !resume && skipped_files_total == 0 && plugin_discovery_complete,
                 false,
                 Some(POST_RUN_FINDING_RULES),
                 options.config_path.as_deref(),
@@ -2116,6 +2119,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 && skipped_files_total == 0
                 && source_walk_skipped_entries == 0
                 && secret_scan_sidecar_skipped == 0
+                && plugin_discovery_complete
                 && !options.no_sei
             {
                 match writer
@@ -2456,6 +2460,7 @@ fn classifier_evidence_was_rejected(subcode: &str) -> bool {
             | "LMWV-INFRA-PLUGIN-ENTITY-CAP"
             | "LMWV-INFRA-HOST-NON-UTF8-PATH"
             | "LMWV-INFRA-PLUGIN-MALFORMED-ENTITY"
+            | FINDING_MALFORMED_FINDING
             | "LMWV-INFRA-PLUGIN-ENTITY-FIELD-OVERSIZE"
             | "LMWV-INFRA-PLUGIN-JAIL-OPEN-FAILED"
             | DUPLICATE_LOCATOR_RULE_ID
@@ -8727,6 +8732,9 @@ mod tests {
     fn classifier_coverage_only_fails_for_rejected_entity_evidence() {
         assert!(classifier_evidence_was_rejected(
             "LMWV-INFRA-PLUGIN-MALFORMED-ENTITY"
+        ));
+        assert!(classifier_evidence_was_rejected(
+            "LMWV-INFRA-PLUGIN-MALFORMED-FINDING"
         ));
         assert!(classifier_evidence_was_rejected(DUPLICATE_LOCATOR_RULE_ID));
         assert!(!classifier_evidence_was_rejected(

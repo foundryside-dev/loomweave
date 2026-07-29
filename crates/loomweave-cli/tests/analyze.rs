@@ -6456,3 +6456,120 @@ fn analyze_fails_loud_on_rule_id_prefix_collision() {
         .expect("query latest run status");
     assert_eq!(status, "failed", "the run row must record the failure");
 }
+
+#[cfg(unix)]
+#[test]
+fn analyze_rejects_overlapping_rule_id_prefixes() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let short_dir = tempfile::tempdir().unwrap();
+    let long_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin_variant(
+        short_dir.path(),
+        "loomweave-plugin-short-prefix",
+        "shortprefix",
+        "LMWV-X-",
+        "0.1.0",
+    );
+    write_sweep_plugin_variant(
+        long_dir.path(),
+        "loomweave-plugin-long-prefix",
+        "longprefix",
+        "LMWV-X-Y-",
+        "0.1.0",
+    );
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+    let plugin_path = std::env::join_paths([
+        short_dir.path().to_path_buf(),
+        long_dir.path().to_path_buf(),
+    ])
+    .unwrap();
+
+    let output = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", plugin_path)
+        .output()
+        .expect("run analyze");
+
+    assert!(
+        !output.status.success(),
+        "a starts_with-overlapping prefix pair must be rejected before either plugin can sweep"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rule_id_prefix"),
+        "the overlap failure must name the unsafe manifest field"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_drops_disable_the_global_stale_finding_sweep() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let safe_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin_variant(
+        a_dir.path(),
+        "loomweave-plugin-colliding-a",
+        "collidinga",
+        "LMWV-SWP-",
+        "0.1.0",
+    );
+    write_sweep_plugin_variant(
+        b_dir.path(),
+        "loomweave-plugin-colliding-b",
+        "collidingb",
+        "LMWV-SWP-",
+        "0.1.0",
+    );
+    write_sweep_plugin_variant(
+        safe_dir.path(),
+        "loomweave-plugin-safe-c",
+        "safec",
+        "LMWV-SAFE-",
+        "0.1.0",
+    );
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN\n").unwrap();
+
+    let only_a = std::env::join_paths([a_dir.path().to_path_buf()]).unwrap();
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", only_a)
+        .assert()
+        .success();
+    assert_eq!(
+        finding_count_for_rule(project_dir.path(), "LMWV-SWP-SYNTAX-ERROR"),
+        1,
+        "the first run must seed the finding owned by plugin A"
+    );
+
+    let collision_plus_safe = std::env::join_paths([
+        a_dir.path().to_path_buf(),
+        b_dir.path().to_path_buf(),
+        safe_dir.path().to_path_buf(),
+    ])
+    .unwrap();
+    loomweave_bin()
+        .args(["analyze", "--no-incremental"])
+        .arg(project_dir.path())
+        .env("PATH", collision_plus_safe)
+        .assert()
+        .success();
+
+    assert_eq!(
+        finding_count_for_rule(project_dir.path(), "LMWV-SWP-SYNTAX-ERROR"),
+        1,
+        "dropping plugin A during discovery means the run never re-examined its finding and has no authority to retire it"
+    );
+}

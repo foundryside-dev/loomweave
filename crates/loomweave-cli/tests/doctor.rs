@@ -398,6 +398,41 @@ fn spawn_one_shot_health_server() -> (u16, std::thread::JoinHandle<()>) {
     (port, handle)
 }
 
+fn spawn_bounded_health_server() -> (u16, std::thread::JoinHandle<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bounded health server");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0_u8; 512];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"ok":true}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    return true;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > std::time::Duration::from_secs(2) {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("accept bounded health probe: {err}"),
+            }
+        }
+    });
+    (port, handle)
+}
+
 /// Like [`spawn_one_shot_health_server`] but answers 200 ONLY on
 /// `expected_path`, 404 otherwise — the real read API's contract.
 ///
@@ -1113,6 +1148,34 @@ fn doctor_reports_published_ephemeral_port() {
             .unwrap_or("")
             .contains(&port.to_string()),
         "http.config should report the published live port: {http}"
+    );
+}
+
+#[test]
+fn doctor_probes_the_isolated_port_for_a_linked_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+    let ctx = loomweave_core::worktree::WorktreeContext::resolve(&linked)
+        .expect("resolve linked worktree");
+    loomweave_cli::worktree::store::ensure_isolated_store(&ctx).expect("create isolated store");
+    let (port, handle) = spawn_bounded_health_server();
+    std::fs::write(&ctx.store_paths.port, format!("{port}\n")).unwrap();
+
+    let (_code, json) = doctor_json(&linked, false);
+    let probed = handle.join().expect("health server joins");
+
+    assert!(
+        probed,
+        "doctor never probed the isolated published port: {json}"
+    );
+    let http = check(&json, "http.config");
+    assert_eq!(http["status"], "ok", "{http}");
+    assert!(
+        http["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&port.to_string()),
+        "doctor must report the port published under the routed isolated store: {http}"
     );
 }
 

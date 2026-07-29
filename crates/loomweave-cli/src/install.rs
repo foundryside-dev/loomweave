@@ -60,6 +60,10 @@ ephemeral.port
 instance_id
 *.lock
 
+# Linked-worktree isolated indexes: metadata.json, databases, and stable
+# analyze-lock sentinels are all regenerable machine-local state.
+worktrees/
+
 # SQLite write-ahead files never belong in the repo.
 *-wal
 *-shm
@@ -620,7 +624,15 @@ fn initialise_db(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstallComponent, InstallPlan};
+    use super::{GITIGNORE_CONTENTS, InstallComponent, InstallPlan};
+
+    #[test]
+    fn canonical_gitignore_excludes_the_isolated_worktree_namespace() {
+        assert!(
+            GITIGNORE_CONTENTS.lines().any(|line| line == "worktrees/"),
+            "metadata.json and databases under worktrees/<stable-id>/ are runtime cache state"
+        );
+    }
 
     #[test]
     fn from_components_truth_table() {
