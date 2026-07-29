@@ -380,6 +380,16 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
         .to_str()
         .ok_or_else(|| WorktreeContextError::non_utf8_path("admin-identity", admin_identity_path))?
         .to_owned();
+    // Windows: `Path::strip_prefix` yields `worktrees\<name>`, but the
+    // stable-ID contract (and the sweep, which hashes `"worktrees/" +
+    // <readdir name>`) pins the forward-slash form — without this the
+    // resolver and the sweep would hash DIVERGENT identities and the sweep
+    // would read every live store as unregistered (clarion-4cd5b0b3b9).
+    // Unix stays byte-exact: `\` is a legal filename byte there, and
+    // rewriting it would desynchronize this identity from the sweep's raw
+    // `readdir` name in the opposite direction.
+    #[cfg(windows)]
+    let admin_identity = admin_identity.replace('\\', "/");
 
     let stable_id = stable_id_for_admin_identity(&admin_identity);
 
