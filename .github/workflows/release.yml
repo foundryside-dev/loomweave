@@ -450,9 +450,10 @@ jobs:
     runs-on: ubuntu-latest
     # crates.io has no TestPyPI analogue, so this publishes ONLY on a pushed v*
     # tag (verify-gated, on a commit asserted to be on main). cargo publish is
-    # idempotent here: an already-uploaded version counts as success, so a re-run
-    # after a partial failure is safe. Crates upload leaf -> root; each upload
-    # waits for the crates.io index before its dependents publish.
+    # intentionally fails on every upload error, including an existing version,
+    # so a re-run cannot trust an unverified registry artifact. Crates upload
+    # leaf -> root; each upload waits for the crates.io index before its
+    # dependents publish.
     # loomweave-plugin-fixture is publish=false (test-only) and omitted.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -499,9 +500,6 @@ jobs:
             printf '%s\n' "$output"
             if [ "$status" -eq 0 ]; then
               echo "$crate published"
-              wait_for_registry "$crate"
-            elif grep -Eq "already uploaded|already exists|is already uploaded" <<<"$output"; then
-              echo "$crate already published, skipping"
               wait_for_registry "$crate"
             else
               echo "::error::$crate failed to publish"
