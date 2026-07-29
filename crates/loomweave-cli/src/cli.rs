@@ -273,6 +273,12 @@ pub enum WorktreeCommand {
         #[arg(long)]
         no_incremental: bool,
 
+        /// Path to loomweave.yaml. Defaults to the worktree's own, falling
+        /// back to the primary checkout's (the same precedence `serve`
+        /// reports for this checkout).
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+
         /// Git worktree name or filesystem path.
         target: String,
     },

@@ -380,6 +380,25 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     loomweave_cli::worktree::store::ensure_isolated_store(&worktree_ctx)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("ensure worktree-isolated store")?;
+    // Effective config resolution (clarion-c39b92b868): an explicit --config
+    // wins; otherwise the resolved context's ladder — the source root's
+    // `loomweave.yaml`, falling through to the primary root's for a linked
+    // worktree — exactly the file `serve` reports as active for this same
+    // checkout. Byte-identical to the old bare `project_root` join for
+    // standalone/main contexts. Resolved ONCE here, so every downstream
+    // consumer (AnalyzeConfig, finding emission, embeddings) reads the same
+    // file; only-if-exists mirrors serve's guard — an absent ladder file
+    // means defaults, not an error.
+    let options = {
+        let mut options = options;
+        if options.config_path.is_none() {
+            let ladder = worktree_ctx.config_path();
+            if ladder.exists() {
+                options.config_path = Some(ladder);
+            }
+        }
+        options
+    };
     let loomweave_dir = worktree_ctx.effective_store.clone();
     let db_path = worktree_ctx.store_paths.db.clone();
 

@@ -284,8 +284,8 @@ fn second_serve_does_not_spawn_a_duplicate_analyze() {
     let target = dir.path().join("target-worktree");
     std::fs::create_dir_all(&target).unwrap();
 
-    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(&script, &target);
-    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(&script, &target);
+    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(&script, &target, None);
+    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(&script, &target, None);
 
     wait_until(Duration::from_secs(5), || {
         count_matching(&coord, "done-") == 2

@@ -106,7 +106,7 @@ fn run_linked_worktree(
     config_path: Option<&Path>,
     worktree_ctx: &loomweave_core::worktree::WorktreeContext,
 ) -> Result<()> {
-    bootstrap_linked_worktree(worktree_ctx, None)?;
+    bootstrap_linked_worktree(worktree_ctx, None, config_path)?;
     let db_path = worktree_ctx.store_paths.db.clone();
     run_server(db_path, config_path, worktree_ctx, true)
 }
@@ -126,6 +126,10 @@ fn run_linked_worktree(
 fn bootstrap_linked_worktree(
     worktree_ctx: &loomweave_core::worktree::WorktreeContext,
     analyze_program: Option<&Path>,
+    // serve's own explicit `--config`, forwarded verbatim to the spawned
+    // analyze (clarion-c39b92b868). `None` (the default ladder) needs no
+    // forwarding: the child re-derives the same source→primary ladder.
+    explicit_config: Option<&Path>,
 ) -> Result<()> {
     // `ensure_isolated_store`'s own contract: an un-`install`ed primary is
     // this caller's error to diagnose, not something it silently half-creates
@@ -191,6 +195,7 @@ fn bootstrap_linked_worktree(
         Ok(program) => loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
             &program,
             &worktree_ctx.source_root,
+            explicit_config,
         ),
         Err(err) => tracing::warn!(
             error = %err,
@@ -916,7 +921,8 @@ mod tests {
         let argv_dump = tmp.path().join("argv.txt");
         let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
 
-        bootstrap_linked_worktree(&ctx, Some(&stub)).expect("bootstrap on an unbuilt worktree");
+        bootstrap_linked_worktree(&ctx, Some(&stub), None)
+            .expect("bootstrap on an unbuilt worktree");
 
         wait_for_file(&argv_dump, StdDuration::from_secs(5));
         let argv = fs::read_to_string(&argv_dump).expect("stub wrote argv");
@@ -931,6 +937,43 @@ mod tests {
             ],
             "the bootstrap spawn's argv must be exactly `worktree analyze -- <target>`, not the \
              hook's plain-analyze argv"
+        );
+    }
+
+    /// clarion-c39b92b868: serve's own explicit `--config` is forwarded
+    /// verbatim to the spawned analyze — the one config input the child
+    /// cannot re-derive. (The ladder default needs no forwarding: the child
+    /// re-derives the same source→primary ladder, pinned by
+    /// `worktree_analyze_uses_primary_config_when_worktree_has_none` in
+    /// `tests/worktree_analyze.rs`.)
+    #[test]
+    #[cfg(unix)]
+    fn bootstrap_spawn_forwards_serves_explicit_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        install_primary(&ctx);
+
+        let argv_dump = tmp.path().join("argv.txt");
+        let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
+        let explicit = tmp.path().join("explicit.yaml");
+
+        bootstrap_linked_worktree(&ctx, Some(&stub), Some(&explicit))
+            .expect("bootstrap with explicit config");
+
+        wait_for_file(&argv_dump, StdDuration::from_secs(5));
+        let argv = fs::read_to_string(&argv_dump).expect("stub wrote argv");
+        let forwarded: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            forwarded,
+            vec![
+                "worktree",
+                "analyze",
+                "--config",
+                explicit.to_str().unwrap(),
+                "--",
+                ctx.source_root.to_str().unwrap()
+            ],
+            "an explicit serve --config must reach the spawned analyze"
         );
     }
 
@@ -959,7 +1002,7 @@ mod tests {
         let argv_dump = tmp.path().join("argv.txt");
         let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
 
-        bootstrap_linked_worktree(&ctx, Some(&stub)).expect("bootstrap on a built worktree");
+        bootstrap_linked_worktree(&ctx, Some(&stub), None).expect("bootstrap on a built worktree");
 
         // Deterministic, no wait needed: `bootstrap_linked_worktree` decides
         // whether to spawn synchronously, inside this call, before returning

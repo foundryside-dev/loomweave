@@ -172,11 +172,21 @@ pub fn fallback_argv(target: &Path) -> Vec<String> {
 /// (true fire-and-forget, mirroring `hook.rs::spawn_detached_analyze`'s
 /// detachment technique). Tests use this function directly so they can
 /// deterministically `wait()` on the child instead of polling.
-pub(crate) fn spawn_worktree_analyze(program: &Path, target: &Path) -> std::io::Result<Child> {
+pub(crate) fn spawn_worktree_analyze(
+    program: &Path,
+    target: &Path,
+    explicit_config: Option<&Path>,
+) -> std::io::Result<Child> {
     let mut command = Command::new(program);
+    command.arg("worktree").arg("analyze");
+    // Forward ONLY an explicit `--config` (clarion-c39b92b868): with none,
+    // the child re-derives the same source→primary ladder `serve` used, so
+    // no forwarding is needed — but an operator-supplied explicit path is
+    // information the child cannot re-derive.
+    if let Some(config) = explicit_config {
+        command.arg("--config").arg(config);
+    }
     command
-        .arg("worktree")
-        .arg("analyze")
         .arg("--")
         .arg(target)
         .stdin(Stdio::null())
@@ -199,8 +209,12 @@ pub(crate) fn spawn_worktree_analyze(program: &Path, target: &Path) -> std::io::
 /// the executable disappeared) is logged and swallowed — `serve` must keep
 /// running in the `building` state either way; the documented fallback is
 /// running `loomweave worktree analyze` by hand.
-pub fn spawn_detached_worktree_analyze(program: &Path, target: &Path) {
-    match spawn_worktree_analyze(program, target) {
+pub fn spawn_detached_worktree_analyze(
+    program: &Path,
+    target: &Path,
+    explicit_config: Option<&Path>,
+) {
+    match spawn_worktree_analyze(program, target, explicit_config) {
         Ok(_child) => {}
         Err(err) => {
             tracing::warn!(
@@ -423,7 +437,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         drop(file);
 
-        let mut child = spawn_worktree_analyze(&script, dir.path()).expect("spawn stub");
+        let mut child = spawn_worktree_analyze(&script, dir.path(), None).expect("spawn stub");
         child.wait().expect("reap stub");
 
         let where_fd1 = std::fs::read_to_string(&marker).expect("stub wrote fd1 target");
@@ -455,7 +469,7 @@ mod tests {
         drop(file);
 
         let target = dir.path().join("target-worktree");
-        let mut child = spawn_worktree_analyze(&script, &target).expect("spawn stub");
+        let mut child = spawn_worktree_analyze(&script, &target, None).expect("spawn stub");
         child.wait().expect("reap stub");
 
         let argv = std::fs::read_to_string(&argv_dump).expect("stub wrote argv");
