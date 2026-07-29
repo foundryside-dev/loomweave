@@ -29,12 +29,11 @@
 //! file is fail-soft: any missing/corrupt/out-of-range content degrades to the
 //! configured URL.
 //!
-//! Precedence (C-9 §2.2, highest wins; see [`resolve_filigree_url`] for the
-//! full contract): `WEFT_FILIGREE_URL` env → `weft.toml [filigree].url` →
-//! `.weft/filigree/ephemeral.port` → configured `base_url`. The operator's
-//! durable env / `weft.toml` declarations (used verbatim) sit *above* on-disk
-//! port discovery — they name a Filigree that may be remote, with no local port
-//! file. Every rung is fail-soft.
+//! Precedence (highest wins; see [`resolve_filigree_url`] for the full
+//! contract): `WEFT_FILIGREE_URL` env → `.weft/filigree/ephemeral.port` →
+//! configured `base_url`. A project-local `weft.toml` is deliberately not an
+//! endpoint source: repositories may be untrusted, while Filigree requests can
+//! carry federation credentials and private scan data. Every rung is fail-soft.
 //!
 //! Scope: ethereal mode only. Filigree's `server` mode resolves through a
 //! home-directory global (`~/.config/filigree/server.json`); that path is not
@@ -55,9 +54,9 @@ pub const SOURCE_DISABLED: &str = "disabled";
 /// `WEFT_<X>_URL` spelling) — a per-process operator declaration that outranks
 /// every durable/on-disk source.
 pub const SOURCE_ENV: &str = "env:WEFT_FILIGREE_URL";
-/// The operator-declared durable endpoint `weft.toml [filigree].url` (C-9 §2.2
-/// rung-3). Outranks on-disk port discovery: it is the operator's explicit
-/// "Filigree is here" (e.g. a remote host with no local `ephemeral.port`).
+/// Legacy source label retained for API compatibility. Filigree resolution no
+/// longer emits it because project-local `weft.toml` is not a trusted endpoint
+/// source for credential-bearing requests.
 pub const SOURCE_WEFT_TOML: &str = "weft.toml";
 /// The live ethereal port published by Filigree's running dashboard at the
 /// consolidated `.weft/filigree/` location — the only location read (ADR-046).
@@ -83,24 +82,21 @@ pub struct FiligreeUrlResolution {
 /// Highest wins, after the enabled short-circuit:
 /// 1. `WEFT_FILIGREE_URL` env (`getenv`) → `source = "env:WEFT_FILIGREE_URL"`,
 ///    used verbatim — a per-process operator override.
-/// 2. `weft.toml [filigree].url` → `source = "weft.toml"`, used verbatim — the
-///    operator's durable declaration (e.g. a remote Filigree with no local
-///    `ephemeral.port`). Outranks on-disk discovery by design (§2.2).
-/// 3. A valid `<project_root>/.weft/filigree/ephemeral.port` → the configured
+/// 2. A valid `<project_root>/.weft/filigree/ephemeral.port` → the configured
 ///    URL with its port overridden by the live port,
 ///    `source = ".weft/filigree/ephemeral.port"`.
-/// 4. Otherwise → the configured URL unchanged, `source = "config"`. A port file
+/// 3. Otherwise → the configured URL unchanged, `source = "config"`. A port file
 ///    present only at the pre-consolidation `.filigree/` path is **not** read;
 ///    it folds here, so a mis-sequenced cutover is visible (not a stale
 ///    resolve).
 ///
-/// - Disabled → no resolved URL, `source = "disabled"` (the env/weft.toml rungs
-///   do not revive a disabled integration).
+/// - Disabled → no resolved URL, `source = "disabled"` (the env rung does not
+///   revive a disabled integration).
 ///
 /// `getenv` is injected (rather than reading `std::env` directly) so the rung is
 /// testable without mutating process env; production passes
-/// `|name| std::env::var(name).ok()`. Both the env and `weft.toml` rungs are
-/// fail-soft: a blank/absent value falls through to the next rung.
+/// `|name| std::env::var(name).ok()`. The env rung is fail-soft: a blank/absent
+/// value falls through to the next rung.
 #[must_use]
 pub fn resolve_filigree_url(
     config: &FiligreeConfig,
@@ -125,16 +121,7 @@ pub fn resolve_filigree_url(
             source: SOURCE_ENV,
         };
     }
-    // Rung 2: weft.toml [filigree].url, used verbatim (outranks on-disk port).
-    if let Some(url) = loomweave_core::store::sibling_url(project_root, "filigree") {
-        return FiligreeUrlResolution {
-            enabled: true,
-            configured_url,
-            resolved_url: Some(url),
-            source: SOURCE_WEFT_TOML,
-        };
-    }
-    // Rung 3: live ethereal port overrides the configured URL's port.
+    // Rung 2: live ethereal port overrides the configured URL's port.
     match read_ephemeral_port(project_root) {
         Some((port, source)) => {
             let resolved = override_port(&configured_url, port);
@@ -145,7 +132,7 @@ pub fn resolve_filigree_url(
                 source,
             }
         }
-        // Rung 4: configured base_url unchanged.
+        // Rung 3: configured base_url unchanged.
         None => FiligreeUrlResolution {
             enabled: true,
             resolved_url: Some(configured_url.clone()),
@@ -338,15 +325,23 @@ mod tests {
     }
 
     #[test]
-    fn weft_toml_url_wins_verbatim_over_live_port() {
-        // The operator's durable declaration (e.g. a remote Filigree) outranks
-        // the on-disk live port (§2.2 rung-3 above rung-4).
+    fn untrusted_weft_toml_url_cannot_redirect_filigree_traffic() {
         let dir = tempfile::tempdir().unwrap();
         write_weft_port_file(dir.path(), "8542\n");
         write_weft_url(dir.path(), "filigree", "http://remote-host:8749");
         let res = resolve_filigree_url(&enabled_config(), dir.path(), |_| None);
-        assert_eq!(res.resolved_url.as_deref(), Some("http://remote-host:8749"));
-        assert_eq!(res.source, SOURCE_WEFT_TOML);
+        assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8542"));
+        assert_eq!(res.source, SOURCE_EPHEMERAL_PORT);
+
+        let dir_without_port = tempfile::tempdir().unwrap();
+        write_weft_url(
+            dir_without_port.path(),
+            "filigree",
+            "http://remote-host:8749",
+        );
+        let res = resolve_filigree_url(&enabled_config(), dir_without_port.path(), |_| None);
+        assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8766"));
+        assert_eq!(res.source, SOURCE_CONFIG);
     }
 
     #[test]
