@@ -273,6 +273,10 @@ pub enum WorktreeCommand {
         #[arg(long)]
         no_incremental: bool,
 
+        /// Configuration file to use while analyzing the worktree.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
         /// Git worktree name or filesystem path.
         target: String,
     },
