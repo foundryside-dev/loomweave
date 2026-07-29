@@ -32,8 +32,11 @@ use rusqlite::Connection;
 /// **Governed by "does a completed row exist at all," not "the most recent
 /// row"**: once any run has completed, readiness is `Ready` regardless of
 /// what a *later* run row says — see [`read_worktree_readiness`] for why.
+/// Public (not `pub(crate)`): `loomweave-cli`'s HTTP read API gates on the
+/// same readiness consult as the MCP tools (clarion-ecf882f230), so the
+/// classification and the query live here exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorktreeReadiness {
+pub enum WorktreeReadiness {
     /// No run has ever completed: either no run row exists yet, or the most
     /// recent row (by `started_at`) is `running` (or an unrecognized future
     /// status).
@@ -51,9 +54,9 @@ pub(crate) enum WorktreeReadiness {
 /// The outcome of a readiness read: the classified state plus the run id (if
 /// any row exists at all) so callers can surface it in error diagnostics.
 #[derive(Debug, Clone)]
-pub(crate) struct ReadinessRead {
-    pub(crate) readiness: WorktreeReadiness,
-    pub(crate) run_id: Option<String>,
+pub struct ReadinessRead {
+    pub readiness: WorktreeReadiness,
+    pub run_id: Option<String>,
 }
 
 /// Classify readiness from a single `runs.status` value, or `None` when no
@@ -101,7 +104,7 @@ pub(crate) fn classify_readiness(status: Option<&str>) -> WorktreeReadiness {
 /// Fail-safe on a query error: logs a warning and reports [`WorktreeReadiness::Building`]
 /// rather than risk answering `Ready` (and unblocking graph tools) against a
 /// read that could not actually be verified.
-pub(crate) fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
+pub fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
     match conn.query_row(
         "SELECT id, status FROM runs \
          ORDER BY \

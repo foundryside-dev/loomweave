@@ -302,6 +302,14 @@ fn run_server(
     let readers = ReaderPool::open_validated(&db_path, 16)
         .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
     let http_project_root = project_root.clone();
+    // The HTTP read API gates on the SAME `gated` flag as the MCP stdio gate
+    // below (clarion-ecf882f230): a linked-worktree bootstrap must not serve
+    // well-formed empty federation answers over the still-building store.
+    // Same fallback argv as `with_worktree_gate` so both surfaces name one
+    // recovery command.
+    let http_worktree_gate = gated.then(|| crate::http_read::WorktreeHttpGate {
+        fallback_argv: loomweave_mcp::worktree_bootstrap::fallback_argv(&project_root),
+    });
     let http_server = crate::http_read::spawn(
         http_project_root,
         db_path.clone(),
@@ -309,6 +317,7 @@ fn run_server(
         instance_id,
         worktree_ctx.store_paths.port.clone(),
         &config.serve.http,
+        http_worktree_gate,
     )
     .context("start HTTP read API")?;
     if let Some(server) = http_server.as_ref() {

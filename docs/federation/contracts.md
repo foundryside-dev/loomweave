@@ -312,13 +312,25 @@ All non-2xx responses use this closed JSON error envelope:
 The `code` enum is closed to `INVALID_PATH`,
 `PATH_OUTSIDE_PROJECT`, `NOT_FOUND`, `BRIEFING_BLOCKED`, `UNAUTHENTICATED`,
 `STORAGE_ERROR`, `BATCH_TOO_LARGE`, `WRITE_DISABLED`, `PROJECT_MISMATCH`,
-and `INTERNAL`. Clients must switch on `code`; `error` is human-readable
-diagnostic text. `WRITE_DISABLED` and `PROJECT_MISMATCH` are emitted only by
-the `/api/wardline/*` routes (see
+`INDEX_BUILDING`, `INDEX_BUILD_FAILED`, and `INTERNAL`. Clients must switch on
+`code`; `error` is human-readable diagnostic text. `WRITE_DISABLED` and
+`PROJECT_MISMATCH` are emitted only by the `/api/wardline/*` routes (see
 [Wardline taint-fact store](#wardline-taint-fact-store-sp9)). `BATCH_TOO_LARGE`
 is emitted by `POST /api/v1/files/batch` (as `400`) and by the `/api/wardline/*`
 batch routes (as `413`) — the same `code` carries a **different HTTP status by
 endpoint**, so a client must route on `code`, not on status.
+
+`INDEX_BUILDING` and `INDEX_BUILD_FAILED` (both `503`) are emitted by every
+data route — `/api/v1/*` except `_capabilities`, and all `/api/wardline/*`
+routes — when the serving instance is a **linked-worktree bootstrap** whose
+isolated index has no completed analyze run yet (the HTTP analog of the MCP
+`index-building`/`index-build-failed` envelopes). The body additionally
+carries `retryable` (`true` only for `INDEX_BUILDING`, which also sends
+`Retry-After: 30`), `run_id` (nullable), and `fallback_command` (the exact
+argv that rebuilds the index). `GET /api/v1/_capabilities` is never gated —
+it is the pre-auth liveness probe and reports no graph data. A client polling
+a worktree instance must treat `503 INDEX_BUILDING` as "retry later", never
+as an empty index.
 
 > The `code` enum is defined canonically in Rust as `loomweave_core::errors::HttpErrorCode`
 > (single source of truth shared with the MCP tool-error vocabulary; see ADR-037).
