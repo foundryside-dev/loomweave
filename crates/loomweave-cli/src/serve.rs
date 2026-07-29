@@ -106,6 +106,19 @@ fn run_linked_worktree(
     config_path: Option<&Path>,
     worktree_ctx: &loomweave_core::worktree::WorktreeContext,
 ) -> Result<()> {
+    // An un-`install`ed primary cannot back this worktree's isolated store.
+    // Mirror the primary route's degraded session (clarion-ac36f51c2b)
+    // instead of exiting 1 with the reason buried in stderr
+    // (clarion-459bf2ac3b) — and anchor the recovery hint at the PRIMARY
+    // root: installing there creates the repository store this worktree's
+    // isolated store nests under, while a worktree-root hint would
+    // materialize the forbidden decoy store (clarion-f8b577dc48).
+    if !worktree_ctx.repository_store.exists() {
+        return serve_no_index(
+            &worktree_ctx.primary_root,
+            &worktree_ctx.repository_store.join("loomweave.db"),
+        );
+    }
     let bootstrap_spawn_failed = bootstrap_linked_worktree(worktree_ctx, None, config_path)?;
     let db_path = worktree_ctx.store_paths.db.clone();
     run_server(
