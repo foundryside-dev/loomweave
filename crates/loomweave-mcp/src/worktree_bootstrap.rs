@@ -23,7 +23,8 @@
 //! a non-zero child exits before `BeginRun`; this prevents zombie processes
 //! and a permanently ambiguous no-row `Building` state.
 
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -257,6 +258,14 @@ fn supervise_bootstrap_child(child: Child, db_path: &Path) -> bool {
 }
 
 fn record_early_bootstrap_failure(db_path: &Path, reason: &str) {
+    if another_analyzer_may_own_lock(db_path) {
+        tracing::warn!(
+            db = %db_path.display(),
+            reason,
+            "worktree bootstrap child failed before BeginRun while another analyzer may own the lock; leaving readiness to the lock owner"
+        );
+        return;
+    }
     let Ok(conn) = Connection::open(db_path) else {
         tracing::warn!(db = %db_path.display(), reason, "could not record early bootstrap failure");
         return;
@@ -287,6 +296,52 @@ fn record_early_bootstrap_failure(db_path: &Path, reason: &str) {
             "could not persist early bootstrap failure"
         ),
     }
+}
+
+/// The linked-worktree analyze lock is a stable sibling of the replaceable
+/// store directory: `<worktrees>/<stable-id>.lock`. A child that lost this
+/// lock can exit before the winner publishes `BeginRun`; publishing a
+/// synthetic failure in that interval would sort after the winner's captured
+/// `started_at` and permanently govern readiness. Only synthesize when the
+/// lock can be proved unowned.
+fn another_analyzer_may_own_lock(db_path: &Path) -> bool {
+    let Some(lock_path) = bootstrap_analyze_lock_path(db_path) else {
+        return true;
+    };
+    let lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                lock_path = %lock_path.display(),
+                "could not inspect worktree analyze lock; suppressing synthetic bootstrap failure"
+            );
+            return true;
+        }
+    };
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                lock_path = %lock_path.display(),
+                "could not probe worktree analyze lock; suppressing synthetic bootstrap failure"
+            );
+            true
+        }
+    }
+}
+
+fn bootstrap_analyze_lock_path(db_path: &Path) -> Option<PathBuf> {
+    let store = db_path.parent()?;
+    let stable_id = store.file_name()?;
+    Some(
+        store
+            .parent()?
+            .join(format!("{}.lock", stable_id.to_string_lossy())),
+    )
 }
 
 #[cfg(test)]
@@ -453,6 +508,37 @@ mod tests {
         assert!(
             !should_spawn_bootstrap_analyze(&conn),
             "a recorded failure requires explicit recovery, not an automatic doomed respawn on every serve restart"
+        );
+    }
+
+    #[test]
+    fn early_failure_is_not_published_while_another_analyzer_holds_the_lock() {
+        use fs2::FileExt as _;
+        use std::fs::OpenOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("worktrees/wt-test");
+        std::fs::create_dir_all(&store).unwrap();
+        let db_path = open_empty_runs_db(&store);
+        let lock_path = dir.path().join("worktrees/wt-test.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        record_early_bootstrap_failure(&db_path, "losing child exited on held analyze lock");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let run_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            run_count, 0,
+            "the lock owner may be between timestamp capture and BeginRun; the losing child must not publish a newer synthetic failure"
         );
     }
 

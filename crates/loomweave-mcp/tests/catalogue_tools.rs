@@ -162,6 +162,18 @@ fn insert_finding(
     severity: &str,
     status: &str,
 ) {
+    insert_finding_with_rule(conn, id, entity_id, "R1", kind, severity, status);
+}
+
+fn insert_finding_with_rule(
+    conn: &Connection,
+    id: &str,
+    entity_id: &str,
+    rule_id: &str,
+    kind: &str,
+    severity: &str,
+    status: &str,
+) {
     // A run row is required by the findings.run_id FK.
     conn.execute(
         "INSERT OR IGNORE INTO runs (id, started_at, config, stats, status) \
@@ -172,9 +184,9 @@ fn insert_finding(
     conn.execute(
         "INSERT INTO findings (id, tool, tool_version, run_id, rule_id, kind, severity, entity_id, \
             related_entities, message, evidence, properties, supports, supported_by, status, created_at, updated_at) \
-         VALUES (?1,'loomweave','1.0','run-1','R1',?3,?4,?2,'[]','m','{}','{}','[]','[]',?5, \
+         VALUES (?1,'loomweave','1.0','run-1',?3,?4,?5,?2,'[]','m','{}','{}','[]','[]',?6, \
                  '2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
-        params![id, entity_id, kind, severity, status],
+        params![id, entity_id, rule_id, kind, severity, status],
     )
     .expect("insert finding");
 }
@@ -593,6 +605,50 @@ async fn findings_for_applies_filter_before_large_result_cap() {
     assert_eq!(env["result"]["page"]["total"], 1, "{env}");
     assert_eq!(env["result"]["findings"][0]["id"], "z-critical");
     assert_eq!(env["result"]["scan_truncated"], false, "{env}");
+}
+
+#[tokio::test]
+async fn capped_rule_aggregates_mark_entity_and_project_summaries_partial() {
+    let (project, db, conn) = open_project();
+    insert_entity(
+        &conn,
+        "python:function:m.f",
+        "function",
+        "m.py",
+        Some((1, 2)),
+    );
+    for i in 0..21 {
+        insert_finding_with_rule(
+            &conn,
+            &format!("f-{i:02}"),
+            "python:function:m.f",
+            &format!("RULE-{i:02}"),
+            "defect",
+            "WARN",
+            "open",
+        );
+    }
+    drop(conn);
+    let state = state_for(project.path(), &db);
+
+    for (tool, arguments) in [
+        ("findings_for", json!({"id": "python:function:m.f"})),
+        ("project_finding_list", json!({})),
+    ] {
+        let env = call_tool(&state, tool, arguments).await;
+        let summary = &env["result"]["summary"];
+        assert_eq!(env["result"]["page"]["truncated"], false, "{env}");
+        assert_eq!(summary["counts"]["rules_truncated"], true, "{env}");
+        assert_eq!(summary["completeness"], "partial", "{env}");
+        assert_ne!(summary["confidence"], "high", "{env}");
+        assert!(
+            summary["advisory"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rule"),
+            "{env}"
+        );
+    }
 }
 
 #[tokio::test]

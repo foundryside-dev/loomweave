@@ -444,7 +444,16 @@ pub fn stable_id_for_admin_identity(admin_identity: &str) -> String {
     format!("wt-{}", blake3::hash(admin_identity.as_bytes()).to_hex())
 }
 
-fn stable_id_for_shared_store_project(primary_root: &Path, admin_identity: &str) -> String {
+/// Derive the project-qualified stable ID used when multiple repositories may
+/// share one configured `store_dir`. Cleanup enumeration must use this same
+/// construction or every live override-backed store appears unregistered.
+///
+/// # Panics
+///
+/// Panics when `primary_root` is not valid UTF-8. Production callers obtain
+/// this path from [`WorktreeContext`], whose resolver rejects non-UTF-8 roots.
+#[must_use]
+pub fn stable_id_for_shared_store_project(primary_root: &Path, admin_identity: &str) -> String {
     let primary_root = primary_root
         .to_str()
         .expect("WorktreeContext rejects non-UTF-8 primary roots before store routing");

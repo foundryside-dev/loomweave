@@ -58,16 +58,18 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 use std::ffi::CStr;
 
 #[cfg(unix)]
 use rustix::fd::OwnedFd;
+#[cfg(unix)]
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, statat};
 #[cfg(target_os = "linux")]
 use rustix::fs::{CWD, ResolveFlags, openat2};
-#[cfg(unix)]
-use rustix::fs::{Mode, OFlags};
 use tracing::warn;
 
 /// The exact name grammar a worktree-store directory must match to ever be
@@ -206,6 +208,8 @@ pub struct WorktreesRoot {
     handle: OwnedFd,
     #[cfg(not(unix))]
     handle: (),
+    #[cfg(not(unix))]
+    path: PathBuf,
 }
 
 impl WorktreesRoot {
@@ -263,7 +267,61 @@ impl WorktreesRoot {
                     "worktrees path is not a directory",
                 ));
             }
-            Ok(Self { handle: () })
+            Ok(Self {
+                handle: (),
+                path: worktrees_dir.to_path_buf(),
+            })
+        }
+    }
+
+    /// Enumerate grammar-valid direct-child store directories through this
+    /// pinned root. On Unix both classification and naming are handle-relative,
+    /// so a rename or pathname replacement cannot split candidate decisions
+    /// from the inode later used by [`Self::delete_worktree_store`].
+    pub(crate) fn candidate_names(&self) -> io::Result<Vec<String>> {
+        #[cfg(unix)]
+        {
+            let mut names = Vec::new();
+            let dir = Dir::read_from(&self.handle).map_err(io::Error::from)?;
+            for entry in dir {
+                let entry = entry.map_err(io::Error::from)?;
+                let raw_name = entry.file_name();
+                if raw_name.to_bytes() == b"." || raw_name.to_bytes() == b".." {
+                    continue;
+                }
+                let stat = statat(&self.handle, raw_name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(io::Error::from)?;
+                if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+                    continue;
+                }
+                let Ok(name) = raw_name.to_str() else {
+                    continue;
+                };
+                if matches_worktree_store_grammar(name) {
+                    names.push(name.to_owned());
+                }
+            }
+            names.sort();
+            Ok(names)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &self.handle;
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(&self.path)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if matches_worktree_store_grammar(&name) {
+                    names.push(name);
+                }
+            }
+            names.sort();
+            Ok(names)
         }
     }
 
@@ -551,5 +609,35 @@ mod linux {
 
     fn is_dot_or_dotdot(name: &CStr) -> bool {
         name.to_bytes() == b"." || name.to_bytes() == b".."
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn candidate_enumeration_stays_on_pinned_root_after_path_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktrees = tmp.path().join("worktrees");
+        std::fs::create_dir(&worktrees).unwrap();
+        let old_name = format!("wt-{}", "a".repeat(64));
+        std::fs::create_dir(worktrees.join(&old_name)).unwrap();
+
+        let root = WorktreesRoot::open(&worktrees).unwrap();
+        let moved = tmp.path().join("worktrees-moved");
+        std::fs::rename(&worktrees, &moved).unwrap();
+        std::fs::create_dir(&worktrees).unwrap();
+        let replacement_name = format!("wt-{}", "b".repeat(64));
+        std::fs::create_dir(worktrees.join(&replacement_name)).unwrap();
+
+        let candidates = root.candidate_names().unwrap();
+
+        assert_eq!(candidates, vec![old_name]);
+        assert!(
+            !candidates.contains(&replacement_name),
+            "candidate decisions must come from the same pinned inode deletion will use"
+        );
     }
 }

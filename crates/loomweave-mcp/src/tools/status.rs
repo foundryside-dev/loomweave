@@ -252,7 +252,7 @@ impl ServerState {
                 // a rebuild-that-failed after an earlier completed run must
                 // still read as `Ready`, which `latest_run`'s status alone
                 // cannot tell you.
-                let readiness = crate::worktree_bootstrap::read_worktree_readiness(conn).readiness;
+                let readiness = crate::worktree_bootstrap::read_worktree_readiness(conn);
                 Ok((
                     snapshot,
                     edge_count,
@@ -290,7 +290,7 @@ impl ServerState {
         // exactly as before Task 5.
         let building = self.worktree_gate.is_some()
             && !matches!(
-                readiness,
+                readiness.readiness,
                 crate::worktree_bootstrap::WorktreeReadiness::Ready
             );
         // Explicit progress-observation state (clarion-917df0e1ad): the
@@ -299,17 +299,20 @@ impl ServerState {
         // never start because the bootstrap spawn itself failed. Response
         // field only (no tool schema/description growth — the tools/list
         // byte budget is untouched); absent entirely for ungated sessions.
-        let index_state = self.worktree_gate.as_ref().map(|gate| match readiness {
-            crate::worktree_bootstrap::WorktreeReadiness::Ready => "ready",
-            crate::worktree_bootstrap::WorktreeReadiness::BuildFailed => "index-build-failed",
-            crate::worktree_bootstrap::WorktreeReadiness::Building => {
-                if gate.bootstrap_spawn_failed {
-                    "bootstrap-spawn-failed"
-                } else {
-                    "index-building"
+        let index_state = self
+            .worktree_gate
+            .as_ref()
+            .map(|gate| match readiness.readiness {
+                crate::worktree_bootstrap::WorktreeReadiness::Ready => "ready",
+                crate::worktree_bootstrap::WorktreeReadiness::BuildFailed => "index-build-failed",
+                crate::worktree_bootstrap::WorktreeReadiness::Building => {
+                    if gate.bootstrap_spawn_failed && readiness.run_id.is_none() {
+                        "bootstrap-spawn-failed"
+                    } else {
+                        "index-building"
+                    }
                 }
-            }
-        });
+            });
 
         // The on-disk size, paired with data_version, exposes a swapped or
         // truncated DB the server may still be serving from a stale handle.

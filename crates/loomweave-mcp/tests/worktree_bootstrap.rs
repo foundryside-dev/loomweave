@@ -424,6 +424,71 @@ async fn status_index_state_distinguishes_building_spawn_failed_and_ready() {
 }
 
 #[tokio::test]
+async fn manual_recovery_run_overrides_session_static_bootstrap_spawn_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    let state = linked_state_with_spawn_outcome(&ctx, true);
+
+    seed_run(
+        &ctx.store_paths.db,
+        "manual-recovery",
+        "2026-02-01T00:00:00.000Z",
+        "running",
+    );
+
+    let graph = call_tool(&state, "entity_find", json!({"pattern": "x"})).await;
+    assert_eq!(graph["error"]["code"], "index-building", "{graph:?}");
+    assert_eq!(graph["error"]["retryable"], true, "{graph:?}");
+    assert_eq!(
+        graph["diagnostics"][0]["run_id"], "manual-recovery",
+        "{graph:?}"
+    );
+    assert!(
+        graph["diagnostics"][0]["bootstrap_state"].is_null(),
+        "a real recovery row supersedes the failed automatic spawn: {graph:?}"
+    );
+
+    let status = call_tool(&state, "project_status_get", json!({})).await;
+    assert_eq!(
+        status["result"]["index_state"], "index-building",
+        "{status:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn analyze_cancel_bypasses_building_gate_for_a_live_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    seed_completed_run(&ctx.store_paths.db, "completed-before-rebuild");
+
+    let stub = tmp.path().join("blocking-analyze-stub.sh");
+    std::fs::write(&stub, "#!/bin/sh\nsleep 5\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&stub).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&stub, permissions).unwrap();
+    }
+    let state = linked_state(&ctx).with_analyze_command(stub);
+    let started = call_tool(&state, "analyze_start", json!({})).await;
+    assert_eq!(started["ok"], true, "{started:?}");
+    let run_id = started["result"]["run_id"].as_str().unwrap().to_owned();
+    seed_run(
+        &ctx.store_paths.db,
+        &run_id,
+        "2026-02-01T00:00:00.000Z",
+        "running",
+    );
+
+    let cancelled = call_tool(&state, "analyze_cancel", json!({"run_id": run_id})).await;
+    assert_eq!(cancelled["ok"], true, "{cancelled:?}");
+    assert_eq!(cancelled["result"]["status"], "cancelled", "{cancelled:?}");
+}
+
+#[tokio::test]
 async fn status_counts_are_null_not_zero_while_building() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = linked_context(tmp.path());

@@ -443,12 +443,30 @@ fn populated_worktrees_namespace(loomweave_dir: &Path) -> Option<Vec<String>> {
     let Ok(entries) = fs::read_dir(&worktrees_dir) else {
         return Some(vec!["<unreadable worktrees/ directory>".to_owned()]);
     };
-    let mut stable_ids: Vec<String> = entries
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| loomweave_cli::worktree::confine::matches_worktree_store_grammar(name))
-        .collect();
+    stable_ids_from_worktrees_entries(entries)
+}
+
+fn stable_ids_from_worktrees_entries(
+    entries: impl Iterator<Item = std::io::Result<fs::DirEntry>>,
+) -> Option<Vec<String>> {
+    let mut stable_ids = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Some(vec!["<unreadable worktrees/ entry>".to_owned()]);
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return Some(vec!["<unreadable worktrees/ entry>".to_owned()]);
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if loomweave_cli::worktree::confine::matches_worktree_store_grammar(&name) {
+            stable_ids.push(name);
+        }
+    }
     if stable_ids.is_empty() {
         return None;
     }
@@ -632,6 +650,19 @@ mod tests {
             GITIGNORE_CONTENTS.lines().any(|line| line == "worktrees/"),
             "metadata.json and databases under worktrees/<stable-id>/ are runtime cache state"
         );
+    }
+
+    #[test]
+    fn per_entry_enumeration_error_fails_closed_as_populated() {
+        let entries = std::iter::once(Err::<std::fs::DirEntry, _>(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot inspect entry",
+        )));
+
+        let stable_ids = super::stable_ids_from_worktrees_entries(entries)
+            .expect("an unreadable entry must block recursive deletion");
+
+        assert_eq!(stable_ids, vec!["<unreadable worktrees/ entry>"]);
     }
 
     #[test]

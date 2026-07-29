@@ -380,6 +380,41 @@ fn override_store_dir_makes_sweep_report_only() {
     );
 }
 
+#[test]
+fn override_sweep_recognizes_this_repositorys_registered_store() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+    let override_dir = tmp.path().join("shared-override-store");
+    fs::write(
+        repo.join("weft.toml"),
+        format!("[loomweave]\nstore_dir = \"{}\"\n", override_dir.display()),
+    )
+    .unwrap();
+    let linked = tmp.path().join("linked");
+    add_worktree(&repo, &linked, "feature");
+
+    let linked_ctx = WorktreeContext::resolve(&linked).expect("resolves as Linked");
+    fs::create_dir_all(&linked_ctx.repository_store).unwrap();
+    ensure_isolated_store(&linked_ctx).expect("create qualified isolated store");
+    let stable_id = linked_ctx.stable_id.clone().unwrap();
+
+    let main_ctx = WorktreeContext::resolve(&repo).expect("resolves as Main");
+    let outcome = sweep_worktree_stores(&main_ctx);
+
+    assert_eq!(
+        outcome,
+        SweepOutcome::ReportOnly {
+            would_delete: vec![],
+        },
+        "a live override-backed store must use the same project-qualified ID in both context resolution and registration enumeration"
+    );
+    assert!(
+        override_dir.join("worktrees").join(stable_id).is_dir(),
+        "report-only sweep must preserve the live store"
+    );
+}
+
 /// clarion-a93b43923e: a store path that reaches through a symlink is the
 /// symlink analogue of the shared `store_dir` override — two repositories
 /// whose `.weft/loomweave` link to one shared directory would let repo A's

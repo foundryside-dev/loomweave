@@ -72,10 +72,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use loomweave_core::worktree::{WorktreeContext, stable_id_for_admin_identity};
+use loomweave_core::worktree::{
+    WorktreeContext, stable_id_for_admin_identity, stable_id_for_shared_store_project,
+};
 use tracing::{debug, info, warn};
 
-use crate::worktree::confine::{DeleteOutcome, WorktreesRoot, matches_worktree_store_grammar};
+use crate::worktree::confine::{DeleteOutcome, WorktreesRoot};
 use crate::worktree::store::WORKTREES_DIR_NAME;
 
 /// The non-blocking advisory lock that serializes concurrent sweeps —
@@ -107,12 +109,9 @@ pub enum SweepOutcome {
     /// The common Git directory's own `worktrees/` administrative
     /// directory could not be read — aborted, nothing deleted.
     AdminDirUnreadable,
-    /// `<repository-store>/worktrees/` itself could not be read — either
-    /// while enumerating store candidates (this return site fires *before*
-    /// the admin-directory read below) or while re-opening it as a confined
-    /// root right before deletion (this return site fires *after* the
-    /// admin-directory read has already succeeded) — aborted, nothing
-    /// deleted either way. Distinct from [`Self::AdminDirUnreadable`]: this
+    /// `<repository-store>/worktrees/` itself could not be pinned or read
+    /// while enumerating store candidates — aborted, nothing deleted.
+    /// Distinct from [`Self::AdminDirUnreadable`]: this
     /// is Loomweave's own store directory, not Git's administrative one.
     StoreDirUnreadable,
     /// A `[loomweave].store_dir` override is active for `ctx.primary_root`:
@@ -184,11 +183,27 @@ fn report_only(cause: &str, to_delete: Vec<String>) -> SweepOutcome {
     }
 }
 
+fn pin_sweep_root(
+    worktrees_dir: &Path,
+    store_path_is_symlinked: bool,
+) -> io::Result<WorktreesRoot> {
+    // A symlink-reached store is report-only, but its candidate list should
+    // still be inode-stable. Resolve that path once, then pin and enumerate
+    // the resolved directory. The caller never authorizes deletion for it.
+    let root_path = if store_path_is_symlinked {
+        fs::canonicalize(worktrees_dir)?
+    } else {
+        worktrees_dir.to_owned()
+    };
+    WorktreesRoot::open(&root_path)
+}
+
 pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
     let worktrees_dir = ctx.repository_store.join(WORKTREES_DIR_NAME);
     if !worktrees_dir.is_dir() {
         return SweepOutcome::NoWorktreesStore;
     }
+    let store_path_is_symlinked = store_path_reaches_through_symlink(&ctx.repository_store);
 
     let _gc_lock = match acquire_gc_lock(&worktrees_dir) {
         Ok(GcLock::Acquired(file)) => file,
@@ -206,6 +221,19 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
                 "worktree cleanup sweep: could not acquire gc.lock; skipping this cycle"
             );
             return SweepOutcome::GcLockUnavailable;
+        }
+    };
+
+    let root = match pin_sweep_root(&worktrees_dir, store_path_is_symlinked) {
+        Ok(root) => root,
+        Err(err) => {
+            warn!(
+                worktrees_dir = %worktrees_dir.display(),
+                error = %err,
+                "worktree cleanup sweep: could not pin the worktrees/ directory handle; \
+                 aborting, nothing deleted"
+            );
+            return SweepOutcome::StoreDirUnreadable;
         }
     };
 
@@ -256,7 +284,7 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
     // store swept promptly" as correct (see the module docs, "The accepted
     // race" — nothing can rebuild that store once the worktree is gone
     // either way, one sweep cycle earlier changes nothing).
-    let candidates = match store_candidates(&worktrees_dir) {
+    let candidates = match root.candidate_names() {
         Ok(names) => names,
         Err(err) => {
             warn!(
@@ -270,7 +298,10 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
     };
 
     let admin_dir = common_dir.join(WORKTREES_DIR_NAME);
-    let registered = match registered_stable_ids(&admin_dir) {
+    let shared_store_project_root = ctx
+        .store_dir_overridden
+        .then_some(ctx.primary_root.as_path());
+    let registered = match registered_stable_ids(&admin_dir, shared_store_project_root) {
         Ok(ids) => ids,
         Err(err) => {
             warn!(
@@ -300,25 +331,12 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
     // mechanism cannot see this either. `ctx.repository_store` is the
     // canonicalized primary root plus literal components, so it equals its
     // own canonicalization exactly when no appended component is a symlink.
-    if store_path_reaches_through_symlink(&ctx.repository_store) {
+    if store_path_is_symlinked {
         return report_only(
             "store path resolves through a symlink (possibly shared between repositories)",
             to_delete,
         );
     }
-
-    let root = match WorktreesRoot::open(&worktrees_dir) {
-        Ok(root) => root,
-        Err(err) => {
-            warn!(
-                worktrees_dir = %worktrees_dir.display(),
-                error = %err,
-                "worktree cleanup sweep: could not pin the worktrees/ directory handle; \
-                 aborting, nothing deleted"
-            );
-            return SweepOutcome::StoreDirUnreadable;
-        }
-    };
 
     let mut deleted = Vec::new();
     for name in &to_delete {
@@ -447,7 +465,10 @@ fn git_common_dir(primary_root: &Path) -> Option<PathBuf> {
 /// empty set here, not an abort. Every *other* read failure (permission
 /// denied, an I/O error, `admin_dir` existing as a non-directory) still
 /// aborts the sweep, per the module docs.
-fn registered_stable_ids(admin_dir: &Path) -> io::Result<HashSet<String>> {
+fn registered_stable_ids(
+    admin_dir: &Path,
+    shared_store_project_root: Option<&Path>,
+) -> io::Result<HashSet<String>> {
     let mut ids = HashSet::new();
     let entries = match fs::read_dir(admin_dir) {
         Ok(entries) => entries,
@@ -469,31 +490,13 @@ fn registered_stable_ids(admin_dir: &Path) -> io::Result<HashSet<String>> {
             continue;
         };
         let admin_identity = format!("{WORKTREES_DIR_NAME}/{name}");
-        ids.insert(stable_id_for_admin_identity(&admin_identity));
+        let stable_id = shared_store_project_root.map_or_else(
+            || stable_id_for_admin_identity(&admin_identity),
+            |primary_root| stable_id_for_shared_store_project(primary_root, &admin_identity),
+        );
+        ids.insert(stable_id);
     }
     Ok(ids)
-}
-
-/// Read every direct-child directory name of `worktrees_dir` (Loomweave's
-/// own `<repository-store>/worktrees/`) that matches the
-/// `wt-[0-9a-f]{64}` grammar — the *candidate* set. `gc.lock` and any other
-/// non-matching entry (a stray file, a malformed name) is never a
-/// candidate, filtered out here before any deletion decision is made.
-fn store_candidates(worktrees_dir: &Path) -> io::Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in fs::read_dir(worktrees_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if matches_worktree_store_grammar(&name) {
-            names.push(name);
-        }
-    }
-    Ok(names)
 }
 
 #[cfg(test)]

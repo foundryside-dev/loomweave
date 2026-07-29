@@ -509,33 +509,80 @@ fn severity_rank(status: &str) -> u8 {
 /// section reporting healthy counts from the correct isolated store one
 /// line below.
 ///
-/// Rather than teach every `IndexDbHealth` branch's hint text to be
-/// worktree-aware (the other candidate fix — rejected: it would smear
-/// worktree-specific wording across five branches whose text is asserted
-/// verbatim by existing tests, for a state this function can already name
-/// directly), a linked worktree short-circuits both `check_loomweave_dir`
-/// and `check_loomweave_dir_json` to a single neutral redirect to the
-/// `worktree_stores` check, which already reports this worktree's real
-/// index health under its own stable ID. Resolution failure (non-UTF-8
-/// path) falls through to the unrouted check, matching every other
-/// `WorktreeContext::resolve`-fallback call site in this codebase.
-fn is_linked_worktree(project_root: &Path) -> bool {
+/// Linked worktrees therefore classify the exact
+/// `WorktreeContext::store_paths` database directly. The aggregate
+/// `worktree_stores` report may be absent when the namespace cannot be
+/// enumerated, or healthy because a different worktree's store is healthy;
+/// neither can stand in for the current checkout's database. Resolution
+/// failure falls through to the legacy root-derived check.
+fn linked_worktree_context(
+    project_root: &Path,
+) -> Option<loomweave_core::worktree::WorktreeContext> {
     loomweave_core::worktree::WorktreeContext::resolve(project_root)
-        .is_ok_and(|ctx| ctx.kind == loomweave_core::worktree::WorktreeKind::Linked)
+        .ok()
+        .filter(|ctx| ctx.kind == loomweave_core::worktree::WorktreeKind::Linked)
+}
+
+fn store_paths_for_doctor(project_root: &Path) -> (loomweave_core::worktree::StorePaths, bool) {
+    let resolved = loomweave_core::worktree::WorktreeContext::resolve(project_root).ok();
+    let is_linked = resolved
+        .as_ref()
+        .is_some_and(|ctx| ctx.kind == loomweave_core::worktree::WorktreeKind::Linked);
+    let paths = resolved.map_or_else(
+        || loomweave_core::worktree::StorePaths::under(&project_root.join(".weft/loomweave")),
+        |ctx| ctx.store_paths,
+    );
+    (paths, is_linked)
 }
 
 /// JSON-path check for tracked-index DB health.  Expands the former
 /// existence-only check with five distinct states: absent (warning),
 /// unreadable (problem), unmigrated (problem), future-schema (problem),
-/// healthy (ok). See [`is_linked_worktree`] for the linked-worktree redirect.
+/// healthy (ok). Linked worktrees use [`linked_worktree_context`] to classify
+/// the current isolated database rather than a checkout-local decoy.
 fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
-    if is_linked_worktree(project_root) {
-        return DoctorJsonCheck::ok(
-            ".weft/loomweave.schema",
-            "linked worktree: this checkout holds no local .weft/loomweave/ store by design \
-             (worktree-index isolation) — see the `worktree_stores` check for this worktree's \
-             actual isolated index health",
-        );
+    if let Some(ctx) = linked_worktree_context(project_root) {
+        let db_path = &ctx.store_paths.db;
+        return match classify_index_db_health_at(db_path) {
+            IndexDbHealth::Healthy => DoctorJsonCheck::ok(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated database is healthy at {} (schema v{CURRENT_SCHEMA_VERSION})",
+                    db_path.display()
+                ),
+            ),
+            IndexDbHealth::Absent => DoctorJsonCheck::warning(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated loomweave.db is absent at {}; run \
+                     `loomweave worktree analyze -- <target>`",
+                    db_path.display()
+                ),
+            ),
+            IndexDbHealth::Unreadable(detail) => DoctorJsonCheck::problem(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated database at {} is unreadable: {detail}",
+                    db_path.display()
+                ),
+            ),
+            IndexDbHealth::Unmigrated => DoctorJsonCheck::problem(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated database at {} is unmigrated \
+                     (user_version=0); rebuild it with `loomweave worktree analyze -- <target>`",
+                    db_path.display()
+                ),
+            ),
+            IndexDbHealth::FutureSchema { found, current } => DoctorJsonCheck::problem(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated database at {} has schema v{found}, \
+                     newer than this build (current v{current})",
+                    db_path.display()
+                ),
+            ),
+        };
     }
     match classify_index_db_health(project_root) {
         IndexDbHealth::Healthy => DoctorJsonCheck::ok(
@@ -570,14 +617,44 @@ fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
 
 /// Text-path twin of [`check_loomweave_dir_json`]: contributes to the `Tally`
 /// so problems fail the gate and warnings are surfaced. See
-/// [`is_linked_worktree`] for the linked-worktree redirect.
+/// [`linked_worktree_context`] for the linked-worktree routing.
 fn check_loomweave_dir(project_root: &Path) -> Tally {
-    if is_linked_worktree(project_root) {
-        return ok(
-            "linked worktree: this checkout holds no local .weft/loomweave/ store by design \
-             (worktree-index isolation) — see the worktree_stores check for this worktree's \
-             actual isolated index health",
-        );
+    if let Some(ctx) = linked_worktree_context(project_root) {
+        let db_path = &ctx.store_paths.db;
+        return match classify_index_db_health_at(db_path) {
+            IndexDbHealth::Healthy => ok(&format!(
+                "current linked worktree isolated database is healthy at {} (schema v{CURRENT_SCHEMA_VERSION})",
+                db_path.display()
+            )),
+            IndexDbHealth::Absent => warn(
+                &format!(
+                    "current linked worktree isolated loomweave.db is absent at {}",
+                    db_path.display()
+                ),
+                Some("loomweave worktree analyze -- <target>"),
+            ),
+            IndexDbHealth::Unreadable(detail) => problem(
+                &format!(
+                    "current linked worktree isolated database at {} is unreadable: {detail}",
+                    db_path.display()
+                ),
+                Some("check permissions; rebuild only after inspecting the isolated store"),
+            ),
+            IndexDbHealth::Unmigrated => problem(
+                &format!(
+                    "current linked worktree isolated database at {} is unmigrated (user_version=0)",
+                    db_path.display()
+                ),
+                Some("loomweave worktree analyze -- <target>"),
+            ),
+            IndexDbHealth::FutureSchema { found, current } => problem(
+                &format!(
+                    "current linked worktree isolated database at {} has schema v{found}, newer than this build (current v{current})",
+                    db_path.display()
+                ),
+                Some("upgrade loomweave to match or exceed the database schema version"),
+            ),
+        };
     }
     match classify_index_db_health(project_root) {
         IndexDbHealth::Healthy => ok(&format!(
@@ -1800,7 +1877,10 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
 }
 
 fn load_mcp_config_for_doctor(project_root: &Path) -> std::result::Result<McpConfig, String> {
-    let path = project_root.join("loomweave.yaml");
+    let path = loomweave_core::worktree::WorktreeContext::resolve(project_root).map_or_else(
+        |_| project_root.join("loomweave.yaml"),
+        |ctx| ctx.config_path(),
+    );
     if path.exists() {
         McpConfig::from_path(&path).map_err(|err| err.to_string())
     } else {
@@ -1899,36 +1979,27 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
     }
 }
 
-/// Like [`check_loomweave_dir_json`], this check re-derives its path from the
-/// literal `--path` — `store_dir(project_root)/instance_id` — which for a
-/// linked worktree is a location `loomweave worktree analyze` never
-/// populates. Left unrouted, an absent file there sent an operator to the
-/// next action "Run `loomweave install --path <project>`" — which, followed
-/// literally inside a linked worktree, would CREATE the forbidden local
-/// `<worktree>/.weft/loomweave/` decoy store, after which every other
-/// root-derived check in this module would start reading and reporting on
-/// that decoy instead of the worktree's real, isolated store. See
-/// [`is_linked_worktree`] for the shared redirect this mirrors.
+/// Validate the exact instance-ID leaf that `serve` will load. Linked
+/// worktrees route through `WorktreeContext::store_paths` so doctor never
+/// validates (or repairs) a decoy store under the linked checkout itself.
 fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     const ID: &str = "http.instance_id";
-    if is_linked_worktree(project_root) {
-        return DoctorJsonCheck::ok(
-            ID,
-            "linked worktree: the project instance ID lives in this worktree's isolated store \
-             (`StorePaths::instance_id`, under `.weft/loomweave/worktrees/<stable-id>/`), not \
-             this checkout's `.weft/loomweave/` — see the `worktree_stores` check for this \
-             worktree's actual isolated index health",
-        );
-    }
-    let path = loomweave_core::store::store_dir(project_root).join("instance_id");
+    let (store_paths, is_linked) = store_paths_for_doctor(project_root);
+    let path = store_paths.instance_id.clone();
+    let db_path = store_paths.db.clone();
+    let scope = if is_linked {
+        "current linked worktree isolated"
+    } else {
+        "project"
+    };
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if fix && loomweave_core::store::db_path(project_root).exists() {
+            if fix && db_path.exists() {
                 return match crate::instance::load_or_create(&path) {
                     Ok(instance_id) => DoctorJsonCheck::fixed(
                         ID,
-                        format!("project instance ID materialised: {instance_id}"),
+                        format!("{scope} instance ID materialised: {instance_id}"),
                     )
                     .with_details(serde_json::json!({
                         "present": true,
@@ -1937,7 +2008,7 @@ fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonChec
                     })),
                     Err(err) => DoctorJsonCheck::problem(
                         ID,
-                        format!("project instance ID repair failed: {err}"),
+                        format!("{scope} instance ID repair failed: {err}"),
                     )
                     .with_details(serde_json::json!({
                         "present": false,
@@ -1946,57 +2017,90 @@ fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonChec
                     })),
                 };
             }
-            return DoctorJsonCheck::warning(
-                ID,
-                "project instance ID is not materialised yet",
-            )
+            let message = if is_linked {
+                format!(
+                    "{scope} instance_id is not materialised at {}",
+                    path.display()
+                )
+            } else {
+                "project instance ID is not materialised yet".to_owned()
+            };
+            return DoctorJsonCheck::warning(ID, message)
             .with_details(serde_json::json!({
                 "present": false,
                 "valid": null,
                 "instance_id": null,
             }))
-            .with_next_action(if loomweave_core::store::db_path(project_root).exists() {
+            .with_next_action(if db_path.exists() {
                 "Run `loomweave doctor --fix`; serving and federation consumers require a project instance ID."
+            } else if is_linked {
+                "Build the current isolated store with `loomweave worktree analyze -- <target>` before materialising its instance ID."
             } else {
                 "Run `loomweave install --path <project>` before materialising a project instance ID."
             });
         }
         Err(err) => {
-            return DoctorJsonCheck::problem(
-                ID,
-                format!("project instance ID is unreadable: {err}"),
-            )
-            .with_details(serde_json::json!({
-                "present": true,
-                "valid": false,
-                "instance_id": null,
-            }))
-            .with_next_action(
-                "Restore read access to `.weft/loomweave/instance_id` and inspect it before replacing any data.",
-            );
+            let message = if is_linked {
+                format!(
+                    "{scope} instance ID at {} is unreadable: {err}",
+                    path.display()
+                )
+            } else {
+                format!("project instance ID is unreadable: {err}")
+            };
+            let next_action = if is_linked {
+                format!(
+                    "Restore read access to `{}` and inspect it before replacing any data.",
+                    path.display()
+                )
+            } else {
+                "Restore read access to `.weft/loomweave/instance_id` and inspect it before replacing any data."
+                    .to_owned()
+            };
+            return DoctorJsonCheck::problem(ID, message)
+                .with_details(serde_json::json!({
+                    "present": true,
+                    "valid": false,
+                    "instance_id": null,
+                }))
+                .with_next_action(next_action);
         }
     };
     match uuid::Uuid::parse_str(raw.trim()) {
         Ok(instance_id) => {
-            DoctorJsonCheck::ok(ID, format!("project instance ID is valid: {instance_id}"))
+            DoctorJsonCheck::ok(ID, format!("{scope} instance ID is valid: {instance_id}"))
                 .with_details(serde_json::json!({
                     "present": true,
                     "valid": true,
                     "instance_id": instance_id.to_string(),
                 }))
         }
-        Err(err) => DoctorJsonCheck::problem(
-            ID,
-            format!("project instance ID is malformed; expected a UUID: {err}"),
-        )
-        .with_details(serde_json::json!({
-            "present": true,
-            "valid": false,
-            "instance_id": null,
-        }))
-        .with_next_action(
-            "Remove the malformed `.weft/loomweave/instance_id`; `loomweave serve` will create a valid replacement.",
-        ),
+        Err(err) => {
+            let message = if is_linked {
+                format!(
+                    "{scope} instance ID at {} is malformed; expected a UUID: {err}",
+                    path.display()
+                )
+            } else {
+                format!("project instance ID is malformed; expected a UUID: {err}")
+            };
+            let next_action = if is_linked {
+                format!(
+                    "Remove the malformed `{}`; `loomweave serve` will create a valid replacement.",
+                    path.display()
+                )
+            } else {
+                "Remove the malformed `.weft/loomweave/instance_id`; `loomweave serve` will create a valid replacement."
+                    .to_owned()
+            };
+            DoctorJsonCheck::problem(ID, message)
+                .with_details(serde_json::json!({
+                    "present": true,
+                    "valid": false,
+                    "instance_id": null,
+                }))
+                .with_next_action(next_action)
+        }
     }
 }
 

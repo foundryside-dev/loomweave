@@ -625,9 +625,10 @@ pub(crate) async fn require_worktree_ready(
     let Ok(read) = read else {
         return next.run(request).await;
     };
+    let bootstrap_spawn_failed = gate.bootstrap_spawn_failed && read.run_id.is_none();
     let (code, retryable, message) = match read.readiness {
         WorktreeReadiness::Ready => return next.run(request).await,
-        WorktreeReadiness::Building if gate.bootstrap_spawn_failed => (
+        WorktreeReadiness::Building if bootstrap_spawn_failed => (
             ErrorCode::BootstrapSpawnFailed,
             false,
             "the linked-worktree bootstrap process could not be spawned; run the fallback \
@@ -654,7 +655,7 @@ pub(crate) async fn require_worktree_ready(
         "code": code,
         "retryable": retryable,
         "run_id": read.run_id,
-        "bootstrap_state": if gate.bootstrap_spawn_failed {
+        "bootstrap_state": if bootstrap_spawn_failed {
             Some("bootstrap-spawn-failed")
         } else {
             None
@@ -1336,6 +1337,32 @@ mod tests {
         assert_eq!(body["code"], "BOOTSTRAP_SPAWN_FAILED", "{body}");
         assert_eq!(body["retryable"], false, "{body}");
         assert_eq!(body["bootstrap_state"], "bootstrap-spawn-failed", "{body}");
+
+        server.shutdown().expect("shutdown HTTP read API");
+    }
+
+    #[test]
+    fn gated_http_reports_progress_after_manual_recovery_starts() {
+        let _guard = http_runtime_test_guard();
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("loomweave.db");
+        schema_init_db(&db_path);
+        seed_run(&db_path, "manual-recovery", "running");
+        let (server, bind) = spawn_gated_server(&db_path, tempdir.path(), true);
+
+        let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
+
+        assert_eq!(
+            status, 503,
+            "the live rebuild still gates data reads: {body}"
+        );
+        assert_eq!(body["code"], "INDEX_BUILDING", "{body}");
+        assert_eq!(body["retryable"], true, "{body}");
+        assert_eq!(body["run_id"], "manual-recovery", "{body}");
+        assert!(
+            body["bootstrap_state"].is_null(),
+            "a real recovery run supersedes the failed automatic spawn: {body}"
+        );
 
         server.shutdown().expect("shutdown HTTP read API");
     }

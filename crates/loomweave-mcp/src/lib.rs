@@ -1827,8 +1827,8 @@ impl ServerState {
     /// itself is gone there is no "remain available while building" case
     /// left to serve — the design's accepted race for `git worktree remove`
     /// under a live `serve`. Building/build-failed then exempts exactly
-    /// `project_status_get` and `analyze_status_get` so an agent can still
-    /// observe progress and the failure diagnostics while every other tool
+    /// `project_status_get`, `analyze_status_get`, and `analyze_cancel` so an
+    /// agent can still observe or stop progress while every other tool
     /// (which would otherwise read a schema-initialized-but-empty, or
     /// partially-written, store) is blocked.
     async fn consult_worktree_gate(&self, id: &Value, canonical_name: &str) -> Option<Value> {
@@ -1850,7 +1850,10 @@ impl ServerState {
             return Some(tool_json_rpc_response(id, &envelope));
         }
 
-        if matches!(canonical_name, "project_status_get" | "analyze_status_get") {
+        if matches!(
+            canonical_name,
+            "project_status_get" | "analyze_status_get" | "analyze_cancel"
+        ) {
             return None;
         }
 
@@ -1864,11 +1867,12 @@ impl ServerState {
         let Ok(read) = read else {
             return None;
         };
+        let bootstrap_spawn_failed = gate.bootstrap_spawn_failed && read.run_id.is_none();
 
         match read.readiness {
             worktree_bootstrap::WorktreeReadiness::Ready => None,
             worktree_bootstrap::WorktreeReadiness::Building => {
-                let (code, message, retryable) = if gate.bootstrap_spawn_failed {
+                let (code, message, retryable) = if bootstrap_spawn_failed {
                     (
                         McpErrorCode::IndexBuildFailed,
                         "the linked-worktree bootstrap process could not be spawned; run the \
@@ -1880,8 +1884,8 @@ impl ServerState {
                         McpErrorCode::IndexBuilding,
                         "this linked worktree's isolated index is still building (no completed \
                          analyze run yet); graph and catalogue tools are unavailable until it \
-                         finishes. project_status_get and analyze_status_get remain available to \
-                         check progress in this same session — no reconnect needed.",
+                         finishes. project_status_get, analyze_status_get, and analyze_cancel \
+                         remain available in this same session — no reconnect needed.",
                         true,
                     )
                 };
@@ -1894,7 +1898,7 @@ impl ServerState {
                         json!({}),
                         vec![json!({
                             "run_id": read.run_id,
-                            "bootstrap_state": gate.bootstrap_spawn_failed.then_some("bootstrap-spawn-failed"),
+                            "bootstrap_state": bootstrap_spawn_failed.then_some("bootstrap-spawn-failed"),
                             "fallback_command": gate.fallback_argv,
                         })],
                     ),
@@ -2257,14 +2261,15 @@ impl ServerState {
             // through and let the normal read path hit (and report) it.
             return None;
         };
+        let bootstrap_spawn_failed = self
+            .worktree_gate
+            .as_ref()
+            .is_some_and(|gate| gate.bootstrap_spawn_failed)
+            && read.run_id.is_none();
         match read.readiness {
             worktree_bootstrap::WorktreeReadiness::Ready => None,
             worktree_bootstrap::WorktreeReadiness::Building => {
-                if self
-                    .worktree_gate
-                    .as_ref()
-                    .is_some_and(|gate| gate.bootstrap_spawn_failed)
-                {
+                if bootstrap_spawn_failed {
                     Some("index-build-failed")
                 } else {
                     Some("index-building")

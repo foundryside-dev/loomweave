@@ -245,8 +245,7 @@ impl ServerState {
                     "returned": returned,
                     "truncated": truncated,
                 });
-                let summary =
-                    catalogue_summary(total, returned, truncated, "high", &counts, None, None);
+                let summary = finding_catalogue_summary(total, returned, truncated, &counts);
 
                 Ok(success_envelope(json!({
                     "entity": entity_json(conn, &entity),
@@ -346,8 +345,7 @@ impl ServerState {
                     "returned": returned,
                     "truncated": truncated,
                 });
-                let summary =
-                    catalogue_summary(total, returned, truncated, "high", &counts, None, None);
+                let summary = finding_catalogue_summary(total, returned, truncated, &counts);
 
                 Ok(success_envelope(json!({
                     "findings": findings,
@@ -735,6 +733,27 @@ fn finding_summary_counts(
         )?,
         "rules_truncated": rule_distinct > FINDING_RULE_COUNT_LIMIT,
     }))
+}
+
+fn finding_catalogue_summary(
+    total: usize,
+    returned: usize,
+    page_truncated: bool,
+    counts: &Value,
+) -> Value {
+    if counts["rules_truncated"].as_bool() == Some(true) {
+        catalogue_summary(
+            total,
+            returned,
+            page_truncated,
+            "medium",
+            counts,
+            Some("rule aggregate capped at 20 distinct rule IDs"),
+            Some("narrow the finding filters to obtain a complete per-rule aggregate"),
+        )
+    } else {
+        catalogue_summary(total, returned, page_truncated, "high", counts, None, None)
+    }
 }
 
 fn finding_group_counts(

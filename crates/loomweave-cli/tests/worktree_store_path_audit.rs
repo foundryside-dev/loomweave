@@ -205,14 +205,11 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     // checks stay root-derived from the literal `--path` given, by explicit
     // task scope (only the additive worktree-store report + the `--fix`
     // guard in install.rs were in scope for GREEN) — see the Task 7 report.
-    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: ".with_next_action(if loomweave_core::store::db_path(project_root).exists() {", count: 1, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "crate::install::write_gitignore(&loomweave_core::store::store_dir(project_root))", count: 1, classification: Classification::IntentionalRootDerived },
-    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "if fix && loomweave_core::store::db_path(project_root).exists() {", count: 1, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let db = loomweave_core::store::db_path(project_root);", count: 2, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let db = loomweave_core::store::db_path(root);", count: 2, classification: Classification::TestExempt },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let db_path = loomweave_core::store::db_path(project_root);", count: 3, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let loomweave_dir = loomweave_core::store::store_dir(project_root);", count: 1, classification: Classification::IntentionalRootDerived },
-    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let path = loomweave_core::store::store_dir(project_root).join(\"instance_id\");", count: 1, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(project_root);", count: 2, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(root);", count: 1, classification: Classification::TestExempt },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "std::fs::read_to_string(loomweave_core::store::store_dir(root).join(\".gitignore\"))", count: 1, classification: Classification::TestExempt },

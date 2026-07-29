@@ -222,6 +222,13 @@ pub enum StoreError {
 ///
 /// [kind]: loomweave_core::worktree::WorktreeKind::Linked
 pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, StoreError> {
+    ensure_isolated_store_with(ctx, WorktreesRoot::open)
+}
+
+fn ensure_isolated_store_with(
+    ctx: &WorktreeContext,
+    open_root: impl FnOnce(&Path) -> io::Result<WorktreesRoot>,
+) -> Result<StoreOutcome, StoreError> {
     let Some(stable_id) = ctx.stable_id.as_deref() else {
         return Ok(StoreOutcome::NotIsolated);
     };
@@ -235,12 +242,6 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
         path: worktrees_dir.clone(),
         source,
     })?;
-    let root =
-        WorktreesRoot::open(&worktrees_dir).map_err(|source| StoreError::OpenWorktreesRoot {
-            path: worktrees_dir.clone(),
-            source,
-        })?;
-
     let candidate = worktrees_dir.join(stable_id);
     // `WorktreeContext::resolve` already rejects a non-UTF-8 `source_root`
     // before this context could exist.
@@ -296,6 +297,14 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
         reason = %reason,
         "worktree-isolated store failed validation; deleting and rebuilding"
     );
+    // Pin the confined root only for the sole operation that needs it:
+    // deleting a stale store. First-time creation and ordinary reuse remain
+    // available on kernels where `openat2` is unavailable, while stale
+    // deletion still fails closed through `WorktreesRoot`.
+    let root = open_root(&worktrees_dir).map_err(|source| StoreError::OpenWorktreesRoot {
+        path: worktrees_dir.clone(),
+        source,
+    })?;
     match root.delete_worktree_store(stable_id, &reason) {
         DeleteOutcome::Deleted => {}
         DeleteOutcome::Refused(refusal) => {
@@ -486,6 +495,45 @@ mod tests {
             user_version > 0,
             "eagerly-created loomweave.db must have schema applied (user_version > 0)"
         );
+    }
+
+    #[test]
+    fn first_time_creation_does_not_require_the_confined_deletion_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        let opener_called = std::cell::Cell::new(false);
+
+        let outcome = super::ensure_isolated_store_with(&ctx, |_| {
+            opener_called.set(true);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "openat2 unavailable",
+            ))
+        })
+        .expect("an absent store only needs creation");
+
+        assert_eq!(outcome, StoreOutcome::Created);
+        assert!(!opener_called.get(), "no stale store exists to delete");
+    }
+
+    #[test]
+    fn valid_reuse_does_not_require_the_confined_deletion_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        ensure_isolated_store(&ctx).expect("create initial store");
+        let opener_called = std::cell::Cell::new(false);
+
+        let outcome = super::ensure_isolated_store_with(&ctx, |_| {
+            opener_called.set(true);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "openat2 unavailable",
+            ))
+        })
+        .expect("valid metadata only needs reuse");
+
+        assert_eq!(outcome, StoreOutcome::Reused);
+        assert!(!opener_called.get(), "no stale store exists to delete");
     }
 
     #[test]
