@@ -67,6 +67,13 @@ only when an incompatible change is made to that surface. See
 
 ### Removed
 
+- **The `weft.toml [loomweave].url` resolution rung** — retired for the same
+  reason as the `[filigree].url` rung below (owner-ratified): repository
+  content must never steer where a consumer that attaches credentials sends
+  them. A `weft.toml [loomweave].url` value is now ignored; operators move
+  the override to the `WEFT_LOOMWEAVE_URL` environment variable or the
+  consumer's private configuration. Ephemeral-port discovery is unchanged.
+
 - **The `weft.toml [filigree].url` resolution rung.** Repository content may
   be untrusted, while Filigree clients attach operator-owned bearer tokens to
   the resolved endpoint — so a repo-controlled file may no longer steer where

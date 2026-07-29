@@ -515,7 +515,6 @@ impl ServerState {
     pub(crate) fn loomweave_read_api_json(&self) -> Value {
         let resolution = loomweave_federation::loomweave_url::resolve_loomweave_url_at(
             None,
-            &self.project_root,
             &self.effective_port_path(),
             |name| std::env::var(name).ok(),
         );
