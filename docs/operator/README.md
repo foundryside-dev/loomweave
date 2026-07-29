@@ -2,6 +2,13 @@
 
 Practical notes for configuring and running Loomweave.
 
+**Supported platforms:** Linux is the supported and CI-verified target
+(macOS additionally gets a CI build check on `aarch64-apple-darwin`).
+Windows is **not** a supported target — the plugin host's process
+sandboxing (`setrlimit`) and the worktree confined-deletion primitive
+(`openat2`) are Unix/Linux mechanisms, and the workspace does not build for
+Windows (owner ruling 2026-07-29, clarion-614022d526).
+
 - [Getting started](./getting-started.md) — single-flow walkthrough: install,
   analyse a small repo, connect an MCP client, ask three questions, verify
   the secret-block. Target ≤15 minutes end-to-end.
