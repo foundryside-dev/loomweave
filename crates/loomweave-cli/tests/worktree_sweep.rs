@@ -380,6 +380,56 @@ fn override_store_dir_makes_sweep_report_only() {
     );
 }
 
+/// The override decision must be the state the context was *resolved* under,
+/// not a fresh config read at sweep time: `analyze` resolves its context at
+/// start but sweeps at the end of a 20–30 minute run, and an override
+/// removed from `weft.toml` inside that window must not flip the sweep from
+/// report-only into delete mode against a store that may still be shared
+/// with another repository (clarion-306ed41ce3).
+#[test]
+fn override_removed_after_resolve_stays_report_only() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+
+    let override_dir = tmp.path().join("shared-override-store");
+    let weft_toml = repo.join("weft.toml");
+    fs::write(
+        &weft_toml,
+        format!("[loomweave]\nstore_dir = \"{}\"\n", override_dir.display()),
+    )
+    .unwrap();
+
+    let ctx = WorktreeContext::resolve(&repo).expect("resolves as Main");
+    assert_eq!(
+        ctx.repository_store, override_dir,
+        "sanity: the override must actually apply"
+    );
+
+    // The operator removes the override while the analyze that resolved
+    // `ctx` is still in flight.
+    fs::remove_file(&weft_toml).unwrap();
+
+    let worktrees_dir = ctx.repository_store.join("worktrees");
+    fs::create_dir_all(&worktrees_dir).unwrap();
+    let name = fake_candidate('b');
+    let candidate = worktrees_dir.join(&name);
+    fs::create_dir(&candidate).unwrap();
+
+    let outcome = sweep_worktree_stores(&ctx);
+
+    assert_eq!(
+        outcome,
+        SweepOutcome::ReportOnly {
+            would_delete: vec![name],
+        }
+    );
+    assert!(
+        candidate.is_dir(),
+        "the sweep must honor the override state its context was resolved under"
+    );
+}
+
 #[test]
 fn held_gc_lock_skips_the_sweep() {
     let tmp = TempDir::new().unwrap();

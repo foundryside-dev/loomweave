@@ -111,7 +111,7 @@ const PATTERNS: &[&str] = &["store_dir(", "db_path(", "embeddings_db_path("];
 /// double-count the same hits under a second pattern list.
 ///
 /// Still not exhaustive: a *second*-hop wrapper (a function that calls one
-/// of these four, rather than one of the original three) would evade both
+/// of these five, rather than one of the original three) would evade both
 /// pattern lists the same way. The brief's "a syn AST gate ... is not
 /// warranted" holds for the same reason it did originally — this audit is a
 /// grep, not a call-graph; each newly-found blind spot gets closed by naming
@@ -121,6 +121,10 @@ const WRAPPER_PATTERNS: &[&str] = &[
     "read_published_port(",
     "publish_port(",
     "resolve_loomweave_url(",
+    // `store_dir(` + override provenance (clarion-306ed41ce3). Escapes
+    // `PATTERNS`' `store_dir(` because the char after `store_dir` is `_`,
+    // not `(` — the textbook one-hop shape this list exists for.
+    "store_dir_resolution(",
 ];
 
 /// The two files where `store_dir`/`db_path`/`embeddings_db_path` are
@@ -266,8 +270,8 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     // The canonical resolution point: this IS where `repository_store` is
     // computed from a root. Every other file in this table exists to route
     // AROUND re-deriving this, not to duplicate it.
-    AllowedHit { file: "crates/loomweave-core/src/worktree/context.rs", text: "let repository_store = store_dir(&primary_root);", count: 1, classification: Classification::IntentionalRootDerived },
-    AllowedHit { file: "crates/loomweave-core/src/worktree/context.rs", text: "let repository_store = store_dir(&source_root);", count: 1, classification: Classification::IntentionalRootDerived },
+    AllowedHit { file: "crates/loomweave-core/src/worktree/context.rs", text: "let (repository_store, store_dir_overridden) = store_dir_resolution(&primary_root);", count: 1, classification: Classification::IntentionalRootDerived },
+    AllowedHit { file: "crates/loomweave-core/src/worktree/context.rs", text: "let (repository_store, store_dir_overridden) = store_dir_resolution(&source_root);", count: 1, classification: Classification::IntentionalRootDerived },
 
     // ---- crates/loomweave-federation/src/loomweave_port.rs ----
     AllowedHit { file: "crates/loomweave-federation/src/loomweave_port.rs", text: "assert!(!loomweave_core::store::store_dir(dir.path()).exists());", count: 1, classification: Classification::TestExempt },
@@ -446,13 +450,14 @@ fn every_runtime_leaf_resolves_from_store_paths() {
     // known-present line is what catches it.
     let sentinel_key = (
         "crates/loomweave-core/src/worktree/context.rs".to_owned(),
-        "let repository_store = store_dir(&primary_root);".to_owned(),
+        "let (repository_store, store_dir_overridden) = store_dir_resolution(&primary_root);"
+            .to_owned(),
     );
     assert!(
         found.contains_key(&sentinel_key),
         "sentinel line missing from the scan — WorktreeContext::linked_store's own \
-         `store_dir(&primary_root)` call was not found; the file walk or comment-skip logic is \
-         probably broken. Found files: {files_scanned}, found hits: {found:#?}"
+         `store_dir_resolution(&primary_root)` call was not found; the file walk or comment-skip \
+         logic is probably broken. Found files: {files_scanned}, found hits: {found:#?}"
     );
 
     let allowed = allowed_map();

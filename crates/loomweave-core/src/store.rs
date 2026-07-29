@@ -66,10 +66,27 @@ pub const WEFT_TOML: &str = "weft.toml";
 /// default — see the module docs for the fail-soft contract.
 #[must_use]
 pub fn store_dir(project_root: &Path) -> PathBuf {
+    store_dir_resolution(project_root).0
+}
+
+/// [`store_dir`], plus whether the resolved path came from a
+/// `[loomweave].store_dir` override in `weft.toml` (`true`) or the built-in
+/// `.weft/loomweave/` default (`false`).
+///
+/// The provenance flag exists for callers that must make a *safety* decision
+/// keyed on the override — the worktree-index cleanup sweep runs report-only
+/// under an override because an absolute override path can be shared between
+/// unrelated repositories. Such callers record this flag at resolve time
+/// (`WorktreeContext::store_dir_overridden`) rather than re-reading
+/// `weft.toml` later: the config is operator-mutable, and a decision re-read
+/// after a long `analyze` run could disagree with the paths the context was
+/// actually derived under (clarion-306ed41ce3).
+#[must_use]
+pub fn store_dir_resolution(project_root: &Path) -> (PathBuf, bool) {
     match store_dir_override(project_root) {
-        Some(dir) if dir.is_absolute() => dir,
-        Some(dir) => project_root.join(dir),
-        None => project_root.join(WEFT_DIR).join(MEMBER),
+        Some(dir) if dir.is_absolute() => (dir, true),
+        Some(dir) => (project_root.join(dir), true),
+        None => (project_root.join(WEFT_DIR).join(MEMBER), false),
     }
 }
 
@@ -118,13 +135,14 @@ pub fn llm_traffic_log_path_at(effective_store: &Path) -> PathBuf {
 /// is blank.
 ///
 /// Exposed (not merely module-private) so a caller outside this module can
-/// ask "is an override active for this project root?" without re-deriving
-/// `store_dir`'s own precedence logic — the worktree-index cleanup sweep
-/// (`loomweave-cli`'s `worktree::sweep`) is the first such caller: an
-/// absolute override is not scoped to one repository (two repositories can
-/// share the same override path), so the sweep must run report-only
-/// whenever this returns `Some`, never authorize a cross-repository
-/// deletion under the shared namespace.
+/// ask "is an override configured for this project root?" without
+/// re-deriving `store_dir`'s own precedence logic. Callers that need the
+/// answer *as of the moment paths were resolved* — the worktree-index
+/// cleanup sweep's report-only decision — must NOT call this at
+/// decision time; they read the provenance recorded on `WorktreeContext`
+/// (`store_dir_overridden`, populated from [`store_dir_resolution`]), so a
+/// `weft.toml` edit mid-run cannot desynchronize the decision from the
+/// paths it governs (clarion-306ed41ce3).
 #[must_use]
 pub fn store_dir_override(project_root: &Path) -> Option<PathBuf> {
     let store_dir = parse_weft_toml(project_root)?.loomweave?.store_dir?;

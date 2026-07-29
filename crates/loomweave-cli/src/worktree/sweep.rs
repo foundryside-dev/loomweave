@@ -41,15 +41,20 @@
 //! administrative directory cannot be read once resolved, the sweep aborts
 //! and deletes nothing — never partial, never a best-effort subset.
 //!
-//! **The override case.** A `[loomweave].store_dir` override
-//! (`loomweave_core::store::store_dir_override`) is not scoped to one
-//! repository: an absolute override can be shared between unrelated
+//! **The override case.** A `[loomweave].store_dir` override is not scoped
+//! to one repository: an absolute override can be shared between unrelated
 //! repositories, so under an active override this repository's registered
 //! set must never be used to authorize deleting another repository's `wt-*`
-//! stores sitting in the same shared namespace. When an override is active
-//! for `ctx.primary_root`, this module enumerates exactly as it otherwise
+//! stores sitting in the same shared namespace. When an override was active
+//! at context-resolve time, this module enumerates exactly as it otherwise
 //! would and logs every candidate it *would* delete, but deletes nothing —
-//! see [`SweepOutcome::ReportOnly`].
+//! see [`SweepOutcome::ReportOnly`]. The decision reads
+//! `ctx.store_dir_overridden` — the provenance recorded when
+//! `ctx.repository_store` was derived — never a fresh `weft.toml` read at
+//! sweep time: `analyze` resolves its context at start but sweeps at the
+//! end of a long run, and an override removed in that window must not flip
+//! the sweep into delete mode against the still-shared store the context
+//! was resolved under (clarion-306ed41ce3).
 //!
 //! **The accepted race.** There are no activity locks, so a store can be
 //! swept while a `serve` process holds it open — this is a deliberate
@@ -67,7 +72,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use loomweave_core::store::store_dir_override;
 use loomweave_core::worktree::{WorktreeContext, stable_id_for_admin_identity};
 use tracing::{debug, info, warn};
 
@@ -251,7 +255,7 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
         .into_iter()
         .partition(|name| !registered.contains(name));
 
-    if store_dir_override(&ctx.primary_root).is_some() {
+    if ctx.store_dir_overridden {
         for name in &to_delete {
             info!(
                 candidate = name.as_str(),
