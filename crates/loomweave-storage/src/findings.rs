@@ -92,28 +92,42 @@ pub fn sweep_stale_findings_for_rules(
     let rule_placeholders = std::iter::repeat_n("?", rule_ids.len())
         .collect::<Vec<_>>()
         .join(", ");
-    let file_placeholders = std::iter::repeat_n("?", examined_source_files.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Retire a stale secret finding only when its anchor entity's source file
-    // was among those re-examined this run (L3 scope-shrinkage guard).
-    let sql = format!(
-        "DELETE FROM findings \
-         WHERE status = 'open' \
-           AND filigree_issue_id IS NULL \
-           AND run_id <> ? \
-           AND rule_id IN ({rule_placeholders}) \
-           AND entity_id IN ( \
-               SELECT id FROM entities \
-               WHERE source_file_path IN ({file_placeholders}) \
-           )"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params = std::iter::once(current_run_id)
-        .chain(rule_ids.iter().copied())
-        .chain(examined_source_files.iter().copied())
-        .collect::<Vec<_>>();
-    let deleted = stmt.execute(rusqlite::params_from_iter(params))?;
+    // The examined-file list is the unbounded input (one entry per source
+    // file the producer re-examined; a per-plugin full re-dispatch is the
+    // whole corpus), so it is chunked below SQLITE_MAX_VARIABLE_NUMBER
+    // (32,766) — a single flat statement errored past ~32k files and the
+    // best-effort caller silently skipped retirement at exactly the scale
+    // where incremental runs matter most (clarion-a2c54fcaf6). 500 matches
+    // the workspace's established chunk size (`query.rs`,
+    // `wardline_taint.rs`). Per-chunk DELETEs compose: each retires only
+    // findings whose anchor file is in that chunk, so ordering and chunk
+    // boundaries cannot retire anything a flat statement would not.
+    let mut deleted = 0;
+    for file_chunk in examined_source_files.chunks(500) {
+        let file_placeholders = std::iter::repeat_n("?", file_chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Retire a stale secret finding only when its anchor entity's source
+        // file was among those re-examined this run (L3 scope-shrinkage
+        // guard).
+        let sql = format!(
+            "DELETE FROM findings \
+             WHERE status = 'open' \
+               AND filigree_issue_id IS NULL \
+               AND run_id <> ? \
+               AND rule_id IN ({rule_placeholders}) \
+               AND entity_id IN ( \
+                   SELECT id FROM entities \
+                   WHERE source_file_path IN ({file_placeholders}) \
+               )"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params = std::iter::once(current_run_id)
+            .chain(rule_ids.iter().copied())
+            .chain(file_chunk.iter().copied())
+            .collect::<Vec<_>>();
+        deleted += stmt.execute(rusqlite::params_from_iter(params))?;
+    }
     Ok(deleted)
 }
 
@@ -459,5 +473,32 @@ mod tests {
             sweep_stale_findings_for_rules(&conn, "run-2", &[], &["/x.py"]).unwrap(),
             0
         );
+    }
+
+    /// clarion-a2c54fcaf6: one bind variable per examined file capped the
+    /// sweep at `SQLITE_MAX_VARIABLE_NUMBER` (32,766) — a per-plugin full
+    /// re-dispatch on a bigger corpus errored and retirement silently never
+    /// happened. The file list is chunked, so an over-limit set both
+    /// succeeds and still retires the stale finding (whichever chunk its
+    /// file lands in).
+    #[test]
+    fn examined_file_set_beyond_the_bind_limit_still_sweeps() {
+        let conn = migrated_conn();
+        insert_finding_with_rule(&conn, "core:finding:x", "run-1", "LMWV-SEC-SECRET-DETECTED");
+
+        let mut files: Vec<String> = (0..33_000).map(|i| format!("/f{i}.py")).collect();
+        // Put the real file mid-list so the hit is inside an interior chunk.
+        files[16_500] = "/x.py".to_owned();
+        let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+
+        let deleted = sweep_stale_findings_for_rules(
+            &conn,
+            "run-2",
+            &["LMWV-SEC-SECRET-DETECTED"],
+            &file_refs,
+        )
+        .expect("an over-limit examined set must not error");
+        assert_eq!(deleted, 1, "the stale finding must still be retired");
+        assert!(ids(&conn).is_empty());
     }
 }
