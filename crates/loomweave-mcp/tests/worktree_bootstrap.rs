@@ -94,10 +94,21 @@ fn init_effective_store(ctx: &WorktreeContext) {
 /// linked worktree: `readers` opened against the *effective* store, gate
 /// active via `with_worktree_gate`.
 fn linked_state(ctx: &WorktreeContext) -> ServerState {
+    linked_state_with_spawn_outcome(ctx, false)
+}
+
+fn linked_state_with_spawn_outcome(
+    ctx: &WorktreeContext,
+    bootstrap_spawn_failed: bool,
+) -> ServerState {
     let pool = ReaderPool::open(&ctx.store_paths.db, 4).expect("reader pool");
     ServerState::new(ctx.source_root.clone(), pool)
         .with_tool_policy(McpToolPolicy::allow_write_tools())
-        .with_worktree_gate(ctx.store_paths.clone(), &ctx.source_root)
+        .with_worktree_gate(
+            ctx.store_paths.clone(),
+            &ctx.source_root,
+            bootstrap_spawn_failed,
+        )
 }
 
 fn seed_run(db_path: &Path, id: &str, started_at: &str, status: &str) {
@@ -364,6 +375,41 @@ async fn failed_build_returns_index_build_failed_with_fallback_command() {
     let status = call_tool(&state, "project_status_get", json!({})).await;
     assert_eq!(status["ok"], true, "{status:?}");
     assert_eq!(status["result"]["latest_run"]["status"], "failed");
+}
+
+#[tokio::test]
+async fn status_index_state_distinguishes_building_spawn_failed_and_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+
+    // Building, spawn fine (or pending): the agent should wait and retry.
+    let state = linked_state(&ctx);
+    let status = call_tool(&state, "project_status_get", json!({})).await;
+    assert_eq!(
+        status["result"]["index_state"], "index-building",
+        "a gated building session must say so explicitly: {status:?}"
+    );
+
+    // Building, but the bootstrap spawn FAILED: waiting is futile — the
+    // response must say the build will not start by itself
+    // (clarion-917df0e1ad).
+    let failed_state = linked_state_with_spawn_outcome(&ctx, true);
+    let status = call_tool(&failed_state, "project_status_get", json!({})).await;
+    assert_eq!(
+        status["result"]["index_state"], "bootstrap-spawn-failed",
+        "a swallowed spawn failure must be observable: {status:?}"
+    );
+
+    // A completed run governs — readiness is recomputed per call, and once
+    // Ready even the spawn-failed session reports it (a manual fallback run
+    // heals without a reconnect).
+    seed_completed_run(&ctx.store_paths.db, "run-1");
+    let status = call_tool(&failed_state, "project_status_get", json!({})).await;
+    assert_eq!(
+        status["result"]["index_state"], "ready",
+        "a completed run must override the spawn-failed report: {status:?}"
+    );
 }
 
 #[tokio::test]

@@ -1348,6 +1348,13 @@ struct WorktreeGate {
     /// The exact `loomweave worktree analyze -- <target>` fallback command,
     /// echoed verbatim in `index-building`/`index-build-failed` diagnostics.
     fallback_argv: Vec<String>,
+    /// Whether `serve`'s bootstrap spawn of `loomweave worktree analyze`
+    /// FAILED (unresolvable executable or spawn error) — recorded so
+    /// `project_status_get` can distinguish "building, retry later" from
+    /// "the build will never start by itself; run the fallback command"
+    /// (clarion-917df0e1ad). Readiness still governs: once any run
+    /// completes (e.g. the manual fallback), `Ready` overrides this flag.
+    bootstrap_spawn_failed: bool,
 }
 
 impl ServerState {
@@ -1396,10 +1403,12 @@ impl ServerState {
         mut self,
         store_paths: loomweave_core::worktree::StorePaths,
         source_root: &Path,
+        bootstrap_spawn_failed: bool,
     ) -> Self {
         self.worktree_gate = Some(WorktreeGate {
             store_paths,
             fallback_argv: worktree_bootstrap::fallback_argv(source_root),
+            bootstrap_spawn_failed,
         });
         self
     }

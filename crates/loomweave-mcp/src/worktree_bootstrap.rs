@@ -209,13 +209,18 @@ pub(crate) fn spawn_worktree_analyze(
 /// the executable disappeared) is logged and swallowed — `serve` must keep
 /// running in the `building` state either way; the documented fallback is
 /// running `loomweave worktree analyze` by hand.
+/// Returns whether the spawn SUCCEEDED — the failure is still logged and
+/// swallowed here (serve keeps running in the `building` state either way),
+/// but the caller records it on the gate so `project_status_get` can report
+/// `bootstrap-spawn-failed` instead of an indistinguishable forever-building
+/// state (clarion-917df0e1ad).
 pub fn spawn_detached_worktree_analyze(
     program: &Path,
     target: &Path,
     explicit_config: Option<&Path>,
-) {
+) -> bool {
     match spawn_worktree_analyze(program, target, explicit_config) {
-        Ok(_child) => {}
+        Ok(_child) => true,
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -224,6 +229,7 @@ pub fn spawn_detached_worktree_analyze(
                 "worktree bootstrap: failed to spawn detached `loomweave worktree analyze`; \
                  the index will stay in the building state until it is run manually"
             );
+            false
         }
     }
 }
