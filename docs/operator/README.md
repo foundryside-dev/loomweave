@@ -7,7 +7,8 @@ Practical notes for configuring and running Loomweave.
   the secret-block. Target ≤15 minutes end-to-end.
 - [Language support](./language-support.md) — what each language plugin (Python,
   Rust) extracts and tags, side by side: entity/edge kinds, categorisation tags,
-  and which tools work per language (e.g. dead-code is Python-only today).
+  and which tools work per language. The two plugins do not cover the same
+  surface, so check here before reading a per-language result as complete.
 - [Rust analysis: known limitations](./rust-known-limitations.md) — what Rust
   analysis does and does not resolve (macros, external edges, dead-code roots).
 - [OpenRouter LLM provider](./openrouter.md) — API key, model ID, attribution

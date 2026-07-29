@@ -149,6 +149,34 @@ fn integrity_check_propagates_source_metadata_errors() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn non_directory_source_component_is_reported_and_repaired_as_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/pkg"), b"not a directory").unwrap();
+
+    let mut conn = Connection::open(dir.path().join("test.db")).unwrap();
+    pragma::apply_write_pragmas(&conn).unwrap();
+    schema::apply_migrations(&mut conn).unwrap();
+    conn.execute(
+        "INSERT INTO entities (id, plugin_id, kind, name, short_name, source_file_id, \
+         source_file_path, properties, created_at, updated_at) \
+         VALUES ('core:file:src/pkg/mod.py', 'core', 'file', 'mod.py', 'mod.py', \
+         'core:file:src/pkg/mod.py', 'src/pkg/mod.py', '{}', 't', 't')",
+        [],
+    )
+    .unwrap();
+
+    let report = check_integrity(&conn, dir.path()).unwrap();
+    assert_eq!(report.stale_file_entities.len(), 1, "{report:?}");
+    assert_eq!(report.stale_file_entities[0].id, "core:file:src/pkg/mod.py");
+
+    let repair = repair_integrity(&mut conn, dir.path()).unwrap();
+    assert_eq!(repair.removed_file_entities, 1, "{repair:?}");
+    assert!(repair.residual.is_healthy(), "{repair:?}");
+}
+
 #[test]
 fn repair_removes_stale_rows_and_restores_integrity() {
     let dir = tempfile::tempdir().unwrap();

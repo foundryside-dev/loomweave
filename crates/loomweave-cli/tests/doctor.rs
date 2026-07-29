@@ -74,6 +74,104 @@ fn write_healthy_db(root: &Path) {
     fs::write(store.join(".gitignore"), canonical).unwrap();
 }
 
+/// A do-nothing language plugin: it completes the handshake and is never asked
+/// to analyze anything (the temp projects hold no `.lwdoc` files). Its only job
+/// is to make plugin discovery — and therefore `plugin.availability` and the
+/// classifier checks — DETERMINISTIC.
+///
+/// Without it a doctor test that asserts full health silently depends on whether
+/// the machine running it happens to have a language plugin installed globally:
+/// green on a developer box, red on a CI runner. That environment coupling is
+/// what pinned CI red (clarion-40132c951e).
+#[cfg(unix)]
+const DOCTOR_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"", b"\r\n"):
+            break
+        name, value = line.decode("ascii").strip().split(":", 1)
+        headers[name.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+
+def write_frame(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    msg = read_frame()
+    method = msg.get("method")
+    if method == "initialized":
+        continue
+    if method == "exit":
+        raise SystemExit(0)
+    ident = msg["id"]
+    if method == "initialize":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {
+            "name": "loomweave-plugin-lwdoc",
+            "version": "0.1.0",
+            "ontology_version": "0.1.0",
+            "capabilities": {},
+        }})
+    elif method == "shutdown":
+        write_frame({"jsonrpc": "2.0", "id": ident, "result": {}})
+    else:
+        raise SystemExit(1)
+"#;
+
+#[cfg(unix)]
+const DOCTOR_PLUGIN_MANIFEST: &str = r#"
+[plugin]
+name = "loomweave-plugin-lwdoc"
+plugin_id = "lwdoc"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "loomweave-plugin-lwdoc"
+language = "lwdoc"
+extensions = ["lwdoc"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 64
+expected_entities_per_file = 10
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module"]
+edge_kinds = []
+rule_id_prefix = "LMWV-DOC-"
+ontology_version = "0.1.0"
+classifier_tags = ["entry-point"]
+
+[ontology.roles]
+file_scope = ["module"]
+"#;
+
+/// Materialise the fixture plugin in a fresh dir and return it, plus the `PATH`
+/// value that makes it (and nothing else) discoverable.
+#[cfg(unix)]
+fn discoverable_plugin_dir() -> (TempDir, String) {
+    let dir = tempfile::tempdir().expect("plugin dir");
+    let script = dir.path().join("loomweave-plugin-lwdoc");
+    fs::write(&script, DOCTOR_PLUGIN_SCRIPT).expect("write plugin script");
+    let mut perms = fs::metadata(&script).expect("stat plugin").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod plugin");
+    fs::write(dir.path().join("plugin.toml"), DOCTOR_PLUGIN_MANIFEST).expect("write manifest");
+
+    let path = format!("{}:/usr/bin:/bin", dir.path().display());
+    (dir, path)
+}
+
 /// Run `doctor` (optionally with `--fix`) and return `(exit_code, stdout)`.
 fn doctor(dir: &Path, fix: bool) -> (i32, String) {
     doctor_with_env(dir, fix, &[], &[])
@@ -300,6 +398,47 @@ fn spawn_one_shot_health_server() -> (u16, std::thread::JoinHandle<()>) {
     (port, handle)
 }
 
+/// Like [`spawn_one_shot_health_server`] but answers 200 ONLY on
+/// `expected_path`, 404 otherwise — the real read API's contract.
+///
+/// The path-agnostic server above answers any request, so it cannot tell a
+/// correct probe from one aimed at a route that does not exist. That blind spot
+/// is why the liveness probe shipped pointed at `/health`, which the read API
+/// never registered. Returns the request line the probe actually sent.
+fn spawn_one_shot_routed_server(
+    expected_path: &'static str,
+) -> (u16, std::thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind routed server");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept probe");
+        let mut buf = [0_u8; 512];
+        let read = stream.read(&mut buf).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+        let request_line = request.lines().next().unwrap_or_default().to_owned();
+        let hit = request_line
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|path| path == expected_path);
+        if hit {
+            let body = r#"{"ok":true}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        } else {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"
+            );
+        }
+        request_line
+    });
+    (port, handle)
+}
+
 /// A freshly `install --all`ed project has every orientation surface, including
 /// Claude Code MCP, so `doctor` must report it healthy.
 #[test]
@@ -317,8 +456,51 @@ fn doctor_reports_plain_install_healthy() {
     );
 }
 
+/// Classifier evidence is produced by LANGUAGE PLUGINS. With none installed
+/// there is nothing to classify and nothing `--fix` can do about it: running
+/// `analyze` yields `skipped_no_plugins`, so reporting the classifier checks as
+/// repairable `problem`s makes `doctor --fix` exit non-zero forever on any
+/// plugin-less machine — which is every CI runner that does not install a
+/// language plugin, and every fresh install before the operator adds one.
+///
+/// `plugin.availability` already warns about the missing plugin; the classifier
+/// checks must degrade to the same warning rather than claim a failed repair.
+#[test]
+fn doctor_fix_exits_zero_when_no_language_plugin_is_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--skills", "--hooks"], dir.path());
+    write_healthy_db(dir.path());
+
+    // A PATH with no `loomweave-plugin-*` on it — the CI runner's shape.
+    let (code, doc) = doctor_json_with_env(dir.path(), true, &[("PATH", "/usr/bin:/bin")], &[]);
+
+    let status = |id: &str| -> String {
+        doc["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("check {id} missing from {doc:#}"))["status"]
+            .as_str()
+            .expect("status string")
+            .to_owned()
+    };
+
+    assert_eq!(
+        code, 0,
+        "a plugin-less project has nothing to classify, so --fix must not report an \
+         unrepairable problem; doctor:\n{doc:#}"
+    );
+    // Not applicable, not broken — and the missing plugin is still surfaced once,
+    // by the check that owns it.
+    assert_eq!(status("classifier.enumeration"), "warning");
+    assert_eq!(status("classifier.tags"), "warning");
+    assert_eq!(status("plugin.availability"), "warning");
+}
+
 /// `doctor --fix` registers the MCP entry; a subsequent plain `doctor` is then
 /// fully healthy and exits 0. The `.mcp.json` gains a `loomweave` serve entry.
+#[cfg(unix)]
 #[test]
 fn doctor_fix_registers_mcp_then_reports_healthy() {
     let dir = tempfile::tempdir().unwrap();
@@ -333,8 +515,13 @@ fn doctor_fix_registers_mcp_then_reports_healthy() {
     // seed a healthy run so `--fix` never shells out to `loomweave analyze`
     // (see `seed_completed_classifier_run`).
     seed_completed_classifier_run(dir.path());
+    // ...and pin plugin discovery, for the same reason: a machine with no
+    // language plugin warns on `plugin.availability` + the classifier checks,
+    // which also prevents the healthy summary line. Asserting FULL health means
+    // owning every input to it, not inheriting the developer's global installs.
+    let (_plugin_dir, path) = discoverable_plugin_dir();
 
-    let (code, out) = doctor(dir.path(), true);
+    let (code, out) = doctor_with_env(dir.path(), true, &[("PATH", path.as_str())], &[]);
     assert_eq!(code, 0, "--fix should repair and exit 0; stdout:\n{out}");
     assert!(
         out.contains("All orientation surfaces healthy."),
@@ -929,6 +1116,33 @@ fn doctor_reports_published_ephemeral_port() {
     );
 }
 
+/// The liveness probe must aim at a route the read API actually serves.
+///
+/// `/api/v1/_capabilities` is the one deliberately unauthenticated route
+/// (siblings probe it pre-auth), which makes it the only sound liveness target:
+/// every other route can legitimately answer 401/403 on a perfectly healthy
+/// server. `/health` was never registered at all, so doctor reported a LIVE
+/// server as "stale port metadata … not reachable" for every operator with the
+/// HTTP read API enabled (clarion-7ad374bac4).
+#[test]
+fn doctor_probes_a_route_the_read_api_actually_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    let (port, handle) = spawn_one_shot_routed_server("/api/v1/_capabilities");
+    let loomweave_dir = dir.path().join(".weft/loomweave");
+    std::fs::create_dir_all(&loomweave_dir).unwrap();
+    std::fs::write(loomweave_dir.join("ephemeral.port"), format!("{port}\n")).unwrap();
+
+    let (code, json) = doctor_json(dir.path(), false);
+    let request_line = handle.join().expect("routed server joins");
+    assert_eq!(code, 0, "{json}");
+    let http = check(&json, "http.config");
+    assert_eq!(
+        http["status"], "ok",
+        "a live server must not be reported unreachable; probe sent {request_line:?}: {http}"
+    );
+}
+
 #[test]
 fn doctor_warns_when_published_ephemeral_port_is_stale() {
     let dir = tempfile::tempdir().unwrap();
@@ -957,8 +1171,10 @@ fn doctor_warns_when_published_ephemeral_port_is_stale() {
         message.contains("stale HTTP read-API port metadata"),
         "{http}"
     );
+    // The message names the route that was actually probed, so an operator can
+    // reproduce the check by hand. That must stay in step with the probe itself.
     assert!(
-        message.contains(&format!("127.0.0.1:{port}/health")),
+        message.contains(&format!("127.0.0.1:{port}/api/v1/_capabilities")),
         "{http}"
     );
     assert!(
@@ -1887,6 +2103,59 @@ fn run_git(repo: &Path, args: &[&str]) {
         .status
         .success();
     assert!(ok, "git {args:?} failed");
+}
+
+/// A hostile or stale `GIT_DIR`/`GIT_WORK_TREE` in the environment must not
+/// redirect Loomweave's git probes (clarion-9202f4acec).
+///
+/// `hardened_git_command` passes `-C <project_root>`, but the repository-selector
+/// environment variables OVERRIDE `-C`. So an inherited `GIT_DIR` makes every
+/// probe answer about a different repository. Here that means doctor reads the
+/// hijacked repo's index and declares this project's untracked db "tracked" —
+/// and `--fix` would then run `git rm --cached` against that unrelated
+/// repository, mutating it.
+#[test]
+fn doctor_git_probes_ignore_a_hijacked_git_dir_in_the_environment() {
+    let project = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], project.path());
+    write_healthy_db(project.path());
+    run_git(project.path(), &["init", "-q"]);
+    run_git(project.path(), &["config", "user.email", "t@t"]);
+    run_git(project.path(), &["config", "user.name", "t"]);
+    // The db is NOT added here: in THIS repo it is untracked.
+
+    // A second repo where the very same relative path IS tracked.
+    let hostile = tempfile::tempdir().unwrap();
+    fs::create_dir_all(hostile.path().join(".weft/loomweave")).unwrap();
+    fs::write(hostile.path().join(".weft/loomweave/loomweave.db"), b"x").unwrap();
+    run_git(hostile.path(), &["init", "-q"]);
+    run_git(hostile.path(), &["config", "user.email", "t@t"]);
+    run_git(hostile.path(), &["config", "user.name", "t"]);
+    run_git(
+        hostile.path(),
+        &["add", "-f", ".weft/loomweave/loomweave.db"],
+    );
+
+    let (code, json) = doctor_json_with_env(
+        project.path(),
+        false,
+        &[
+            (
+                "GIT_DIR",
+                &hostile.path().join(".git").display().to_string(),
+            ),
+            ("GIT_WORK_TREE", &hostile.path().display().to_string()),
+        ],
+        &[],
+    );
+
+    let db = check(&json, "db.tracked");
+    assert_eq!(
+        db["status"], "ok",
+        "the probe must answer about THIS project, not the repo named by the \
+         inherited GIT_DIR: {db}"
+    );
+    assert_eq!(code, 0, "{json}");
 }
 
 /// A git-tracked runtime DB is a gate-failing problem: it mutates on every
