@@ -666,9 +666,9 @@ mod tests {
 
     /// clarion-73874f5939: a schema-only mismatch must be reported as a
     /// schema mismatch — the fall-through arm used to label every parsed
-    /// mismatch "source_root mismatch", producing a self-contradictory
+    /// mismatch `"source_root mismatch"`, producing a self-contradictory
     /// diagnostic (`describes "/same/path", resolved worktree is
-    /// "/same/path"`) on the first METADATA_SCHEMA bump.
+    /// "/same/path"`) on the first `METADATA_SCHEMA` bump.
     #[test]
     fn schema_mismatch_reason_names_the_failing_check() {
         let tmp = tempfile::tempdir().unwrap();
