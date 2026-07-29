@@ -17,6 +17,26 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OpenFlags};
 
+/// Resolve the store `project_root` actually reads: `WorktreeContext`'s
+/// `store_paths.db` (worktree-index Task 7) — never a bare
+/// `db_path(project_root)`, which for a linked worktree is the *source*
+/// root's own store, a location `loomweave worktree analyze` never
+/// populates. Falls back to the root-derived path on the one error
+/// `WorktreeContext::resolve` can return (a non-UTF-8 path component).
+fn resolve_effective_db_path(project_root: &Path) -> std::path::PathBuf {
+    match loomweave_core::worktree::WorktreeContext::resolve(project_root) {
+        Ok(ctx) => ctx.store_paths.db,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "resolve worktree context for db command failed; falling back to \
+                 <project_root>/.weft/loomweave/loomweave.db"
+            );
+            loomweave_core::store::db_path(project_root)
+        }
+    }
+}
+
 /// Back up the project's `.weft/loomweave/loomweave.db` to `output`.
 ///
 /// The copy is taken with `rusqlite::backup::Backup` (a consistent online
@@ -30,7 +50,7 @@ use rusqlite::{Connection, OpenFlags};
 /// exists and `force` is not set, if `output` resolves to the source database
 /// itself, or if the backup / integrity check fails.
 pub fn backup(project_root: &Path, output: &Path, force: bool) -> Result<()> {
-    let db_path = loomweave_core::store::db_path(project_root);
+    let db_path = resolve_effective_db_path(project_root);
     ensure!(
         db_path.exists(),
         "Loomweave database not found at {}; run `loomweave analyze` first",
@@ -100,7 +120,7 @@ pub fn backup(project_root: &Path, output: &Path, force: bool) -> Result<()> {
 /// `busy` result — the committed frames are already durable, so we report the
 /// partial outcome rather than fail.
 pub fn checkpoint(project_root: &Path) -> Result<()> {
-    let db_path = loomweave_core::store::db_path(project_root);
+    let db_path = resolve_effective_db_path(project_root);
     ensure!(
         db_path.exists(),
         "Loomweave database not found at {}; run `loomweave analyze` first",

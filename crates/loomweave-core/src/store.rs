@@ -66,10 +66,27 @@ pub const WEFT_TOML: &str = "weft.toml";
 /// default — see the module docs for the fail-soft contract.
 #[must_use]
 pub fn store_dir(project_root: &Path) -> PathBuf {
+    store_dir_resolution(project_root).0
+}
+
+/// [`store_dir`], plus whether the resolved path came from a
+/// `[loomweave].store_dir` override in `weft.toml` (`true`) or the built-in
+/// `.weft/loomweave/` default (`false`).
+///
+/// The provenance flag exists for callers that must make a *safety* decision
+/// keyed on the override — the worktree-index cleanup sweep runs report-only
+/// under an override because an absolute override path can be shared between
+/// unrelated repositories. Such callers record this flag at resolve time
+/// (`WorktreeContext::store_dir_overridden`) rather than re-reading
+/// `weft.toml` later: the config is operator-mutable, and a decision re-read
+/// after a long `analyze` run could disagree with the paths the context was
+/// actually derived under (clarion-306ed41ce3).
+#[must_use]
+pub fn store_dir_resolution(project_root: &Path) -> (PathBuf, bool) {
     match store_dir_override(project_root) {
-        Some(dir) if dir.is_absolute() => dir,
-        Some(dir) => project_root.join(dir),
-        None => project_root.join(WEFT_DIR).join(MEMBER),
+        Some(dir) if dir.is_absolute() => (dir, true),
+        Some(dir) => (project_root.join(dir), true),
+        None => (project_root.join(WEFT_DIR).join(MEMBER), false),
     }
 }
 
@@ -86,9 +103,28 @@ pub fn db_path(project_root: &Path) -> PathBuf {
 /// artifact (C-9: a member writes only its own `.weft/<member>/` subtree) —
 /// the original `.loomweave/diagnostics/` literal predated the Weft store
 /// cutover (weft-ac59e8e730).
+///
+/// This re-derives `store_dir(project_root)`, so it is only correct for a
+/// Standalone or Main checkout. A linked-worktree caller must resolve
+/// `WorktreeContext` and call [`llm_traffic_log_path_at`] with
+/// `worktree_ctx.effective_store` instead — see
+/// `loomweave-cli/src/serve.rs`'s `build_llm_provider`.
 #[must_use]
 pub fn llm_traffic_log_path(project_root: &Path) -> PathBuf {
-    store_dir(project_root)
+    llm_traffic_log_path_at(&store_dir(project_root))
+}
+
+/// `<effective_store>/diagnostics/llm-traffic.jsonl` — same layout as
+/// [`llm_traffic_log_path`], but rooted at an already-resolved effective
+/// store (main/standalone's `store_dir(project_root)`, or a linked
+/// worktree's isolated `effective_store`) rather than re-deriving it from a
+/// project root. Callers that have already resolved a `WorktreeContext`
+/// should call this directly instead of `llm_traffic_log_path`, which would
+/// silently re-derive the wrong (checkout-local) path for a linked
+/// worktree.
+#[must_use]
+pub fn llm_traffic_log_path_at(effective_store: &Path) -> PathBuf {
+    effective_store
         .join("diagnostics")
         .join("llm-traffic.jsonl")
 }
@@ -97,7 +133,18 @@ pub fn llm_traffic_log_path(project_root: &Path) -> PathBuf {
 /// any. Returns `None` (fail-soft, never an error) when the file is absent or
 /// malformed, the `[loomweave]` table or `store_dir` key is absent, or the value
 /// is blank.
-fn store_dir_override(project_root: &Path) -> Option<PathBuf> {
+///
+/// Exposed (not merely module-private) so a caller outside this module can
+/// ask "is an override configured for this project root?" without
+/// re-deriving `store_dir`'s own precedence logic. Callers that need the
+/// answer *as of the moment paths were resolved* — the worktree-index
+/// cleanup sweep's report-only decision — must NOT call this at
+/// decision time; they read the provenance recorded on `WorktreeContext`
+/// (`store_dir_overridden`, populated from [`store_dir_resolution`]), so a
+/// `weft.toml` edit mid-run cannot desynchronize the decision from the
+/// paths it governs (clarion-306ed41ce3).
+#[must_use]
+pub fn store_dir_override(project_root: &Path) -> Option<PathBuf> {
     let store_dir = parse_weft_toml(project_root)?.loomweave?.store_dir?;
     let trimmed = store_dir.trim();
     if trimmed.is_empty() {

@@ -248,6 +248,40 @@ pub enum Command {
         #[command(subcommand)]
         command: SarifCommand,
     },
+
+    /// Linked-worktree isolated-index maintenance.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorktreeCommand {
+    /// Build or rebuild a linked worktree's isolated index directly.
+    ///
+    /// `<name-or-path>` is either a registered Git worktree's administrative
+    /// name (as `git worktree list` reports it) or a filesystem path. This is
+    /// the recovery path and the documented fallback whenever a graph tool
+    /// reports `index-build-failed`: it builds the same isolated store that a
+    /// bare `loomweave analyze <linked-worktree-path>` routes to, without
+    /// requiring the operator to know or type the full path.
+    Analyze {
+        /// Force a full re-analysis, disabling the incremental skip of files
+        /// unchanged since the last run. Without this flag unchanged files
+        /// are skipped.
+        #[arg(long)]
+        no_incremental: bool,
+
+        /// Path to loomweave.yaml. Defaults to the worktree's own, falling
+        /// back to the primary checkout's (the same precedence `serve`
+        /// reports for this checkout).
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+
+        /// Git worktree name or filesystem path.
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

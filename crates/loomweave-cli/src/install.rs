@@ -370,12 +370,17 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
 /// path (`"."` → project root, `".."` → an ancestor, or any absolute dir), so a
 /// blind `remove_dir_all` could wipe the project tree or an unrelated directory.
 ///
-/// Two independent checks must both pass:
+/// Three independent checks must all pass:
 /// 1. The store dir must not be the project root or an ancestor of it (canonical
 ///    path comparison) — this alone defuses `store_dir = "."` / `".."`.
 /// 2. It must look like a Loomweave store: the canonical `.weft/loomweave`
 ///    location, or a directory that actually holds a `loomweave.db`. An arbitrary
 ///    absolute path or a misconfigured under-tree override is refused, not wiped.
+/// 3. (worktree-indexes Task 7) `<loomweave_dir>/worktrees/` must not hold any
+///    `wt-[0-9a-f]{64}` isolated store: those are OTHER linked worktrees' live,
+///    worktree-index-isolated stores (Task 3), not disposable scratch under the
+///    primary's own store — `remove_dir_all` would destroy them (and any
+///    concurrently-running `serve` session holding one open) with no warning.
 fn ensure_safe_to_force_remove(loomweave_dir: &Path, project_root: &Path) -> Result<()> {
     let store_canon = loomweave_dir
         .canonicalize()
@@ -404,7 +409,47 @@ fn ensure_safe_to_force_remove(loomweave_dir: &Path, project_root: &Path) -> Res
             loomweave_dir.display()
         );
     }
+
+    if let Some(stable_ids) = populated_worktrees_namespace(loomweave_dir) {
+        bail!(
+            "--force refuses to delete {}: its worktrees/ namespace holds {} \
+             worktree-isolated store(s) ({}) — deleting it would destroy those linked \
+             worktrees' indexes too. Remove .weft/loomweave/worktrees/ intentionally first \
+             if you mean to wipe them, then re-run `loomweave worktree analyze -- <target>` \
+             for each linked worktree still in use to rebuild its index.",
+            loomweave_dir.display(),
+            stable_ids.len(),
+            stable_ids.join(", "),
+        );
+    }
     Ok(())
+}
+
+/// `Some(stable_ids)` (sorted, non-empty) when `<loomweave_dir>/worktrees/`
+/// exists and holds at least one entry matching the
+/// `wt-[0-9a-f]{64}` grammar, or when it exists but could not be enumerated
+/// (unreadable — treated the same as populated, since "unknown" is not a safe
+/// green light for a recursive delete). `None` when the namespace is absent or
+/// genuinely empty.
+fn populated_worktrees_namespace(loomweave_dir: &Path) -> Option<Vec<String>> {
+    let worktrees_dir = loomweave_dir.join(loomweave_cli::worktree::store::WORKTREES_DIR_NAME);
+    if !worktrees_dir.is_dir() {
+        return None;
+    }
+    let Ok(entries) = fs::read_dir(&worktrees_dir) else {
+        return Some(vec!["<unreadable worktrees/ directory>".to_owned()]);
+    };
+    let mut stable_ids: Vec<String> = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| loomweave_cli::worktree::confine::matches_worktree_store_grammar(name))
+        .collect();
+    if stable_ids.is_empty() {
+        return None;
+    }
+    stable_ids.sort();
+    Some(stable_ids)
 }
 
 fn install_claude_code(project_root: &Path) -> Result<()> {
@@ -481,11 +526,20 @@ fn install_hooks(project_root: &Path) -> Result<()> {
 }
 
 fn install_instruction_blocks(project_root: &Path) -> Result<()> {
+    // C-20: when CLAUDE.md is only a redirect to AGENTS.md the block is written
+    // to AGENTS.md alone (and a legacy CLAUDE.md block is migrated off), so the
+    // report must name what actually happened rather than the dual-write shape.
+    let redirects = crate::instructions::claude_md_redirects_to_agents_md(project_root);
     let report = crate::instructions::install_instructions(project_root)
         .context("inject loomweave instructions into CLAUDE.md / AGENTS.md")?;
+    let targets = if redirects {
+        "AGENTS.md (CLAUDE.md redirects to it)"
+    } else {
+        "{CLAUDE,AGENTS}.md"
+    };
     if report.changed {
         println!(
-            "Injected loomweave instructions block into {}/{{CLAUDE,AGENTS}}.md",
+            "Injected loomweave instructions block into {}/{targets}",
             project_root.display()
         );
     } else {

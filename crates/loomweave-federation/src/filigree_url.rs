@@ -1,6 +1,6 @@
 //! Resolve the live Filigree API base URL.
 //!
-//! Mirrors Filigree's ethereal endpoint-discovery convention: the dashboard
+//! Mirrors Filigree's ephemeral endpoint-discovery convention: the dashboard
 //! publishes its live port to a per-project `ephemeral.port` file (a plain
 //! integer, written atomically, present only while the dashboard runs) and
 //! serves the read API on that port. The port is chosen deterministically but
@@ -35,7 +35,7 @@
 //! deliberately not used for Filigree: repository content must not redirect
 //! authenticated Filigree requests or bearer tokens. Every rung is fail-soft.
 //!
-//! Scope: ethereal mode only. Filigree's `server` mode resolves through a
+//! Scope: ephemeral mode only. Filigree's `server` mode resolves through a
 //! home-directory global (`~/.config/filigree/server.json`); that path is not
 //! exercised here and is left as a known gap (clarion-318f1254eb tracks the
 //! issues_for-side resolution diagnostics that build on this resolver).
@@ -59,11 +59,27 @@ pub const SOURCE_ENV: &str = "env:WEFT_FILIGREE_URL";
 /// because repository content can be attacker-controlled while Filigree bearer
 /// tokens come from the operator environment.
 pub const SOURCE_WEFT_TOML: &str = "weft.toml";
-/// The live ethereal port published by Filigree's running dashboard at the
+/// The live ephemeral port published by Filigree's running dashboard at the
 /// consolidated `.weft/filigree/` location — the only location read (ADR-046).
 pub const SOURCE_EPHEMERAL_PORT: &str = ".weft/filigree/ephemeral.port";
 /// Loomweave's own configured `integrations.filigree.base_url`.
 pub const SOURCE_CONFIG: &str = "config";
+
+/// Build the ordered, deduplicated sibling-discovery candidate list: `source_root`
+/// first, then `primary_root` only if it differs. Both are expected to already
+/// be canonicalized (as `loomweave_core::worktree::WorktreeContext::source_root`
+/// / `primary_root` are), so a plain equality check is sufficient here — no
+/// need to re-canonicalize. For a standalone checkout or the main worktree of a
+/// repository the two are always equal, so this collapses to the single-root
+/// list, producing exactly today's behavior at every rung that consumes it.
+#[must_use]
+pub fn dedup_candidate_roots<'a>(source_root: &'a Path, primary_root: &'a Path) -> Vec<&'a Path> {
+    if source_root == primary_root {
+        vec![source_root]
+    } else {
+        vec![source_root, primary_root]
+    }
+}
 
 /// The outcome of resolving where Loomweave should reach Filigree's read API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -76,6 +92,14 @@ pub struct FiligreeUrlResolution {
     pub resolved_url: Option<String>,
     /// Which input produced [`Self::resolved_url`]; one of the `SOURCE_*` labels.
     pub source: &'static str,
+    /// The candidate root whose published `ephemeral.port` won — `Some` only
+    /// when [`Self::source`] is the ephemeral-port rung. Callers building a
+    /// [`FiligreeHttpClient`](crate::filigree::FiligreeHttpClient) pass this
+    /// through so the minted federation token resolves from the SAME root as
+    /// the URL: a stale worktree-local token paired with the primary's live
+    /// daemon URL 401s against a correctly discovered endpoint
+    /// (clarion-f93e006216).
+    pub winning_root: Option<std::path::PathBuf>,
 }
 
 /// Resolve the Filigree read-API base URL along the C-9 §2.2 precedence ladder.
@@ -105,6 +129,27 @@ pub fn resolve_filigree_url(
     project_root: &Path,
     getenv: impl Fn(&str) -> Option<String>,
 ) -> FiligreeUrlResolution {
+    resolve_filigree_url_with_roots(config, &[project_root], getenv)
+}
+
+/// [`resolve_filigree_url`], but rung 2 (the live ephemeral port) checks each
+/// of `roots` in order and uses the first hit, instead of a single project
+/// root. `roots` should be an ordered, deduplicated candidate list — for a
+/// linked Git worktree, `[source_root, primary_root]` (see the module docs
+/// and `WorktreeContext`) — so a worktree-local Filigree instance is
+/// preferred but a repository-wide one is still found. A single-element list
+/// (the `resolve_filigree_url` case) is byte-identical to today's behavior.
+///
+/// There is deliberately no `weft.toml [filigree].url` rung: repository
+/// content may be untrusted, while Filigree clients attach operator-owned
+/// bearer tokens to the resolved endpoint. Operator overrides use the
+/// process environment (`WEFT_FILIGREE_URL`) or the private config.
+#[must_use]
+pub fn resolve_filigree_url_with_roots(
+    config: &FiligreeConfig,
+    roots: &[&Path],
+    getenv: impl Fn(&str) -> Option<String>,
+) -> FiligreeUrlResolution {
     let configured_url = config.base_url.clone();
     if !config.enabled {
         return FiligreeUrlResolution {
@@ -112,6 +157,7 @@ pub fn resolve_filigree_url(
             configured_url,
             resolved_url: None,
             source: SOURCE_DISABLED,
+            winning_root: None,
         };
     }
     // Rung 1: WEFT_FILIGREE_URL env, used verbatim.
@@ -121,21 +167,28 @@ pub fn resolve_filigree_url(
             configured_url,
             resolved_url: Some(url.trim().to_owned()),
             source: SOURCE_ENV,
+            winning_root: None,
         };
     }
-    // Rung 2: live ethereal port overrides the configured URL's port.
+    // Rung 2: live ephemeral port overrides the configured URL's port.
     // Do not read project-root `weft.toml [filigree].url` here: repository
     // content may be untrusted, while Filigree clients attach operator-owned
     // bearer tokens to the resolved endpoint. Remote/operator overrides must
     // use the process environment (`WEFT_FILIGREE_URL`) or the private config.
-    match read_ephemeral_port(project_root) {
-        Some((port, source)) => {
+    // Checks each candidate root in order; the first published port wins, and
+    // is recorded so token resolution can pair with it (clarion-f93e006216).
+    match roots
+        .iter()
+        .find_map(|root| read_ephemeral_port(root).map(|hit| (*root, hit)))
+    {
+        Some((root, (port, source))) => {
             let resolved = override_port(&configured_url, port);
             FiligreeUrlResolution {
                 enabled: true,
                 configured_url,
                 resolved_url: Some(resolved),
                 source,
+                winning_root: Some(root.to_path_buf()),
             }
         }
         // Rung 3: configured base_url unchanged.
@@ -144,6 +197,7 @@ pub fn resolve_filigree_url(
             resolved_url: Some(configured_url.clone()),
             configured_url,
             source: SOURCE_CONFIG,
+            winning_root: None,
         },
     }
 }
@@ -154,7 +208,18 @@ pub fn resolve_filigree_url(
 /// policy stays in one place.
 #[must_use]
 pub fn read_filigree_ephemeral_port(project_root: &Path) -> Option<u16> {
-    read_ephemeral_port(project_root).map(|(port, _source)| port)
+    read_filigree_ephemeral_port_with_roots(&[project_root])
+}
+
+/// [`read_filigree_ephemeral_port`], checking each of `roots` in order and
+/// returning the first hit. See [`resolve_filigree_url_with_roots`] for the
+/// ordered-candidate-list contract this mirrors.
+#[must_use]
+pub fn read_filigree_ephemeral_port_with_roots(roots: &[&Path]) -> Option<u16> {
+    roots
+        .iter()
+        .find_map(|root| read_ephemeral_port(root))
+        .map(|(port, _source)| port)
 }
 
 /// Read Filigree's published ephemeral port from the consolidated
@@ -363,5 +428,58 @@ mod tests {
         assert!(!res.enabled);
         assert_eq!(res.resolved_url, None);
         assert_eq!(res.source, SOURCE_DISABLED);
+    }
+
+    #[test]
+    fn dedup_candidate_roots_collapses_equal_paths() {
+        let root = Path::new("/repo");
+        assert_eq!(dedup_candidate_roots(root, root), vec![root]);
+    }
+
+    #[test]
+    fn dedup_candidate_roots_keeps_both_distinct_paths_in_order() {
+        let source = Path::new("/worktrees/feature");
+        let primary = Path::new("/repo");
+        assert_eq!(
+            dedup_candidate_roots(source, primary),
+            vec![source, primary]
+        );
+    }
+
+    #[test]
+    fn multi_root_lookup_prefers_source_root_port_over_primary() {
+        let source = tempfile::tempdir().unwrap();
+        let primary = tempfile::tempdir().unwrap();
+        write_weft_port_file(source.path(), "8600\n");
+        write_weft_port_file(primary.path(), "8542\n");
+
+        let roots = [source.path(), primary.path()];
+        let res = resolve_filigree_url_with_roots(&enabled_config(), &roots, |_| None);
+        assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8600"));
+        assert_eq!(res.source, SOURCE_EPHEMERAL_PORT);
+        assert_eq!(read_filigree_ephemeral_port_with_roots(&roots), Some(8600));
+    }
+
+    #[test]
+    fn multi_root_lookup_falls_back_to_primary_root_port_when_source_has_none() {
+        let source = tempfile::tempdir().unwrap();
+        let primary = tempfile::tempdir().unwrap();
+        write_weft_port_file(primary.path(), "8542\n");
+
+        let roots = [source.path(), primary.path()];
+        let res = resolve_filigree_url_with_roots(&enabled_config(), &roots, |_| None);
+        assert_eq!(res.resolved_url.as_deref(), Some("http://127.0.0.1:8542"));
+        assert_eq!(res.source, SOURCE_EPHEMERAL_PORT);
+        assert_eq!(read_filigree_ephemeral_port_with_roots(&roots), Some(8542));
+    }
+
+    #[test]
+    fn multi_root_lookup_folds_to_config_when_neither_root_has_a_port() {
+        let source = tempfile::tempdir().unwrap();
+        let primary = tempfile::tempdir().unwrap();
+        let roots = [source.path(), primary.path()];
+        let res = resolve_filigree_url_with_roots(&enabled_config(), &roots, |_| None);
+        assert_eq!(res.source, SOURCE_CONFIG);
+        assert_eq!(read_filigree_ephemeral_port_with_roots(&roots), None);
     }
 }

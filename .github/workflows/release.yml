@@ -453,7 +453,14 @@ jobs:
     # idempotent here: an already-uploaded version counts as success, so a re-run
     # after a partial failure is safe. Crates upload leaf -> root; each upload
     # waits for the crates.io index before its dependents publish.
-    # loomweave-plugin-fixture is publish=false (test-only) and omitted.
+    # Two workspace crates are publish=false (test-only) and deliberately
+    # omitted from the order below: loomweave-plugin-fixture and
+    # loomweave-worktree-confine-probe. Both enter loomweave-cli only as
+    # path-only dev-dependencies, which cargo strips at packaging — so their
+    # absence here cannot partial-fail a release the way a missing
+    # PUBLISHABLE crate did in v1.4.0 (see the loomweave-llm note below).
+    # When auditing this list against [workspace.members], expect the count
+    # to differ by exactly those two.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read

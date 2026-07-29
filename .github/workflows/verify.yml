@@ -123,6 +123,42 @@ jobs:
       - name: test
         run: cargo nextest run --workspace --all-features --no-tests=pass
 
+      # Task 2 (confined worktree-index deletion primitive): the bind-mount
+      # confinement test needs an unprivileged user+mount namespace
+      # (unshare(CLONE_NEWUSER|CLONE_NEWNS)), available to unprivileged
+      # processes on ubuntu-latest but not universally, so it's #[ignore]d
+      # everywhere else and run explicitly, here, as its own step. See
+      # crates/loomweave-cli/tests/worktree_confine.rs's doc comment on
+      # `bind_mount_beneath_candidate_refuses_deletion` for why the
+      # namespace setup itself runs in a separate, freshly-spawned
+      # loomweave-worktree-confine-probe binary rather than in this test
+      # process. The preceding "build workspace bins" + "test" steps already
+      # rebuild that probe fresh, so this step (unlike a standalone local
+      # run) is not exposed to the stale-dev-dep-binary footgun documented
+      # there.
+      #
+      # Deliberately NOT `--no-tests=pass` (unlike the "test" step above):
+      # this step exists to run exactly one test, so if a future rename or
+      # `#[cfg]` change ever makes the `-E 'test(bind_mount)'` filter match
+      # zero tests, the step must error, not pass vacuously. Do not add
+      # `--no-tests=pass` here to "fix" a red run — that would silently
+      # disable this gate instead of running it.
+      #
+      # Ubuntu 24.04 (current ubuntu-latest) restricts unprivileged user
+      # namespaces via AppArmor by default (`kernel.apparmor_restrict_
+      # unprivileged_userns=1`); lift it first (ubuntu-latest has
+      # passwordless sudo) so `unshare(CLONE_NEWUSER)` can actually succeed.
+      # Do NOT remove this thinking it's stray/unexplained sudo — without
+      # it, the suite below fails loud with a capability diagnostic instead
+      # of testing confinement. The suite itself stays fail-loud exactly as
+      # designed: this only grants the *capability* to acquire a namespace,
+      # it doesn't touch how the test asserts once it has one.
+      - name: allow unprivileged user namespaces (Ubuntu 24.04 AppArmor)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: confined-deletion privileged suite
+        run: cargo nextest run -p loomweave-cli --run-ignored ignored-only -E 'test(bind_mount)'
+
       - name: doc
         run: cargo doc --workspace --no-deps --all-features
         env:
@@ -225,6 +261,55 @@ jobs:
 
       - name: pytest
         run: uv run --project plugins/python --extra dev pytest plugins/python
+
+  # A second interpreter leg (clarion-09181ad2d5): the plugin's floor is 3.11,
+  # but the PEP 695 type-parameter tests are `sys.version_info < (3, 12)`
+  # skips — on a 3.11-only matrix they never execute anywhere, so the
+  # type-parameter names path in pyright_session.py had zero CI coverage.
+  # Deliberately a separate job (not a matrix on `python-plugin`): renaming
+  # that job would break any branch-protection rule pinned to its check name.
+  # Only the version-sensitive steps run here; lint/type/audit gates stay
+  # single-legged on 3.11.
+  python-plugin-312:
+    name: Python plugin (3.12 tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: plugins/python/uv.lock
+
+      - name: cache pyright runtime
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ~/.cache/pyright-python/
+          key: pyright-python-1.1.409-${{ runner.os }}-py312
+
+      - name: install uv
+        run: python -m pip install uv==0.10.2
+
+      - name: sync plugin (locked dev extras)
+        run: uv sync --project plugins/python --locked --extra dev
+
+      - name: pytest
+        run: uv run --project plugins/python --extra dev pytest plugins/python
+
+      # The whole reason this leg exists: fail loud if the PEP 695 tests were
+      # skipped anyway (e.g. uv resolved a different interpreter), instead of
+      # silently reporting green with the coverage gap intact.
+      - name: assert PEP 695 tests ran
+        run: |
+          set -o pipefail
+          uv run --project plugins/python --extra dev pytest plugins/python \
+            --no-cov -k "type_parameter or type_alias_after_definition" -rs \
+            --no-header | tee /tmp/pep695.out
+          if grep -qi "skipped" /tmp/pep695.out; then
+            echo "PEP 695 tests were skipped on the 3.12 leg" >&2
+            exit 1
+          fi
 
   walking-skeleton:
     name: Sprint 1 walking skeleton (end-to-end)

@@ -43,7 +43,7 @@ use loomweave_storage::{
 
 use loomweave_federation::config::{FiligreeConfig, McpConfig, SemanticSearchConfig};
 use loomweave_federation::filigree::FiligreeHttpClient;
-use loomweave_federation::filigree_url::resolve_filigree_url;
+use loomweave_federation::filigree_url::resolve_filigree_url_with_roots;
 use loomweave_federation::scan_results::{
     CleanStaleRequest, CleanStaleResponse, EmitOptions, FindingForEmit, LOOMWEAVE_SCAN_SOURCE,
     PreparedBatch, ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
@@ -354,14 +354,66 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let project_root = project_path
         .canonicalize()
         .with_context(|| format!("cannot canonicalise path {}", project_path.display()))?;
-    let loomweave_dir = loomweave_core::store::store_dir(&project_root);
-    if !loomweave_dir.exists() {
+
+    // Route storage through the typed worktree resolver UNCONDITIONALLY —
+    // not only under `loomweave worktree analyze`. For a standalone checkout
+    // or the main worktree this resolves to today's unchanged
+    // `store_dir(project_root)` (byte-identical behavior). For a *linked*
+    // worktree it resolves to the isolated per-worktree store nested under
+    // the primary's own store; this is the routing that makes a bare
+    // `loomweave analyze <linked-worktree-path>` — the exact argv the
+    // SessionStart hook spawns — land in that isolated store instead of
+    // silently writing a 20-30 minute index to `<worktree>/.weft/loomweave/`,
+    // a location `serve`'s readiness poll never observes.
+    let worktree_ctx = loomweave_core::worktree::WorktreeContext::resolve(&project_root)
+        .with_context(|| format!("resolve worktree context for {}", project_root.display()))?;
+    if !worktree_ctx.repository_store.exists() {
         bail!(
             "{} has no .weft/loomweave/ store. Run `loomweave install` first.",
-            project_root.display()
+            worktree_ctx.primary_root.display()
         );
     }
-    let db_path = loomweave_dir.join("loomweave.db");
+    // A no-op for a standalone/main context; for a linked worktree this
+    // creates, reuses, or (on a stale/mismatched metadata.json) deletes via
+    // the confined primitive and rebuilds the isolated store — see
+    // `crate::worktree::store` for the full contract.
+    loomweave_cli::worktree::store::ensure_isolated_store(&worktree_ctx)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("ensure worktree-isolated store")?;
+    // Effective config resolution (clarion-c39b92b868): an explicit --config
+    // wins; otherwise the resolved context's ladder — the source root's
+    // `loomweave.yaml`, falling through to the primary root's for a linked
+    // worktree — exactly the file `serve` reports as active for this same
+    // checkout. Byte-identical to the old bare `project_root` join for
+    // standalone/main contexts. Resolved ONCE here, so every downstream
+    // consumer (AnalyzeConfig, finding emission, embeddings) reads the same
+    // file; only-if-exists mirrors serve's guard — an absent ladder file
+    // means defaults, not an error.
+    let options = {
+        let mut options = options;
+        if options.config_path.is_none() {
+            let ladder = worktree_ctx.config_path();
+            if ladder.exists() {
+                options.config_path = Some(ladder);
+            }
+        }
+        options
+    };
+    // Sibling (Filigree) local-state discovery roots: source root first, then
+    // primary root, deduplicated — the same ordered list `serve` uses
+    // (clarion-2833649dd9). Collapses to `[project_root]` for standalone/main
+    // checkouts, so behavior there is unchanged; for a linked worktree this
+    // is what lets finding emission and prune find the primary's published
+    // `ephemeral.port` and minted `federation_token`.
+    let sibling_roots: Vec<PathBuf> = loomweave_federation::filigree_url::dedup_candidate_roots(
+        &worktree_ctx.source_root,
+        &worktree_ctx.primary_root,
+    )
+    .into_iter()
+    .map(Path::to_path_buf)
+    .collect();
+    let loomweave_dir = worktree_ctx.effective_store.clone();
+    let db_path = worktree_ctx.store_paths.db.clone();
 
     // Cross-process advisory lock (STO-01). Must outlive the writer-actor's
     // `handle.await` at the bottom of this function — see the drop-order
@@ -478,6 +530,46 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
     }
 
+    // Reject `rule_id_prefix` collisions across plugins (clarion-9988bd9ced):
+    // the per-plugin syntax-finding sweep, subcode validation, and finding
+    // attribution all key on the prefix, and two plugins sharing one would
+    // merge their sweep scopes — letting plugin A's clean classification of a
+    // shared file retire plugin B's findings on it. Which of the colliding
+    // manifests is "right" is unknowable here, so every plugin in a colliding
+    // group is dropped (loudly, into `discovery_errors` — visible in
+    // classifier coverage); if that empties the set, the run fails via the
+    // discovery-error path below rather than reporting `skipped_no_plugins`.
+    {
+        let mut prefix_counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for plugin in &plugins {
+            *prefix_counts
+                .entry(plugin.manifest.ontology.rule_id_prefix.as_str())
+                .or_insert(0) += 1;
+        }
+        let colliding: Vec<String> = prefix_counts
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(prefix, _)| (*prefix).to_owned())
+            .collect();
+        plugins.retain(|plugin| {
+            let prefix = &plugin.manifest.ontology.rule_id_prefix;
+            if colliding.iter().any(|c| c == prefix) {
+                let msg = format!(
+                    "plugin {:?} dropped: rule_id_prefix {prefix:?} is also declared by another \
+                     discovered plugin — prefixes must be unique per plugin, or findings and the \
+                     syntax-finding sweep cannot be safely attributed",
+                    plugin.manifest.plugin.plugin_id
+                );
+                tracing::error!(error = %msg, "skipping plugin: rule_id_prefix collision");
+                discovery_errors.push(msg);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     if plugins.is_empty() {
         // Distinguish "no plugins installed" (SkippedNoPlugins — expected on a
         // bare machine) from "plugins present but all failed discovery" (FailRun
@@ -485,7 +577,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // latter as `skipped_no_plugins` hides bugs.
         if !discovery_errors.is_empty() {
             let reason = format!(
-                "all {} discovered plugin manifest(s) failed to parse: {}",
+                "all {} discovered plugin(s) failed discovery or validation: {}",
                 discovery_errors.len(),
                 discovery_errors.join("; ")
             );
@@ -642,8 +734,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         sidecar_walk_skipped = secret_scan_sidecar_skipped,
         "secret scan file walk complete"
     );
-    let mut secret_scan_outcome =
-        crate::secret_scan::pre_ingest(&project_root, &secret_scan_files, &options.secret_scan)?;
+    let mut secret_scan_outcome = crate::secret_scan::pre_ingest(
+        &project_root,
+        &loomweave_dir,
+        &secret_scan_files,
+        &options.secret_scan,
+    )?;
     let syntax_rule_ids = plugins
         .iter()
         .map(|plugin| format!("{}SYNTAX-ERROR", plugin.manifest.ontology.rule_id_prefix))
@@ -1352,6 +1448,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 // "looked, clean".
                 plugin_classifier_coverage[coverage_index].mark_failed();
                 syntax_classified_source_files.remove(&syntax_error_rule_id);
+                warn_sweep_scope_withheld(&plugin_id, "anchorless syntax degradation");
             }
         }
         let mut syntax_merges = legacy_plugin_syntax_merges(
@@ -1451,6 +1548,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     // "looked, clean" and retire its still-valid finding.
                     plugin_classifier_coverage[coverage_index].mark_failed();
                     syntax_classified_source_files.remove(&syntax_error_rule_id);
+                    warn_sweep_scope_withheld(&plugin_id, "host-rejected classifier evidence");
                 }
                 // Log findings individually (operator-facing stderr) and persist
                 // them (REQ-ANALYZE-06) so an ontology check, malformed-JSON drop,
@@ -1646,6 +1744,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &writer,
             &db_path,
             &project_root,
+            &sibling_roots,
             &run_id,
             // `mark_unseen` sweeps findings this scan did NOT report as gone —
             // only sound when the scan examined the whole corpus, i.e. it skipped
@@ -1692,6 +1791,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     ) {
         prune_unseen_findings_in_filigree(
             &project_root,
+            &sibling_roots,
             &run_id,
             options.prune_unseen,
             options.config_path.as_deref(),
@@ -1870,7 +1970,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 std::env::var(name).ok()
             }) {
                 Ok(Some(provider)) => match populate_semantic_embeddings(
-                    &project_root,
+                    &worktree_ctx.store_paths.embeddings,
                     &db_path,
                     &mcp_config.semantic_search,
                     provider,
@@ -1948,6 +2048,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &writer,
                 &db_path,
                 &project_root,
+                &sibling_roots,
                 &run_id,
                 // Runs that skipped files do not sweep (see Phase-8 note); only a
                 // run that examined the whole corpus may mark findings unseen.
@@ -2325,6 +2426,20 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             ),
         }
     }
+
+    // Cleanup sweep (Task 6): after each analyze completes, from every
+    // worktree kind, reclaims any worktree-isolated store whose Git
+    // registration is gone (main-checkout `analyze` runs are what reclaim a
+    // store once the worktree that owned it is gone and never runs
+    // Loomweave again). Placed here — after the run's own outcome is fully
+    // settled and reported, not before — so a `bail!` earlier in this
+    // function (a genuinely failed run) does not trigger a sweep;
+    // reclamation for that case is simply deferred to the next successful
+    // `analyze` or the next `serve` startup. `sweep_best_effort` cannot fail
+    // this `analyze` run: it has no `Result` to propagate (see
+    // `loomweave_cli::worktree::sweep`).
+    loomweave_cli::worktree::sweep::sweep_best_effort(&worktree_ctx);
+
     Ok(())
 }
 
@@ -4614,7 +4729,7 @@ struct SemanticEmbeddingCandidate {
 }
 
 async fn populate_semantic_embeddings(
-    project_root: &Path,
+    embeddings_path: &Path,
     db_path: &Path,
     config: &SemanticSearchConfig,
     provider: Arc<dyn EmbeddingProvider>,
@@ -4633,7 +4748,7 @@ async fn populate_semantic_embeddings(
 
     let conn = Connection::open(db_path)
         .with_context(|| format!("open Loomweave database {}", db_path.display()))?;
-    let store = EmbeddingStore::open_in_store_dir(project_root)
+    let store = EmbeddingStore::open(embeddings_path)
         .map_err(|err| anyhow::anyhow!("{err}"))
         .context("open semantic embedding sidecar")?;
     let pending = semantic_embedding_candidates(&conn, &store, &model_id, &mut stats)?;
@@ -4798,10 +4913,12 @@ fn semantic_embedding_text(short_name: &str, name: &str, properties_json: &str) 
 /// emittable batch skips the POST entirely (no wasted call when a run deletes
 /// nothing). `complete_scan_run` rides into the wire request: `true` for the
 /// final/only batch, `false` for an additive follow-up batch.
+#[allow(clippy::too_many_arguments)] // one-shot emission inputs, mirrors http_read::spawn
 async fn emit_findings_to_filigree(
     writer: &Writer,
     db_path: &Path,
     project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     mark_unseen: bool,
     complete_scan_run: bool,
@@ -4929,7 +5046,7 @@ async fn emit_findings_to_filigree(
 
     post_findings_batch(
         filigree_cfg,
-        project_root,
+        sibling_roots,
         run_id,
         batch,
         total_findings,
@@ -4942,6 +5059,24 @@ async fn emit_findings_to_filigree(
 /// as the project-relative path Filigree's scan-results intake requires. A path
 /// that does not live under the root is returned unchanged (Filigree then
 /// rejects it loudly, which is preferable to silently rewriting it).
+/// Operator-visible signal that a plugin's scoped syntax-finding sweep was
+/// withheld this run (clarion-98237e9a45). Withholding is the fail-closed
+/// direction and deliberately does NOT fail the run — but it pins any stale
+/// syntax finding for a file this run actually fixed: the file's new content
+/// hash is recorded, so every later incremental run skips it and the finding
+/// survives until a `--no-incremental` pass (or the file changes again). An
+/// exit-0 run must say so, naming the recovery, rather than leave the
+/// operator to rediscover the stuck-finding symptom.
+fn warn_sweep_scope_withheld(plugin_id: &str, cause: &str) {
+    tracing::warn!(
+        plugin_id,
+        cause,
+        "stale syntax findings for this plugin were NOT retired this run ({cause}); any finding \
+         for a file this run fixed stays until a `loomweave analyze --no-incremental` pass heals \
+         it"
+    );
+}
+
 fn relativize_for_emit(project_root: &Path, path: &str) -> String {
     Path::new(path)
         .strip_prefix(project_root)
@@ -5001,7 +5136,7 @@ fn federation_finding_for_emit(row: loomweave_storage::FindingForEmitRow) -> Fin
 /// `LMWV-INFRA-FILIGREE-UNREACHABLE` stats blob via [`unreachable_stats`].
 async fn post_findings_batch(
     filigree_cfg: &FiligreeConfig,
-    project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     batch: PreparedBatch,
     total_findings: usize,
@@ -5010,10 +5145,13 @@ async fn post_findings_batch(
     let emitted = batch.emitted;
     let skipped_no_path = batch.skipped_no_path;
 
-    // Resolve the live Filigree URL (ephemeral port over stale config), the same
-    // resolution `loomweave serve` and `project_status` use.
+    // Resolve the live Filigree URL (ephemeral port over stale config) over
+    // the same ordered sibling-root list `serve` and `project_status` use —
+    // for a linked worktree, source root then primary root
+    // (clarion-2833649dd9).
+    let root_refs: Vec<&Path> = sibling_roots.iter().map(PathBuf::as_path).collect();
     let resolution =
-        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
+        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -5027,12 +5165,15 @@ async fn post_findings_batch(
     // runtime, and join it off the async executor.
     let request = batch.request;
     let thread_cfg = resolved_cfg;
-    let thread_root = project_root.to_path_buf();
+    let thread_roots = sibling_roots.to_vec();
+    let thread_winning = resolution.winning_root;
     let worker = std::thread::spawn(move || -> Result<ScanResultsResponse, String> {
-        let client = FiligreeHttpClient::from_config_with_project_root(
+        let thread_refs: Vec<&Path> = thread_roots.iter().map(PathBuf::as_path).collect();
+        let client = FiligreeHttpClient::from_config_with_project_roots(
             &thread_cfg,
             |name| std::env::var(name).ok(),
-            Some(&thread_root),
+            &thread_refs,
+            thread_winning.as_deref(),
         )
         .map_err(|err| format!("build Filigree client: {err}"))?
         .ok_or_else(|| "Filigree integration disabled".to_owned())?;
@@ -5137,6 +5278,7 @@ fn unreachable_stats(
 /// by Filigree, so the sweep can only touch Loomweave's findings.
 async fn prune_unseen_findings_in_filigree(
     project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     prune_unseen: bool,
     config_path: Option<&Path>,
@@ -5155,10 +5297,11 @@ async fn prune_unseen_findings_in_filigree(
     }
     let older_than_days = filigree_cfg.prune_unseen_days;
 
-    // Resolve the live Filigree URL (ephemeral port over stale config), the
-    // same resolution emission uses.
+    // Resolve the live Filigree URL over the same ordered sibling-root list
+    // emission uses (clarion-2833649dd9).
+    let root_refs: Vec<&Path> = sibling_roots.iter().map(PathBuf::as_path).collect();
     let resolution =
-        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
+        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -5173,12 +5316,15 @@ async fn prune_unseen_findings_in_filigree(
     // Same blocking-reqwest-on-a-plain-OS-thread dance as emission: build → POST
     // → drop the client off the tokio executor so the inner runtime drop is safe.
     let thread_cfg = resolved_cfg;
-    let thread_root = project_root.to_path_buf();
+    let thread_roots = sibling_roots.to_vec();
+    let thread_winning = resolution.winning_root;
     let worker = std::thread::spawn(move || -> Result<CleanStaleResponse, String> {
-        let client = FiligreeHttpClient::from_config_with_project_root(
+        let thread_refs: Vec<&Path> = thread_roots.iter().map(PathBuf::as_path).collect();
+        let client = FiligreeHttpClient::from_config_with_project_roots(
             &thread_cfg,
             |name| std::env::var(name).ok(),
-            Some(&thread_root),
+            &thread_refs,
+            thread_winning.as_deref(),
         )
         .map_err(|err| format!("build Filigree client: {err}"))?
         .ok_or_else(|| "Filigree integration disabled".to_owned())?;
@@ -9047,7 +9193,7 @@ mod tests {
             Vec::<EmbeddingRecording>::new(),
         ));
         let stats = populate_semantic_embeddings(
-            project.path(),
+            &loomweave_storage::embeddings_db_path(project.path()),
             &db_path,
             &SemanticSearchConfig {
                 enabled: true,
@@ -9101,7 +9247,7 @@ mod tests {
             Vec::<EmbeddingRecording>::new(),
         ));
         let stats = populate_semantic_embeddings(
-            project.path(),
+            &loomweave_storage::embeddings_db_path(project.path()),
             &db_path,
             &SemanticSearchConfig {
                 enabled: true,

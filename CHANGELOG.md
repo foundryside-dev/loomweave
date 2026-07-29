@@ -14,14 +14,99 @@ only when an incompatible change is made to that surface. See
 
 ### Added
 
+- **Isolated worktree indexes.** A linked Git worktree now gets its own
+  per-worktree index store nested under the primary checkout's
+  `.weft/loomweave/worktrees/<stable-id>/` instead of silently sharing (or
+  shadowing) the primary's index. `loomweave serve` on an unbuilt linked
+  worktree bootstraps it: a detached `loomweave worktree analyze` is spawned
+  once, and graph tools answer structured `index-building` /
+  `index-build-failed` envelopes (with the exact fallback command) until a
+  run completes — no reconnect needed. The federation HTTP read API is gated
+  identically (`503 INDEX_BUILDING` / `INDEX_BUILD_FAILED`;
+  `/api/v1/_capabilities` stays open), so consumers polling during the build
+  get an explicit not-ready signal, never empty-but-plausible answers. A
+  confined deletion primitive (`openat2`-pinned, Linux) plus a cleanup sweep
+  reclaims stores whose worktrees are gone; under a shared
+  `[loomweave].store_dir` override — judged by the override state the
+  context was *resolved* under — the sweep is report-only. New
+  `loomweave worktree analyze [--no-incremental] [--config <path>] --
+  <name-or-path>` builds a worktree index directly; without `--config` it
+  resolves the same source→primary configuration ladder `serve` reports.
+
 - **Catalogue list lead summaries.** Finding, faceted, shortcut, and semantic
   list responses now lead with compact totals, aggregate counts, completeness,
   confidence, and recovery advice. Paginated responses remain explicitly
   partial even on a short final page, and aggregate scans fail completeness
   closed when their bounded source scan cannot cover every candidate.
 
+- **Single-source instruction block on a CLAUDE.md → AGENTS.md redirect**
+  (weft convention C-20). When a project's `CLAUDE.md` carries, outside every
+  managed block, a line that is solely `@AGENTS.md` / `@./AGENTS.md`, `loomweave
+  install` now writes its block to `AGENTS.md` alone — creating it if absent —
+  and migrates any legacy `CLAUDE.md` block out under the C-4 own-namespace and
+  foreign-safe rules. Projects with no such redirect keep the existing
+  dual-write unchanged. `loomweave doctor` inverts to match: under a redirect
+  the block's *absence* from `CLAUDE.md` is the healthy state, a leftover block
+  is a gating problem, and `--fix` migrates it rather than re-injecting.
+  Detection fails safe — an absent, unreadable, non-UTF-8 or symlinked
+  `CLAUDE.md` reads as no redirect.
+
+### Changed
+
+- **The always-loaded agent-context surface is now budgeted** (weft convention
+  C-20). The instruction block injected into `CLAUDE.md`/`AGENTS.md` shrank from
+  1,731 to 789 chars and is now a pointer — what Loomweave is, when to reach for
+  it, where the full reference lives, and two load-bearing rules. The
+  `loomweave-workflow` skill's `SKILL.md` shrank from 36,249 to 3,744 chars; its
+  depth moved **verbatim** into five on-demand `references/*.md` files shipped
+  with the skill (`tools`, `catalogue`, `freshness`, `gotchas`, `entity-ids`).
+  Nothing was deleted — `loomweave install --skills` / `--codex-skills` install
+  the reference files alongside `SKILL.md`. The MCP `loomweave-workflow` prompt
+  serves `SKILL.md` only; the references are read from the installed skill
+  directory.
+
+### Removed
+
+- **The `weft.toml [filigree].url` resolution rung.** Repository content may
+  be untrusted, while Filigree clients attach operator-owned bearer tokens to
+  the resolved endpoint — so a repo-controlled file may no longer steer where
+  those tokens are sent. Operators who used that key must move the override
+  to the `WEFT_FILIGREE_URL` environment variable or private configuration.
+  Live discovery via the `.weft/filigree/ephemeral.port` sidecar is
+  unchanged, and for a linked worktree it falls through source root →
+  primary root; the minted `federation_token` is always read from the same
+  root the port resolved from, never first-found across candidates.
+
+### Security
+
+- **Hardened git spawns now clear the environment.** Every production `git`
+  invocation goes through `hardened_git_command`, which `env_clear()`s the
+  child and re-adds a closed allowlist (`PATH`, locale pins, the git
+  config/attr/locks hardening variables). Ambient `GIT_DIR` /
+  `GIT_COMMON_DIR` / `GIT_WORK_TREE` (and any other inherited git variable)
+  can no longer redirect Loomweave's git probes — including the
+  deletion-adjacent worktree cleanup sweep — to a foreign repository. Note
+  `GIT_CEILING_DIRECTORIES` is also dropped by the clear.
+
 ### Fixed
 
+- **Stale syntax findings now retire when files are fixed.** A file whose
+  parse error was fixed no longer keeps its old `*-SYNTAX-ERROR` finding
+  forever: a per-plugin sweep retires findings for files whose
+  classification completed cleanly in the current run — bounded to
+  batch-persisted classifications, per plugin, so a partial or degraded run
+  never retires findings it has no evidence about. Plugins declaring a
+  colliding `rule_id_prefix` are rejected at discovery (dropped loudly; the
+  run fails if none remain) since attribution — and therefore safe
+  retirement — is impossible under a shared prefix.
+- **Doctor fixes.** The read-API liveness probe now targets a route the API
+  actually serves (`/api/v1/_capabilities`); classifier-coverage checks no
+  longer fail on a plugin-less machine (not-applicable degradation, narrow);
+  git db-tracking checks are argument-injection-hardened and immune to
+  repo-local `core.fsmonitor`/pager configuration.
+- **Storage integrity treats non-directory source path components as stale**
+  (`NotADirectory` now handled like `NotFound`), so `doctor --fix` repairs
+  rather than erroring when a recorded directory was replaced by a file.
 - **Doctor bootstrap-state repair.** `loomweave doctor` now warns when an
   installed catalogue has never been analysed or lacks its local instance
   identity. `loomweave doctor --fix` materialises a private project UUID and

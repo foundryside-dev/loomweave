@@ -1370,7 +1370,7 @@ async fn issues_for_returns_unavailable_when_filigree_disabled() {
 
 #[tokio::test]
 async fn issues_for_reports_resolved_endpoint_and_result_kind() {
-    // AC#1/#2: issues_for surfaces the configured vs resolved (ethereal-port)
+    // AC#1/#2: issues_for surfaces the configured vs resolved (ephemeral-port)
     // endpoint, and distinguishes reachable-but-empty (no_matches) from a
     // populated result (matched) — without the agent curling ports by hand.
     let (project, db_path) = open_project();
@@ -6202,7 +6202,7 @@ async fn project_status_skipped_run_keeps_prior_completed_index_visible() {
 
 #[tokio::test]
 async fn project_status_resolves_live_filigree_endpoint() {
-    // AC#3: the live ethereal port (.weft/filigree/ephemeral.port) is reported as
+    // AC#3: the live ephemeral port (.weft/filigree/ephemeral.port) is reported as
     // the resolution source, overriding the stale configured port.
     let (project, db_path) = open_project();
     let filigree_dir = project.path().join(".weft").join("filigree");

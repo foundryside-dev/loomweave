@@ -67,14 +67,14 @@ static HTTP_ERROR_DISPATCH: LazyLock<tracing::Dispatch> = LazyLock::new(|| {
 /// would let one instance strand the *other, still-running* server's published
 /// port. See `loomweave_port::remove_published_port_if_matches`.
 struct PublishedPortGuard {
-    project_root: PathBuf,
+    port_path: PathBuf,
     port: u16,
 }
 
 impl Drop for PublishedPortGuard {
     fn drop(&mut self) {
-        loomweave_federation::loomweave_port::remove_published_port_if_matches(
-            &self.project_root,
+        loomweave_federation::loomweave_port::remove_published_port_if_matches_at(
+            &self.port_path,
             self.port,
         );
     }
@@ -158,11 +158,32 @@ impl HttpReadServer {
     }
 }
 
+/// Linked-worktree bootstrap gate for the HTTP read API
+/// (clarion-ecf882f230). Passed as `Some` only by a linked-worktree `serve`:
+/// every data route then consults `runs`-table readiness per request — the
+/// same `read_worktree_readiness` the MCP tools gate on — and answers 503
+/// `INDEX_BUILDING`/`INDEX_BUILD_FAILED` until a completed run row exists.
+/// Without this, a federation consumer polling during the 20–30 minute
+/// bootstrap build would receive well-formed empty answers indistinguishable
+/// from a truthfully empty index (the fabricated-answer class behind the
+/// Warpline NULL-SEI incident). `/api/v1/_capabilities` stays open: it is
+/// the pre-auth liveness probe and reports no graph data.
+#[derive(Debug, Clone)]
+pub struct WorktreeHttpGate {
+    /// The exact recovery argv surfaced in gate error bodies — mirrors the
+    /// MCP gate's `fallback_command` diagnostic
+    /// (`loomweave_mcp::worktree_bootstrap::fallback_argv`).
+    pub fallback_argv: Vec<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) project_root: PathBuf,
     pub(crate) readers: ReaderPool,
     pub(crate) instance_id: crate::instance::InstanceId,
+    /// `Some` ⇒ this serve session is a linked-worktree bootstrap and data
+    /// routes are readiness-gated per request. See [`WorktreeHttpGate`].
+    pub(crate) worktree_gate: Option<Arc<WorktreeHttpGate>>,
     /// Resolved inbound auth token. `Some` when the configured `token_env`
     /// was set at spawn time, `None` when it was unset (loopback v0.1 trust
     /// mode). All `/api/v1/files`-family requests require
@@ -217,19 +238,24 @@ struct HttpReadReady {
     readers_identity: Arc<()>,
 }
 
+#[allow(clippy::too_many_arguments)] // one-shot bootstrap inputs, mirrors run_http_read_server
 pub fn spawn(
     project_root: PathBuf,
     db_path: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
+    port_path: PathBuf,
     config: &HttpReadConfig,
+    worktree_gate: Option<WorktreeHttpGate>,
 ) -> Result<Option<HttpReadServer>> {
     spawn_with_env(
         project_root,
         db_path,
         readers,
         instance_id,
+        port_path,
         config,
+        worktree_gate,
         |name| std::env::var(name).ok(),
     )
 }
@@ -237,12 +263,21 @@ pub fn spawn(
 /// Spawn variant that takes an explicit env lookup so tests can drive the
 /// auth-trust gate (and the resolved-bearer-token plumbing) without
 /// mutating process environment.
+#[allow(clippy::too_many_arguments)] // one-shot bootstrap inputs, mirrors run_http_read_server
 pub fn spawn_with_env<F>(
     project_root: PathBuf,
     db_path: PathBuf,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
+    // The published-port sidecar leaf this instance should publish the
+    // actually-bound port to (and unlink on shutdown) — the caller's resolved
+    // `StorePaths::port`, NOT re-derived from `project_root` here. A linked
+    // worktree's isolated store publishes to a different location than its own
+    // `.weft/loomweave/`; re-deriving from `project_root` would silently land
+    // there instead (design doc, "Configuration and sibling discovery").
+    port_path: PathBuf,
     config: &HttpReadConfig,
+    worktree_gate: Option<WorktreeHttpGate>,
     env_lookup: F,
 ) -> Result<Option<HttpReadServer>>
 where
@@ -303,6 +338,8 @@ where
                 wardline_taint_write,
                 readers,
                 instance_id,
+                worktree_gate,
+                port_path,
                 auth_token_thread,
                 identity_secret_thread,
                 bind,
@@ -359,6 +396,8 @@ fn run_http_read_server(
     wardline_taint_write: bool,
     readers: ReaderPool,
     instance_id: crate::instance::InstanceId,
+    worktree_gate: Option<WorktreeHttpGate>,
+    port_path: PathBuf,
     auth_token: Option<Arc<String>>,
     identity_secret: Option<Arc<String>>,
     bind: std::net::SocketAddr,
@@ -408,19 +447,20 @@ fn run_http_read_server(
         // configured URL. The guard unlinks the file when this scope unwinds.
         let _published_port_guard = if local_addr.ip().is_loopback() {
             if let Err(err) =
-                loomweave_federation::loomweave_port::publish_port(&project_root, local_addr.port())
+                loomweave_federation::loomweave_port::publish_port_at(&port_path, local_addr.port())
             {
                 // Publication is best-effort enrichment: a failure to write the
                 // discovery file must not take the read API down.
                 tracing::warn!(
                     error = %err,
                     port = local_addr.port(),
-                    "failed to publish .weft/loomweave/ephemeral.port; consumers will fall back to configured URL"
+                    port_path = %port_path.display(),
+                    "failed to publish ephemeral.port; consumers will fall back to configured URL"
                 );
                 None
             } else {
                 Some(PublishedPortGuard {
-                    project_root: project_root.clone(),
+                    port_path: port_path.clone(),
                     port: local_addr.port(),
                 })
             }
@@ -463,6 +503,7 @@ fn run_http_read_server(
             project_root,
             readers,
             instance_id,
+            worktree_gate: worktree_gate.map(Arc::new),
             auth_token,
             identity_secret,
             hmac_replay_cache: auth::new_hmac_replay_cache(),
@@ -539,6 +580,70 @@ fn build_http_runtime() -> Result<tokio::runtime::Runtime> {
         .context("create HTTP read runtime")
 }
 
+/// Per-request linked-worktree readiness gate (clarion-ecf882f230), the HTTP
+/// analog of the MCP `consult_worktree_gate`: recomputed from the `runs`
+/// table on every request, never cached, so readiness flips mid-session
+/// without a restart. Layered INSIDE the identity guard in [`router`] (the
+/// identity `route_layer` is added after this one, making it outermost), so
+/// an unauthenticated caller learns nothing about build state. A
+/// storage-layer read failure falls through to the handler, which surfaces
+/// its own `STORAGE_ERROR` — mirroring the MCP gate's fall-through.
+pub(crate) async fn require_worktree_ready(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    use loomweave_mcp::worktree_bootstrap::WorktreeReadiness;
+
+    let Some(gate) = state.worktree_gate.clone() else {
+        return next.run(request).await;
+    };
+    let read = state
+        .readers
+        .with_reader(|conn| {
+            Ok(loomweave_mcp::worktree_bootstrap::read_worktree_readiness(
+                conn,
+            ))
+        })
+        .await;
+    let Ok(read) = read else {
+        return next.run(request).await;
+    };
+    let (code, retryable, message) = match read.readiness {
+        WorktreeReadiness::Ready => return next.run(request).await,
+        WorktreeReadiness::Building => (
+            ErrorCode::IndexBuilding,
+            true,
+            "this linked worktree's isolated index is still building (no completed analyze run \
+             yet); retry after the bootstrap analyze completes",
+        ),
+        WorktreeReadiness::BuildFailed => (
+            ErrorCode::IndexBuildFailed,
+            false,
+            "this linked worktree's isolated index build failed; run the fallback command to \
+             retry",
+        ),
+    };
+    // The `error`/`code` pair matches `ErrorResponse`'s wire shape; `run_id`,
+    // `retryable`, and `fallback_command` are additive diagnostics mirroring
+    // the MCP gate envelope.
+    let body = serde_json::json!({
+        "error": message,
+        "code": code,
+        "retryable": retryable,
+        "run_id": read.run_id,
+        "fallback_command": gate.fallback_argv,
+    });
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    if retryable {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            "30".parse().expect("static header value"),
+        );
+    }
+    response
+}
+
 pub(crate) fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/files", get(get_file))
@@ -562,6 +667,13 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/api/v1/identity/sei/:sei", get(get_identity_sei))
         .route("/api/v1/identity/lineage/:sei", get(get_identity_lineage))
+        // Layer order is load-bearing: the identity guard is added AFTER the
+        // worktree gate, making it the outermost of the two — auth runs
+        // first, so unauthenticated callers never observe build state.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_worktree_ready,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_http_identity,
@@ -603,6 +715,11 @@ pub(crate) fn router(state: AppState) -> Router {
             "/api/wardline/taint-facts/by-sei",
             post(post_wardline_taint_facts_batch_get_by_sei),
         )
+        // Same order as the v1 group: worktree gate inner, identity outer.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_worktree_ready,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_http_identity_wardline,
@@ -980,12 +1097,16 @@ mod tests {
             // tokens configured.
             let env_lookup = |_: &str| -> Option<String> { None };
 
+            let port_path =
+                loomweave_federation::loomweave_port::published_port_path(tempdir.path());
             let server = spawn_with_env(
                 tempdir.path().to_path_buf(),
                 db_path.clone(),
                 readers,
                 instance_id,
+                port_path,
                 &config,
+                None,
                 env_lookup,
             )
             .expect("spawn HTTP read API")
@@ -1005,6 +1126,160 @@ mod tests {
             captured.contains("without authentication"),
             "expected loopback-no-token warning to mention 'without authentication'; captured: {captured}"
         );
+    }
+
+    /// Minimal blocking HTTP/1.1 GET against the just-spawned server. `spawn`
+    /// blocks on the ready handshake, so no retry loop is needed.
+    fn http_get_json(bind: &std::net::SocketAddr, path: &str) -> (u16, serde_json::Value) {
+        use std::io::{BufRead, Read, Write};
+        let mut stream = std::net::TcpStream::connect(bind).expect("connect to HTTP read API");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {bind}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut reader = std::io::BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("read status");
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .expect("status code present")
+            .parse::<u16>()
+            .expect("numeric status");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("read header");
+            if line == "\r\n" || line == "\n" || line.is_empty() {
+                break;
+            }
+        }
+        let mut body = String::new();
+        reader.read_to_string(&mut body).expect("read body");
+        let value = if body.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&body).expect("JSON body")
+        };
+        (status, value)
+    }
+
+    /// Schema-initialize a fresh `loomweave.db` — exactly the state a linked
+    /// worktree's isolated store is in the instant `serve` bootstraps it,
+    /// before any analyze run has written a `runs` row.
+    fn schema_init_db(db_path: &std::path::Path) {
+        let mut conn = rusqlite::Connection::open(db_path).expect("open sqlite");
+        loomweave_storage::pragma::apply_write_pragmas(&conn).expect("write pragmas");
+        loomweave_storage::schema::apply_migrations(&mut conn).expect("apply migrations");
+    }
+
+    fn seed_run(db_path: &std::path::Path, id: &str, status: &str) {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES (?1, '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', '{}', '{}', ?2)",
+            rusqlite::params![id, status],
+        )
+        .expect("insert runs row");
+    }
+
+    fn spawn_gated_server(
+        db_path: &std::path::Path,
+        project_root: &std::path::Path,
+    ) -> (HttpReadServer, std::net::SocketAddr) {
+        use loomweave_federation::config::HttpReadConfig;
+        use std::net::TcpListener;
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe bind");
+        let bind = probe.local_addr().expect("probe local addr");
+        drop(probe);
+        let readers = ReaderPool::open(db_path, 4).expect("open reader pool");
+        let config = HttpReadConfig {
+            enabled: true,
+            bind: Some(bind),
+            allow_non_loopback: false,
+            ..HttpReadConfig::default()
+        };
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000007")
+                .expect("parse synthetic instance id");
+        let port_path = loomweave_federation::loomweave_port::published_port_path(project_root);
+        let server = spawn(
+            project_root.to_path_buf(),
+            db_path.to_path_buf(),
+            readers,
+            instance_id,
+            port_path,
+            &config,
+            Some(WorktreeHttpGate {
+                fallback_argv: vec![
+                    "loomweave".to_owned(),
+                    "worktree".to_owned(),
+                    "analyze".to_owned(),
+                    "--".to_owned(),
+                    "/wt".to_owned(),
+                ],
+            }),
+        )
+        .expect("spawn HTTP read API")
+        .expect("config.enabled = true implies Some(server)");
+        (server, bind)
+    }
+
+    /// clarion-ecf882f230: a gated (linked-worktree bootstrap) server must
+    /// answer data routes with an explicit 503 `INDEX_BUILDING` — never
+    /// well-formed empty answers — until a completed run row exists, while
+    /// `_capabilities` (the pre-auth liveness probe) stays open. Once a
+    /// completed row appears the very next request passes the gate, no
+    /// restart needed.
+    #[test]
+    fn gated_http_answers_index_building_until_a_completed_run_exists() {
+        let _guard = http_runtime_test_guard();
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("loomweave.db");
+        schema_init_db(&db_path);
+
+        let (server, bind) = spawn_gated_server(&db_path, tempdir.path());
+
+        let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
+        assert_eq!(status, 503, "building store must gate data routes: {body}");
+        assert_eq!(body["code"], "INDEX_BUILDING");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["fallback_command"][0], "loomweave");
+
+        let (status, _caps) = http_get_json(&bind, "/api/v1/_capabilities");
+        assert_eq!(status, 200, "capabilities must stay open while building");
+
+        seed_run(&db_path, "run-1", "completed");
+        let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
+        assert_ne!(status, 503, "a completed run must lift the gate: {body}");
+        assert_eq!(body["code"], "NOT_FOUND", "empty index answers honestly");
+
+        server.shutdown().expect("shutdown HTTP read API");
+    }
+
+    /// clarion-ecf882f230: a failed-only build history answers 503
+    /// `INDEX_BUILD_FAILED` (not retryable) with the fallback command.
+    #[test]
+    fn gated_http_answers_index_build_failed_after_failed_only_run() {
+        let _guard = http_runtime_test_guard();
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("loomweave.db");
+        schema_init_db(&db_path);
+        seed_run(&db_path, "run-failed", "failed");
+
+        let (server, bind) = spawn_gated_server(&db_path, tempdir.path());
+
+        let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
+        assert_eq!(status, 503, "failed-only history must gate data routes");
+        assert_eq!(body["code"], "INDEX_BUILD_FAILED");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["run_id"], "run-failed");
+
+        server.shutdown().expect("shutdown HTTP read API");
     }
 
     /// W.2 writer-actor lifecycle: with `wardline_taint_write: true`, `spawn`
@@ -1045,12 +1320,15 @@ mod tests {
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000006")
                 .expect("parse synthetic instance id");
 
+        let port_path = loomweave_federation::loomweave_port::published_port_path(tempdir.path());
         let server = spawn(
             tempdir.path().to_path_buf(),
             db_path.clone(),
             readers,
             instance_id,
+            port_path,
             &config,
+            None,
         )
         .expect("spawn HTTP read API")
         .expect("config.enabled = true implies Some(server)");
@@ -1100,12 +1378,15 @@ mod tests {
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-000000000001")
                 .expect("parse synthetic instance id");
 
+        let port_path = loomweave_federation::loomweave_port::published_port_path(tempdir.path());
         let mut server = spawn(
             tempdir.path().to_path_buf(),
             db_path.clone(),
             readers,
             instance_id,
+            port_path,
             &config,
+            None,
         )
         .expect("spawn HTTP read API")
         .expect("config.enabled = true implies Some(server)");
@@ -1156,9 +1437,18 @@ mod tests {
                 ..HttpReadConfig::default()
             };
             let iid = crate::instance::parse_instance_id_for_test(id).expect("iid");
-            let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
-                .expect("spawn")
-                .expect("enabled => Some");
+            let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
+            let server = spawn(
+                dir.path().to_path_buf(),
+                db,
+                readers,
+                iid,
+                port_path,
+                &cfg,
+                None,
+            )
+            .expect("spawn")
+            .expect("enabled => Some");
             (dir, server)
         };
 
@@ -1198,9 +1488,18 @@ mod tests {
         let iid =
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a3")
                 .expect("iid");
-        let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
-            .expect("spawn")
-            .expect("enabled => Some");
+        let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
+        let server = spawn(
+            dir.path().to_path_buf(),
+            db,
+            readers,
+            iid,
+            port_path,
+            &cfg,
+            None,
+        )
+        .expect("spawn")
+        .expect("enabled => Some");
 
         assert!(
             read_published_port(dir.path()).is_some(),
@@ -1238,8 +1537,17 @@ mod tests {
         let iid =
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a4")
                 .expect("iid");
+        let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
 
-        let result = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg);
+        let result = spawn(
+            dir.path().to_path_buf(),
+            db,
+            readers,
+            iid,
+            port_path,
+            &cfg,
+            None,
+        );
         assert!(
             result.is_err(),
             "an explicit in-use bind must fail, not silently fall back to :0"
@@ -1273,10 +1581,19 @@ mod tests {
         let iid =
             crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-0000000000a5")
                 .expect("iid");
+        let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
 
-        let server = spawn(dir.path().to_path_buf(), db, readers, iid, &cfg)
-            .expect("spawn must succeed via ephemeral fallback")
-            .expect("enabled => Some");
+        let server = spawn(
+            dir.path().to_path_buf(),
+            db,
+            readers,
+            iid,
+            port_path,
+            &cfg,
+            None,
+        )
+        .expect("spawn must succeed via ephemeral fallback")
+        .expect("enabled => Some");
 
         let published = read_published_port(dir.path()).expect("published a port");
         assert_ne!(

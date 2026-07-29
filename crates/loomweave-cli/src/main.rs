@@ -21,9 +21,10 @@ mod serve;
 mod skill_pack;
 mod stats;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     // Load .env before tracing setup for operator-facing commands so a
@@ -145,6 +146,28 @@ fn main() -> Result<()> {
                 path,
             } => sarif::run_import(&file, scan_source, &path),
         },
+        cli::Command::Worktree { command } => match command {
+            cli::WorktreeCommand::Analyze {
+                no_incremental,
+                config,
+                target,
+            } => {
+                let cwd = std::env::current_dir().context("determine current directory")?;
+                let resolved = loomweave_cli::worktree::cmd::resolve_target(&cwd, &target)
+                    .with_context(|| format!("resolve worktree analyze target {target:?}"))?;
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(analyze::run_with_options(
+                    resolved,
+                    analyze::AnalyzeOptions {
+                        no_incremental,
+                        config_path: config,
+                        ..analyze::AnalyzeOptions::default()
+                    },
+                ))
+            }
+        },
     }
 }
 
@@ -155,7 +178,8 @@ fn main() -> Result<()> {
 /// Two cases must NOT load it, because they would import repository-controlled
 /// values into a subprocess environment before those values have been vetted:
 ///
-/// - `analyze`: project `.env` contents are scanned as source sidecars by the
+/// - `analyze` (and `worktree analyze`, which runs the identical pipeline):
+///   project `.env` contents are scanned as source sidecars by the
 ///   pre-ingest secret scanner and must not reach plugin subprocess
 ///   environments before that gate runs.
 /// - `guidance create` / `guidance edit`: authoring spawns `$VISUAL`/`$EDITOR`
@@ -169,6 +193,9 @@ fn should_load_dotenv(command: &cli::Command) -> bool {
     !matches!(
         command,
         cli::Command::Analyze { .. }
+            | cli::Command::Worktree {
+                command: cli::WorktreeCommand::Analyze { .. },
+            }
             | cli::Command::Guidance {
                 command: cli::GuidanceCommand::Create { .. } | cli::GuidanceCommand::Edit { .. },
             }
@@ -199,6 +226,17 @@ mod tests {
     #[test]
     fn analyze_does_not_load_dotenv() {
         assert!(!loads(&["loomweave", "analyze", "."]));
+    }
+
+    #[test]
+    fn worktree_analyze_does_not_load_dotenv() {
+        assert!(!loads(&[
+            "loomweave",
+            "worktree",
+            "analyze",
+            "--",
+            "some-worktree"
+        ]));
     }
 
     #[test]

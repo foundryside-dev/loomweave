@@ -7,8 +7,6 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Serialize, Serializer};
 use uuid::Uuid;
 
-const INSTANCE_ID_FILE: &str = "instance_id";
-
 /// A validated Loomweave project instance ID — guaranteed to be a UUID at the
 /// type level. The inner `Uuid` is private and the only ways to construct
 /// one are [`load_or_create`] (reads/creates the persisted file) and
@@ -41,18 +39,28 @@ impl Serialize for InstanceId {
     }
 }
 
-pub fn load_or_create(project_root: &Path) -> Result<InstanceId> {
-    let path = loomweave_core::store::store_dir(project_root).join(INSTANCE_ID_FILE);
-    match fs::read_to_string(&path) {
-        Ok(raw) => read_existing_instance_id(&path, &raw),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => create_instance_id(&path),
+/// Load this store's persisted instance ID, minting one on first use.
+///
+/// `path` must be the exact instance-ID leaf file location — the caller's
+/// resolved `StorePaths::instance_id` — never re-derived from a project root
+/// here: re-deriving would land a linked worktree's instance ID under the
+/// wrong (non-isolated) store, the same failure mode `WorktreeContext`
+/// exists to prevent for every other store leaf.
+pub fn load_or_create(path: &Path) -> Result<InstanceId> {
+    match fs::read_to_string(path) {
+        Ok(raw) => read_existing_instance_id(path, &raw),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => create_instance_id(path),
         Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
     }
 }
 
 fn create_instance_id(path: &Path) -> Result<InstanceId> {
     let instance_id = InstanceId::new_random();
-    let temp_path = path.with_file_name(format!(".{INSTANCE_ID_FILE}.{instance_id}.tmp"));
+    let leaf_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("instance_id");
+    let temp_path = path.with_file_name(format!(".{leaf_name}.{instance_id}.tmp"));
     let mut file = create_new_private_file(&temp_path)
         .with_context(|| format!("create temporary {}", temp_path.display()))?;
     writeln!(file, "{instance_id}").with_context(|| format!("write {}", temp_path.display()))?;
