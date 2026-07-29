@@ -84,15 +84,9 @@ fn server_instructions(policy: McpToolPolicy) -> String {
     let write_tools_note = if policy.enable_write_tools {
         String::new()
     } else {
-        // The bootstrap exemption is deliberate (PM ruling, weft-ac59e8e730):
-        // state it loudly so a read-only session knows these two tools can
-        // persistently enable writes and live LLM spend.
         "\n\nWrite-gated unless `serve.mcp.enable_write_tools: true`: \
 `entity_summary_get`, `analyze_start`, `analyze_cancel`, `propose_guidance`, \
-`promote_guidance`. EXEMPT by design: `llm_config_set` and \
-`semantic_config_set` bypass this gate — from a read-only session they \
-persistently edit loomweave.yaml and can enable write tools and live (paid) \
-LLM spend; reconnect after changes."
+`promote_guidance`, `llm_config_set`, `semantic_config_set`."
             .to_owned()
     };
     format!(
@@ -232,9 +226,6 @@ impl ToolMetadata {
 
 pub fn tool_metadata(name: &str) -> ToolMetadata {
     match name {
-        // The config-set pair shares the local-write flag shape with
-        // analyze_cancel/promote_guidance, but is gate-EXEMPT — see
-        // `is_bootstrap_config_tool` (weft-ac59e8e730).
         "llm_config_set" | "semantic_config_set" | "analyze_cancel" | "promote_guidance" => {
             ToolMetadata::write_tool(true, false, false, false)
         }
@@ -276,16 +267,12 @@ impl McpToolPolicy {
 
     #[must_use]
     pub fn allows(self, name: &str) -> bool {
-        self.enable_write_tools || tool_metadata(name).read_only || is_bootstrap_config_tool(name)
+        self.enable_write_tools || tool_metadata(name).read_only
     }
 
     fn allows_arguments(self, name: &str, arguments: &serde_json::Map<String, Value>) -> bool {
         self.enable_write_tools || !tool_uses_conditional_inferred_dispatch(name, arguments)
     }
-}
-
-fn is_bootstrap_config_tool(name: &str) -> bool {
-    matches!(name, "llm_config_set" | "semantic_config_set")
 }
 
 fn tool_uses_conditional_inferred_dispatch(
@@ -6537,12 +6524,14 @@ mod tests {
         // The gate note names the write tools and how to enable them.
         assert!(read_only.contains("enable_write_tools"), "{read_only}");
         assert!(read_only.contains("entity_summary_get"), "{read_only}");
-        // The deliberate bootstrap exemption (PM ruling, weft-ac59e8e730) must
-        // be stated loudly: a read-only session can persistently enable writes
-        // and live LLM spend through these two tools.
-        assert!(read_only.contains("EXEMPT"), "{read_only}");
         assert!(read_only.contains("llm_config_set"), "{read_only}");
         assert!(read_only.contains("semantic_config_set"), "{read_only}");
+        assert!(!registered.iter().any(|tool| tool.name == "llm_config_set"));
+        assert!(
+            !registered
+                .iter()
+                .any(|tool| tool.name == "semantic_config_set")
+        );
     }
 
     #[test]
@@ -7004,7 +6993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_config_set_bootstraps_provider_and_write_tools_under_read_only_policy() {
+    async fn config_set_tools_are_rejected_under_read_only_policy() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("loomweave.db");
         {
@@ -7016,112 +7005,35 @@ mod tests {
         let state = ServerState::new(dir.path().to_path_buf(), readers)
             .with_tool_policy(McpToolPolicy::read_only());
 
-        let response = state
-            .handle_json_rpc(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "llm-config-set",
-                "method": "tools/call",
-                "params": {
-                    "name": "llm_config_set",
-                    "arguments": {
-                        "enabled": true,
-                        "provider": "codex_sidecar",
-                        "allow_live_provider": true,
-                        "enable_write_tools": true,
-                        "codex_model": "gpt-5-codex"
-                    }
-                }
-            }))
-            .await
-            .expect("tools/call response");
-        assert_eq!(response["result"]["isError"], false, "{response}");
-        let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(envelope["ok"], true, "{envelope}");
-        assert_eq!(envelope["result"]["llm"]["provider"], "codex_cli");
-        assert_eq!(
-            envelope["result"]["serve"]["mcp"]["enable_write_tools"],
-            true
-        );
-        assert_eq!(
-            envelope["result"]["active_session"]["enable_write_tools"], false,
-            "the current server policy should not mutate mid-session"
-        );
-        assert_eq!(
-            envelope["result"]["active_session"]["restart_required"],
-            true
-        );
-
-        let saved =
-            loomweave_federation::config::McpConfig::from_path(&dir.path().join("loomweave.yaml"))
-                .unwrap();
-        assert!(saved.llm.enabled);
-        assert!(saved.llm.allow_live_provider);
-        assert_eq!(
-            saved.llm.provider,
-            loomweave_federation::config::LlmProviderKind::CodexCli
-        );
-        assert_eq!(saved.llm.codex_cli.model.as_deref(), Some("gpt-5-codex"));
-        assert!(saved.serve.mcp.enable_write_tools);
-    }
-
-    #[tokio::test]
-    async fn semantic_config_set_bootstraps_local_embeddings_under_read_only_policy() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("loomweave.db");
-        {
-            let mut conn = rusqlite::Connection::open(&db).unwrap();
-            pragma::apply_write_pragmas(&conn).unwrap();
-            schema::apply_migrations(&mut conn).unwrap();
+        for (name, arguments) in [
+            (
+                "llm_config_set",
+                serde_json::json!({"enable_write_tools": true}),
+            ),
+            (
+                "semantic_config_set",
+                serde_json::json!({
+                    "allow_live_provider": true,
+                    "endpoint_url": "https://attacker.invalid/v1"
+                }),
+            ),
+        ] {
+            let response = state
+                .handle_json_rpc(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": name,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}
+                }))
+                .await
+                .expect("tools/call response");
+            assert_eq!(response["error"]["code"], -32601, "{response}");
         }
-        let readers = ReaderPool::open(&db, 4).unwrap();
-        let state = ServerState::new(dir.path().to_path_buf(), readers)
-            .with_tool_policy(McpToolPolicy::read_only());
 
-        let response = state
-            .handle_json_rpc(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "semantic-config-set",
-                "method": "tools/call",
-                "params": {
-                    "name": "semantic_config_set",
-                    "arguments": {
-                        "enabled": true,
-                        "provider": "local_openai",
-                        "endpoint_url": "http://127.0.0.1:11434/v1",
-                        "model_id": "nomic-embed-text",
-                        "dimensions": 768
-                    }
-                }
-            }))
-            .await
-            .expect("tools/call response");
-        assert_eq!(response["result"]["isError"], false, "{response}");
-        let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(envelope["ok"], true, "{envelope}");
-        assert_eq!(
-            envelope["result"]["semantic_search"]["provider"],
-            "local_openai"
+        assert!(
+            !dir.path().join("loomweave.yaml").exists(),
+            "rejected config writes must not create a configuration file"
         );
-        assert_eq!(
-            envelope["result"]["semantic_search"]["provider_available"],
-            true
-        );
-        assert_eq!(
-            envelope["result"]["active_session"]["restart_required"],
-            true
-        );
-
-        let saved =
-            loomweave_federation::config::McpConfig::from_path(&dir.path().join("loomweave.yaml"))
-                .unwrap();
-        assert!(saved.semantic_search.enabled);
-        assert_eq!(
-            saved.semantic_search.provider,
-            loomweave_federation::config::SemanticProviderKind::LocalOpenAi
-        );
-        assert_eq!(saved.semantic_search.dimensions, 768);
     }
 
     #[test]

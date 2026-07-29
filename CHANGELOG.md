@@ -14,6 +14,10 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
+- **Read-only MCP config mutation bypass.** `llm_config_set` and
+  `semantic_config_set` now obey `serve.mcp.enable_write_tools`, preventing a
+  read-only MCP session from persistently enabling write tools or redirecting
+  live provider traffic through configuration changes.
 - **Doctor bootstrap-state repair.** `loomweave doctor` now warns when an
   installed catalogue has never been analysed or lacks its local instance
   identity. `loomweave doctor --fix` materialises a private project UUID and
