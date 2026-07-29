@@ -1,6 +1,6 @@
 //! Resolve the live Filigree API base URL.
 //!
-//! Mirrors Filigree's ethereal endpoint-discovery convention: the dashboard
+//! Mirrors Filigree's ephemeral endpoint-discovery convention: the dashboard
 //! publishes its live port to a per-project `ephemeral.port` file (a plain
 //! integer, written atomically, present only while the dashboard runs) and
 //! serves the read API on that port. The port is chosen deterministically but
@@ -35,7 +35,7 @@
 //! deliberately not used for Filigree: repository content must not redirect
 //! authenticated Filigree requests or bearer tokens. Every rung is fail-soft.
 //!
-//! Scope: ethereal mode only. Filigree's `server` mode resolves through a
+//! Scope: ephemeral mode only. Filigree's `server` mode resolves through a
 //! home-directory global (`~/.config/filigree/server.json`); that path is not
 //! exercised here and is left as a known gap (clarion-318f1254eb tracks the
 //! issues_for-side resolution diagnostics that build on this resolver).
@@ -59,7 +59,7 @@ pub const SOURCE_ENV: &str = "env:WEFT_FILIGREE_URL";
 /// because repository content can be attacker-controlled while Filigree bearer
 /// tokens come from the operator environment.
 pub const SOURCE_WEFT_TOML: &str = "weft.toml";
-/// The live ethereal port published by Filigree's running dashboard at the
+/// The live ephemeral port published by Filigree's running dashboard at the
 /// consolidated `.weft/filigree/` location — the only location read (ADR-046).
 pub const SOURCE_EPHEMERAL_PORT: &str = ".weft/filigree/ephemeral.port";
 /// Loomweave's own configured `integrations.filigree.base_url`.
@@ -124,7 +124,7 @@ pub fn resolve_filigree_url(
     resolve_filigree_url_with_roots(config, &[project_root], getenv)
 }
 
-/// [`resolve_filigree_url`], but rung 2 (the live ethereal port) checks each
+/// [`resolve_filigree_url`], but rung 2 (the live ephemeral port) checks each
 /// of `roots` in order and uses the first hit, instead of a single project
 /// root. `roots` should be an ordered, deduplicated candidate list — for a
 /// linked Git worktree, `[source_root, primary_root]` (see the module docs
@@ -160,7 +160,7 @@ pub fn resolve_filigree_url_with_roots(
             source: SOURCE_ENV,
         };
     }
-    // Rung 2: live ethereal port overrides the configured URL's port.
+    // Rung 2: live ephemeral port overrides the configured URL's port.
     // Do not read project-root `weft.toml [filigree].url` here: repository
     // content may be untrusted, while Filigree clients attach operator-owned
     // bearer tokens to the resolved endpoint. Remote/operator overrides must

@@ -587,7 +587,7 @@ impl ServerState {
         let include_contained = optional_bool(arguments, "include_contained")?.unwrap_or(true);
         // Surface the same configured-vs-resolved Filigree endpoint block that
         // `project_status` reports, so an agent can see WHICH endpoint a result
-        // came from (e.g. an ethereal port resolved from
+        // came from (e.g. an ephemeral port resolved from
         // `.weft/filigree/ephemeral.port`) instead of curling ports by hand. Null on
         // storage-only servers built without a diagnostics context.
         let endpoint = self.filigree_diagnostics_json();

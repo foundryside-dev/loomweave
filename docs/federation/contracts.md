@@ -1508,7 +1508,7 @@ sweep, it must resolve *where* Filigree is actually listening.
 gates Loomweave's own semantics. Loomweave stays solo-useful with Filigree absent
 (weft.md §5).
 
-**The convention.** Filigree's dashboard, when running in its default *ethereal*
+**The convention.** Filigree's dashboard, when running in its default *ephemeral*
 mode, publishes its live listen port to
 `<project_root>/.weft/filigree/ephemeral.port` (the consolidated Weft store
 location, ADR-046) — a plain trimmed integer, written atomically, present only
@@ -1551,7 +1551,7 @@ file. Loomweave does **not** read `server.json` at release:1.1 — under Filigre
 server mode, discovery finds no `ephemeral.port` and degrades to the configured
 `base_url` (`source = config`), which is correct but does not auto-track a
 server-mode port. Closing this gap (reading the server-mode global) is tracked as
-post-1.1 work; the ethereal path is the only one exercised today.
+post-1.1 work; the ephemeral path is the only one exercised today.
 
 **Agent-facing surface.** `project_status` reports the resolution verbatim so an
 agent can tell *where* the URL came from without probing ports:

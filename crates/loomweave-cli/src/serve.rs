@@ -260,7 +260,7 @@ fn run_server(
         &worktree_ctx.primary_root,
     );
 
-    // Resolve where Filigree actually listens — prefer the live ethereal port
+    // Resolve where Filigree actually listens — prefer the live ephemeral port
     // published in `.weft/filigree/ephemeral.port` over the static configured
     // port (which goes stale, the dogfood bug) — then build the client against the
     // resolved URL so `issues_for` reaches the running dashboard. The same
