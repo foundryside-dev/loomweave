@@ -124,7 +124,7 @@ pub fn resolve_filigree_url(
     resolve_filigree_url_with_roots(config, &[project_root], getenv)
 }
 
-/// [`resolve_filigree_url`], but rung 3 (the live ethereal port) checks each
+/// [`resolve_filigree_url`], but rung 2 (the live ethereal port) checks each
 /// of `roots` in order and uses the first hit, instead of a single project
 /// root. `roots` should be an ordered, deduplicated candidate list — for a
 /// linked Git worktree, `[source_root, primary_root]` (see the module docs
@@ -132,10 +132,10 @@ pub fn resolve_filigree_url(
 /// preferred but a repository-wide one is still found. A single-element list
 /// (the `resolve_filigree_url` case) is byte-identical to today's behavior.
 ///
-/// Rung 2 (`weft.toml [filigree].url`) still consults only `roots[0]` — that
-/// operator declaration is a durable, explicit statement of where Filigree
-/// is, not an on-disk discovery artifact a worktree could shadow the way an
-/// ignored `ephemeral.port` sidecar can.
+/// There is deliberately no `weft.toml [filigree].url` rung: repository
+/// content may be untrusted, while Filigree clients attach operator-owned
+/// bearer tokens to the resolved endpoint. Operator overrides use the
+/// process environment (`WEFT_FILIGREE_URL`) or the private config.
 #[must_use]
 pub fn resolve_filigree_url_with_roots(
     config: &FiligreeConfig,
