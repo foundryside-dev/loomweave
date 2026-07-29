@@ -306,16 +306,22 @@ pub trait FiligreeLookup: Send + Sync {
 /// minted token is preferred but a repository-wide one is still found. A
 /// single-element list is byte-identical to today's behavior.
 fn read_minted_federation_token_from_roots(roots: &[&Path]) -> Option<String> {
-    roots.iter().find_map(|root| {
-        let path = root.join(".weft").join("filigree").join("federation_token");
-        let raw = std::fs::read_to_string(path).ok()?;
-        let token = raw.trim();
-        if token.is_empty() {
-            None
-        } else {
-            Some(token.to_owned())
-        }
-    })
+    roots.iter().find_map(|root| read_minted_token_at(root))
+}
+
+/// Read the daemon-minted `federation_token` at exactly one root — the
+/// paired-resolution primitive (clarion-f93e006216): when the URL resolved
+/// from a specific root's published port, the token presented to that daemon
+/// must come from the same root, or stay absent.
+fn read_minted_token_at(root: &Path) -> Option<String> {
+    let path = root.join(".weft").join("filigree").join("federation_token");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let token = raw.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_owned())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -350,8 +356,8 @@ impl FiligreeHttpClient {
         F: Fn(&str) -> Option<String>,
     {
         match project_root {
-            Some(root) => Self::from_config_with_project_roots(config, env_lookup, &[root]),
-            None => Self::from_config_with_project_roots(config, env_lookup, &[]),
+            Some(root) => Self::from_config_with_project_roots(config, env_lookup, &[root], None),
+            None => Self::from_config_with_project_roots(config, env_lookup, &[], None),
         }
     }
 
@@ -362,6 +368,15 @@ impl FiligreeHttpClient {
     /// for a linked Git worktree, `[source_root, primary_root]`; an empty or
     /// single-element list is byte-identical to today's behavior.
     ///
+    /// `port_winning_root` is the URL resolution's
+    /// [`winning_root`](crate::filigree_url::FiligreeUrlResolution::winning_root):
+    /// when `Some`, the minted-token rung reads ONLY that root, so the token
+    /// presented always comes from the same daemon whose published port won —
+    /// a stale token from another candidate root must never be paired with
+    /// this URL (clarion-f93e006216). When `None` (env/config-resolved URL,
+    /// no root association), the ordered first-hit walk over `roots` is
+    /// preserved.
+    ///
     /// `roots.first()` is stored as this client's own `project_root` (used
     /// for `resolve_filigree_mcp_command`'s `{project}` placeholder), the
     /// same single-root role the old `project_root` parameter played.
@@ -371,6 +386,7 @@ impl FiligreeHttpClient {
         config: &FiligreeConfig,
         env_lookup: F,
         roots: &[&Path],
+        port_winning_root: Option<&Path>,
     ) -> Result<Option<Self>, FiligreeClientError>
     where
         F: Fn(&str) -> Option<String>,
@@ -393,7 +409,13 @@ impl FiligreeHttpClient {
         let token = env_lookup(&config.token_env)
             .filter(|value| !value.trim().is_empty())
             .or_else(|| env_lookup("FILIGREE_API_TOKEN").filter(|value| !value.trim().is_empty()))
-            .or_else(|| read_minted_federation_token_from_roots(roots));
+            .or_else(|| match port_winning_root {
+                // Paired resolution (clarion-f93e006216): the URL came from
+                // this root's published port, so only this root's daemon
+                // could have minted a token this endpoint accepts.
+                Some(winning) => read_minted_token_at(winning),
+                None => read_minted_federation_token_from_roots(roots),
+            });
         Ok(Some(Self {
             base_url: config.base_url.clone(),
             project: config.project.clone(),
@@ -1096,6 +1118,104 @@ mod tests {
         std::fs::write(dir.join("federation_token"), contents).expect("write token");
     }
 
+    fn write_port_file(root: &Path, port: u16) {
+        let dir = root.join(".weft").join("filigree");
+        std::fs::create_dir_all(&dir).expect("create store dir");
+        std::fs::write(dir.join("ephemeral.port"), format!("{port}\n")).expect("write port");
+    }
+
+    /// clarion-f93e006216: URL and minted token must resolve from the SAME
+    /// root. A stale worktree-local token must never be paired with the
+    /// primary's live daemon URL — that produced auth failures against a
+    /// correctly discovered endpoint.
+    #[test]
+    fn token_resolution_pairs_with_the_url_winning_root() {
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let primary = tempfile::tempdir().expect("tempdir");
+        // Worktree: leftover token, no live daemon (no port file).
+        mint_token_file(worktree.path(), "stale-worktree-secret");
+        // Primary: live daemon — port AND its own minted token.
+        mint_token_file(primary.path(), "primary-secret");
+        write_port_file(primary.path(), 4321);
+
+        let config = token_resolution_config();
+        let roots = [worktree.path(), primary.path()];
+        let resolution =
+            crate::filigree_url::resolve_filigree_url_with_roots(&config, &roots, |_| None);
+        assert_eq!(
+            resolution.winning_root.as_deref(),
+            Some(primary.path()),
+            "the port rung must record which root won"
+        );
+
+        let client = FiligreeHttpClient::from_config_with_project_roots(
+            &config,
+            |_| None,
+            &roots,
+            resolution.winning_root.as_deref(),
+        )
+        .expect("build client")
+        .expect("enabled client");
+        assert_eq!(
+            client.token,
+            Some("primary-secret".to_owned()),
+            "the token must come from the same root the URL resolved from"
+        );
+    }
+
+    /// When the winning daemon minted no token, auth stays off — another
+    /// root's token is never presented to a daemon that did not mint it.
+    #[test]
+    fn token_resolution_does_not_borrow_another_roots_token() {
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let primary = tempfile::tempdir().expect("tempdir");
+        mint_token_file(worktree.path(), "stale-worktree-secret");
+        write_port_file(primary.path(), 4321);
+
+        let config = token_resolution_config();
+        let roots = [worktree.path(), primary.path()];
+        let resolution =
+            crate::filigree_url::resolve_filigree_url_with_roots(&config, &roots, |_| None);
+
+        let client = FiligreeHttpClient::from_config_with_project_roots(
+            &config,
+            |_| None,
+            &roots,
+            resolution.winning_root.as_deref(),
+        )
+        .expect("build client")
+        .expect("enabled client");
+        assert_eq!(
+            client.token, None,
+            "a tokenless winning daemon must not inherit a foreign root's token"
+        );
+    }
+
+    /// No port rung winner (URL from config) → the legacy ordered first-hit
+    /// token walk is preserved.
+    #[test]
+    fn token_resolution_without_winning_root_keeps_ordered_first_hit() {
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let primary = tempfile::tempdir().expect("tempdir");
+        mint_token_file(primary.path(), "primary-secret");
+
+        let config = token_resolution_config();
+        let roots = [worktree.path(), primary.path()];
+        let resolution =
+            crate::filigree_url::resolve_filigree_url_with_roots(&config, &roots, |_| None);
+        assert_eq!(resolution.winning_root, None);
+
+        let client = FiligreeHttpClient::from_config_with_project_roots(
+            &config,
+            |_| None,
+            &roots,
+            resolution.winning_root.as_deref(),
+        )
+        .expect("build client")
+        .expect("enabled client");
+        assert_eq!(client.token, Some("primary-secret".to_owned()));
+    }
+
     fn resolved_token_with_root(env: &[(&str, &str)], root: &Path) -> Option<String> {
         let config = token_resolution_config();
         FiligreeHttpClient::from_config_with_project_root(
@@ -1154,6 +1274,7 @@ mod tests {
             &config,
             |_: &str| None,
             &[source.path(), primary.path()],
+            None,
         )
         .expect("build client")
         .expect("enabled client");
@@ -1171,6 +1292,7 @@ mod tests {
             &config,
             |_: &str| None,
             &[source.path(), primary.path()],
+            None,
         )
         .expect("build client")
         .expect("enabled client");

@@ -43,7 +43,7 @@ use loomweave_storage::{
 
 use loomweave_federation::config::{FiligreeConfig, McpConfig, SemanticSearchConfig};
 use loomweave_federation::filigree::FiligreeHttpClient;
-use loomweave_federation::filigree_url::resolve_filigree_url;
+use loomweave_federation::filigree_url::resolve_filigree_url_with_roots;
 use loomweave_federation::scan_results::{
     CleanStaleRequest, CleanStaleResponse, EmitOptions, FindingForEmit, LOOMWEAVE_SCAN_SOURCE,
     PreparedBatch, ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
@@ -399,6 +399,19 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
         options
     };
+    // Sibling (Filigree) local-state discovery roots: source root first, then
+    // primary root, deduplicated — the same ordered list `serve` uses
+    // (clarion-2833649dd9). Collapses to `[project_root]` for standalone/main
+    // checkouts, so behavior there is unchanged; for a linked worktree this
+    // is what lets finding emission and prune find the primary's published
+    // `ephemeral.port` and minted `federation_token`.
+    let sibling_roots: Vec<PathBuf> = loomweave_federation::filigree_url::dedup_candidate_roots(
+        &worktree_ctx.source_root,
+        &worktree_ctx.primary_root,
+    )
+    .into_iter()
+    .map(Path::to_path_buf)
+    .collect();
     let loomweave_dir = worktree_ctx.effective_store.clone();
     let db_path = worktree_ctx.store_paths.db.clone();
 
@@ -1689,6 +1702,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &writer,
             &db_path,
             &project_root,
+            &sibling_roots,
             &run_id,
             // `mark_unseen` sweeps findings this scan did NOT report as gone —
             // only sound when the scan examined the whole corpus, i.e. it skipped
@@ -1735,6 +1749,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     ) {
         prune_unseen_findings_in_filigree(
             &project_root,
+            &sibling_roots,
             &run_id,
             options.prune_unseen,
             options.config_path.as_deref(),
@@ -1991,6 +2006,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &writer,
                 &db_path,
                 &project_root,
+                &sibling_roots,
                 &run_id,
                 // Runs that skipped files do not sweep (see Phase-8 note); only a
                 // run that examined the whole corpus may mark findings unseen.
@@ -4855,10 +4871,12 @@ fn semantic_embedding_text(short_name: &str, name: &str, properties_json: &str) 
 /// emittable batch skips the POST entirely (no wasted call when a run deletes
 /// nothing). `complete_scan_run` rides into the wire request: `true` for the
 /// final/only batch, `false` for an additive follow-up batch.
+#[allow(clippy::too_many_arguments)] // one-shot emission inputs, mirrors http_read::spawn
 async fn emit_findings_to_filigree(
     writer: &Writer,
     db_path: &Path,
     project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     mark_unseen: bool,
     complete_scan_run: bool,
@@ -4986,7 +5004,7 @@ async fn emit_findings_to_filigree(
 
     post_findings_batch(
         filigree_cfg,
-        project_root,
+        sibling_roots,
         run_id,
         batch,
         total_findings,
@@ -5058,7 +5076,7 @@ fn federation_finding_for_emit(row: loomweave_storage::FindingForEmitRow) -> Fin
 /// `LMWV-INFRA-FILIGREE-UNREACHABLE` stats blob via [`unreachable_stats`].
 async fn post_findings_batch(
     filigree_cfg: &FiligreeConfig,
-    project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     batch: PreparedBatch,
     total_findings: usize,
@@ -5067,10 +5085,13 @@ async fn post_findings_batch(
     let emitted = batch.emitted;
     let skipped_no_path = batch.skipped_no_path;
 
-    // Resolve the live Filigree URL (ephemeral port over stale config), the same
-    // resolution `loomweave serve` and `project_status` use.
+    // Resolve the live Filigree URL (ephemeral port over stale config) over
+    // the same ordered sibling-root list `serve` and `project_status` use —
+    // for a linked worktree, source root then primary root
+    // (clarion-2833649dd9).
+    let root_refs: Vec<&Path> = sibling_roots.iter().map(PathBuf::as_path).collect();
     let resolution =
-        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
+        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -5084,12 +5105,15 @@ async fn post_findings_batch(
     // runtime, and join it off the async executor.
     let request = batch.request;
     let thread_cfg = resolved_cfg;
-    let thread_root = project_root.to_path_buf();
+    let thread_roots = sibling_roots.to_vec();
+    let thread_winning = resolution.winning_root;
     let worker = std::thread::spawn(move || -> Result<ScanResultsResponse, String> {
-        let client = FiligreeHttpClient::from_config_with_project_root(
+        let thread_refs: Vec<&Path> = thread_roots.iter().map(PathBuf::as_path).collect();
+        let client = FiligreeHttpClient::from_config_with_project_roots(
             &thread_cfg,
             |name| std::env::var(name).ok(),
-            Some(&thread_root),
+            &thread_refs,
+            thread_winning.as_deref(),
         )
         .map_err(|err| format!("build Filigree client: {err}"))?
         .ok_or_else(|| "Filigree integration disabled".to_owned())?;
@@ -5194,6 +5218,7 @@ fn unreachable_stats(
 /// by Filigree, so the sweep can only touch Loomweave's findings.
 async fn prune_unseen_findings_in_filigree(
     project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     prune_unseen: bool,
     config_path: Option<&Path>,
@@ -5212,10 +5237,11 @@ async fn prune_unseen_findings_in_filigree(
     }
     let older_than_days = filigree_cfg.prune_unseen_days;
 
-    // Resolve the live Filigree URL (ephemeral port over stale config), the
-    // same resolution emission uses.
+    // Resolve the live Filigree URL over the same ordered sibling-root list
+    // emission uses (clarion-2833649dd9).
+    let root_refs: Vec<&Path> = sibling_roots.iter().map(PathBuf::as_path).collect();
     let resolution =
-        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
+        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -5230,12 +5256,15 @@ async fn prune_unseen_findings_in_filigree(
     // Same blocking-reqwest-on-a-plain-OS-thread dance as emission: build → POST
     // → drop the client off the tokio executor so the inner runtime drop is safe.
     let thread_cfg = resolved_cfg;
-    let thread_root = project_root.to_path_buf();
+    let thread_roots = sibling_roots.to_vec();
+    let thread_winning = resolution.winning_root;
     let worker = std::thread::spawn(move || -> Result<CleanStaleResponse, String> {
-        let client = FiligreeHttpClient::from_config_with_project_root(
+        let thread_refs: Vec<&Path> = thread_roots.iter().map(PathBuf::as_path).collect();
+        let client = FiligreeHttpClient::from_config_with_project_roots(
             &thread_cfg,
             |name| std::env::var(name).ok(),
-            Some(&thread_root),
+            &thread_refs,
+            thread_winning.as_deref(),
         )
         .map_err(|err| format!("build Filigree client: {err}"))?
         .ok_or_else(|| "Filigree integration disabled".to_owned())?;

@@ -287,6 +287,10 @@ fn run_server(
         &filigree_config,
         |name| std::env::var(name).ok(),
         &sibling_roots,
+        // Paired resolution (clarion-f93e006216): the minted token must come
+        // from the same root the URL's port rung won at, never a stale token
+        // from another candidate root.
+        filigree_resolution.winning_root.as_deref(),
     )
     .context("build Filigree HTTP client")?;
 

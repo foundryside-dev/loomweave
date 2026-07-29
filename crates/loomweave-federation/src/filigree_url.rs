@@ -92,6 +92,14 @@ pub struct FiligreeUrlResolution {
     pub resolved_url: Option<String>,
     /// Which input produced [`Self::resolved_url`]; one of the `SOURCE_*` labels.
     pub source: &'static str,
+    /// The candidate root whose published `ephemeral.port` won — `Some` only
+    /// when [`Self::source`] is the ephemeral-port rung. Callers building a
+    /// [`FiligreeHttpClient`](crate::filigree::FiligreeHttpClient) pass this
+    /// through so the minted federation token resolves from the SAME root as
+    /// the URL: a stale worktree-local token paired with the primary's live
+    /// daemon URL 401s against a correctly discovered endpoint
+    /// (clarion-f93e006216).
+    pub winning_root: Option<std::path::PathBuf>,
 }
 
 /// Resolve the Filigree read-API base URL along the C-9 §2.2 precedence ladder.
@@ -149,6 +157,7 @@ pub fn resolve_filigree_url_with_roots(
             configured_url,
             resolved_url: None,
             source: SOURCE_DISABLED,
+            winning_root: None,
         };
     }
     // Rung 1: WEFT_FILIGREE_URL env, used verbatim.
@@ -158,6 +167,7 @@ pub fn resolve_filigree_url_with_roots(
             configured_url,
             resolved_url: Some(url.trim().to_owned()),
             source: SOURCE_ENV,
+            winning_root: None,
         };
     }
     // Rung 2: live ephemeral port overrides the configured URL's port.
@@ -165,15 +175,20 @@ pub fn resolve_filigree_url_with_roots(
     // content may be untrusted, while Filigree clients attach operator-owned
     // bearer tokens to the resolved endpoint. Remote/operator overrides must
     // use the process environment (`WEFT_FILIGREE_URL`) or the private config.
-    // Checks each candidate root in order; the first published port wins.
-    match roots.iter().find_map(|root| read_ephemeral_port(root)) {
-        Some((port, source)) => {
+    // Checks each candidate root in order; the first published port wins, and
+    // is recorded so token resolution can pair with it (clarion-f93e006216).
+    match roots
+        .iter()
+        .find_map(|root| read_ephemeral_port(root).map(|hit| (*root, hit)))
+    {
+        Some((root, (port, source))) => {
             let resolved = override_port(&configured_url, port);
             FiligreeUrlResolution {
                 enabled: true,
                 configured_url,
                 resolved_url: Some(resolved),
                 source,
+                winning_root: Some(root.to_path_buf()),
             }
         }
         // Rung 3: configured base_url unchanged.
@@ -182,6 +197,7 @@ pub fn resolve_filigree_url_with_roots(
             resolved_url: Some(configured_url.clone()),
             configured_url,
             source: SOURCE_CONFIG,
+            winning_root: None,
         },
     }
 }
