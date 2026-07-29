@@ -1448,6 +1448,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 // "looked, clean".
                 plugin_classifier_coverage[coverage_index].mark_failed();
                 syntax_classified_source_files.remove(&syntax_error_rule_id);
+                warn_sweep_scope_withheld(&plugin_id, "anchorless syntax degradation");
             }
         }
         let mut syntax_merges = legacy_plugin_syntax_merges(
@@ -1547,6 +1548,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     // "looked, clean" and retire its still-valid finding.
                     plugin_classifier_coverage[coverage_index].mark_failed();
                     syntax_classified_source_files.remove(&syntax_error_rule_id);
+                    warn_sweep_scope_withheld(&plugin_id, "host-rejected classifier evidence");
                 }
                 // Log findings individually (operator-facing stderr) and persist
                 // them (REQ-ANALYZE-06) so an ontology check, malformed-JSON drop,
@@ -5057,6 +5059,24 @@ async fn emit_findings_to_filigree(
 /// as the project-relative path Filigree's scan-results intake requires. A path
 /// that does not live under the root is returned unchanged (Filigree then
 /// rejects it loudly, which is preferable to silently rewriting it).
+/// Operator-visible signal that a plugin's scoped syntax-finding sweep was
+/// withheld this run (clarion-98237e9a45). Withholding is the fail-closed
+/// direction and deliberately does NOT fail the run — but it pins any stale
+/// syntax finding for a file this run actually fixed: the file's new content
+/// hash is recorded, so every later incremental run skips it and the finding
+/// survives until a `--no-incremental` pass (or the file changes again). An
+/// exit-0 run must say so, naming the recovery, rather than leave the
+/// operator to rediscover the stuck-finding symptom.
+fn warn_sweep_scope_withheld(plugin_id: &str, cause: &str) {
+    tracing::warn!(
+        plugin_id,
+        cause,
+        "stale syntax findings for this plugin were NOT retired this run ({cause}); any finding \
+         for a file this run fixed stays until a `loomweave analyze --no-incremental` pass heals \
+         it"
+    );
+}
+
 fn relativize_for_emit(project_root: &Path, path: &str) -> String {
     Path::new(path)
         .strip_prefix(project_root)

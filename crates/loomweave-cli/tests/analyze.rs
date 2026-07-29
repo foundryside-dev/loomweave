@@ -5852,7 +5852,22 @@ fn analyze_preserves_syntax_finding_when_classification_fails() {
     // undeclared-kind rejection; mod_b is unchanged, so this is a genuine
     // incremental run and the scoped sweep is the only sweep that fires.
     std::fs::write(project_dir.path().join("mod_a.swp"), b"BROKEN MYSTERY\n").unwrap();
-    analyze();
+    let run2 = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .output()
+        .expect("run analyze");
+    assert!(run2.status.success(), "rejections must not fail the run");
+    // clarion-98237e9a45: withholding a plugin's sweep scope pins any stale
+    // syntax finding until a --no-incremental pass — an exit-0 run must say
+    // so, naming the recovery, instead of leaving the operator to rediscover
+    // the stuck-finding symptom.
+    let run2_stderr = String::from_utf8_lossy(&run2.stderr);
+    assert!(
+        run2_stderr.contains("--no-incremental"),
+        "withholding a sweep scope must name the recovery on stderr: {run2_stderr}"
+    );
     let stats = latest_run_stats(project_dir.path());
     assert_eq!(
         stats["skipped_files"].as_u64(),
