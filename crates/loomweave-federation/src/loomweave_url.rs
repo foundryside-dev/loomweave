@@ -107,6 +107,18 @@ pub fn resolve_loomweave_url_at(
         };
     }
     // Rung 2: weft.toml [loomweave].url, verbatim (outranks on-disk port).
+    //
+    // SECURITY INVARIANT (clarion-c1b3bea8af): `weft.toml` is repository
+    // content and may be untrusted. The analogous `[filigree].url` rung was
+    // REMOVED on the 1.5.0 line because Filigree clients attach
+    // operator-owned bearer tokens to the resolved endpoint — a repo file
+    // must never steer where credentials are sent. This rung survives only
+    // because every current consumer is unauthenticated (doctor's
+    // `http.config` display and `project_status`'s read-API block attach
+    // nothing). Any future consumer that attaches credentials to a resolved
+    // Loomweave URL MUST either refuse `SOURCE_WEFT_TOML`-sourced results
+    // (the `source` field exists to make that check one comparison) or this
+    // rung must be retired the way the Filigree one was.
     if let Some(url) =
         loomweave_core::store::sibling_url(project_root, loomweave_core::store::MEMBER)
     {
