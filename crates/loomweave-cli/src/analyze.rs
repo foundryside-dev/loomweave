@@ -43,7 +43,7 @@ use loomweave_storage::{
 
 use loomweave_federation::config::{FiligreeConfig, McpConfig, SemanticSearchConfig};
 use loomweave_federation::filigree::FiligreeHttpClient;
-use loomweave_federation::filigree_url::resolve_filigree_url;
+use loomweave_federation::filigree_url::resolve_filigree_url_with_roots;
 use loomweave_federation::scan_results::{
     CleanStaleRequest, CleanStaleResponse, EmitOptions, FindingForEmit, LOOMWEAVE_SCAN_SOURCE,
     PreparedBatch, ScanResultsResponse, clean_stale_url, prepare_batch, scan_results_url,
@@ -380,6 +380,38 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     loomweave_cli::worktree::store::ensure_isolated_store(&worktree_ctx)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("ensure worktree-isolated store")?;
+    // Effective config resolution (clarion-c39b92b868): an explicit --config
+    // wins; otherwise the resolved context's ladder — the source root's
+    // `loomweave.yaml`, falling through to the primary root's for a linked
+    // worktree — exactly the file `serve` reports as active for this same
+    // checkout. Byte-identical to the old bare `project_root` join for
+    // standalone/main contexts. Resolved ONCE here, so every downstream
+    // consumer (AnalyzeConfig, finding emission, embeddings) reads the same
+    // file; only-if-exists mirrors serve's guard — an absent ladder file
+    // means defaults, not an error.
+    let options = {
+        let mut options = options;
+        if options.config_path.is_none() {
+            let ladder = worktree_ctx.config_path();
+            if ladder.exists() {
+                options.config_path = Some(ladder);
+            }
+        }
+        options
+    };
+    // Sibling (Filigree) local-state discovery roots: source root first, then
+    // primary root, deduplicated — the same ordered list `serve` uses
+    // (clarion-2833649dd9). Collapses to `[project_root]` for standalone/main
+    // checkouts, so behavior there is unchanged; for a linked worktree this
+    // is what lets finding emission and prune find the primary's published
+    // `ephemeral.port` and minted `federation_token`.
+    let sibling_roots: Vec<PathBuf> = loomweave_federation::filigree_url::dedup_candidate_roots(
+        &worktree_ctx.source_root,
+        &worktree_ctx.primary_root,
+    )
+    .into_iter()
+    .map(Path::to_path_buf)
+    .collect();
     let loomweave_dir = worktree_ctx.effective_store.clone();
     let db_path = worktree_ctx.store_paths.db.clone();
 
@@ -498,6 +530,46 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
     }
 
+    // Reject `rule_id_prefix` collisions across plugins (clarion-9988bd9ced):
+    // the per-plugin syntax-finding sweep, subcode validation, and finding
+    // attribution all key on the prefix, and two plugins sharing one would
+    // merge their sweep scopes — letting plugin A's clean classification of a
+    // shared file retire plugin B's findings on it. Which of the colliding
+    // manifests is "right" is unknowable here, so every plugin in a colliding
+    // group is dropped (loudly, into `discovery_errors` — visible in
+    // classifier coverage); if that empties the set, the run fails via the
+    // discovery-error path below rather than reporting `skipped_no_plugins`.
+    {
+        let mut prefix_counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for plugin in &plugins {
+            *prefix_counts
+                .entry(plugin.manifest.ontology.rule_id_prefix.as_str())
+                .or_insert(0) += 1;
+        }
+        let colliding: Vec<String> = prefix_counts
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(prefix, _)| (*prefix).to_owned())
+            .collect();
+        plugins.retain(|plugin| {
+            let prefix = &plugin.manifest.ontology.rule_id_prefix;
+            if colliding.iter().any(|c| c == prefix) {
+                let msg = format!(
+                    "plugin {:?} dropped: rule_id_prefix {prefix:?} is also declared by another \
+                     discovered plugin — prefixes must be unique per plugin, or findings and the \
+                     syntax-finding sweep cannot be safely attributed",
+                    plugin.manifest.plugin.plugin_id
+                );
+                tracing::error!(error = %msg, "skipping plugin: rule_id_prefix collision");
+                discovery_errors.push(msg);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     if plugins.is_empty() {
         // Distinguish "no plugins installed" (SkippedNoPlugins — expected on a
         // bare machine) from "plugins present but all failed discovery" (FailRun
@@ -505,7 +577,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // latter as `skipped_no_plugins` hides bugs.
         if !discovery_errors.is_empty() {
             let reason = format!(
-                "all {} discovered plugin manifest(s) failed to parse: {}",
+                "all {} discovered plugin(s) failed discovery or validation: {}",
                 discovery_errors.len(),
                 discovery_errors.join("; ")
             );
@@ -845,6 +917,20 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // current-locator union AND re-appended to the prior-index rebuild below.
     let mut retained_locators: HashSet<String> = HashSet::new();
     let mut skipped_files_total: u64 = 0;
+    // Per-plugin syntax-error rule id → canonical-absolute source paths (the
+    // form `entities.source_file_path` stores) whose syntax classification
+    // COMPLETED this run: the file's batch was persisted, so the classifier
+    // actually saw its (possibly degraded) module evidence. This is the exact
+    // re-examination scope for the scoped stale-finding sweep below, which
+    // needs it to retire a fixed file's finding on an incremental run — see
+    // that call site for why the general sweep cannot. Two deliberate
+    // narrowings versus "files dispatched":
+    // - a file that never produced a persisted batch (e.g. the jail-safe open
+    //   failed) was NOT examined, and sweeping its prior finding would launder
+    //   a still-broken file into `complete` on the next skipped run;
+    // - the map is keyed per rule so one plugin's re-dispatch can never sweep
+    //   a co-extensioned plugin's findings on the same file.
+    let mut syntax_classified_source_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     // ── Per-plugin processing ─────────────────────────────────────────────────
     //
@@ -1244,6 +1330,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     let batch_entity_ids: Vec<String> =
                         batch.entities.iter().map(|(id, _)| id.clone()).collect();
                     let batch_edges = std::mem::take(&mut batch.edges);
+                    let batch_source_file_path = batch.source_file_path.clone();
                     match persist_plugin_file_batch(
                         &writer,
                         batch,
@@ -1258,6 +1345,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                             plugin_entity_count += effects.entity_count;
                             plugin_classifier_coverage[coverage_index]
                                 .record_completed_file(effects.degraded_source_files.clone());
+                            syntax_classified_source_files
+                                .entry(syntax_error_rule_id.clone())
+                                .or_default()
+                                .insert(batch_source_file_path);
                             seen_plugin_entity_ids.extend(batch_entity_ids);
                             pending_plugin_edges.extend(batch_edges);
                             let ready_edges = drain_ready_plugin_edges(
@@ -1351,8 +1442,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             } else {
                 // Syntax degradation without a file anchor cannot contribute
                 // a sound file count. Preserve the declaration but fail the
-                // plugin's coverage closed.
+                // plugin's coverage closed — and withhold this plugin's whole
+                // sweep scope: the degraded file is unidentifiable, so the
+                // scoped sweep could retire its still-valid prior finding as
+                // "looked, clean".
                 plugin_classifier_coverage[coverage_index].mark_failed();
+                syntax_classified_source_files.remove(&syntax_error_rule_id);
+                warn_sweep_scope_withheld(&plugin_id, "anchorless syntax degradation");
             }
         }
         let mut syntax_merges = legacy_plugin_syntax_merges(
@@ -1445,7 +1541,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 {
                     // A successful transport can still carry host-rejected
                     // enumeration evidence (ontology/path/protocol drops).
+                    // Rejection findings carry no file anchor, so the dropped
+                    // evidence cannot be attributed to a file — withhold this
+                    // plugin's whole sweep scope rather than let the scoped
+                    // sweep read an unexamined file's missing re-emission as
+                    // "looked, clean" and retire its still-valid finding.
                     plugin_classifier_coverage[coverage_index].mark_failed();
+                    syntax_classified_source_files.remove(&syntax_error_rule_id);
+                    warn_sweep_scope_withheld(&plugin_id, "host-rejected classifier evidence");
                 }
                 // Log findings individually (operator-facing stderr) and persist
                 // them (REQ-ANALYZE-06) so an ontology check, malformed-JSON drop,
@@ -1641,6 +1744,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             &writer,
             &db_path,
             &project_root,
+            &sibling_roots,
             &run_id,
             // `mark_unseen` sweeps findings this scan did NOT report as gone —
             // only sound when the scan examined the whole corpus, i.e. it skipped
@@ -1687,6 +1791,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     ) {
         prune_unseen_findings_in_filigree(
             &project_root,
+            &sibling_roots,
             &run_id,
             options.prune_unseen,
             options.config_path.as_deref(),
@@ -1943,6 +2048,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &writer,
                 &db_path,
                 &project_root,
+                &sibling_roots,
                 &run_id,
                 // Runs that skipped files do not sweep (see Phase-8 note); only a
                 // run that examined the whole corpus may mark findings unseen.
@@ -2088,6 +2194,64 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         error = %e,
                         "scoped secret-finding sweep skipped (run already committed successfully)"
                     ),
+                }
+            }
+            // Rule-scoped sweep for the plugins' syntax-error rule family. Unlike
+            // the secret scan this producer is NOT a full pass — a syntax finding
+            // is only re-emitted for a file the run actually examined — so the
+            // bound is the classification scope itself
+            // (`syntax_classified_source_files`), which is exact rather than a
+            // scope-shrinkage guard: a file whose syntax classification did not
+            // complete this run (never dispatched, or dispatched but its batch
+            // never persisted) is never a candidate, so a still-broken skipped
+            // file's finding survives exactly as the general sweep's
+            // `skipped_files == 0` clause intends. One sweep per rule keeps each
+            // plugin's rule paired with the files THAT plugin classified: when
+            // two plugins cover the same extension and only one re-dispatches
+            // (e.g. its version changed), the other's findings on the shared
+            // files are not sweep candidates.
+            //
+            // The general sweep cannot cover this: it is gated OFF whenever any
+            // file was incrementally skipped, which is every routine run on a real
+            // project. A file that was broken and is then FIXED is re-dispatched
+            // (its bytes changed) and stops reproducing its finding — but the row
+            // lingers, because once fixed the file is unchanged again and no later
+            // incremental run re-walks it either. Only a `--no-incremental` pass
+            // could ever clear it.
+            //
+            // That lingering row is not merely cosmetic: the skipped-file branch
+            // reads a prior syntax finding as live evidence the file is still
+            // degraded and fails the plugin's classifier coverage closed, so one
+            // stale row pins `classifier_coverage.status` to `failed` on every
+            // subsequent run and forces `classification.complete: false` across
+            // every tag read surface. Same lifecycle preservation (`open` +
+            // Filigree-unlinked only) and best-effort posture as the sweeps above.
+            if !resume {
+                for (rule_id, examined) in &syntax_classified_source_files {
+                    let examined_source_files: Vec<String> = examined.iter().cloned().collect();
+                    match writer
+                        .send_wait(|ack| WriterCmd::SweepStaleFindingsForRules {
+                            current_run_id: run_id.clone(),
+                            rule_ids: vec![rule_id.clone()],
+                            examined_source_files,
+                            ack,
+                        })
+                        .await
+                    {
+                        Ok(retired) if retired > 0 => tracing::info!(
+                            run_id = %run_id,
+                            rule_id = %rule_id,
+                            stale_syntax_findings_retired = retired,
+                            "scoped sweep retired syntax findings for files that now parse cleanly"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            run_id = %run_id,
+                            rule_id = %rule_id,
+                            error = %e,
+                            "scoped syntax-finding sweep skipped (run already committed successfully)"
+                        ),
+                    }
                 }
             }
         }
@@ -4749,10 +4913,12 @@ fn semantic_embedding_text(short_name: &str, name: &str, properties_json: &str) 
 /// emittable batch skips the POST entirely (no wasted call when a run deletes
 /// nothing). `complete_scan_run` rides into the wire request: `true` for the
 /// final/only batch, `false` for an additive follow-up batch.
+#[allow(clippy::too_many_arguments)] // one-shot emission inputs, mirrors http_read::spawn
 async fn emit_findings_to_filigree(
     writer: &Writer,
     db_path: &Path,
     project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     mark_unseen: bool,
     complete_scan_run: bool,
@@ -4880,7 +5046,7 @@ async fn emit_findings_to_filigree(
 
     post_findings_batch(
         filigree_cfg,
-        project_root,
+        sibling_roots,
         run_id,
         batch,
         total_findings,
@@ -4893,6 +5059,24 @@ async fn emit_findings_to_filigree(
 /// as the project-relative path Filigree's scan-results intake requires. A path
 /// that does not live under the root is returned unchanged (Filigree then
 /// rejects it loudly, which is preferable to silently rewriting it).
+/// Operator-visible signal that a plugin's scoped syntax-finding sweep was
+/// withheld this run (clarion-98237e9a45). Withholding is the fail-closed
+/// direction and deliberately does NOT fail the run — but it pins any stale
+/// syntax finding for a file this run actually fixed: the file's new content
+/// hash is recorded, so every later incremental run skips it and the finding
+/// survives until a `--no-incremental` pass (or the file changes again). An
+/// exit-0 run must say so, naming the recovery, rather than leave the
+/// operator to rediscover the stuck-finding symptom.
+fn warn_sweep_scope_withheld(plugin_id: &str, cause: &str) {
+    tracing::warn!(
+        plugin_id,
+        cause,
+        "stale syntax findings for this plugin were NOT retired this run ({cause}); any finding \
+         for a file this run fixed stays until a `loomweave analyze --no-incremental` pass heals \
+         it"
+    );
+}
+
 fn relativize_for_emit(project_root: &Path, path: &str) -> String {
     Path::new(path)
         .strip_prefix(project_root)
@@ -4952,7 +5136,7 @@ fn federation_finding_for_emit(row: loomweave_storage::FindingForEmitRow) -> Fin
 /// `LMWV-INFRA-FILIGREE-UNREACHABLE` stats blob via [`unreachable_stats`].
 async fn post_findings_batch(
     filigree_cfg: &FiligreeConfig,
-    project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     batch: PreparedBatch,
     total_findings: usize,
@@ -4961,10 +5145,13 @@ async fn post_findings_batch(
     let emitted = batch.emitted;
     let skipped_no_path = batch.skipped_no_path;
 
-    // Resolve the live Filigree URL (ephemeral port over stale config), the same
-    // resolution `loomweave serve` and `project_status` use.
+    // Resolve the live Filigree URL (ephemeral port over stale config) over
+    // the same ordered sibling-root list `serve` and `project_status` use —
+    // for a linked worktree, source root then primary root
+    // (clarion-2833649dd9).
+    let root_refs: Vec<&Path> = sibling_roots.iter().map(PathBuf::as_path).collect();
     let resolution =
-        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
+        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -4978,12 +5165,15 @@ async fn post_findings_batch(
     // runtime, and join it off the async executor.
     let request = batch.request;
     let thread_cfg = resolved_cfg;
-    let thread_root = project_root.to_path_buf();
+    let thread_roots = sibling_roots.to_vec();
+    let thread_winning = resolution.winning_root;
     let worker = std::thread::spawn(move || -> Result<ScanResultsResponse, String> {
-        let client = FiligreeHttpClient::from_config_with_project_root(
+        let thread_refs: Vec<&Path> = thread_roots.iter().map(PathBuf::as_path).collect();
+        let client = FiligreeHttpClient::from_config_with_project_roots(
             &thread_cfg,
             |name| std::env::var(name).ok(),
-            Some(&thread_root),
+            &thread_refs,
+            thread_winning.as_deref(),
         )
         .map_err(|err| format!("build Filigree client: {err}"))?
         .ok_or_else(|| "Filigree integration disabled".to_owned())?;
@@ -5088,6 +5278,7 @@ fn unreachable_stats(
 /// by Filigree, so the sweep can only touch Loomweave's findings.
 async fn prune_unseen_findings_in_filigree(
     project_root: &Path,
+    sibling_roots: &[PathBuf],
     run_id: &str,
     prune_unseen: bool,
     config_path: Option<&Path>,
@@ -5106,10 +5297,11 @@ async fn prune_unseen_findings_in_filigree(
     }
     let older_than_days = filigree_cfg.prune_unseen_days;
 
-    // Resolve the live Filigree URL (ephemeral port over stale config), the
-    // same resolution emission uses.
+    // Resolve the live Filigree URL over the same ordered sibling-root list
+    // emission uses (clarion-2833649dd9).
+    let root_refs: Vec<&Path> = sibling_roots.iter().map(PathBuf::as_path).collect();
     let resolution =
-        resolve_filigree_url(filigree_cfg, project_root, |name| std::env::var(name).ok());
+        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, |name| std::env::var(name).ok());
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -5124,12 +5316,15 @@ async fn prune_unseen_findings_in_filigree(
     // Same blocking-reqwest-on-a-plain-OS-thread dance as emission: build → POST
     // → drop the client off the tokio executor so the inner runtime drop is safe.
     let thread_cfg = resolved_cfg;
-    let thread_root = project_root.to_path_buf();
+    let thread_roots = sibling_roots.to_vec();
+    let thread_winning = resolution.winning_root;
     let worker = std::thread::spawn(move || -> Result<CleanStaleResponse, String> {
-        let client = FiligreeHttpClient::from_config_with_project_root(
+        let thread_refs: Vec<&Path> = thread_roots.iter().map(PathBuf::as_path).collect();
+        let client = FiligreeHttpClient::from_config_with_project_roots(
             &thread_cfg,
             |name| std::env::var(name).ok(),
-            Some(&thread_root),
+            &thread_refs,
+            thread_winning.as_deref(),
         )
         .map_err(|err| format!("build Filigree client: {err}"))?
         .ok_or_else(|| "Filigree integration disabled".to_owned())?;
@@ -5337,6 +5532,12 @@ struct PluginFileBatch {
     /// Core file entity id for the analyzed file. Used as the authoritative
     /// replacement key for scan-time anchored edges from that source file.
     source_file_id: String,
+    /// Canonical-absolute path of the analyzed file (the form
+    /// `entities.source_file_path` stores). On successful persistence this
+    /// records the file as syntax-classified for the scoped stale-finding
+    /// sweep — a dispatched file that never yields a persisted batch was not
+    /// examined and must stay out of the sweep's bound.
+    source_file_path: String,
     /// `(entity_id_string, record)` pairs accepted from one analyzed file.
     entities: Vec<(String, EntityRecord)>,
     /// Manifest-declared semantic roles for this plugin's entity kinds.
@@ -6011,6 +6212,12 @@ fn run_plugin_blocking(
             batch_tx
                 .blocking_send(PluginBatchMessage::File(PluginFileBatch {
                     source_file_id: file_entity_id.clone(),
+                    // Canonicalised the same way the skipped branch resolves
+                    // its anchor, so both halves speak the path form entities
+                    // store.
+                    source_file_path: crate::secret_scan::canonical_or_original(file)
+                        .display()
+                        .to_string(),
                     entities: file_entities,
                     kind_roles: kind_roles.clone(),
                     edges: immediate_edges,

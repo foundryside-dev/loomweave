@@ -41,15 +41,20 @@
 //! administrative directory cannot be read once resolved, the sweep aborts
 //! and deletes nothing — never partial, never a best-effort subset.
 //!
-//! **The override case.** A `[loomweave].store_dir` override
-//! (`loomweave_core::store::store_dir_override`) is not scoped to one
-//! repository: an absolute override can be shared between unrelated
+//! **The override case.** A `[loomweave].store_dir` override is not scoped
+//! to one repository: an absolute override can be shared between unrelated
 //! repositories, so under an active override this repository's registered
 //! set must never be used to authorize deleting another repository's `wt-*`
-//! stores sitting in the same shared namespace. When an override is active
-//! for `ctx.primary_root`, this module enumerates exactly as it otherwise
+//! stores sitting in the same shared namespace. When an override was active
+//! at context-resolve time, this module enumerates exactly as it otherwise
 //! would and logs every candidate it *would* delete, but deletes nothing —
-//! see [`SweepOutcome::ReportOnly`].
+//! see [`SweepOutcome::ReportOnly`]. The decision reads
+//! `ctx.store_dir_overridden` — the provenance recorded when
+//! `ctx.repository_store` was derived — never a fresh `weft.toml` read at
+//! sweep time: `analyze` resolves its context at start but sweeps at the
+//! end of a long run, and an override removed in that window must not flip
+//! the sweep into delete mode against the still-shared store the context
+//! was resolved under (clarion-306ed41ce3).
 //!
 //! **The accepted race.** There are no activity locks, so a store can be
 //! swept while a `serve` process holds it open — this is a deliberate
@@ -67,7 +72,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use loomweave_core::store::store_dir_override;
 use loomweave_core::worktree::{WorktreeContext, stable_id_for_admin_identity};
 use tracing::{debug, info, warn};
 
@@ -148,6 +152,38 @@ pub fn sweep_best_effort(ctx: &WorktreeContext) {
 /// caller needs to branch on it — deliberately not `#[must_use]`, since
 /// discarding it (as [`sweep_best_effort`] effectively does after logging)
 /// is the expected production usage, not a bug.
+/// Whether `repository_store` resolves through a symlink in any of its
+/// components (clarion-a93b43923e). The path is built from the CANONICALIZED
+/// primary root plus literal components (`WorktreeContext::resolve`
+/// canonicalizes; an active override forces report-only before this check is
+/// consulted), so it equals its own canonicalization exactly when no
+/// component is a symlink. An unresolvable path — the store does not exist
+/// yet — reports `false`: there is nothing beneath it to protect, and the
+/// sweep's own enumeration fails first anyway.
+fn store_path_reaches_through_symlink(repository_store: &Path) -> bool {
+    match fs::canonicalize(repository_store) {
+        Ok(canonical) => canonical != repository_store,
+        Err(_) => false,
+    }
+}
+
+/// Log every would-be deletion once with the report-only `cause` and return
+/// [`SweepOutcome::ReportOnly`] — shared by the override and symlink-prefix
+/// guards, which differ only in why deletion is withheld.
+fn report_only(cause: &str, to_delete: Vec<String>) -> SweepOutcome {
+    for name in &to_delete {
+        info!(
+            candidate = name.as_str(),
+            cause,
+            "worktree cleanup sweep: would delete this unregistered candidate, but report-only \
+             mode deletes nothing"
+        );
+    }
+    SweepOutcome::ReportOnly {
+        would_delete: to_delete,
+    }
+}
+
 pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
     let worktrees_dir = ctx.repository_store.join(WORKTREES_DIR_NAME);
     if !worktrees_dir.is_dir() {
@@ -251,17 +287,24 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
         .into_iter()
         .partition(|name| !registered.contains(name));
 
-    if store_dir_override(&ctx.primary_root).is_some() {
-        for name in &to_delete {
-            info!(
-                candidate = name.as_str(),
-                "worktree cleanup sweep: store_dir override active; would delete this \
-                 unregistered candidate, but report-only mode deletes nothing"
-            );
-        }
-        return SweepOutcome::ReportOnly {
-            would_delete: to_delete,
-        };
+    if ctx.store_dir_overridden {
+        return report_only("store_dir override active", to_delete);
+    }
+
+    // Symlink analogue of the override case (clarion-a93b43923e): a store
+    // path that reaches through a symlink (`.weft` or `.weft/loomweave`
+    // linking elsewhere — stores relocated to another disk) may be SHARED
+    // between repositories exactly like an absolute override, and carries no
+    // `weft.toml` signal to key report-only mode on. `openat2`'s confinement
+    // only starts AT whatever the prefix resolved to, so the pinned-handle
+    // mechanism cannot see this either. `ctx.repository_store` is the
+    // canonicalized primary root plus literal components, so it equals its
+    // own canonicalization exactly when no appended component is a symlink.
+    if store_path_reaches_through_symlink(&ctx.repository_store) {
+        return report_only(
+            "store path resolves through a symlink (possibly shared between repositories)",
+            to_delete,
+        );
     }
 
     let root = match WorktreesRoot::open(&worktrees_dir) {
@@ -333,46 +376,33 @@ fn acquire_gc_lock(worktrees_dir: &Path) -> io::Result<GcLock> {
     }
 }
 
-/// [`loomweave_core::hardened_git::hardened_git_command`], plus one narrow
-/// guard this module needs that `hardened_git_command` itself does not
-/// (yet) provide: `GIT_DIR`, `GIT_COMMON_DIR`, and `GIT_WORK_TREE` are
-/// explicitly removed from the child's environment.
+/// [`loomweave_core::hardened_git::hardened_git_command`], which since the
+/// clarion-9202f4acec sanitization rebuilds the child environment from
+/// nothing (`env_clear()` + an explicit allow-list), so `GIT_DIR`,
+/// `GIT_COMMON_DIR`, and `GIT_WORK_TREE` can never reach the child.
 ///
-/// **The hazard.** `-C <dir>` does not override an *exported* `GIT_DIR`: if
-/// the Loomweave process inherits `GIT_DIR` from its parent — a Git hook
-/// running in a different repository, `git rebase --exec 'loomweave ...'`,
-/// a CI runner that exports it for its own purposes — `git rev-parse
-/// --git-common-dir` answers for that FOREIGN repository, not
-/// `primary_root`'s. Combined with [`registered_stable_ids`]'s
+/// **The hazard this closes.** `-C <dir>` does not override an *exported*
+/// `GIT_DIR`: if the Loomweave process inherits `GIT_DIR` from its parent —
+/// a Git hook running in a different repository, `git rebase --exec
+/// 'loomweave ...'`, a CI runner that exports it for its own purposes —
+/// `git rev-parse --git-common-dir` answers for that FOREIGN repository,
+/// not `primary_root`'s. Combined with [`registered_stable_ids`]'s
 /// `NotFound` → empty-registered-set rule (see its doc comment), a foreign
 /// repository that happens to have no `worktrees/` admin directory of its
 /// own — the common case — makes the registered set empty, so *every* real
 /// `wt-*` store under this repository reads as unregistered and gets
 /// deleted, live ones included. `GIT_COMMON_DIR` and `GIT_WORK_TREE` are
-/// stripped alongside `GIT_DIR` because either can also redirect Git's
-/// discovery away from `primary_root`.
+/// hazardous for the same reason: either can redirect Git's discovery away
+/// from `primary_root`.
 ///
-/// `Command::env_remove` is unconditional: the child process will not see
-/// the named variable regardless of what this process's own environment
-/// contains, so this closes the hazard completely for the one `git`
-/// invocation the sweep makes — see
-/// `git_common_dir_command_strips_foreign_git_env_vars` below, which
-/// asserts exactly that on the constructed [`std::process::Command`]
-/// without needing to mutate any real environment.
-///
-/// This is a narrow, sweep-local guard, not a general fix: full
-/// Git-environment sanitization for `hardened_git_command` itself is
-/// tracked separately (clarion-9202f4acec) and is deliberately not folded
-/// in here — this module's own deletion-adjacent path needed to stop
-/// trusting the ambient environment now, independent of when that broader
-/// work lands.
+/// This wrapper existed as a narrow, sweep-local `env_remove` guard while
+/// the general sanitization was still pending; that work has landed in
+/// `hardened_git_command` itself, whose closed-set env test pins the
+/// guarantee. `git_common_dir_command_keeps_foreign_git_env_out` below
+/// asserts this call path stays on the hardened builder and never
+/// re-introduces the hazardous variables.
 fn hardened_git_command_for_sweep(dir: &Path) -> std::process::Command {
-    let mut command = loomweave_core::hardened_git::hardened_git_command(dir);
-    command
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE");
-    command
+    loomweave_core::hardened_git::hardened_git_command(dir)
 }
 
 /// Resolve `primary_root`'s common Git directory via one hardened `git
@@ -481,33 +511,44 @@ mod tests {
     /// process environment via `std::env::set_var`/`remove_var`, because
     /// this workspace denies `unsafe_code` everywhere except one documented
     /// site in the plugin host (`CLAUDE.md`), and `std::env::set_var` /
-    /// `remove_var` are `unsafe fn` on this toolchain — confirmed by
-    /// attempting exactly that in `tests/worktree_sweep.rs` and getting a
-    /// hard compiler error (`-D unsafe-code`), not just a lint warning.
-    /// `Command::env_remove` is documented to unconditionally exclude the
-    /// named variable from the child's environment regardless of what the
-    /// parent process's environment contains, so asserting the removal is
-    /// present on the constructed command is a complete, deterministic
-    /// proof of the behavioral guarantee — not merely a proxy for one —
-    /// without needing to touch any real environment variable at all.
+    /// `remove_var` are `unsafe fn` on this toolchain.
+    ///
+    /// The hardened builder calls `env_clear()` and rebuilds the child
+    /// environment from an explicit allow-list, so a hazardous variable can
+    /// only reach the child as an explicit `.env(...)` SET — a `Some(_)`
+    /// entry in `get_envs()`. (After `env_clear()`, `env_remove` records no
+    /// `(key, None)` marker, which is why this test does not look for
+    /// removals.) Asserting no hazardous SET exists, plus one
+    /// hardened-builder signature key, proves this call path stays on the
+    /// cleared-and-rebuilt environment without touching any real variable.
+    /// The behavioral proof that an inherited `GIT_DIR` cannot redirect a
+    /// probe lives with the hardened builder's own closed-set env test and
+    /// `doctor_git_probes_ignore_a_hijacked_git_dir_in_the_environment`.
     #[test]
-    fn git_common_dir_command_strips_foreign_git_env_vars() {
+    fn git_common_dir_command_keeps_foreign_git_env_out() {
         let dir = Path::new("/does/not/need/to/exist/for/this/check");
         let command = hardened_git_command_for_sweep(dir);
 
-        // `env_remove` records the key with a `None` value in the command's
-        // env-modification table; a `Some(_)` entry would be an explicit
-        // `.env(...)` SET, not a removal — only `None` entries count here.
-        let removed: std::collections::HashSet<&str> = command
+        let envs: Vec<(String, Option<String>)> = command
             .get_envs()
-            .filter_map(|(key, value)| (value.is_none()).then(|| key.to_str()).flatten())
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
             .collect();
 
+        // Signature of the cleared-and-rebuilt hardened environment.
+        assert!(
+            envs.contains(&("GIT_CONFIG_NOSYSTEM".to_owned(), Some("1".to_owned()))),
+            "sweep must build its git command via the hardened builder; envs={envs:?}"
+        );
+        // Nothing on this call path re-introduces a discovery-redirecting var.
         for hazardous in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"] {
             assert!(
-                removed.contains(hazardous),
-                "{hazardous} must be an explicit removal on the git_common_dir \
-                 command's environment; got removed={removed:?}"
+                !envs.iter().any(|(k, v)| k == hazardous && v.is_some()),
+                "{hazardous} must never be SET on the git_common_dir command; envs={envs:?}"
             );
         }
     }

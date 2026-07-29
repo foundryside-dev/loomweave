@@ -93,7 +93,16 @@ fn parse_git_version(out: &str) -> Option<(u32, u32)> {
 fn attr_source_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
-        Command::new("git")
+        // Same environment discipline as `hardened_git_command` — which CALLS
+        // this, so building the full hardened command here would re-enter the
+        // OnceLock. `--version` is a builtin with no repository access;
+        // cleared env + the process-spawn essentials is the whole allowlist
+        // it needs (clarion-9ea93124aa: this was the one git spawn in the
+        // file that inherited the environment).
+        let mut command = Command::new("git");
+        command.env_clear();
+        apply_operator_env_passthrough(&mut command, |name| std::env::var_os(name));
+        command
             .arg("--version")
             .output()
             .ok()
@@ -102,6 +111,35 @@ fn attr_source_supported() -> bool {
             .and_then(|s| parse_git_version(&s))
             .is_some_and(|v| v >= (2, 40))
     })
+}
+
+/// Re-add the operator-owned variables a cleared-environment git spawn still
+/// needs (or deliberately honors) — the passthrough half of the allowlist,
+/// with `getenv` injected so tests can drive it without mutating process
+/// environment:
+///
+/// * `PATH` — resolve the `git` binary itself.
+/// * `SYSTEMROOT` — Windows refuses to start processes without it.
+/// * `GIT_CEILING_DIRECTORIES` — bounds *upward* repository discovery, so a
+///   non-repo project directory nested inside another repository is not
+///   probed as the OUTER repo. Operator-owned (never repository content),
+///   and it can only STOP discovery, never redirect it — passing it through
+///   cannot reopen the selector-hijack class the clear defends against
+///   (clarion-9ea93124aa).
+fn apply_operator_env_passthrough(
+    command: &mut Command,
+    getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    if let Some(path) = getenv("PATH") {
+        command.env("PATH", path);
+    }
+    #[cfg(windows)]
+    if let Some(root) = getenv("SYSTEMROOT") {
+        command.env("SYSTEMROOT", root);
+    }
+    if let Some(ceiling) = getenv("GIT_CEILING_DIRECTORIES") {
+        command.env("GIT_CEILING_DIRECTORIES", ceiling);
+    }
 }
 
 #[cfg(windows)]
@@ -128,7 +166,25 @@ const NULL_DEVICE: &str = "/dev/null";
 /// and is still safe (the `--cached` call sites are the real control).
 pub fn hardened_git_command(repo_root: &Path) -> Command {
     let mut command = Command::new("git");
+    // Start from an EMPTY environment (clarion-9202f4acec). The repository
+    // selectors — GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE,
+    // GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_NAMESPACE,
+    // GIT_EXEC_PATH, GIT_CONFIG_* — all OVERRIDE the `-C <repo_root>` below, so
+    // a hostile or merely stale environment silently repoints every probe at a
+    // different repository. Enumerating them with `env_remove` is a losing game:
+    // the list grows with each Git release. Clearing and re-adding only what a
+    // read-only local probe needs fails closed on the ones we have not heard of.
+    //
+    // The explicit `env_remove` calls below are kept deliberately: they document
+    // the specific injection vectors this wrapper defends against, and they keep
+    // the guarantee if a caller ever hands us a pre-populated Command.
+    command.env_clear();
+    apply_operator_env_passthrough(&mut command, |name| std::env::var_os(name));
     command
+        // Machine-parsed output: pin the locale so messages and any
+        // locale-sensitive formatting cannot shift under the parser.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
         .env("GIT_CONFIG_SYSTEM", NULL_DEVICE)
@@ -242,13 +298,120 @@ mod tests {
         assert!(envs.contains(&("GIT_CONFIG_NOSYSTEM".to_owned(), Some("1".to_owned()))));
         assert!(envs.contains(&("GIT_CONFIG_GLOBAL".to_owned(), Some(NULL_DEVICE.to_owned()))));
         assert!(envs.contains(&("GIT_ATTR_NOSYSTEM".to_owned(), Some("1".to_owned()))));
-        // Inherited env-based config/exec injection is stripped.
-        for removed in ["GIT_CONFIG_COUNT", "GIT_EXTERNAL_DIFF", "GIT_ATTR_SOURCE"] {
+        // Machine-parsed output needs a pinned locale.
+        assert!(envs.contains(&("LC_ALL".to_owned(), Some("C".to_owned()))));
+        assert!(envs.contains(&("LANG".to_owned(), Some("C".to_owned()))));
+
+        // The environment is CLEARED and rebuilt, so the child sees exactly the
+        // keys below and nothing else — including selectors no one has enumerated
+        // yet. Asserting the whole key set (not just a deny-list) is what makes
+        // that closed: a new inherited variable cannot slip in unnoticed.
+        //
+        // NOTE: after `env_clear()`, `Command::env_remove` drops the key instead
+        // of recording a `(key, None)` entry, so removed vars correctly do NOT
+        // appear here. `clarion-9202f4acec`'s behavioural proof — that an
+        // inherited `GIT_DIR` no longer redirects a probe — lives in
+        // `loomweave-cli`'s `doctor_git_probes_ignore_a_hijacked_git_dir_in_the_environment`.
+        let mut keys: Vec<&str> = envs.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "GIT_ATTR_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_OPTIONAL_LOCKS",
+            "LANG",
+            "LC_ALL",
+        ];
+        if std::env::var_os("PATH").is_some() {
+            expected.push("PATH");
+        }
+        #[cfg(windows)]
+        if std::env::var_os("SYSTEMROOT").is_some() {
+            expected.push("SYSTEMROOT");
+        }
+        // Operator-owned upward-discovery bound; passed through when the
+        // ambient environment carries one (clarion-9ea93124aa). The
+        // deterministic passthrough proof is
+        // `ceiling_directories_pass_through_the_clear` below.
+        if std::env::var_os("GIT_CEILING_DIRECTORIES").is_some() {
+            expected.push("GIT_CEILING_DIRECTORIES");
+        }
+        expected.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "the child environment must be exactly the read-only-probe allowlist"
+        );
+        for selector in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_EXEC_PATH",
+            "GIT_CONFIG_COUNT",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_ATTR_SOURCE",
+        ] {
             assert!(
-                envs.iter().any(|(k, v)| k == removed && v.is_none()),
-                "{removed} must be removed from the child environment"
+                !keys.contains(&selector),
+                "{selector} must never reach the child environment"
             );
         }
+    }
+
+    /// clarion-9ea93124aa: an operator-set `GIT_CEILING_DIRECTORIES` survives
+    /// the clear — it bounds upward discovery (the same safety direction as
+    /// the clear itself) and repository content can never set it. Driven
+    /// through the injected getenv so no process environment is mutated.
+    #[test]
+    fn ceiling_directories_pass_through_the_clear() {
+        let mut command = Command::new("git");
+        command.env_clear();
+        apply_operator_env_passthrough(&mut command, |name| match name {
+            "GIT_CEILING_DIRECTORIES" => Some(std::ffi::OsString::from("/srv/checkouts")),
+            _ => None,
+        });
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&(
+                "GIT_CEILING_DIRECTORIES".to_owned(),
+                Some("/srv/checkouts".to_owned())
+            )),
+            "the operator ceiling must reach the child: {envs:?}"
+        );
+    }
+
+    /// The allowlist must be sufficient, not merely safe: a cleared environment
+    /// that cannot find or run `git` would turn every probe into a silent
+    /// "untracked / not a repo" answer, which several call sites treat as a
+    /// benign negative rather than an error.
+    #[test]
+    fn hardened_command_can_still_run_git() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert!(
+            hardened_git_command(repo.path())
+                .args(["init", "-q"])
+                .status()
+                .is_ok_and(|s| s.success()),
+            "the allowlist must leave git runnable"
+        );
+        let out = hardened_git_command(repo.path())
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(out.status.success(), "rev-parse failed: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
     }
 
     #[test]

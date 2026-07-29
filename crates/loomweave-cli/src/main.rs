@@ -149,6 +149,7 @@ fn main() -> Result<()> {
         cli::Command::Worktree { command } => match command {
             cli::WorktreeCommand::Analyze {
                 no_incremental,
+                config,
                 target,
             } => {
                 let cwd = std::env::current_dir().context("determine current directory")?;
@@ -161,6 +162,7 @@ fn main() -> Result<()> {
                     resolved,
                     analyze::AnalyzeOptions {
                         no_incremental,
+                        config_path: config,
                         ..analyze::AnalyzeOptions::default()
                     },
                 ))

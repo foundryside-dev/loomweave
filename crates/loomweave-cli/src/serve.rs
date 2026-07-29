@@ -90,7 +90,7 @@ pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
             // call. clarion-ac36f51c2b.
             serve_no_index(path, &db_path)
         }
-        ServeRoute::Full => run_server(db_path, config_path, &worktree_ctx, false),
+        ServeRoute::Full => run_server(db_path, config_path, &worktree_ctx, None),
     }
 }
 
@@ -106,9 +106,27 @@ fn run_linked_worktree(
     config_path: Option<&Path>,
     worktree_ctx: &loomweave_core::worktree::WorktreeContext,
 ) -> Result<()> {
-    bootstrap_linked_worktree(worktree_ctx, None)?;
+    // An un-`install`ed primary cannot back this worktree's isolated store.
+    // Mirror the primary route's degraded session (clarion-ac36f51c2b)
+    // instead of exiting 1 with the reason buried in stderr
+    // (clarion-459bf2ac3b) — and anchor the recovery hint at the PRIMARY
+    // root: installing there creates the repository store this worktree's
+    // isolated store nests under, while a worktree-root hint would
+    // materialize the forbidden decoy store (clarion-f8b577dc48).
+    if !worktree_ctx.repository_store.exists() {
+        return serve_no_index(
+            &worktree_ctx.primary_root,
+            &worktree_ctx.repository_store.join("loomweave.db"),
+        );
+    }
+    let bootstrap_spawn_failed = bootstrap_linked_worktree(worktree_ctx, None, config_path)?;
     let db_path = worktree_ctx.store_paths.db.clone();
-    run_server(db_path, config_path, worktree_ctx, true)
+    run_server(
+        db_path,
+        config_path,
+        worktree_ctx,
+        Some(bootstrap_spawn_failed),
+    )
 }
 
 /// Ensure the isolated store exists, then spawn `loomweave worktree analyze`
@@ -126,7 +144,17 @@ fn run_linked_worktree(
 fn bootstrap_linked_worktree(
     worktree_ctx: &loomweave_core::worktree::WorktreeContext,
     analyze_program: Option<&Path>,
-) -> Result<()> {
+    // serve's own explicit `--config`, forwarded verbatim to the spawned
+    // analyze (clarion-c39b92b868). `None` (the default ladder) needs no
+    // forwarding: the child re-derives the same source→primary ladder.
+    explicit_config: Option<&Path>,
+    // Returns whether the bootstrap SPAWN failed (unresolvable executable or
+    // spawn error) — surfaced through the gate into `project_status_get`'s
+    // `index_state` as `bootstrap-spawn-failed` (clarion-917df0e1ad), so an
+    // agent polling for progress learns the build will not start by itself.
+    // `false` when the spawn succeeded OR was correctly skipped (already
+    // built): only a failure that strands the store in `building` matters.
+) -> Result<bool> {
     // `ensure_isolated_store`'s own contract: an un-`install`ed primary is
     // this caller's error to diagnose, not something it silently half-creates
     // (its `create_dir_all` would otherwise happily materialize the
@@ -172,7 +200,7 @@ fn bootstrap_linked_worktree(
             "worktree bootstrap: a completed run already exists; skipping the bootstrap spawn \
              (staleness refresh is the SessionStart hook's job)"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // Fire-and-forget: a spawn failure (e.g. the executable vanished) is
@@ -187,19 +215,23 @@ fn bootstrap_linked_worktree(
         Some(program) => Ok(program.to_path_buf()),
         None => std::env::current_exe(),
     };
-    match resolved_program {
-        Ok(program) => loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
+    let spawn_failed = match resolved_program {
+        Ok(program) => !loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
             &program,
             &worktree_ctx.source_root,
+            explicit_config,
         ),
-        Err(err) => tracing::warn!(
-            error = %err,
-            "worktree bootstrap: cannot resolve the loomweave executable to launch \
-             `loomweave worktree analyze`; the index will stay in the building state until it \
-             is run manually"
-        ),
-    }
-    Ok(())
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "worktree bootstrap: cannot resolve the loomweave executable to launch \
+                 `loomweave worktree analyze`; the index will stay in the building state until \
+                 it is run manually"
+            );
+            true
+        }
+    };
+    Ok(spawn_failed)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -207,7 +239,10 @@ fn run_server(
     db_path: PathBuf,
     config_path: Option<&Path>,
     worktree_ctx: &loomweave_core::worktree::WorktreeContext,
-    gated: bool,
+    // `None` = ungated (main/standalone). `Some(spawn_failed)` = a linked
+    // worktree with the bootstrap gate active; the bool records whether the
+    // bootstrap spawn failed (clarion-917df0e1ad).
+    worktree_gate: Option<bool>,
 ) -> Result<()> {
     let project_root = worktree_ctx.source_root.clone();
     let instance_id = crate::instance::load_or_create(&worktree_ctx.store_paths.instance_id)
@@ -260,7 +295,7 @@ fn run_server(
         &worktree_ctx.primary_root,
     );
 
-    // Resolve where Filigree actually listens — prefer the live ethereal port
+    // Resolve where Filigree actually listens — prefer the live ephemeral port
     // published in `.weft/filigree/ephemeral.port` over the static configured
     // port (which goes stale, the dogfood bug) — then build the client against the
     // resolved URL so `issues_for` reaches the running dashboard. The same
@@ -282,6 +317,10 @@ fn run_server(
         &filigree_config,
         |name| std::env::var(name).ok(),
         &sibling_roots,
+        // Paired resolution (clarion-f93e006216): the minted token must come
+        // from the same root the URL's port rung won at, never a stale token
+        // from another candidate root.
+        filigree_resolution.winning_root.as_deref(),
     )
     .context("build Filigree HTTP client")?;
 
@@ -302,6 +341,14 @@ fn run_server(
     let readers = ReaderPool::open_validated(&db_path, 16)
         .map_err(|err| anyhow!("open reader pool for {}: {err}", db_path.display()))?;
     let http_project_root = project_root.clone();
+    // The HTTP read API gates on the SAME `gated` flag as the MCP stdio gate
+    // below (clarion-ecf882f230): a linked-worktree bootstrap must not serve
+    // well-formed empty federation answers over the still-building store.
+    // Same fallback argv as `with_worktree_gate` so both surfaces name one
+    // recovery command.
+    let http_worktree_gate = worktree_gate.map(|_| crate::http_read::WorktreeHttpGate {
+        fallback_argv: loomweave_mcp::worktree_bootstrap::fallback_argv(&project_root),
+    });
     let http_server = crate::http_read::spawn(
         http_project_root,
         db_path.clone(),
@@ -309,6 +356,7 @@ fn run_server(
         instance_id,
         worktree_ctx.store_paths.port.clone(),
         &config.serve.http,
+        http_worktree_gate,
     )
     .context("start HTTP read API")?;
     if let Some(server) = http_server.as_ref() {
@@ -336,7 +384,7 @@ fn run_server(
         // review #12: forward serve's resolved config to analyze_start, but only
         // when it exists on disk (the McpConfig::default() fallback has no file).
         config_path.exists().then(|| config_path.to_path_buf()),
-        gated,
+        worktree_gate,
         worktree_ctx.store_paths.clone(),
     )?;
     supervise_stdio_with_http(stdio, http_server)
@@ -407,7 +455,7 @@ fn spawn_mcp_stdio(
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
-    gated: bool,
+    worktree_gate: Option<bool>,
     store_paths: loomweave_core::worktree::StorePaths,
 ) -> Result<StdioServe> {
     let (result_tx, result_rx) = mpsc::channel();
@@ -426,7 +474,7 @@ fn spawn_mcp_stdio(
                 diagnostics,
                 tool_policy,
                 analyze_config_path,
-                gated,
+                worktree_gate,
                 store_paths,
             );
             let _ = result_tx.send(result);
@@ -448,7 +496,7 @@ fn run_mcp_stdio(
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
     analyze_config_path: Option<PathBuf>,
-    gated: bool,
+    worktree_gate: Option<bool>,
     store_paths: loomweave_core::worktree::StorePaths,
 ) -> Result<()> {
     let stdin = std::io::stdin();
@@ -466,11 +514,12 @@ fn run_mcp_stdio(
     // every explicit leaf path (db/embeddings/runs/...) `ServerState`'s
     // `effective_*` accessors need for a gated (linked-worktree) session
     // (worktree-index Task 7) — not just the db path.
-    let worktree_gate = gated.then(|| (project_root.clone(), store_paths));
+    let worktree_gate =
+        worktree_gate.map(|spawn_failed| (project_root.clone(), store_paths, spawn_failed));
     let mut state =
         loomweave_mcp::ServerState::new(project_root, readers).with_tool_policy(tool_policy);
-    if let Some((source_root, store_paths)) = worktree_gate {
-        state = state.with_worktree_gate(store_paths, &source_root);
+    if let Some((source_root, store_paths, bootstrap_spawn_failed)) = worktree_gate {
+        state = state.with_worktree_gate(store_paths, &source_root, bootstrap_spawn_failed);
     }
     // Forward serve's config to an analyze_start-spawned analyze so the child
     // parses the same configuration (review #12). Some only when serve was
@@ -907,7 +956,8 @@ mod tests {
         let argv_dump = tmp.path().join("argv.txt");
         let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
 
-        bootstrap_linked_worktree(&ctx, Some(&stub)).expect("bootstrap on an unbuilt worktree");
+        bootstrap_linked_worktree(&ctx, Some(&stub), None)
+            .expect("bootstrap on an unbuilt worktree");
 
         wait_for_file(&argv_dump, StdDuration::from_secs(5));
         let argv = fs::read_to_string(&argv_dump).expect("stub wrote argv");
@@ -922,6 +972,43 @@ mod tests {
             ],
             "the bootstrap spawn's argv must be exactly `worktree analyze -- <target>`, not the \
              hook's plain-analyze argv"
+        );
+    }
+
+    /// clarion-c39b92b868: serve's own explicit `--config` is forwarded
+    /// verbatim to the spawned analyze — the one config input the child
+    /// cannot re-derive. (The ladder default needs no forwarding: the child
+    /// re-derives the same source→primary ladder, pinned by
+    /// `worktree_analyze_uses_primary_config_when_worktree_has_none` in
+    /// `tests/worktree_analyze.rs`.)
+    #[test]
+    #[cfg(unix)]
+    fn bootstrap_spawn_forwards_serves_explicit_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        install_primary(&ctx);
+
+        let argv_dump = tmp.path().join("argv.txt");
+        let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
+        let explicit = tmp.path().join("explicit.yaml");
+
+        bootstrap_linked_worktree(&ctx, Some(&stub), Some(&explicit))
+            .expect("bootstrap with explicit config");
+
+        wait_for_file(&argv_dump, StdDuration::from_secs(5));
+        let argv = fs::read_to_string(&argv_dump).expect("stub wrote argv");
+        let forwarded: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            forwarded,
+            vec![
+                "worktree",
+                "analyze",
+                "--config",
+                explicit.to_str().unwrap(),
+                "--",
+                ctx.source_root.to_str().unwrap()
+            ],
+            "an explicit serve --config must reach the spawned analyze"
         );
     }
 
@@ -950,7 +1037,7 @@ mod tests {
         let argv_dump = tmp.path().join("argv.txt");
         let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
 
-        bootstrap_linked_worktree(&ctx, Some(&stub)).expect("bootstrap on a built worktree");
+        bootstrap_linked_worktree(&ctx, Some(&stub), None).expect("bootstrap on a built worktree");
 
         // Deterministic, no wait needed: `bootstrap_linked_worktree` decides
         // whether to spawn synchronously, inside this call, before returning

@@ -563,3 +563,105 @@ fn two_worktrees_analyze_concurrently_without_contention() {
         "worktree B's own content must appear in exactly one isolated store"
     );
 }
+
+#[cfg(unix)]
+fn latest_run_config(db_path: &Path) -> serde_json::Value {
+    let conn = Connection::open(db_path).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT config FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query latest runs.config");
+    serde_json::from_str(&raw).expect("runs.config JSON")
+}
+
+/// clarion-c39b92b868: with no explicit `--config`, a linked-worktree
+/// analyze resolves configuration through the worktree ladder — the
+/// worktree's own `loomweave.yaml` first, falling back to the PRIMARY
+/// checkout's — matching what `serve` reports for the same checkout. Before
+/// the fix, the run silently used built-in defaults whenever the worktree
+/// itself had no config file.
+#[cfg(unix)]
+#[test]
+fn worktree_analyze_uses_primary_config_when_worktree_has_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let (repo, linked) = setup_primary_with_linked_worktree(
+        tmp.path(),
+        plugin_dir.path(),
+        "ladder-config",
+        "feature-ladder",
+        "ladder_module",
+    );
+    // Primary-only config: the design's stated common case — an ignored
+    // local configuration at the primary, worked from a worktree with none.
+    // `install` writes a default loomweave.yaml that the fixture commits, so
+    // the linked checkout starts with a copy; drop it to model the
+    // ignored/local-only configuration.
+    std::fs::write(
+        repo.join("loomweave.yaml"),
+        "analysis:\n  clustering:\n    seed: 4242\n",
+    )
+    .unwrap();
+    std::fs::remove_file(linked.join("loomweave.yaml")).expect("drop the worktree's copy");
+    assert!(
+        !linked.join("loomweave.yaml").exists(),
+        "fixture: the worktree itself must have no config"
+    );
+
+    loomweave_bin()
+        .args(["worktree", "analyze", "--"])
+        .arg(&linked)
+        .env("PATH", path_with_plugin(plugin_dir.path()))
+        .assert()
+        .success();
+
+    let store = find_single_worktree_store(&repo);
+    let config = latest_run_config(&store.join("loomweave.db"));
+    assert_eq!(
+        config["analysis"]["clustering"]["seed"], 4242,
+        "the primary's loomweave.yaml must govern a config-less linked worktree's \
+         analyze: {config}"
+    );
+}
+
+/// The `--config` flag on `worktree analyze` wins over the ladder — parity
+/// with plain `analyze` (clarion-c39b92b868).
+#[cfg(unix)]
+#[test]
+fn worktree_analyze_explicit_config_wins_over_ladder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let (repo, linked) = setup_primary_with_linked_worktree(
+        tmp.path(),
+        plugin_dir.path(),
+        "explicit-config",
+        "feature-explicit",
+        "explicit_module",
+    );
+    std::fs::write(
+        repo.join("loomweave.yaml"),
+        "analysis:\n  clustering:\n    seed: 4242\n",
+    )
+    .unwrap();
+    let explicit = tmp.path().join("elsewhere.yaml");
+    std::fs::write(&explicit, "analysis:\n  clustering:\n    seed: 7777\n").unwrap();
+
+    loomweave_bin()
+        .args(["worktree", "analyze", "--config"])
+        .arg(&explicit)
+        .arg("--")
+        .arg(&linked)
+        .env("PATH", path_with_plugin(plugin_dir.path()))
+        .assert()
+        .success();
+
+    let store = find_single_worktree_store(&repo);
+    let config = latest_run_config(&store.join("loomweave.db"));
+    assert_eq!(
+        config["analysis"]["clustering"]["seed"], 7777,
+        "an explicit --config must win over the ladder: {config}"
+    );
+}

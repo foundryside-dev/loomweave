@@ -125,6 +125,101 @@ fn serve_stdio_initialize_round_trip() {
     assert_eq!(response["result"]["serverInfo"]["name"], "loomweave");
 }
 
+/// clarion-459bf2ac3b: `serve` in a linked worktree of a primary that was
+/// never `loomweave install`ed must serve the degraded no-index session
+/// (mirroring clarion-ac36f51c2b's primary-route UX), not exit 1 with the
+/// reason buried in stderr — and the recovery hint must anchor at the
+/// PRIMARY root: a worktree-root `install --path` hint would materialize
+/// the forbidden decoy store (clarion-f8b577dc48).
+#[test]
+fn serve_linked_worktree_of_uninstalled_primary_degrades_instead_of_exiting() {
+    let tmp = tempfile::tempdir().expect("temp root");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let output = StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f.txt"), "hi\n").expect("seed file");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "feature", "../linked"],
+    );
+    let linked = tmp.path().join("linked");
+
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("loomweave"))
+        .args(["serve", "--path"])
+        .arg(&linked)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn loomweave serve");
+
+    {
+        let mut stdin = child.stdin.take().expect("child stdin");
+        write_frame(
+            &mut stdin,
+            &Frame {
+                body: serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test-client", "version": "0.0.0"}
+                    }
+                }))
+                .expect("serialize request"),
+            },
+        )
+        .expect("write initialize frame");
+        stdin.flush().expect("flush initialize frame");
+    }
+
+    let output = child.wait_with_output().expect("wait for loomweave serve");
+    assert!(
+        output.status.success(),
+        "an un-installed primary must degrade, never exit 1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(output.stdout));
+    let frame = read_frame(&mut reader, ContentLengthCeiling::new(usize::MAX))
+        .expect("read initialize response");
+    let response: serde_json::Value =
+        serde_json::from_slice(&frame.body).expect("response body is json");
+    assert_eq!(response["id"], 1);
+    let instructions = response["result"]["instructions"]
+        .as_str()
+        .expect("degraded initialize carries instructions");
+    let primary = std::fs::canonicalize(&repo).expect("canonicalize repo");
+    let linked_canon = std::fs::canonicalize(&linked).expect("canonicalize linked");
+    assert!(
+        instructions.contains(&format!("--path {}", primary.display())),
+        "the install hint must anchor at the primary root: {instructions}"
+    );
+    assert!(
+        !instructions.contains(&format!("--path {}", linked_canon.display())),
+        "the hint must never point install at the worktree (decoy store): {instructions}"
+    );
+}
+
 #[test]
 fn serve_stdio_accepts_mcp_json_line_initialize_without_stdin_eof() {
     let dir = tempfile::tempdir().expect("temp project");

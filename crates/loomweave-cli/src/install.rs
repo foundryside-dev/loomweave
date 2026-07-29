@@ -526,11 +526,20 @@ fn install_hooks(project_root: &Path) -> Result<()> {
 }
 
 fn install_instruction_blocks(project_root: &Path) -> Result<()> {
+    // C-20: when CLAUDE.md is only a redirect to AGENTS.md the block is written
+    // to AGENTS.md alone (and a legacy CLAUDE.md block is migrated off), so the
+    // report must name what actually happened rather than the dual-write shape.
+    let redirects = crate::instructions::claude_md_redirects_to_agents_md(project_root);
     let report = crate::instructions::install_instructions(project_root)
         .context("inject loomweave instructions into CLAUDE.md / AGENTS.md")?;
+    let targets = if redirects {
+        "AGENTS.md (CLAUDE.md redirects to it)"
+    } else {
+        "{CLAUDE,AGENTS}.md"
+    };
     if report.changed {
         println!(
-            "Injected loomweave instructions block into {}/{{CLAUDE,AGENTS}}.md",
+            "Injected loomweave instructions block into {}/{targets}",
             project_root.display()
         );
     } else {

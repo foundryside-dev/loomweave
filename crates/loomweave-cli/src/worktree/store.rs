@@ -262,10 +262,32 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
         {
             return Ok(StoreOutcome::Reused);
         }
-        MetadataState::Valid(meta) => format!(
-            "source_root mismatch: metadata.json describes {:?}, resolved worktree is {source_root:?}",
-            meta.source_root
-        ),
+        // Name exactly which of the three validity checks failed
+        // (clarion-73874f5939): this reason is the delete-and-rebuild's only
+        // audit trail, and a blanket "source_root mismatch" on a schema bump
+        // reads as self-contradictory when both paths are identical.
+        MetadataState::Valid(meta) => {
+            let mut mismatches = Vec::new();
+            if meta.schema != METADATA_SCHEMA {
+                mismatches.push(format!(
+                    "schema {:?} != expected {METADATA_SCHEMA:?}",
+                    meta.schema
+                ));
+            }
+            if meta.stable_id != stable_id {
+                mismatches.push(format!(
+                    "stable_id {:?} != resolved {stable_id:?}",
+                    meta.stable_id
+                ));
+            }
+            if meta.source_root != source_root {
+                mismatches.push(format!(
+                    "source_root {:?} != resolved worktree {source_root:?}",
+                    meta.source_root
+                ));
+            }
+            format!("metadata.json mismatch: {}", mismatches.join("; "))
+        }
         MetadataState::Unreadable(detail) => format!("unreadable metadata.json: {detail}"),
     };
 
@@ -295,8 +317,9 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
 
 /// The result of reading `<candidate>/metadata.json`.
 enum MetadataState {
-    /// The store directory does not exist yet (or exists but is otherwise
-    /// empty) — first-time creation, no delete-and-rebuild needed.
+    /// The store directory does not exist yet — first-time creation, no
+    /// delete-and-rebuild needed. (A directory that exists but has no
+    /// `metadata.json` reads as [`Self::Unreadable`] and is rebuilt.)
     Absent,
     /// The directory exists, but `metadata.json` is missing, unreadable, or
     /// fails to parse. `String` is a human-readable detail for the rebuild
@@ -638,6 +661,44 @@ mod tests {
         assert!(
             log.contains(&reason),
             "log line must include the rebuild reason {reason:?}: {log}"
+        );
+    }
+
+    /// clarion-73874f5939: a schema-only mismatch must be reported as a
+    /// schema mismatch — the fall-through arm used to label every parsed
+    /// mismatch `"source_root mismatch"`, producing a self-contradictory
+    /// diagnostic (`describes "/same/path", resolved worktree is
+    /// "/same/path"`) on the first `METADATA_SCHEMA` bump.
+    #[test]
+    fn schema_mismatch_reason_names_the_failing_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        assert_eq!(
+            ensure_isolated_store(&ctx).expect("create"),
+            StoreOutcome::Created
+        );
+
+        let metadata_path = ctx.effective_store.join(METADATA_FILE_NAME);
+        let raw = std::fs::read_to_string(&metadata_path).expect("read metadata");
+        let mut value: serde_json::Value = serde_json::from_str(&raw).expect("parse metadata");
+        value["schema"] = serde_json::Value::String("loomweave.worktree-index.v0".to_owned());
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_string(&value).expect("serialize"),
+        )
+        .expect("write stale-schema metadata");
+
+        let outcome = ensure_isolated_store(&ctx).expect("rebuild");
+        let StoreOutcome::Rebuilt { reason } = outcome else {
+            panic!("expected Rebuilt, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("schema"),
+            "the reason must name the failing check: {reason}"
+        );
+        assert!(
+            !reason.contains("source_root"),
+            "a schema-only mismatch must not claim a source_root mismatch: {reason}"
         );
     }
 

@@ -293,6 +293,23 @@ impl ServerState {
                 readiness,
                 crate::worktree_bootstrap::WorktreeReadiness::Ready
             );
+        // Explicit progress-observation state (clarion-917df0e1ad): the
+        // gate's error text sends agents here "to check progress", so a gated
+        // session must distinguish a build in flight from one that will
+        // never start because the bootstrap spawn itself failed. Response
+        // field only (no tool schema/description growth — the tools/list
+        // byte budget is untouched); absent entirely for ungated sessions.
+        let index_state = self.worktree_gate.as_ref().map(|gate| match readiness {
+            crate::worktree_bootstrap::WorktreeReadiness::Ready => "ready",
+            crate::worktree_bootstrap::WorktreeReadiness::BuildFailed => "index-build-failed",
+            crate::worktree_bootstrap::WorktreeReadiness::Building => {
+                if gate.bootstrap_spawn_failed {
+                    "bootstrap-spawn-failed"
+                } else {
+                    "index-building"
+                }
+            }
+        });
 
         // The on-disk size, paired with data_version, exposes a swapped or
         // truncated DB the server may still be serving from a stale handle.
@@ -396,6 +413,11 @@ impl ServerState {
         });
         if building {
             null_corpus_derived_fields_while_building(&mut result);
+        }
+        // Present only for gated (linked-worktree) sessions — inserted after
+        // the nulling pass, which must not scrub it.
+        if let Some(index_state) = index_state {
+            result["index_state"] = Value::String(index_state.to_owned());
         }
 
         Ok(success_envelope(result))

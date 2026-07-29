@@ -213,12 +213,18 @@ deduplicated lookup list: source root, then primary root. Loomweave's own port
 and instance ID use explicit `StorePaths` leaves so concurrent servers cannot
 overwrite each other.
 
-The `weft.toml [filigree].url` rung of that lookup, though, still consults
-only the source root. It is a durable, explicit operator declaration of
-where Filigree is — not an on-disk discovery artifact a worktree's own
-checkout could plausibly shadow the way an ignored `ephemeral.port` sidecar
-can — so unlike the ephemeral-port rung it does not fall through to the
-primary root when the source root has none.
+There is no `weft.toml [filigree].url` rung in that lookup (removed on the
+1.5.0 line for a security reason that outranks discovery convenience:
+repository content may be untrusted, while Filigree clients attach
+operator-owned bearer tokens to the resolved endpoint — operator overrides
+belong in the process environment, `WEFT_FILIGREE_URL`, or private config).
+The ephemeral-port rung is the discovery mechanism, and it falls through
+source root → primary root as described above. The rung that wins records
+its root, and the minted `federation_token` is read from that SAME root —
+never first-found across the list — so a stale worktree-local token is
+never presented to the primary's live daemon (clarion-f93e006216). This
+discovery applies identically to `serve` and to `analyze`'s finding
+emission and prune paths (clarion-2833649dd9).
 
 The secret-scan baseline (`secrets-baseline.yaml`) is a per-store leaf under
 `StorePaths`, not shared or copied from the primary: a freshly created
@@ -244,11 +250,25 @@ baseline accumulates (or someone copies in) matching entries.
    `WorktreeContext`, so both spellings land in the isolated store. An
    un-routed plain analyze writing a 20–30 minute index into
    `<worktree>/.weft/loomweave/` — a store serve's readiness poll never
-   observes — is the silent failure this step exists to prevent.
+   observes — is the silent failure this step exists to prevent. When
+   `serve` itself was given an explicit `--config`, the spawn forwards it
+   (`worktree analyze --config <path> -- <target>`); with the default
+   ladder no forwarding is needed — the spawned analyze resolves the same
+   source→primary config ladder itself (clarion-c39b92b868), so the
+   bootstrap-built index is governed by the same configuration `serve`
+   reports.
 3. Serve immediately. Graph tools return the existing structured tool-error
    envelope (`error.code` / `error.retryable` plus top-level `diagnostics`)
    with code `index-building` and the fallback command. `index-building` and
    `index-build-failed` join the pinned `McpErrorCode` wire vocabulary.
+   The ADR-044 HTTP read API is gated identically (clarion-ecf882f230):
+   every data route consults the same per-request readiness and answers
+   `503` with `INDEX_BUILDING`/`INDEX_BUILD_FAILED` (plus `run_id` and the
+   fallback command) until a completed run exists — a federation consumer
+   polling during the build gets an explicit not-ready signal, never
+   well-formed empty answers indistinguishable from a truthfully empty
+   index. `GET /api/v1/_capabilities` stays open as the pre-auth liveness
+   probe.
 4. Readiness is governed by "has any run row ever completed" (`completed`,
    or the legitimate terminal `skipped_no_plugins`), never by "what does the
    most recent row say": once a completed row exists, readers activate and
@@ -269,9 +289,12 @@ their database-derived counts are `null`, never fabricated as zero.
 
 ### Explicit analysis
 
-`loomweave worktree analyze [--no-incremental] -- <name-or-path>` builds or
-rebuilds a worktree index directly. It is the recovery path and the documented
-fallback in every build-failed message.
+`loomweave worktree analyze [--no-incremental] [--config <path>] --
+<name-or-path>` builds or rebuilds a worktree index directly. It is the
+recovery path and the documented fallback in every build-failed message.
+Without `--config` it resolves the same source→primary configuration ladder
+as `serve`, so the fallback command needs no extra flags to rebuild with the
+configuration the session actually reports.
 
 ### Cleanup
 
@@ -280,11 +303,12 @@ On `serve` startup and after each analysis, under a non-blocking `gc.lock`:
 1. Enumerate direct `wt-[0-9a-f]{64}` children of the pinned `worktrees/`
    handle — the **candidate** set.
 2. Resolve the repository's common Git directory (one hardened `git
-   rev-parse`, its own invocation additionally stripping
-   `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` so it cannot be redirected by
-   an ambient Git environment variable — a narrow, deletion-path-local
-   guard; general `hardened_git_command` environment sanitization remains
-   tracked separately, clarion-9202f4acec), then read that directory's own
+   rev-parse`; `hardened_git_command` itself `env_clear()`s the child
+   environment — landed on the 1.5.0 line — so an ambient
+   `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` cannot redirect this
+   deletion-adjacent invocation to a foreign repository; the sweep briefly
+   carried its own three-variable strip and retired it in favor of the
+   shared clear), then read that directory's own
    `worktrees/` administrative subdirectory with a single `readdir` — the
    **registered** set. `git worktree list` is deliberately never run for
    this: it does not expose the administrative directory name each entry
@@ -331,7 +355,14 @@ When a `[loomweave].store_dir` override is active the sweep is **report-only**:
 it logs would-be candidates and deletes nothing (the Non-goals entry below is
 a hard requirement, not advice — an absolute override can be shared between
 unrelated repositories, and repository A's registered-worktree set must never
-authorize deleting repository B's stores). Every deletion the sweep performs
+authorize deleting repository B's stores). "Active" means active **at
+context-resolve time**: the decision reads the provenance
+`WorktreeContext` recorded when `repository_store` was derived
+(`store_dir_overridden`), never a fresh `weft.toml` read at sweep time —
+`analyze` resolves at start and sweeps at the end of a long run, and an
+override removed in between must not flip the sweep into delete mode
+against the still-shared store the paths were resolved under
+(clarion-306ed41ce3). Every deletion the sweep performs
 is logged with the store's stable ID and the reason, as is every
 delete-and-rebuild triggered by unreadable or mismatched metadata: under this
 posture the log line is the only audit trail an automatic deletion leaves.

@@ -26,6 +26,9 @@
 
 use std::fs;
 use std::path::Path;
+// The git call sites use `hardened_git_command` (clarion-9202f4acec); this is
+// for spawning our OWN binary in `repair_classifier_analysis`, which is not git
+// and must not inherit the git hardening wrapper.
 use std::process::Command;
 use std::time::Duration;
 
@@ -40,6 +43,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 
+use loomweave_core::hardened_git_command;
 use loomweave_storage::StorageError;
 use loomweave_storage::schema::{
     CURRENT_SCHEMA_VERSION, reject_unmigrated_for_read, verify_user_version,
@@ -740,9 +744,10 @@ fn validate_external_sqlite_read_gate(
     Ok(())
 }
 
+const ENUMERATION_ID: &str = "classifier.enumeration";
+const TAGS_ID: &str = "classifier.tags";
+
 fn check_classifier_json(project_root: &Path, fix: bool) -> (DoctorJsonCheck, DoctorJsonCheck) {
-    const ENUMERATION_ID: &str = "classifier.enumeration";
-    const TAGS_ID: &str = "classifier.tags";
     let db_path = loomweave_core::store::db_path(project_root);
     if !db_path.exists() {
         let details = serde_json::json!({
@@ -785,6 +790,9 @@ fn check_classifier_json(project_root: &Path, fix: bool) -> (DoctorJsonCheck, Do
             "run_status": latest.run_status(),
             "reason": reason,
         });
+        if let Some(not_applicable) = classifier_not_applicable(&latest) {
+            return not_applicable;
+        }
         if fix && latest.run_status().is_none() && latest.run_id().is_none() {
             return match repair_classifier_analysis(project_root) {
                 Ok(()) => {
@@ -1338,9 +1346,7 @@ fn db_tracked_state(project_root: &Path) -> DbTrackedState {
         // Store dir is outside the repo — this repo cannot be tracking it.
         return DbTrackedState::Untracked;
     };
-    let tracked = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let tracked = hardened_git_command(project_root)
         .args(["ls-files", "--error-unmatch", "--"])
         .arg(rel)
         .output()
@@ -1360,9 +1366,7 @@ fn git_untrack_db(project_root: &Path) -> Result<()> {
     let rel = store
         .strip_prefix(project_root)
         .context("store dir is outside the project root; cannot git rm --cached")?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let status = hardened_git_command(project_root)
         .args(["rm", "--cached", "-q", "--ignore-unmatch", "--"])
         .arg(rel.join("loomweave.db"))
         .arg(rel.join("loomweave.db-wal"))
@@ -1498,6 +1502,58 @@ fn check_index_freshness_json(project_root: &Path) -> DoctorJsonCheck {
     } else {
         DoctorJsonCheck::ok("index.freshness", lines.join("\n"))
     }
+}
+
+/// Classifier evidence comes from language plugins. With none installed there is
+/// nothing to classify and no repair to perform: `analyze` would only record
+/// `skipped_no_plugins`. Return the pair of warnings `plugin.availability`
+/// already implies, rather than a problem `--fix` can never clear — which would
+/// otherwise pin `doctor --fix` to exit 1 on every plugin-less machine (CI
+/// runners, and fresh installs before the operator adds a plugin).
+///
+/// `None` when the missing plugin does not explain the state. Only two states
+/// qualify: no run at all, or a run that skipped for want of plugins. A `failed`
+/// run, or a `completed` run whose coverage is missing or malformed, is real
+/// broken evidence and must keep failing closed — uninstalling a plugin must not
+/// launder it into "not applicable".
+fn classifier_not_applicable(
+    latest: &LatestClassifierCoverage,
+) -> Option<(DoctorJsonCheck, DoctorJsonCheck)> {
+    if !matches!(latest.run_status(), None | Some("skipped_no_plugins"))
+        || any_language_plugin_discovered()
+    {
+        return None;
+    }
+    let reason = "no language plugin is installed, so no classifier evidence can exist";
+    let details = serde_json::json!({
+        "available": false,
+        "run_id": latest.run_id(),
+        "run_status": latest.run_status(),
+        "reason": reason,
+    });
+    Some((
+        classifier_unavailable_check(
+            ENUMERATION_ID,
+            "warning",
+            format!("classifier enumeration is not applicable: {reason}"),
+            details.clone(),
+        ),
+        classifier_unavailable_check(
+            TAGS_ID,
+            "warning",
+            format!("active classifier declarations are not applicable: {reason}"),
+            details,
+        ),
+    ))
+}
+
+/// Whether any language plugin is visible to the same discovery path `analyze`
+/// uses. Errors are treated as "not discovered": a plugin that cannot be loaded
+/// cannot produce classifier evidence either.
+fn any_language_plugin_discovered() -> bool {
+    loomweave_core::plugin::discover()
+        .into_iter()
+        .any(|result| result.is_ok())
 }
 
 fn check_plugin_availability_json() -> DoctorJsonCheck {
@@ -1698,8 +1754,8 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
                 "http.config",
                 format!(
                     "stale HTTP read-API port metadata in .weft/loomweave/ephemeral.port: \
-                     {url}/health is not reachable; start `loomweave serve` or ignore this \
-                     persisted port when .mcp.json launches the stdio runtime"
+                     {url}{HTTP_LIVENESS_PATH} is not reachable; start `loomweave serve` or \
+                     ignore this persisted port when .mcp.json launches the stdio runtime"
                 ),
             );
         }
@@ -1928,6 +1984,19 @@ fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonChec
     }
 }
 
+/// The one route the read API serves unauthenticated, by design, so siblings can
+/// probe it pre-auth (`http_read/linkages.rs`). That makes it the only sound
+/// liveness target: every other route may legitimately answer 401/403 on a
+/// perfectly healthy server, and a probe that reads those as "dead" is worse
+/// than no probe at all.
+const HTTP_LIVENESS_PATH: &str = "/api/v1/_capabilities";
+
+/// Whether a Loomweave read API is answering at `base_url`.
+///
+/// This previously probed `/health`, a route the read API has never registered,
+/// so a LIVE server was reported as unreachable stale port metadata for every
+/// operator with HTTP enabled (clarion-7ad374bac4). The test fake answered any
+/// path with 200, so nothing caught it.
 fn http_health_reachable(base_url: &str) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(250))
@@ -1935,7 +2004,7 @@ fn http_health_reachable(base_url: &str) -> bool {
     else {
         return false;
     };
-    let url = format!("{}/health", base_url.trim_end_matches('/'));
+    let url = format!("{}{HTTP_LIVENESS_PATH}", base_url.trim_end_matches('/'));
     client
         .get(url)
         .send()
@@ -2103,11 +2172,22 @@ fn check_mcp_hygiene_json() -> DoctorJsonCheck {
     )
 }
 
+/// The healthy-state message for the instructions check, redirect-aware (C-20).
+/// Naming both files under a redirect would claim a block in CLAUDE.md that the
+/// installer deliberately keeps out of it.
+fn instructions_present_message(project_root: &Path) -> String {
+    if instructions::claude_md_redirects_to_agents_md(project_root) {
+        "agent-orientation block present in AGENTS.md (CLAUDE.md redirects to it)".to_owned()
+    } else {
+        "agent-orientation block present in CLAUDE.md + AGENTS.md".to_owned()
+    }
+}
+
 fn check_instructions_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     match instructions::instructions_state(project_root) {
         InstructionsState::UpToDate => DoctorJsonCheck::ok(
             "instructions.block",
-            "agent-orientation block present in CLAUDE.md + AGENTS.md",
+            instructions_present_message(project_root),
         ),
         InstructionsState::Missing => {
             let what = "agent-orientation block missing from CLAUDE.md / AGENTS.md";
@@ -2127,6 +2207,14 @@ fn check_instructions_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
                 }
                 InstructionsState::Duplicated => {
                     "agent-orientation block duplicated (stale split-brain copy)"
+                }
+                // C-20 inversion: under a redirect the block's ABSENCE from
+                // CLAUDE.md is health, so the defect is a leftover and the
+                // repair is migration — `install_instructions` migrates rather
+                // than re-injects, so `--fix` cannot churn here.
+                InstructionsState::RedirectStale => {
+                    "CLAUDE.md redirects to AGENTS.md but still carries a Loomweave \
+                     instruction block"
                 }
                 InstructionsState::UpToDate | InstructionsState::Missing => unreachable!(),
             };
@@ -2425,9 +2513,7 @@ fn check_mcp(project_root: &Path, fix: bool) -> Tally {
 
 fn check_instructions(project_root: &Path, fix: bool) -> Tally {
     match instructions::instructions_state(project_root) {
-        InstructionsState::UpToDate => {
-            ok("agent-orientation block present in CLAUDE.md + AGENTS.md")
-        }
+        InstructionsState::UpToDate => ok(&instructions_present_message(project_root)),
         // Optional surface: the same guidance ships via the MCP preamble and the
         // loomweave-workflow skill, so a missing block is advisory — never a gate
         // failure. Mirrors the integration-bindings severity model.
@@ -2451,6 +2537,12 @@ fn check_instructions(project_root: &Path, fix: bool) -> Tally {
                 }
                 InstructionsState::Duplicated => {
                     "agent-orientation block duplicated (stale split-brain copy)"
+                }
+                // C-20 inversion — see the JSON twin: absence in a redirecting
+                // CLAUDE.md is health, so `--fix` migrates instead of injecting.
+                InstructionsState::RedirectStale => {
+                    "CLAUDE.md redirects to AGENTS.md but still carries a Loomweave \
+                     instruction block"
                 }
                 InstructionsState::UpToDate | InstructionsState::Missing => unreachable!(),
             };
@@ -2572,6 +2664,24 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    #[cfg(unix)]
+    fn install_fsmonitor_payload(root: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let marker = root.join("fsmonitor-fired");
+        let hook = root.join("fsmonitor-hook.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf fired >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook, perms).unwrap();
+        run_git(root, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        marker
+    }
+
     fn run_git(repo: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .arg("-C")
@@ -2616,6 +2726,22 @@ mod tests {
         write_db(root);
         run_git(root, &["add", "-f", ".weft/loomweave/loomweave.db"]);
         assert_eq!(db_tracked_state(root), DbTrackedState::Tracked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_tracked_state_does_not_run_repo_fsmonitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let marker = install_fsmonitor_payload(root);
+        write_db(root);
+
+        assert_eq!(db_tracked_state(root), DbTrackedState::Untracked);
+        assert!(
+            !marker.exists(),
+            "db tracking probe must not run repo-configured fsmonitor"
+        );
     }
 
     #[test]
@@ -2874,6 +3000,25 @@ filigree tracks tasks for this project.\n\
         assert!(
             db.exists(),
             "git rm --cached must keep the working-tree file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_untrack_db_does_not_run_repo_fsmonitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let db = write_db(root);
+        run_git(root, &["add", "-f", ".weft/loomweave/loomweave.db"]);
+        let marker = install_fsmonitor_payload(root);
+
+        git_untrack_db(root).expect("untrack succeeds");
+
+        assert!(db.exists(), "git rm --cached must keep the file");
+        assert!(
+            !marker.exists(),
+            "db untrack repair must not run repo-configured fsmonitor"
         );
     }
 }

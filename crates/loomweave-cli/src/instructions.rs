@@ -50,7 +50,13 @@ const START_PREFIX: &str = "<!-- loomweave:instructions";
 const END_MARKER: &str = "<!-- /loomweave:instructions -->";
 
 /// The two project-root files Loomweave manages a block in.
-const TARGET_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
+const TARGET_FILES: &[&str] = &[CLAUDE_MD, AGENTS_MD];
+
+/// Claude Code's project-root agent-context file.
+const CLAUDE_MD: &str = "CLAUDE.md";
+
+/// The tool-agnostic project-root agent-context file, and the redirect target.
+const AGENTS_MD: &str = "AGENTS.md";
 
 /// The canonical body bytes that live inside the span. `include_str!` keeps the
 /// asset's trailing newline; we trim trailing whitespace so the drift compare
@@ -117,6 +123,12 @@ pub enum InstructionsState {
     /// canonicalisable case is auto-collapsed with `--fix`; a foreign-shielded
     /// duplicate is surfaced for hand resolution (foreign-safety > own-dedup).
     Duplicated,
+    /// `CLAUDE.md` only redirects to `AGENTS.md` (C-20), yet still carries a
+    /// legacy Loomweave block. Under a redirect the healthy state is the block's
+    /// **absence** here — the redirect already delivers it from `AGENTS.md`, so a
+    /// second copy is duplicate guidance free to drift. Doctor treats this as a
+    /// **problem** whose repair is *migration*, never re-injection.
+    RedirectStale,
 }
 
 /// Classify one file's Loomweave block without writing.
@@ -134,15 +146,18 @@ enum FileState {
     /// Well-formed first own block, but a stale duplicate own block also exists
     /// (canonicalisable before a foreign fence, or shielded beyond one).
     Duplicated,
+    /// A migrate-off target (a redirecting `CLAUDE.md`) that still carries an own
+    /// block. Healthy for such a file is *no* own block at all.
+    Leftover,
 }
 
 /// Aggregate per-file states into a single [`InstructionsState`].
 ///
 /// Precedence is **severity-ordered**, high → low: `Malformed` > `Drifted` >
-/// `Duplicated` > `Missing` > `UpToDate`. This deliberately differs from
-/// [`crate::skill_pack`]'s "Missing first" rule: here `Missing` is only a
-/// warning while `Drifted`/`Malformed`/`Duplicated` fail the gate, so a missing
-/// block must never mask a gate-failing one.
+/// `Duplicated` > `Leftover` > `Missing` > `UpToDate`. This deliberately differs
+/// from [`crate::skill_pack`]'s "Missing first" rule: here `Missing` is only a
+/// warning while every state above it fails the gate, so a missing block must
+/// never mask a gate-failing one.
 fn aggregate(states: &[FileState]) -> InstructionsState {
     if states.iter().any(|s| matches!(s, FileState::Malformed)) {
         InstructionsState::Malformed
@@ -150,6 +165,8 @@ fn aggregate(states: &[FileState]) -> InstructionsState {
         InstructionsState::Drifted
     } else if states.iter().any(|s| matches!(s, FileState::Duplicated)) {
         InstructionsState::Duplicated
+    } else if states.iter().any(|s| matches!(s, FileState::Leftover)) {
+        InstructionsState::RedirectStale
     } else if states.iter().any(|s| matches!(s, FileState::Absent)) {
         InstructionsState::Missing
     } else {
@@ -157,14 +174,47 @@ fn aggregate(states: &[FileState]) -> InstructionsState {
     }
 }
 
-/// Classify the Loomweave block across both [`TARGET_FILES`] without writing.
+/// Classify the Loomweave block across a project's agent-context files without
+/// writing.
+///
+/// Redirect-aware (C-20): the file set and the *meaning* of each file both come
+/// from [`instruction_targets`]. Under a redirect, `CLAUDE.md` is judged by
+/// [`migrated_file_state`] — where absence is health — so a redirecting project
+/// is never reported `Missing` for a block that deliberately does not live
+/// there.
 #[must_use]
 pub fn instructions_state(project_root: &Path) -> InstructionsState {
-    let states: Vec<FileState> = TARGET_FILES
+    let (write_to, migrate_off) = instruction_targets(project_root);
+    let states: Vec<FileState> = write_to
         .iter()
         .map(|name| file_state(&project_root.join(name)))
+        .chain(
+            migrate_off
+                .iter()
+                .map(|name| migrated_file_state(&project_root.join(name))),
+        )
         .collect();
     aggregate(&states)
+}
+
+/// Classify a file the block should have been migrated *off*. Healthy is the
+/// absence of an own block; an unreadable or absent file is healthy too (there
+/// is certainly no block in it).
+///
+/// Keyed on *any* own open-marker line, not just a claimable top-level one: a
+/// marker shielded inside an unclosed foreign block is still stale guidance the
+/// redirect makes redundant, and reporting it (as unfixable, since
+/// [`remove_instructions`] will not claim what it cannot prove is ours) beats
+/// going green over a split brain.
+fn migrated_file_state(path: &Path) -> FileState {
+    let Ok(content) = fs::read_to_string(path) else {
+        return FileState::Current;
+    };
+    if own_open_marker_count(&content) == 0 {
+        FileState::Current
+    } else {
+        FileState::Leftover
+    }
 }
 
 /// Classify a single target file. A file that does not exist is [`Absent`]
@@ -404,6 +454,238 @@ fn locate_span(content: &str) -> Span {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CLAUDE.md → AGENTS.md redirect routing (C-20)
+// ---------------------------------------------------------------------------
+
+/// Is `line` *solely* an @-import of `AGENTS.md`?
+///
+/// The hand-rolled equivalent of the federation-normative regex
+/// `^@(?:\./)?AGENTS\.md$` (case-insensitive), matched against the trimmed line
+/// so it is anchored at both ends. Deliberately narrow: `See @AGENTS.md for
+/// details` is not solely an import, `@AGENTS.md.bak` names a different file,
+/// and `@/AGENTS.md` is an absolute path — treating any of them as a redirect
+/// would stop us maintaining the block that `CLAUDE.md` actually carries. The
+/// `./` is matched as a unit so only the relative spelling qualifies.
+fn is_agents_md_redirect(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix('@') else {
+        return false;
+    };
+    let rest = rest.strip_prefix("./").unwrap_or(rest);
+    rest.eq_ignore_ascii_case(AGENTS_MD)
+}
+
+/// Blank every managed instruction block, preserving line structure.
+///
+/// Characters inside any tool's block — Loomweave's own as well as a sibling's —
+/// become spaces while newlines survive, so a caller can scan for a redirect
+/// line without seeing text a block merely *quotes*. An unclosed block masks to
+/// EOF: we cannot prove where it ends, so we decline to read anything past it as
+/// free-standing project prose.
+///
+/// Line-anchored, because [`parse_fence`] is: Loomweave never does a bare `-->`
+/// substring scan, which could match a sibling's marker mid-prose. (The peer
+/// implementations mask from the fence's byte offset within its line; on a
+/// line-anchored fence the two agree, since a fence line holds nothing before
+/// its `<!--`.)
+fn mask_managed_blocks(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut inside: Option<String> = None;
+    for line in content.split_inclusive('\n') {
+        let fence = parse_fence(line.trim());
+        let masked = match (&inside, &fence) {
+            (None, Some((ns, false))) => {
+                inside = Some(ns.clone());
+                true
+            }
+            (None, _) => false,
+            (Some(open_ns), Some((ns, true))) if open_ns == ns => {
+                inside = None;
+                true
+            }
+            (Some(_), _) => true,
+        };
+        if masked {
+            out.extend(line.chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Whether `CLAUDE.md` is merely a redirect to `AGENTS.md` (C-20).
+///
+/// True when, *outside* every managed instruction block, `CLAUDE.md` carries a
+/// line that is solely an @-import of `AGENTS.md`. Such a project keeps one
+/// source of agent context, so Loomweave maintains its block in `AGENTS.md`
+/// alone (see [`instruction_targets`]).
+///
+/// Anything we cannot read as a plain project file — absent, unreadable, not
+/// valid UTF-8, or a symlink — reads as *no* redirect, so the caller keeps the
+/// existing dual-write behaviour. Failing safe here costs a redundant block;
+/// failing open would silently stop maintaining the block a project actually
+/// reads.
+///
+/// **Known limitation, accepted as spec:** a ```` ``` ````-fenced markdown
+/// example of `@AGENTS.md` inside `CLAUDE.md` still triggers. C-20 specifies
+/// managed-block exclusion only, and every member implements the *same*
+/// limitation on purpose — a file must get the same verdict whichever member's
+/// installer runs, and uniformity beats a unilateral widening here.
+#[must_use]
+pub fn claude_md_redirects_to_agents_md(project_root: &Path) -> bool {
+    let path = project_root.join(CLAUDE_MD);
+    if is_symlink(&path).unwrap_or(true) {
+        return false;
+    }
+    let Ok(content) = fs::read_to_string(&path) else {
+        return false;
+    };
+    mask_managed_blocks(&content)
+        .lines()
+        .any(is_agents_md_redirect)
+}
+
+/// `(write_to, migrate_off)` agent-context filenames for a project.
+///
+/// Normally Loomweave dual-writes `CLAUDE.md` and `AGENTS.md` and migrates
+/// nothing. When `CLAUDE.md` only redirects to `AGENTS.md` the block belongs in
+/// `AGENTS.md` alone, and any legacy block left in `CLAUDE.md` is listed for
+/// migration — the redirect already supplies that content, so a second copy is
+/// duplicate guidance that drifts.
+fn instruction_targets(project_root: &Path) -> (&'static [&'static str], &'static [&'static str]) {
+    if claude_md_redirects_to_agents_md(project_root) {
+        (&[AGENTS_MD], &[CLAUDE_MD])
+    } else {
+        (TARGET_FILES, &[])
+    }
+}
+
+/// Count own open-marker lines in `content`, top-level or not. The split-brain
+/// signal for [`remove_instructions`] and [`migrated_file_state`]: counting
+/// *every* own marker (including one shielded inside a foreign block) can only
+/// make removal more conservative, never less.
+fn own_open_marker_count(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|line| line.trim().starts_with(START_PREFIX))
+        .count()
+}
+
+/// What [`remove_instructions`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoveOutcome {
+    /// There was nothing to remove — success, no write.
+    Nothing,
+    /// The own block was excised (or the file deleted, when it held nothing
+    /// else).
+    Removed,
+    /// Ownership was not provable, so nothing was written. Carries the reason.
+    Refused(String),
+    /// The target is a symlink; skipped rather than written through.
+    SkippedSymlink,
+}
+
+/// Remove Loomweave's own instruction block from `path`, or refuse.
+///
+/// The delete-side mirror of [`install_into_file`], and deliberately **more
+/// conservative** than it. Injection can always fall back to an append — which
+/// deletes nothing — so it may safely bound a malformed block at a foreign fence
+/// and recover. Removal has no such fallback: a mis-bounded delete eats a
+/// sibling's block. So every case where ownership is not *provable* is a no-op
+/// that writes nothing:
+///
+/// - no own top-level open fence (including one shielded inside an unclosed
+///   foreign block) → nothing to remove;
+/// - own close marker missing, or sitting beyond a real foreign block → refuse;
+/// - more than one own block (split brain) → refuse, matching doctor's "resolve
+///   it by hand" posture rather than guessing which copy to drop.
+///
+/// Own-namespace-only and foreign-safe throughout (C-4): the bounds come from
+/// the same [`first_own_open_fence_pos`] / [`first_real_foreign_block_pos`] pair
+/// the injector uses, so a Loomweave marker quoted inside a sibling's block is
+/// never mistaken for ours.
+///
+/// # Errors
+///
+/// Returns an error only if the stat, temp write, rename, or unlink fails; an
+/// unreadable file is reported as a refusal, not an error.
+fn remove_instructions(path: &Path) -> Result<RemoveOutcome> {
+    if is_symlink(path).with_context(|| format!("stat {}", path.display()))? {
+        return Ok(RemoveOutcome::SkippedSymlink);
+    }
+
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RemoveOutcome::Nothing);
+        }
+        Err(err) => {
+            return Ok(RemoveOutcome::Refused(format!(
+                "could not read {}: {err}",
+                path.display()
+            )));
+        }
+    };
+
+    let Some(start) = first_own_open_fence_pos(&content) else {
+        return Ok(RemoveOutcome::Nothing);
+    };
+
+    let blocks = own_open_marker_count(&content);
+    if blocks > 1 {
+        return Ok(RemoveOutcome::Refused(format!(
+            "{} carries {blocks} Loomweave instruction blocks (split brain); refusing to \
+             guess which copy to remove — resolve it by hand",
+            path.display()
+        )));
+    }
+
+    let Some((own_end_start, own_end_after)) = own_end_line_pos(&content, start) else {
+        return Ok(RemoveOutcome::Refused(unclosed_reason(path)));
+    };
+    if own_end_start >= first_real_foreign_block_pos(&content, start) {
+        return Ok(RemoveOutcome::Refused(unclosed_reason(path)));
+    }
+
+    // Excise, then tidy only at the seam. `append_block` separates with a blank
+    // line, so a naive cut leaves a doubled one; trimming newlines on each side
+    // of the seam restores the single blank line without touching blank runs
+    // elsewhere in the file.
+    let head = content[..start].trim_end_matches('\n');
+    let tail = content[own_end_after..].trim_start_matches('\n');
+    let remainder = match (head.is_empty(), tail.is_empty()) {
+        (false, false) => format!("{head}\n\n{tail}"),
+        (true, _) => tail.to_owned(),
+        (_, true) => head.to_owned(),
+    };
+
+    if remainder.trim().is_empty() {
+        // The file held nothing but Loomweave's block — i.e. exactly what the
+        // installer creates for a missing file. Removing it is the symmetric
+        // inverse of that create; leaving a blank file behind would also trip
+        // `atomic_write`'s refuse-to-empty guard (C-4 (g)).
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        return Ok(RemoveOutcome::Removed);
+    }
+
+    let remainder = if remainder.ends_with('\n') {
+        remainder
+    } else {
+        format!("{remainder}\n")
+    };
+    atomic_write(path, &remainder)?;
+    Ok(RemoveOutcome::Removed)
+}
+
+fn unclosed_reason(path: &Path) -> String {
+    format!(
+        "the Loomweave instruction block in {} is unclosed or its close marker sits beyond \
+         another tool's block; refusing to delete across a boundary we cannot prove is ours",
+        path.display()
+    )
+}
+
 /// Outcome of an [`install_instructions`] call.
 #[derive(Debug, Clone)]
 pub struct InstructionsInstallReport {
@@ -418,8 +700,19 @@ pub struct InstructionsInstallReport {
     pub skipped_symlinks: Vec<PathBuf>,
 }
 
-/// Inject (or repair) the Loomweave block into both [`TARGET_FILES`] under
-/// `project_root`, idempotently. Doubles as the `doctor --fix` repair.
+/// Inject (or repair) the Loomweave block into a project's agent-context files
+/// under `project_root`, idempotently. Doubles as the `doctor --fix` repair.
+///
+/// **Redirect routing (C-20).** The target set comes from
+/// [`instruction_targets`]: normally both [`TARGET_FILES`], but when `CLAUDE.md`
+/// is merely a redirect to `AGENTS.md` the block belongs in `AGENTS.md` alone
+/// and a legacy `CLAUDE.md` block is migrated off. Migration runs **first**, so
+/// a redirecting project never briefly carries two blocks. `AGENTS.md` is
+/// created if absent, exactly as for a first install.
+///
+/// The removal side is deliberately more conservative than this one — see
+/// [`remove_instructions`]. A refusal is warned about and left in place; it
+/// never fails the install, and it never writes.
 ///
 /// Per-file behaviour, touching **only** Loomweave's own span and obeying the
 /// weft C-4 multi-owner managed-block contract — a rewrite never crosses a
@@ -457,7 +750,38 @@ pub struct InstructionsInstallReport {
 pub fn install_instructions(project_root: &Path) -> Result<InstructionsInstallReport> {
     let mut changed = false;
     let mut skipped_symlinks = Vec::new();
-    for name in TARGET_FILES {
+    let (write_to, migrate_off) = instruction_targets(project_root);
+
+    for name in migrate_off {
+        let path = project_root.join(name);
+        let outcome = remove_instructions(&path).with_context(|| {
+            format!(
+                "migrate loomweave instructions out of {} (it redirects to {AGENTS_MD})",
+                path.display()
+            )
+        })?;
+        match outcome {
+            RemoveOutcome::Removed => changed = true,
+            RemoveOutcome::Nothing => {}
+            // Degrade, don't abort — same posture as the symlink skip below. A
+            // legacy block we cannot prove is ours stays put; the redirect still
+            // delivers the current copy from AGENTS.md, so the failure mode is a
+            // stale duplicate, never missing guidance. To stderr, never stdout
+            // (operator-diagnostic hygiene).
+            RemoveOutcome::Refused(reason) => eprintln!("loomweave: warning: {reason}"),
+            RemoveOutcome::SkippedSymlink => {
+                eprintln!(
+                    "loomweave: warning: skipping {}: it is a symlink (loomweave never writes \
+                     through a symlink; replace the link with a regular file by hand, then \
+                     re-run `loomweave install` or `loomweave doctor --fix`)",
+                    path.display()
+                );
+                skipped_symlinks.push(path);
+            }
+        }
+    }
+
+    for name in write_to {
         let path = project_root.join(name);
         if is_symlink(&path)
             .with_context(|| format!("inject loomweave instructions into {}", path.display()))?
@@ -700,8 +1024,8 @@ fn preserve_mode(path: &Path, temp_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        END_MARKER, INSTRUCTIONS_BODY, InstructionsState, START_PREFIX, canonical_body,
-        install_instructions, instructions_state, render_block,
+        END_MARKER, INSTRUCTIONS_BODY, InstructionsState, START_PREFIX, TARGET_FILES,
+        canonical_body, install_instructions, instructions_state, render_block,
     };
 
     /// A representative Filigree two-block neighbour, taken verbatim in shape
@@ -724,6 +1048,31 @@ filigree tracks tasks for this project.\n\
         );
         assert!(INSTRUCTIONS_BODY.contains("mcp__loomweave__"));
         assert!(INSTRUCTIONS_BODY.contains("loomweave-workflow"));
+    }
+
+    /// C-20 budgets the always-loaded surface by number, not by taste: the
+    /// block Loomweave writes into a consuming project's `CLAUDE.md` /
+    /// `AGENTS.md` is paid for on every session, before the first tool call.
+    ///
+    /// Measured on the **rendered block** — markers included — because that is
+    /// what actually lands in the file; the bare asset is asserted too so both
+    /// readings of the convention hold. A version bump lengthens the start
+    /// marker, so the headroom here is deliberate, not slack to spend.
+    #[test]
+    fn rendered_block_fits_the_c20_budget() {
+        let asset = INSTRUCTIONS_BODY.trim_end().chars().count();
+        assert!(
+            asset <= 800,
+            "instructions asset is {asset} chars (C-20 budget 800)"
+        );
+        let block = render_block().chars().count();
+        assert!(
+            block <= 800,
+            "rendered instructions block is {block} chars (C-20 budget 800) — it is a \
+             pointer: what Loomweave is, when to reach for it, where the full reference \
+             lives, and at most two load-bearing rules. Depth belongs in the \
+             loomweave-workflow skill."
+        );
     }
 
     #[test]
@@ -799,7 +1148,7 @@ filigree tracks tasks for this project.\n\
         // Hand-edit the body inside the Loomweave span on one file.
         let claude = dir.path().join("CLAUDE.md");
         let content = std::fs::read_to_string(&claude).unwrap();
-        let drifted = content.replace("code archaeology", "DRIFTED HEADER");
+        let drifted = content.replace("## Loomweave", "## DRIFTED HEADER");
         assert_ne!(drifted, content, "test setup: substitution must apply");
         std::fs::write(&claude, &drifted).unwrap();
         assert_eq!(instructions_state(dir.path()), InstructionsState::Drifted);
@@ -851,7 +1200,8 @@ filigree tracks tasks for this project.\n\
 
         // 2. Replace (drift): edit the Loomweave body; Filigree still survives.
         let content = std::fs::read_to_string(&claude).unwrap();
-        let drifted = content.replace("code archaeology", "EDITED");
+        let drifted = content.replace("## Loomweave", "## EDITED");
+        assert_ne!(drifted, content, "test setup: substitution must apply");
         std::fs::write(&claude, &drifted).unwrap();
         assert_eq!(instructions_state(dir.path()), InstructionsState::Drifted);
         install_instructions(dir.path()).unwrap();
@@ -1207,5 +1557,314 @@ filigree tracks tasks for this project.\n\
         install_instructions(dir.path()).unwrap();
         let mode = std::fs::metadata(&claude).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640, "file mode not preserved across rewrite");
+    }
+
+    // -----------------------------------------------------------------------
+    // CLAUDE.md -> AGENTS.md redirect routing (C-20)
+    // -----------------------------------------------------------------------
+
+    use super::{RemoveOutcome, claude_md_redirects_to_agents_md, remove_instructions};
+
+    /// The real exemplar's shape: a redirect line plus ordinary project prose.
+    const REDIRECT_CLAUDE_MD: &str = "# Project\n\n@AGENTS.md\n";
+
+    fn write(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    fn read(dir: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).unwrap()
+    }
+
+    #[test]
+    fn redirect_line_matches_only_a_bare_agents_import() {
+        for yes in [
+            "@AGENTS.md",
+            "@./AGENTS.md",
+            "  @AGENTS.md  ",
+            "@agents.md",
+            "@AGENTS.MD",
+        ] {
+            assert!(super::is_agents_md_redirect(yes), "should match: {yes:?}");
+        }
+        for no in [
+            "See @AGENTS.md for details",
+            "@AGENTS.md.bak",
+            "@/AGENTS.md",
+            "@AGENTS",
+            "AGENTS.md",
+            "@../AGENTS.md",
+            "",
+        ] {
+            assert!(
+                !super::is_agents_md_redirect(no),
+                "should not match: {no:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_routes_the_block_to_agents_md_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "CLAUDE.md", REDIRECT_CLAUDE_MD);
+
+        assert!(claude_md_redirects_to_agents_md(dir.path()));
+        assert!(install_instructions(dir.path()).unwrap().changed);
+
+        // AGENTS.md was absent: the installer creates it and writes the block.
+        let agents = read(dir.path(), "AGENTS.md");
+        assert!(
+            agents.contains(START_PREFIX),
+            "block missing from AGENTS.md"
+        );
+        assert_eq!(
+            read(dir.path(), "CLAUDE.md"),
+            REDIRECT_CLAUDE_MD,
+            "the redirecting CLAUDE.md must be left byte-identical"
+        );
+        assert_eq!(instructions_state(dir.path()), InstructionsState::UpToDate);
+    }
+
+    #[test]
+    fn redirect_migrates_a_legacy_claude_md_block_out() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seed the pre-redirect dual-write state, then add the redirect line.
+        install_instructions(dir.path()).unwrap();
+        let seeded = read(dir.path(), "CLAUDE.md");
+        write(
+            dir.path(),
+            "CLAUDE.md",
+            &format!("# Project\n\n@AGENTS.md\n\n{seeded}"),
+        );
+
+        assert_eq!(
+            instructions_state(dir.path()),
+            InstructionsState::RedirectStale,
+            "a leftover block under a redirect is a gate-failing defect, not health"
+        );
+
+        assert!(install_instructions(dir.path()).unwrap().changed);
+        let claude = read(dir.path(), "CLAUDE.md");
+        assert!(
+            !claude.contains(START_PREFIX),
+            "legacy block not migrated out of CLAUDE.md:\n{claude}"
+        );
+        assert!(
+            claude.contains("@AGENTS.md"),
+            "the redirect line must survive migration — eat it and the file stops \
+             redirecting, so the next run re-injects (an infinite migrate/re-inject loop)"
+        );
+        assert!(read(dir.path(), "AGENTS.md").contains(START_PREFIX));
+        assert_eq!(instructions_state(dir.path()), InstructionsState::UpToDate);
+    }
+
+    #[test]
+    fn migration_preserves_a_coresident_foreign_block() {
+        let dir = tempfile::tempdir().unwrap();
+        install_instructions(dir.path()).unwrap();
+        let seeded = read(dir.path(), "CLAUDE.md");
+        write(
+            dir.path(),
+            "CLAUDE.md",
+            &format!("# Project\n\n@AGENTS.md\n\n{seeded}\n{FILIGREE_BLOCK}"),
+        );
+
+        install_instructions(dir.path()).unwrap();
+        let claude = read(dir.path(), "CLAUDE.md");
+        assert!(!claude.contains(START_PREFIX), "own block not migrated");
+        assert!(
+            claude.contains(FILIGREE_BLOCK),
+            "migration ate the co-resident filigree block:\n{claude}"
+        );
+        assert!(claude.contains("@AGENTS.md"), "redirect line lost");
+    }
+
+    #[test]
+    fn agents_md_quoted_inside_a_foreign_block_does_not_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let quoted = "# Project\n\n<!-- filigree:instructions:v3:abc -->\n@AGENTS.md\n\
+                      <!-- /filigree:instructions -->\n";
+        write(dir.path(), "CLAUDE.md", quoted);
+
+        assert!(
+            !claude_md_redirects_to_agents_md(dir.path()),
+            "an @AGENTS.md line a sibling's block merely quotes is documentation, \
+             not this project's redirect"
+        );
+        install_instructions(dir.path()).unwrap();
+        assert!(
+            read(dir.path(), "CLAUDE.md").contains(START_PREFIX),
+            "dual-write must be unchanged when there is no real redirect"
+        );
+        assert!(read(dir.path(), "AGENTS.md").contains(START_PREFIX));
+    }
+
+    #[test]
+    fn no_redirect_keeps_dual_write_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "CLAUDE.md",
+            "# Project\n\nSee @AGENTS.md for details.\n",
+        );
+        assert!(!claude_md_redirects_to_agents_md(dir.path()));
+        install_instructions(dir.path()).unwrap();
+        for name in TARGET_FILES {
+            assert!(
+                read(dir.path(), name).contains(START_PREFIX),
+                "{name} lost its block"
+            );
+        }
+        assert_eq!(instructions_state(dir.path()), InstructionsState::UpToDate);
+    }
+
+    #[test]
+    fn redirect_install_is_idempotent_and_byte_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        install_instructions(dir.path()).unwrap();
+        let seeded = read(dir.path(), "CLAUDE.md");
+        write(
+            dir.path(),
+            "CLAUDE.md",
+            &format!("# Project\n\n@AGENTS.md\n\n{seeded}"),
+        );
+
+        assert!(install_instructions(dir.path()).unwrap().changed);
+        let (claude_1, agents_1) = (read(dir.path(), "CLAUDE.md"), read(dir.path(), "AGENTS.md"));
+
+        let second = install_instructions(dir.path()).unwrap();
+        assert!(
+            !second.changed,
+            "a converged redirect install must be a no-op"
+        );
+        assert_eq!(
+            read(dir.path(), "CLAUDE.md"),
+            claude_1,
+            "CLAUDE.md not byte-stable"
+        );
+        assert_eq!(
+            read(dir.path(), "AGENTS.md"),
+            agents_1,
+            "AGENTS.md not byte-stable"
+        );
+    }
+
+    /// Removal is deliberately more conservative than injection: injection can
+    /// always fall back to an append (which deletes nothing), removal cannot.
+    #[test]
+    fn removal_refuses_every_unprovable_ownership_case_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+
+        // 1. Split brain: two own blocks.
+        let two = format!("@AGENTS.md\n\n{}\n{}\n", render_block(), render_block());
+        std::fs::write(&path, &two).unwrap();
+        assert!(matches!(
+            remove_instructions(&path).unwrap(),
+            RemoveOutcome::Refused(_)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            two,
+            "split brain was written to"
+        );
+
+        // 2. Dangling own open with no close.
+        let dangling = format!("@AGENTS.md\n\n{START_PREFIX}:v0:deadbeef -->\norphan body\n");
+        std::fs::write(&path, &dangling).unwrap();
+        assert!(matches!(
+            remove_instructions(&path).unwrap(),
+            RemoveOutcome::Refused(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), dangling);
+
+        // 3. Own close beyond a real foreign block: deleting to it would swallow
+        //    the sibling.
+        let beyond = format!(
+            "@AGENTS.md\n\n{START_PREFIX}:v0:deadbeef -->\nbody\n{FILIGREE_BLOCK}{END_MARKER}\n"
+        );
+        std::fs::write(&path, &beyond).unwrap();
+        assert!(matches!(
+            remove_instructions(&path).unwrap(),
+            RemoveOutcome::Refused(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), beyond);
+
+        // 4. No own block at all: nothing to do, and nothing written.
+        let plain = "@AGENTS.md\n";
+        std::fs::write(&path, plain).unwrap();
+        assert_eq!(remove_instructions(&path).unwrap(), RemoveOutcome::Nothing);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), plain);
+    }
+
+    #[test]
+    fn removal_deletes_a_file_that_held_nothing_but_the_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(&path, format!("{}\n", render_block())).unwrap();
+        assert_eq!(remove_instructions(&path).unwrap(), RemoveOutcome::Removed);
+        assert!(
+            !path.exists(),
+            "removing the only content is the symmetric inverse of the create"
+        );
+    }
+
+    #[test]
+    fn unreadable_or_symlinked_claude_md_reads_as_no_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent.
+        assert!(!claude_md_redirects_to_agents_md(dir.path()));
+        // Non-UTF-8.
+        std::fs::write(dir.path().join("CLAUDE.md"), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(!claude_md_redirects_to_agents_md(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_claude_md_reads_as_no_redirect_and_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.md");
+        std::fs::write(&real, REDIRECT_CLAUDE_MD).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("CLAUDE.md")).unwrap();
+
+        assert!(
+            !claude_md_redirects_to_agents_md(dir.path()),
+            "a symlinked CLAUDE.md fails SAFE: no redirect, dual-write unchanged"
+        );
+        let report = install_instructions(dir.path()).unwrap();
+        assert_eq!(report.skipped_symlinks.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            REDIRECT_CLAUDE_MD,
+            "the symlink target must not be written through"
+        );
+        assert!(read(dir.path(), "AGENTS.md").contains(START_PREFIX));
+    }
+
+    #[test]
+    fn masking_hides_own_and_foreign_blocks_and_an_unclosed_block_masks_to_eof() {
+        let own = format!("{START_PREFIX}:v0:deadbeef -->\n@AGENTS.md\n{END_MARKER}\n");
+        assert!(
+            !super::mask_managed_blocks(&own)
+                .lines()
+                .any(super::is_agents_md_redirect),
+            "an @AGENTS.md line inside our OWN block is not the project's redirect"
+        );
+
+        let unclosed = "<!-- filigree:instructions:v3:abc -->\nprose\n@AGENTS.md\n";
+        assert!(
+            !super::mask_managed_blocks(unclosed)
+                .lines()
+                .any(super::is_agents_md_redirect),
+            "an unclosed block masks to EOF: we cannot prove where it ends"
+        );
+
+        let outside = format!("@AGENTS.md\n{FILIGREE_BLOCK}");
+        assert!(
+            super::mask_managed_blocks(&outside)
+                .lines()
+                .any(super::is_agents_md_redirect),
+            "a redirect line outside every block must still be seen"
+        );
     }
 }

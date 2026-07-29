@@ -62,7 +62,9 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::ffi::CStr;
 
+#[cfg(unix)]
 use rustix::fd::OwnedFd;
+#[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
 use tracing::warn;
 
@@ -192,7 +194,16 @@ pub fn refuse_unsupported(candidate_name: &str, reason: &str) -> DeleteOutcome {
 /// original path string cannot redirect a deletion — see the module docs.
 #[derive(Debug)]
 pub struct WorktreesRoot {
+    /// The pinned directory fd (unix). On non-unix targets the field is a
+    /// unit placeholder: no fd primitive exists there, and
+    /// [`delete_worktree_store`](Self::delete_worktree_store) refuses with
+    /// [`DeleteOutcome::UnsupportedPlatform`] before ever consulting a
+    /// handle, so the placeholder carries no authority
+    /// (clarion-4cd5b0b3b9).
+    #[cfg(unix)]
     handle: OwnedFd,
+    #[cfg(not(unix))]
+    handle: (),
 }
 
 impl WorktreesRoot {
@@ -210,12 +221,37 @@ impl WorktreesRoot {
     /// Returns an error if `worktrees_dir` cannot be opened as a directory
     /// (missing, not a directory, or a symlink).
     pub fn open(worktrees_dir: &Path) -> io::Result<Self> {
-        let handle = rustix::fs::open(
-            worktrees_dir,
-            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        Ok(Self { handle })
+        #[cfg(unix)]
+        {
+            let handle = rustix::fs::open(
+                worktrees_dir,
+                OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            Ok(Self { handle })
+        }
+        #[cfg(not(unix))]
+        {
+            // No fd-pinning primitive here; preserve the two properties the
+            // unix open provides that std can express — the path must be a
+            // directory and must not itself be a symlink. Deletion beneath
+            // it refuses `UnsupportedPlatform` regardless, so this handle
+            // carries no authority on this platform.
+            let meta = std::fs::symlink_metadata(worktrees_dir)?;
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worktrees directory is a symlink",
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "worktrees path is not a directory",
+                ));
+            }
+            Ok(Self { handle: () })
+        }
     }
 
     /// Attempt to delete `candidate_name`'s store, confined beneath this

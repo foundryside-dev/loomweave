@@ -64,8 +64,51 @@ const EMPTY_GUIDANCE_FINGERPRINT: &str = "guidance-empty";
 /// in this crate's own tree; the CLI (which depends on loomweave-mcp) reaches
 /// down into it to embed the same bytes for its on-disk `install --skills`
 /// copy (clarion-04391392c7).
-pub const LOOMWEAVE_WORKFLOW_SKILL: &str =
-    include_str!("../assets/skills/loomweave-workflow/SKILL.md");
+///
+/// This is `SKILL.md` alone — the always-loaded entry point. Since C-20 the
+/// depth lives one hop away in [`WORKFLOW_SKILL_FILES`]'s `references/*.md`,
+/// which `prompts/get` does NOT inline: a prompt fetch is a context cost paid
+/// per session, and the budget exists precisely so it stays small. SKILL.md
+/// names every reference by relative path, so an MCP-only consumer knows what
+/// to open in the installed skill directory.
+pub const LOOMWEAVE_WORKFLOW_SKILL: &str = WORKFLOW_SKILL_FILES[0].1;
+
+/// Every file in the bundled `loomweave-workflow` skill pack, as
+/// `(relative_path, contents)`. `SKILL.md` is first by contract
+/// ([`LOOMWEAVE_WORKFLOW_SKILL`] reads it positionally).
+///
+/// The manifest lives here, next to the assets, rather than in the CLI's
+/// `skill_pack` module: the CLI depends on this crate, so an mcp-side test
+/// (`skill_md_speaks_the_registered_tool_dialect`) can check the whole pack
+/// against the live `tools/list` catalogue, which it could not do if the file
+/// list were declared up the dependency edge. Growing the pack is a data change
+/// here — the CLI installer walks whatever this slice holds.
+pub const WORKFLOW_SKILL_FILES: &[(&str, &str)] = &[
+    (
+        "SKILL.md",
+        include_str!("../assets/skills/loomweave-workflow/SKILL.md"),
+    ),
+    (
+        "references/entity-ids.md",
+        include_str!("../assets/skills/loomweave-workflow/references/entity-ids.md"),
+    ),
+    (
+        "references/tools.md",
+        include_str!("../assets/skills/loomweave-workflow/references/tools.md"),
+    ),
+    (
+        "references/catalogue.md",
+        include_str!("../assets/skills/loomweave-workflow/references/catalogue.md"),
+    ),
+    (
+        "references/freshness.md",
+        include_str!("../assets/skills/loomweave-workflow/references/freshness.md"),
+    ),
+    (
+        "references/gotchas.md",
+        include_str!("../assets/skills/loomweave-workflow/references/gotchas.md"),
+    ),
+];
 
 /// Orientation text returned in the MCP `initialize` result's `instructions`
 /// field. The `Tools:` enumeration is derived from [`list_tools_for_policy`]
@@ -1305,6 +1348,13 @@ struct WorktreeGate {
     /// The exact `loomweave worktree analyze -- <target>` fallback command,
     /// echoed verbatim in `index-building`/`index-build-failed` diagnostics.
     fallback_argv: Vec<String>,
+    /// Whether `serve`'s bootstrap spawn of `loomweave worktree analyze`
+    /// FAILED (unresolvable executable or spawn error) — recorded so
+    /// `project_status_get` can distinguish "building, retry later" from
+    /// "the build will never start by itself; run the fallback command"
+    /// (clarion-917df0e1ad). Readiness still governs: once any run
+    /// completes (e.g. the manual fallback), `Ready` overrides this flag.
+    bootstrap_spawn_failed: bool,
 }
 
 impl ServerState {
@@ -1353,10 +1403,12 @@ impl ServerState {
         mut self,
         store_paths: loomweave_core::worktree::StorePaths,
         source_root: &Path,
+        bootstrap_spawn_failed: bool,
     ) -> Self {
         self.worktree_gate = Some(WorktreeGate {
             store_paths,
             fallback_argv: worktree_bootstrap::fallback_argv(source_root),
+            bootstrap_spawn_failed,
         });
         self
     }
@@ -6571,7 +6623,8 @@ mod tests {
         );
     }
 
-    /// SKILL.md must speak the registered tool dialect (clarion-888434f3ce).
+    /// The skill pack must speak the registered tool dialect
+    /// (clarion-888434f3ce).
     ///
     /// The skill is the canonical onboarding doc (embedded asset, served via
     /// `prompts/get`, installed by `loomweave install --skills`). An MCP client
@@ -6580,49 +6633,130 @@ mod tests {
     /// skill teaching retired names burns failed calls. Three invariants:
     /// no retired alias appears as a backticked token, every
     /// `mcp__loomweave__<name>` mention is registered (or the `*` wildcard),
-    /// and every registered tool is documented somewhere in the skill.
+    /// and every registered tool is documented somewhere in the pack.
+    ///
+    /// Checked over the WHOLE pack (`SKILL.md` ∪ `references/*.md`), not
+    /// `SKILL.md` alone. C-20 moved the tool tables one hop into `references/`;
+    /// scanning only the entry point would have quietly stopped enforcing all
+    /// three invariants on the very text that names the tools — and would let a
+    /// retired alias re-enter through a reference file.
     #[test]
-    fn skill_md_speaks_the_registered_tool_dialect() {
-        let skill = include_str!("../assets/skills/loomweave-workflow/SKILL.md");
+    fn skill_pack_speaks_the_registered_tool_dialect() {
         let registered: std::collections::BTreeSet<&str> =
             list_tools().iter().map(|tool| tool.name).collect();
 
-        for &(old, new) in RENAME_MAP {
-            if old == new {
-                continue;
+        for &(path, skill) in super::WORKFLOW_SKILL_FILES {
+            for &(old, new) in RENAME_MAP {
+                if old == new {
+                    continue;
+                }
+                assert!(
+                    !skill.contains(&format!("`{old}`")),
+                    "{path} teaches retired tool name `{old}` — the registered name is `{new}`"
+                );
+                assert!(
+                    !skill.contains(&format!("mcp__loomweave__{old}")),
+                    "{path} claims mcp__loomweave__{old} exists — clients expose \
+                     mcp__loomweave__{new}"
+                );
             }
-            assert!(
-                !skill.contains(&format!("`{old}`")),
-                "SKILL.md teaches retired tool name `{old}` — the registered name is `{new}`"
-            );
-            assert!(
-                !skill.contains(&format!("mcp__loomweave__{old}")),
-                "SKILL.md claims mcp__loomweave__{old} exists — clients expose mcp__loomweave__{new}"
-            );
+
+            for (idx, _) in skill.match_indices("mcp__loomweave__") {
+                let rest = &skill[idx + "mcp__loomweave__".len()..];
+                if rest.starts_with('*') {
+                    continue; // the documented wildcard form
+                }
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
+                assert!(
+                    registered.contains(name.as_str()),
+                    "{path} mentions mcp__loomweave__{name}, which is not in tools/list"
+                );
+            }
         }
 
-        for (idx, _) in skill.match_indices("mcp__loomweave__") {
-            let rest = &skill[idx + "mcp__loomweave__".len()..];
-            if rest.starts_with('*') {
-                continue; // the documented wildcard form
-            }
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
-                .collect();
-            assert!(
-                registered.contains(name.as_str()),
-                "SKILL.md mentions mcp__loomweave__{name}, which is not in tools/list"
-            );
-        }
-
+        let pack: String = super::WORKFLOW_SKILL_FILES
+            .iter()
+            .map(|(_, contents)| *contents)
+            .collect::<Vec<_>>()
+            .join("\n");
         for name in &registered {
             assert!(
-                skill.contains(&format!("`{name}`")),
-                "registered tool `{name}` is undocumented in SKILL.md — document it \
-                 (or its containing table row) so the skill covers the live catalogue"
+                pack.contains(&format!("`{name}`")),
+                "registered tool `{name}` is undocumented in the loomweave-workflow pack — \
+                 document it (or its containing table row) in SKILL.md or a references/ file \
+                 so the skill covers the live catalogue"
             );
         }
+    }
+
+    /// C-20 budgets the always-loaded skill surface: the frontmatter
+    /// description is loaded into the skill listing every session (invoked or
+    /// not) and the `SKILL.md` body is loaded whenever the skill is opened.
+    /// Overflow relocates to `references/*.md`, which are read on demand and
+    /// are therefore unbudgeted.
+    #[test]
+    fn skill_md_fits_the_c20_budget() {
+        let skill = super::LOOMWEAVE_WORKFLOW_SKILL;
+        let body = skill
+            .splitn(3, "---\n")
+            .nth(2)
+            .expect("SKILL.md has YAML frontmatter");
+        let body_chars = body.chars().count();
+        assert!(
+            body_chars <= 4_000,
+            "SKILL.md body is {body_chars} chars (C-20 budget 4000) — relocate depth into \
+             references/*.md, never delete it"
+        );
+
+        let description: String = skill
+            .lines()
+            .skip_while(|line| !line.starts_with("description:"))
+            .skip(1)
+            .take_while(|line| line.starts_with("  "))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let description_chars = description.chars().count();
+        assert!(
+            description_chars > 0,
+            "could not read the folded frontmatter description"
+        );
+        assert!(
+            description_chars <= 500,
+            "SKILL.md frontmatter description is {description_chars} chars (C-20 budget 500)"
+        );
+    }
+
+    /// Every `references/…` path SKILL.md points at must exist in the pack, or
+    /// the C-20 relocation strands the reader: the depth left SKILL.md and the
+    /// pointer leads nowhere. The pack ships together, so this is checkable.
+    #[test]
+    fn skill_md_reference_pointers_resolve() {
+        let shipped: std::collections::BTreeSet<&str> = super::WORKFLOW_SKILL_FILES
+            .iter()
+            .map(|(path, _)| *path)
+            .collect();
+        let mut seen = 0usize;
+        for (idx, _) in super::LOOMWEAVE_WORKFLOW_SKILL.match_indices("references/") {
+            let rest = &super::LOOMWEAVE_WORKFLOW_SKILL[idx..];
+            let path: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || "/-_.".contains(*c))
+                .collect();
+            assert!(
+                shipped.contains(path.as_str()),
+                "SKILL.md points at {path}, which the skill pack does not ship"
+            );
+            seen += 1;
+        }
+        assert!(seen > 0, "SKILL.md names no references/ file");
+        assert!(
+            shipped.len() > 1,
+            "the pack ships no reference files at all"
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::hardened_git::hardened_git_command;
-use crate::store::store_dir;
+use crate::store::store_dir_resolution;
 use crate::worktree::paths::StorePaths;
 
 /// The tracked, user-edited Loomweave config file name at a project root.
@@ -161,6 +161,17 @@ pub struct WorktreeContext {
     /// the same `repository_store` regardless of which checkout initiated
     /// the resolve.
     pub repository_store: PathBuf,
+    /// Whether `repository_store` came from a `[loomweave].store_dir`
+    /// override in `weft.toml` (`true`) or the built-in `.weft/loomweave/`
+    /// default (`false`) — recorded at resolve time. Safety decisions keyed
+    /// on the override (the cleanup sweep's report-only mode: an absolute
+    /// override can be shared between unrelated repositories) must consult
+    /// this field, never re-read `weft.toml` at decision time: `analyze`
+    /// resolves its context at start but sweeps at the end of a long run,
+    /// and an override removed in between must not flip the sweep into
+    /// delete mode against paths that were resolved under the override
+    /// (clarion-306ed41ce3).
+    pub store_dir_overridden: bool,
     /// The store this checkout actually reads and writes:
     /// `repository_store` unless `kind` is [`WorktreeKind::Linked`], in
     /// which case `repository_store/worktrees/<stable_id>`.
@@ -220,7 +231,7 @@ impl WorktreeContext {
     /// Build a context that uses its own, unchanged store (standalone or
     /// main).
     fn own_store(kind: WorktreeKind, source_root: PathBuf) -> Self {
-        let repository_store = store_dir(&source_root);
+        let (repository_store, store_dir_overridden) = store_dir_resolution(&source_root);
         let config_origin = resolve_config_origin(&source_root, &source_root);
         Self {
             kind,
@@ -228,6 +239,7 @@ impl WorktreeContext {
             effective_store: repository_store.clone(),
             store_paths: StorePaths::under(&repository_store),
             repository_store,
+            store_dir_overridden,
             config_origin,
             stable_id: None,
             git_admin_identity: None,
@@ -265,7 +277,7 @@ impl WorktreeContext {
         stable_id: String,
         admin_identity: String,
     ) -> Self {
-        let repository_store = store_dir(&primary_root);
+        let (repository_store, store_dir_overridden) = store_dir_resolution(&primary_root);
         let effective_store = repository_store.join("worktrees").join(&stable_id);
         let config_origin = resolve_config_origin(&source_root, &primary_root);
         Self {
@@ -274,6 +286,7 @@ impl WorktreeContext {
             primary_root,
             store_paths: StorePaths::under(&effective_store),
             repository_store,
+            store_dir_overridden,
             effective_store,
             config_origin,
             stable_id: Some(stable_id),
@@ -367,6 +380,16 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
         .to_str()
         .ok_or_else(|| WorktreeContextError::non_utf8_path("admin-identity", admin_identity_path))?
         .to_owned();
+    // Windows: `Path::strip_prefix` yields `worktrees\<name>`, but the
+    // stable-ID contract (and the sweep, which hashes `"worktrees/" +
+    // <readdir name>`) pins the forward-slash form — without this the
+    // resolver and the sweep would hash DIVERGENT identities and the sweep
+    // would read every live store as unregistered (clarion-4cd5b0b3b9).
+    // Unix stays byte-exact: `\` is a legal filename byte there, and
+    // rewriting it would desynchronize this identity from the sweep's raw
+    // `readdir` name in the opposite direction.
+    #[cfg(windows)]
+    let admin_identity = admin_identity.replace('\\', "/");
 
     let stable_id = stable_id_for_admin_identity(&admin_identity);
 

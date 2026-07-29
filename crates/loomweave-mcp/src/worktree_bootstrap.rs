@@ -32,8 +32,11 @@ use rusqlite::Connection;
 /// **Governed by "does a completed row exist at all," not "the most recent
 /// row"**: once any run has completed, readiness is `Ready` regardless of
 /// what a *later* run row says — see [`read_worktree_readiness`] for why.
+/// Public (not `pub(crate)`): `loomweave-cli`'s HTTP read API gates on the
+/// same readiness consult as the MCP tools (clarion-ecf882f230), so the
+/// classification and the query live here exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorktreeReadiness {
+pub enum WorktreeReadiness {
     /// No run has ever completed: either no run row exists yet, or the most
     /// recent row (by `started_at`) is `running` (or an unrecognized future
     /// status).
@@ -51,9 +54,9 @@ pub(crate) enum WorktreeReadiness {
 /// The outcome of a readiness read: the classified state plus the run id (if
 /// any row exists at all) so callers can surface it in error diagnostics.
 #[derive(Debug, Clone)]
-pub(crate) struct ReadinessRead {
-    pub(crate) readiness: WorktreeReadiness,
-    pub(crate) run_id: Option<String>,
+pub struct ReadinessRead {
+    pub readiness: WorktreeReadiness,
+    pub run_id: Option<String>,
 }
 
 /// Classify readiness from a single `runs.status` value, or `None` when no
@@ -101,7 +104,7 @@ pub(crate) fn classify_readiness(status: Option<&str>) -> WorktreeReadiness {
 /// Fail-safe on a query error: logs a warning and reports [`WorktreeReadiness::Building`]
 /// rather than risk answering `Ready` (and unblocking graph tools) against a
 /// read that could not actually be verified.
-pub(crate) fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
+pub fn read_worktree_readiness(conn: &Connection) -> ReadinessRead {
     match conn.query_row(
         "SELECT id, status FROM runs \
          ORDER BY \
@@ -169,11 +172,21 @@ pub fn fallback_argv(target: &Path) -> Vec<String> {
 /// (true fire-and-forget, mirroring `hook.rs::spawn_detached_analyze`'s
 /// detachment technique). Tests use this function directly so they can
 /// deterministically `wait()` on the child instead of polling.
-pub(crate) fn spawn_worktree_analyze(program: &Path, target: &Path) -> std::io::Result<Child> {
+pub(crate) fn spawn_worktree_analyze(
+    program: &Path,
+    target: &Path,
+    explicit_config: Option<&Path>,
+) -> std::io::Result<Child> {
     let mut command = Command::new(program);
+    command.arg("worktree").arg("analyze");
+    // Forward ONLY an explicit `--config` (clarion-c39b92b868): with none,
+    // the child re-derives the same source→primary ladder `serve` used, so
+    // no forwarding is needed — but an operator-supplied explicit path is
+    // information the child cannot re-derive.
+    if let Some(config) = explicit_config {
+        command.arg("--config").arg(config);
+    }
     command
-        .arg("worktree")
-        .arg("analyze")
         .arg("--")
         .arg(target)
         .stdin(Stdio::null())
@@ -196,9 +209,18 @@ pub(crate) fn spawn_worktree_analyze(program: &Path, target: &Path) -> std::io::
 /// the executable disappeared) is logged and swallowed — `serve` must keep
 /// running in the `building` state either way; the documented fallback is
 /// running `loomweave worktree analyze` by hand.
-pub fn spawn_detached_worktree_analyze(program: &Path, target: &Path) {
-    match spawn_worktree_analyze(program, target) {
-        Ok(_child) => {}
+/// Returns whether the spawn SUCCEEDED — the failure is still logged and
+/// swallowed here (serve keeps running in the `building` state either way),
+/// but the caller records it on the gate so `project_status_get` can report
+/// `bootstrap-spawn-failed` instead of an indistinguishable forever-building
+/// state (clarion-917df0e1ad).
+pub fn spawn_detached_worktree_analyze(
+    program: &Path,
+    target: &Path,
+    explicit_config: Option<&Path>,
+) -> bool {
+    match spawn_worktree_analyze(program, target, explicit_config) {
+        Ok(_child) => true,
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -207,6 +229,7 @@ pub fn spawn_detached_worktree_analyze(program: &Path, target: &Path) {
                 "worktree bootstrap: failed to spawn detached `loomweave worktree analyze`; \
                  the index will stay in the building state until it is run manually"
             );
+            false
         }
     }
 }
@@ -420,7 +443,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         drop(file);
 
-        let mut child = spawn_worktree_analyze(&script, dir.path()).expect("spawn stub");
+        let mut child = spawn_worktree_analyze(&script, dir.path(), None).expect("spawn stub");
         child.wait().expect("reap stub");
 
         let where_fd1 = std::fs::read_to_string(&marker).expect("stub wrote fd1 target");
@@ -452,7 +475,7 @@ mod tests {
         drop(file);
 
         let target = dir.path().join("target-worktree");
-        let mut child = spawn_worktree_analyze(&script, &target).expect("spawn stub");
+        let mut child = spawn_worktree_analyze(&script, &target, None).expect("spawn stub");
         child.wait().expect("reap stub");
 
         let argv = std::fs::read_to_string(&argv_dump).expect("stub wrote argv");

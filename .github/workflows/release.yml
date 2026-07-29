@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
 
@@ -96,7 +96,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
@@ -171,7 +171,7 @@ jobs:
             runner: macos-14
             manylinux: auto
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -230,7 +230,7 @@ jobs:
             runner: macos-14
             manylinux: auto
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -273,7 +273,7 @@ jobs:
     name: Build Python plugin sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -453,12 +453,19 @@ jobs:
     # idempotent here: an already-uploaded version counts as success, so a re-run
     # after a partial failure is safe. Crates upload leaf -> root; each upload
     # waits for the crates.io index before its dependents publish.
-    # loomweave-plugin-fixture is publish=false (test-only) and omitted.
+    # Two workspace crates are publish=false (test-only) and deliberately
+    # omitted from the order below: loomweave-plugin-fixture and
+    # loomweave-worktree-confine-probe. Both enter loomweave-cli only as
+    # path-only dev-dependencies, which cargo strips at packaging — so their
+    # absence here cannot partial-fail a release the way a missing
+    # PUBLISHABLE crate did in v1.4.0 (see the loomweave-llm note below).
+    # When auditing this list against [workspace.members], expect the count
+    # to differ by exactly those two.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
@@ -536,7 +543,7 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
 
@@ -647,7 +654,7 @@ jobs:
           echo "notes-file=NOTES.md" >> "$GITHUB_OUTPUT"
 
       - name: create release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
         with:
           tag_name: ${{ github.ref_name }}
           name: Loomweave ${{ github.ref_name }}
