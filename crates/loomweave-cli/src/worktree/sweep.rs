@@ -152,6 +152,38 @@ pub fn sweep_best_effort(ctx: &WorktreeContext) {
 /// caller needs to branch on it — deliberately not `#[must_use]`, since
 /// discarding it (as [`sweep_best_effort`] effectively does after logging)
 /// is the expected production usage, not a bug.
+/// Whether `repository_store` resolves through a symlink in any of its
+/// components (clarion-a93b43923e). The path is built from the CANONICALIZED
+/// primary root plus literal components (`WorktreeContext::resolve`
+/// canonicalizes; an active override forces report-only before this check is
+/// consulted), so it equals its own canonicalization exactly when no
+/// component is a symlink. An unresolvable path — the store does not exist
+/// yet — reports `false`: there is nothing beneath it to protect, and the
+/// sweep's own enumeration fails first anyway.
+fn store_path_reaches_through_symlink(repository_store: &Path) -> bool {
+    match fs::canonicalize(repository_store) {
+        Ok(canonical) => canonical != repository_store,
+        Err(_) => false,
+    }
+}
+
+/// Log every would-be deletion once with the report-only `cause` and return
+/// [`SweepOutcome::ReportOnly`] — shared by the override and symlink-prefix
+/// guards, which differ only in why deletion is withheld.
+fn report_only(cause: &str, to_delete: Vec<String>) -> SweepOutcome {
+    for name in &to_delete {
+        info!(
+            candidate = name.as_str(),
+            cause,
+            "worktree cleanup sweep: would delete this unregistered candidate, but report-only \
+             mode deletes nothing"
+        );
+    }
+    SweepOutcome::ReportOnly {
+        would_delete: to_delete,
+    }
+}
+
 pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
     let worktrees_dir = ctx.repository_store.join(WORKTREES_DIR_NAME);
     if !worktrees_dir.is_dir() {
@@ -256,16 +288,23 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
         .partition(|name| !registered.contains(name));
 
     if ctx.store_dir_overridden {
-        for name in &to_delete {
-            info!(
-                candidate = name.as_str(),
-                "worktree cleanup sweep: store_dir override active; would delete this \
-                 unregistered candidate, but report-only mode deletes nothing"
-            );
-        }
-        return SweepOutcome::ReportOnly {
-            would_delete: to_delete,
-        };
+        return report_only("store_dir override active", to_delete);
+    }
+
+    // Symlink analogue of the override case (clarion-a93b43923e): a store
+    // path that reaches through a symlink (`.weft` or `.weft/loomweave`
+    // linking elsewhere — stores relocated to another disk) may be SHARED
+    // between repositories exactly like an absolute override, and carries no
+    // `weft.toml` signal to key report-only mode on. `openat2`'s confinement
+    // only starts AT whatever the prefix resolved to, so the pinned-handle
+    // mechanism cannot see this either. `ctx.repository_store` is the
+    // canonicalized primary root plus literal components, so it equals its
+    // own canonicalization exactly when no appended component is a symlink.
+    if store_path_reaches_through_symlink(&ctx.repository_store) {
+        return report_only(
+            "store path resolves through a symlink (possibly shared between repositories)",
+            to_delete,
+        );
     }
 
     let root = match WorktreesRoot::open(&worktrees_dir) {

@@ -380,6 +380,52 @@ fn override_store_dir_makes_sweep_report_only() {
     );
 }
 
+/// clarion-a93b43923e: a store path that reaches through a symlink is the
+/// symlink analogue of the shared `store_dir` override — two repositories
+/// whose `.weft/loomweave` link to one shared directory would let repo A's
+/// registered set authorize deleting repo B's live stores, and unlike the
+/// `weft.toml` route there is no override signal to key on. Such a store
+/// sweeps report-only.
+#[test]
+fn symlinked_store_prefix_makes_sweep_report_only() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+
+    // Relocate the store behind a symlink: `.weft/loomweave -> ../shared`.
+    let shared = tmp.path().join("shared-store");
+    fs::create_dir_all(&shared).unwrap();
+    let weft = repo.join(".weft");
+    fs::create_dir_all(&weft).unwrap();
+    std::os::unix::fs::symlink(&shared, weft.join("loomweave")).unwrap();
+
+    let ctx = WorktreeContext::resolve(&repo).expect("resolves as Main");
+    assert!(
+        ctx.repository_store.starts_with(&repo),
+        "sanity: the literal store path stays under the repo: {}",
+        ctx.repository_store.display()
+    );
+
+    let worktrees_dir = ctx.repository_store.join("worktrees");
+    fs::create_dir_all(&worktrees_dir).unwrap();
+    let name = fake_candidate('c');
+    let candidate = worktrees_dir.join(&name);
+    fs::create_dir(&candidate).unwrap();
+
+    let outcome = sweep_worktree_stores(&ctx);
+
+    assert_eq!(
+        outcome,
+        SweepOutcome::ReportOnly {
+            would_delete: vec![name],
+        }
+    );
+    assert!(
+        candidate.is_dir(),
+        "a symlink-reached store must never be delete-swept"
+    );
+}
+
 /// The override decision must be the state the context was *resolved* under,
 /// not a fresh config read at sweep time: `analyze` resolves its context at
 /// start but sweeps at the end of a 20–30 minute run, and an override
