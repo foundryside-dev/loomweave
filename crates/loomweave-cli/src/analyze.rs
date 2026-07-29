@@ -530,6 +530,46 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         }
     }
 
+    // Reject `rule_id_prefix` collisions across plugins (clarion-9988bd9ced):
+    // the per-plugin syntax-finding sweep, subcode validation, and finding
+    // attribution all key on the prefix, and two plugins sharing one would
+    // merge their sweep scopes — letting plugin A's clean classification of a
+    // shared file retire plugin B's findings on it. Which of the colliding
+    // manifests is "right" is unknowable here, so every plugin in a colliding
+    // group is dropped (loudly, into `discovery_errors` — visible in
+    // classifier coverage); if that empties the set, the run fails via the
+    // discovery-error path below rather than reporting `skipped_no_plugins`.
+    {
+        let mut prefix_counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for plugin in &plugins {
+            *prefix_counts
+                .entry(plugin.manifest.ontology.rule_id_prefix.as_str())
+                .or_insert(0) += 1;
+        }
+        let colliding: Vec<String> = prefix_counts
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(prefix, _)| (*prefix).to_owned())
+            .collect();
+        plugins.retain(|plugin| {
+            let prefix = &plugin.manifest.ontology.rule_id_prefix;
+            if colliding.iter().any(|c| c == prefix) {
+                let msg = format!(
+                    "plugin {:?} dropped: rule_id_prefix {prefix:?} is also declared by another \
+                     discovered plugin — prefixes must be unique per plugin, or findings and the \
+                     syntax-finding sweep cannot be safely attributed",
+                    plugin.manifest.plugin.plugin_id
+                );
+                tracing::error!(error = %msg, "skipping plugin: rule_id_prefix collision");
+                discovery_errors.push(msg);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     if plugins.is_empty() {
         // Distinguish "no plugins installed" (SkippedNoPlugins — expected on a
         // bare machine) from "plugins present but all failed discovery" (FailRun
@@ -537,7 +577,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // latter as `skipped_no_plugins` hides bugs.
         if !discovery_errors.is_empty() {
             let reason = format!(
-                "all {} discovered plugin manifest(s) failed to parse: {}",
+                "all {} discovered plugin(s) failed discovery or validation: {}",
                 discovery_errors.len(),
                 discovery_errors.join("; ")
             );

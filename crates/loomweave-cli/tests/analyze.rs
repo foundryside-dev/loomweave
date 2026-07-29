@@ -6069,6 +6069,12 @@ fn write_numbered_crashing_plugin(plugin_dir: &std::path::Path, index: usize) {
         .replace(
             "extensions = [\"crx\"]",
             &format!("extensions = [\"{extension}\"]"),
+        )
+        // Prefixes must be unique per plugin (clarion-9988bd9ced) — a shared
+        // one would get every numbered fixture dropped at discovery.
+        .replace(
+            "rule_id_prefix = \"LMWV-CRASH-\"",
+            &format!("rule_id_prefix = \"LMWV-CRASH{index}-\""),
         );
     let plugin_script = plugin_dir.join(&executable);
     std::fs::write(&plugin_script, script).unwrap();
@@ -6371,4 +6377,67 @@ fn analyze_persists_timeout_finding_for_hanging_plugin() {
         crash_count, 0,
         "no redundant LMWV-INFRA-PLUGIN-CRASH when the cause is a timeout"
     );
+}
+
+/// clarion-9988bd9ced: two plugins declaring the same `rule_id_prefix`
+/// cannot be safely attributed — the per-plugin syntax-finding sweep,
+/// subcode validation, and finding attribution all key on the prefix, so a
+/// collision would let plugin A's clean classification of a shared file
+/// retire plugin B's findings on it. Every plugin in a colliding group is
+/// dropped loudly; with no other plugin present the run fails via the
+/// discovery-error path instead of reporting `skipped_no_plugins`.
+#[cfg(unix)]
+#[test]
+fn analyze_fails_loud_on_rule_id_prefix_collision() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    write_sweep_plugin_variant(
+        a_dir.path(),
+        "loomweave-plugin-dupa",
+        "dupafixture",
+        "LMWV-SWP-",
+        "0.1.0",
+    );
+    write_sweep_plugin_variant(
+        b_dir.path(),
+        "loomweave-plugin-dupb",
+        "dupbfixture",
+        "LMWV-SWP-",
+        "0.1.0",
+    );
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    std::fs::write(project_dir.path().join("mod_a.swp"), b"ok\n").unwrap();
+    let plugin_path =
+        std::env::join_paths([a_dir.path().to_path_buf(), b_dir.path().to_path_buf()]).unwrap();
+
+    let output = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .output()
+        .expect("run analyze");
+    assert!(
+        !output.status.success(),
+        "a whole-set prefix collision must fail the run, not report skipped_no_plugins"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rule_id_prefix"),
+        "the failure must name the collision: {stderr}"
+    );
+
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query latest run status");
+    assert_eq!(status, "failed", "the run row must record the failure");
 }
