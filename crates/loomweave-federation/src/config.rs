@@ -846,14 +846,18 @@ where
         }
         LlmProviderKind::CodexCli => {
             let live_env_opt_in = env_lookup("LOOMWEAVE_LLM_LIVE").as_deref() == Some("1");
-            if !config.llm.allow_live_provider && !live_env_opt_in {
+            // Unlike an API provider, a locally authenticated CLI needs no
+            // credential outside the repository config.  Require an
+            // out-of-band opt-in so an untrusted loomweave.yaml cannot both
+            // select an arbitrary executable and authorize spawning it.
+            if !live_env_opt_in {
                 return Ok(ProviderSelection::Disabled);
             }
             Ok(ProviderSelection::CodexCli)
         }
         LlmProviderKind::ClaudeCli => {
             let live_env_opt_in = env_lookup("LOOMWEAVE_LLM_LIVE").as_deref() == Some("1");
-            if !config.llm.allow_live_provider && !live_env_opt_in {
+            if !live_env_opt_in {
                 return Ok(ProviderSelection::Disabled);
             }
             Ok(ProviderSelection::ClaudeCli)
@@ -1482,7 +1486,13 @@ llm_policy:
         assert_eq!(cfg.llm.codex_cli.timeout_seconds, 30);
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
-        assert_eq!(selected, ProviderSelection::CodexCli);
+        assert_eq!(selected, ProviderSelection::Disabled);
+
+        let env_selected = select_provider_with_env(&cfg, |name| {
+            (name == "LOOMWEAVE_LLM_LIVE").then(|| "1".to_owned())
+        })
+        .expect("provider selection via independent env opt-in");
+        assert_eq!(env_selected, ProviderSelection::CodexCli);
     }
 
     #[test]
@@ -1544,7 +1554,13 @@ llm_policy:
         assert!(cfg.llm.claude_cli.no_session_persistence);
 
         let selected = select_provider_with_env(&cfg, |_| None).expect("provider selection");
-        assert_eq!(selected, ProviderSelection::ClaudeCli);
+        assert_eq!(selected, ProviderSelection::Disabled);
+
+        let env_selected = select_provider_with_env(&cfg, |name| {
+            (name == "LOOMWEAVE_LLM_LIVE").then(|| "1".to_owned())
+        })
+        .expect("provider selection via independent env opt-in");
+        assert_eq!(env_selected, ProviderSelection::ClaudeCli);
     }
 
     #[test]

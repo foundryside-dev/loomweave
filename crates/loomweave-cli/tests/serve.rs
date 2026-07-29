@@ -2553,6 +2553,7 @@ fn call_summary_through_serve(project_root: &Path) -> Value {
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("loomweave"))
         .args(["serve", "--path"])
         .arg(project_root)
+        .env("LOOMWEAVE_LLM_LIVE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -103,9 +103,13 @@ internal tool turn and then emits the final JSON result.
 
 ## Live Opt-In
 
-`llm_policy.enabled: true` is not enough for any live provider. Set
-`allow_live_provider: true` with `loomweave config llm set --enable --allow-live`
-or in `loomweave.yaml`, or launch with:
+`llm_policy.enabled: true` is not enough for any live provider. OpenRouter can
+be enabled by setting `allow_live_provider: true` with
+`loomweave config llm set --enable --allow-live` or in `loomweave.yaml`.
+
+Local CLI providers always require the independent environment opt-in below,
+even when `allow_live_provider: true` is present. This prevents a repository's
+`loomweave.yaml` from authorizing execution of a repository-selected program:
 
 ```sh
 LOOMWEAVE_LLM_LIVE=1 loomweave serve --path .
