@@ -1132,9 +1132,7 @@ fn db_tracked_state(project_root: &Path) -> DbTrackedState {
         // Store dir is outside the repo — this repo cannot be tracking it.
         return DbTrackedState::Untracked;
     };
-    let tracked = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let tracked = loomweave_core::hardened_git_command(project_root)
         .args(["ls-files", "--error-unmatch", "--"])
         .arg(rel)
         .output()
@@ -1154,9 +1152,7 @@ fn git_untrack_db(project_root: &Path) -> Result<()> {
     let rel = store
         .strip_prefix(project_root)
         .context("store dir is outside the project root; cannot git rm --cached")?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let status = loomweave_core::hardened_git_command(project_root)
         .args(["rm", "--cached", "-q", "--ignore-unmatch", "--"])
         .arg(rel.join("loomweave.db"))
         .arg(rel.join("loomweave.db-wal"))
@@ -2398,6 +2394,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_db(dir.path());
         assert_eq!(db_tracked_state(dir.path()), DbTrackedState::Untracked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_git_operations_do_not_run_repo_configured_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        write_db(root);
+        run_git(root, &["add", "-f", ".weft/loomweave/loomweave.db"]);
+
+        let monitor = root.join(".git/evil-fsmonitor");
+        std::fs::write(&monitor, "#!/bin/sh\ntouch fsmonitor-ran\n").unwrap();
+        let mut permissions = std::fs::metadata(&monitor).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&monitor, permissions).unwrap();
+        run_git(root, &["config", "core.fsmonitor", ".git/evil-fsmonitor"]);
+
+        assert_eq!(db_tracked_state(root), DbTrackedState::Tracked);
+        git_untrack_db(root).expect("untrack succeeds");
+        assert!(
+            !root.join("fsmonitor-ran").exists(),
+            "doctor's git commands must disable repo-configured fsmonitor hooks"
+        );
     }
 
     /// Materialise `<root>/.weft/loomweave/.gitignore` with the given bytes,
