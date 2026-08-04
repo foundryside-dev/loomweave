@@ -368,7 +368,7 @@ jobs:
           ls -la pkg-plugin
 
       - name: publish loomweave-plugin-python
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           packages-dir: pkg-plugin
           attestations: true
@@ -404,7 +404,7 @@ jobs:
           ls -la pkg-rust-plugin
 
       - name: publish loomweave-plugin-rust
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           packages-dir: pkg-rust-plugin
           attestations: true
@@ -438,7 +438,7 @@ jobs:
           ls -la pkg-loomweave
 
       - name: publish loomweave
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           packages-dir: pkg-loomweave
           attestations: true
