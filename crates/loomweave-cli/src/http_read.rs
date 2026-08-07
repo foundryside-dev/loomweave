@@ -602,7 +602,10 @@ pub(crate) async fn require_worktree_ready(
     let Some(gate) = state.worktree_gate.clone() else {
         return next.run(request).await;
     };
-    if !state.project_root.exists() {
+    // Confirmed-missing only (`Path::try_exists` semantics): a transient
+    // stat error must not be answered as a permanent, non-retryable 410 —
+    // see `loomweave_mcp::source_root_confirmed_missing`.
+    if loomweave_mcp::source_root_confirmed_missing(&state.project_root) {
         let body = serde_json::json!({
             "error": format!(
                 "the worktree source root {} no longer exists; this serve session cannot answer for a removed tree",
