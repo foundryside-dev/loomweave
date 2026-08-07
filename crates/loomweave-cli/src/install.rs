@@ -544,6 +544,16 @@ fn install_hooks(project_root: &Path) -> Result<()> {
     } else {
         println!("loomweave SessionStart hook already present");
     }
+    match crate::git_hooks::install_git_sync_hooks(project_root)
+        .context("merge git-sync managed block into git hooks")?
+    {
+        Some(true) => println!(
+            "Added loomweave git-sync block to {} git hooks (post-commit, post-checkout, post-merge)",
+            project_root.display()
+        ),
+        Some(false) => println!("loomweave git-sync git hooks already present"),
+        None => println!("no git repository detected; skipped git-sync hooks"),
+    }
     Ok(())
 }
 

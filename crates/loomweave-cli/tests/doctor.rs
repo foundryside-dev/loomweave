@@ -2694,3 +2694,36 @@ fn doctor_rejects_a_malformed_linked_worktree_instance_id() {
         "{instance}"
     );
 }
+
+/// `doctor --fix` installs the managed git-sync hooks into a repo that gained
+/// git after install, and a repeat doctor run sees them as present — the
+/// warning → fixed → ok lifecycle for `hook.git_sync`.
+#[test]
+fn doctor_fix_installs_missing_git_sync_hooks() {
+    let project = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], project.path());
+    write_healthy_db(project.path());
+    // Repo gains git AFTER install: the read-only doctor must warn (not gate),
+    // and --fix must converge the hooks to present.
+    run_git(project.path(), &["init", "-q"]);
+
+    let (code, json) = doctor_json(project.path(), false);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["status"], "warning", "{hooks}");
+    assert_eq!(code, 0, "a missing enrichment must not gate-fail: {json}");
+
+    let (_, json) = doctor_json(project.path(), true);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["fixed"], true, "{hooks}");
+
+    let (code, json) = doctor_json(project.path(), false);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["status"], "ok", "{hooks}");
+    assert_eq!(code, 0, "{json}");
+    let hook_file = project.path().join(".git/hooks/post-commit");
+    let content = std::fs::read_to_string(hook_file).unwrap();
+    assert!(
+        content.contains("loomweave hook git-sync --path ."),
+        "installed hook must run git-sync: {content}"
+    );
+}

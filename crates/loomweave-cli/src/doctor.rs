@@ -88,6 +88,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     let mut tally = Tally::default();
     tally += check_skill(&project_root, fix);
     tally += check_hook(&project_root, fix);
+    tally += check_git_hooks(&project_root, fix);
     tally += check_mcp(&project_root, fix);
     tally += check_instructions(&project_root, fix);
     tally += check_integration_bindings(&project_root, fix);
@@ -232,6 +233,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_plugin_availability_json(),
         check_skill_json(project_root, fix),
         check_hook_json(project_root, fix),
+        check_git_hooks_json(project_root, fix),
         check_mcp_json(project_root, fix),
         check_instructions_json(project_root, fix),
         check_http_config_json(project_root),
@@ -1743,6 +1745,47 @@ fn check_hook_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     }
 }
 
+fn check_git_hooks_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    use crate::git_hooks::GitHookState;
+    match crate::git_hooks::git_sync_hook_state(project_root) {
+        GitHookState::Present => DoctorJsonCheck::ok(
+            "hook.git_sync",
+            "git-sync hooks present (post-commit/post-checkout/post-merge)",
+        ),
+        GitHookState::NoGitDir => DoctorJsonCheck::ok(
+            "hook.git_sync",
+            "no git repository; git-sync hooks not applicable",
+        ),
+        state => {
+            let what = match state {
+                GitHookState::Missing => "git-sync git hooks missing",
+                GitHookState::Stale => "git-sync git hooks stale (outdated or partial block)",
+                GitHookState::Present | GitHookState::NoGitDir => unreachable!(),
+            };
+            // Same severity posture as the text surface: warn, do not gate.
+            if !fix {
+                return DoctorJsonCheck::warning("hook.git_sync", what);
+            }
+            match crate::git_hooks::install_git_sync_hooks(project_root) {
+                Ok(Some(_))
+                    if crate::git_hooks::git_sync_hook_state(project_root)
+                        == GitHookState::Present =>
+                {
+                    DoctorJsonCheck::fixed("hook.git_sync", format!("{what}; fixed"))
+                }
+                Ok(_) => DoctorJsonCheck::problem(
+                    "hook.git_sync",
+                    format!("{what}; repair did not converge"),
+                ),
+                Err(err) => DoctorJsonCheck::problem(
+                    "hook.git_sync",
+                    format!("{what}; repair failed: {err}"),
+                ),
+            }
+        }
+    }
+}
+
 fn check_mcp_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     match mcp_registration::mcp_entry_state(project_root) {
         McpState::Present => DoctorJsonCheck::ok(
@@ -2568,6 +2611,40 @@ fn check_hook(project_root: &Path, fix: bool) -> Tally {
                 Ok(_)
                     if hooks_settings::session_start_hook_state(project_root)
                         == HookState::Present =>
+                {
+                    ok(&format!("{what} — fixed"))
+                }
+                Ok(_) => problem(&format!("{what} — repair did not converge"), None),
+                Err(err) => problem(&format!("{what} — repair failed: {err}"), None),
+            }
+        }
+    }
+}
+
+fn check_git_hooks(project_root: &Path, fix: bool) -> Tally {
+    use crate::git_hooks::GitHookState;
+    match crate::git_hooks::git_sync_hook_state(project_root) {
+        GitHookState::Present => {
+            ok("git-sync hooks present (post-commit/post-checkout/post-merge)")
+        }
+        // Not a git repo: git-sync has nowhere to live and that is fine.
+        GitHookState::NoGitDir => ok("no git repository; git-sync hooks not applicable"),
+        state => {
+            let what = match state {
+                GitHookState::Missing => "git-sync git hooks missing",
+                GitHookState::Stale => "git-sync git hooks stale (outdated or partial block)",
+                GitHookState::Present | GitHookState::NoGitDir => unreachable!(),
+            };
+            // Freshness enrichment, not a correctness requirement: a project
+            // installed before `git init` (or one that never re-ran install)
+            // must not gate-fail doctor. Warn with the repair nudge instead.
+            if !fix {
+                return warn(what, Some("loomweave install --hooks"));
+            }
+            match crate::git_hooks::install_git_sync_hooks(project_root) {
+                Ok(Some(_))
+                    if crate::git_hooks::git_sync_hook_state(project_root)
+                        == GitHookState::Present =>
                 {
                     ok(&format!("{what} — fixed"))
                 }
