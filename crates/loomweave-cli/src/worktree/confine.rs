@@ -43,11 +43,17 @@
 //!   `openat2` checks re-enforce confinement independently on every entry
 //!   in the delete pass too.
 //! - Off Linux — or on a Linux kernel old enough that `openat2` itself
-//!   returns [`rustix::io::Errno::NOSYS`] — [`refuse_unsupported`] is used:
-//!   nothing is deleted, unconditionally. This is the platform's hard
-//!   floor, not a best-effort fallback: a platform without race-resistant,
-//!   handle-relative, no-cross-mount traversal simply has no mechanism this
-//!   module trusts.
+//!   returns [`rustix::io::Errno::NOSYS`] (pre-5.6) — [`refuse_unsupported`]
+//!   is used: nothing is deleted, unconditionally. This is the platform's
+//!   hard floor, not a best-effort fallback: a platform without
+//!   race-resistant, handle-relative, no-cross-mount traversal simply has no
+//!   mechanism this module trusts. The hard floor applies to **deletion
+//!   only**: on such a kernel [`WorktreesRoot::open`] itself fails with
+//!   `ENOSYS` (its pin *is* an `openat2` call), and the sweep keeps its
+//!   report-only visibility by recognizing that failure via
+//!   [`error_signals_missing_openat2`] and enumerating through
+//!   [`unpinned_candidate_names`] instead — a plain `read_dir` view that
+//!   never authorizes a deletion.
 //!
 //! No `remove_dir_all` on a string path exists anywhere in this module —
 //! every deletion is a single-component `unlinkat` relative to a
@@ -190,6 +196,61 @@ pub fn refuse_unsupported(candidate_name: &str, reason: &str) -> DeleteOutcome {
     DeleteOutcome::UnsupportedPlatform
 }
 
+/// Whether an [`io::Error`] from [`WorktreesRoot::open`] means the running
+/// kernel has no `openat2(2)` at all (Linux pre-5.6: `ENOSYS`) — the one
+/// open failure a sweep may degrade on, keeping report-only visibility via
+/// [`unpinned_candidate_names`] while deletion stays refused as
+/// [`DeleteOutcome::UnsupportedPlatform`]. Every other failure (missing
+/// directory, permission denied, symlink refused, ...) is a real
+/// unreadable-store condition and must abort, not degrade.
+///
+/// Kept as a plain error-kind predicate precisely so the degradation
+/// decision is unit-testable on modern kernels, where a real `ENOSYS`
+/// cannot be provoked (see `sweep.rs`'s
+/// `enosys_pin_failure_selects_the_unpinned_report_only_root`).
+pub fn error_signals_missing_openat2(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(rustix::io::Errno::NOSYS.raw_os_error())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Enumerate grammar-valid direct-child store names of `worktrees_dir` via
+/// a plain, path-based `read_dir` — **no pinned handle, no inode-stability
+/// property**. This is the report-only fallback view for a Linux kernel
+/// without `openat2` (where [`WorktreesRoot::open`] fails with `ENOSYS`,
+/// see [`error_signals_missing_openat2`]): it lets a sweep still *report*
+/// what it would have considered, but it must never feed a deletion — the
+/// deletion path hard-requires [`WorktreesRoot`]'s pinned handle, and on
+/// such a kernel every deletion refuses
+/// [`DeleteOutcome::UnsupportedPlatform`] anyway.
+///
+/// # Errors
+///
+/// Returns any `read_dir`/metadata error from enumerating `worktrees_dir`.
+pub fn unpinned_candidate_names(worktrees_dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(worktrees_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if matches_worktree_store_grammar(&name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// A pinned handle to a repository's `<store>/worktrees/` directory.
 ///
 /// [`delete_worktree_store`](Self::delete_worktree_store) is always
@@ -225,7 +286,11 @@ impl WorktreesRoot {
     /// # Errors
     ///
     /// Returns an error if `worktrees_dir` cannot be opened as a directory
-    /// (missing, not a directory, or a symlink).
+    /// (missing, not a directory, or a symlink). On a Linux kernel without
+    /// `openat2` (pre-5.6) the pin itself fails with `ENOSYS` — callers
+    /// that only need report-only visibility should recognize that one case
+    /// via [`error_signals_missing_openat2`] and fall back to
+    /// [`unpinned_candidate_names`]; deletion has no fallback.
     pub fn open(worktrees_dir: &Path) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -306,22 +371,10 @@ impl WorktreesRoot {
         }
         #[cfg(not(unix))]
         {
+            // No fd primitive here; same path-based view as the report-only
+            // fallback. Deletion refuses `UnsupportedPlatform` regardless.
             let _ = &self.handle;
-            let mut names = Vec::new();
-            for entry in std::fs::read_dir(&self.path)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if matches_worktree_store_grammar(&name) {
-                    names.push(name);
-                }
-            }
-            names.sort();
-            Ok(names)
+            unpinned_candidate_names(&self.path)
         }
     }
 
