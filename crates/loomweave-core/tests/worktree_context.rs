@@ -148,6 +148,92 @@ fn linked_nested_project_preserves_its_path_under_the_primary_checkout() {
 }
 
 #[test]
+fn moved_linked_worktree_without_repair_still_classifies_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    init_repo(&repo, "main");
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "feature", "../linked"],
+    );
+    let linked = dir.path().join("linked");
+
+    let before = WorktreeContext::resolve(&linked).expect("resolves before move");
+    assert_eq!(before.kind, WorktreeKind::Linked);
+
+    // Move the worktree directory WITHOUT `git worktree repair`: the
+    // registered path in `git worktree list` is now stale (it names the old
+    // location), but git commands run inside the moved checkout still work —
+    // its `.git` file points at the (unmoved) common dir's administrative
+    // entry. Git's own evidence still proves this is a linked worktree.
+    let moved = dir.path().join("linked-moved");
+    std::fs::rename(&linked, &moved).unwrap();
+
+    let after = WorktreeContext::resolve(&moved).expect("resolves after move");
+
+    // Silently degrading to Standalone here would let `loomweave analyze`
+    // build a decoy store at <worktree>/.weft/loomweave/ — the exact outcome
+    // worktree isolation exists to forbid.
+    assert_eq!(after.kind, WorktreeKind::Linked);
+    assert_eq!(after.primary_root, std::fs::canonicalize(&repo).unwrap());
+    // The stable ID is keyed by the Git administrative identity, which a
+    // plain directory move does not change.
+    assert_eq!(after.stable_id, before.stable_id);
+    assert_eq!(after.effective_store, before.effective_store);
+}
+
+#[test]
+fn branch_only_nested_project_errors_instead_of_pointing_at_a_nonexistent_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    init_repo(&repo, "main");
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", "feature", "../linked"],
+    );
+    let linked = dir.path().join("linked");
+
+    // A nested project that exists ONLY on the worktree's branch — the
+    // primary checkout (on `main`) has no services/newsvc at all.
+    let linked_project = linked.join("services/newsvc");
+    std::fs::create_dir_all(&linked_project).unwrap();
+    std::fs::write(linked_project.join("svc.py"), "pass\n").unwrap();
+    git(&linked, &["add", "."]);
+    git(
+        &linked,
+        &["commit", "-qm", "add branch-only nested project"],
+    );
+
+    let err = WorktreeContext::resolve(&linked_project)
+        .expect_err("a primary-side project directory that does not exist must fail loud");
+
+    let canonical_repo = std::fs::canonicalize(&repo).unwrap();
+    let message = err.to_string();
+    match err {
+        WorktreeContextError::NestedProjectMissingFromPrimary {
+            primary_project,
+            primary_checkout,
+            ..
+        } => {
+            assert_eq!(primary_checkout, canonical_repo);
+            assert_eq!(primary_project, canonical_repo.join("services/newsvc"));
+        }
+        other => panic!("expected NestedProjectMissingFromPrimary, got {other:?}"),
+    }
+    // The message must be truthful and actionable: it names the missing
+    // primary-side directory rather than routing the caller to a
+    // `loomweave install` hint against a path that does not exist.
+    assert!(
+        message.contains("does not exist"),
+        "message must say the primary-side project directory does not exist: {message}"
+    );
+    assert!(
+        message.contains(canonical_repo.join("services/newsvc").to_str().unwrap()),
+        "message must name the missing primary-side path: {message}"
+    );
+}
+
+#[test]
 fn shared_absolute_store_override_namespaces_identical_admin_names_by_project() {
     let dir = tempfile::tempdir().unwrap();
     let shared_store = dir.path().join("shared-store");
@@ -373,6 +459,7 @@ fn non_utf8_worktree_path_is_rejected_with_typed_error() {
         WorktreeContextError::NonUtf8Path { field, .. } => {
             assert_eq!(field, "source_root");
         }
+        other => panic!("expected NonUtf8Path, got {other:?}"),
     }
 }
 
