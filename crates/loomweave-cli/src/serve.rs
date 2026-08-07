@@ -141,6 +141,71 @@ fn run_linked_worktree(
     )
 }
 
+/// How long the Held-lock wait tolerates a lock-holding analyze whose store
+/// generation never matches this binary's expectations before serving the
+/// existing (schema-bearing) store degraded behind the index gate. Generous:
+/// a healthy same-version holder publishes metadata + schema within
+/// milliseconds-to-seconds of taking the lock (even a stale-store
+/// delete-and-rebuild is one directory), so only a genuine version skew ever
+/// reaches this cap — and the cap converts it from a dead session into a
+/// gated one.
+const HELD_WAIT_DEGRADED_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One iteration's decision in `bootstrap_linked_worktree`'s Held-lock wait —
+/// a pure function of three observations so the policy is directly
+/// unit-assertable (see `tests::held_wait_step_*`) without staging a real
+/// cross-process lock race.
+///
+/// Invariants pinned here:
+/// - A bare schema probe (`runs_table_ready`) alone NEVER breaks the wait:
+///   without `metadata_current` it can be the old, about-to-be-deleted store
+///   generation of a holder mid-`ensure_isolated_store` delete-and-rebuild.
+/// - The wait NEVER errors. Transient states (slow holder, crashed holder)
+///   resolve by the caller's lock retry; the only terminal fallback is
+///   serving degraded behind the gate after [`HELD_WAIT_DEGRADED_CAP`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldWaitStep {
+    /// The on-disk generation matches this binary AND the schema milestone is
+    /// published: safe to open the reader pool, holder keeps building.
+    ServeCurrent,
+    /// Cap exceeded with a schema-bearing db whose metadata never matched
+    /// (version-skewed holder): serve it behind the index gate rather than
+    /// failing the session.
+    ServeDegraded,
+    /// Keep waiting — and keep re-trying the lock, which self-heals a holder
+    /// that crashed before initializing anything.
+    Wait,
+}
+
+fn held_wait_step(
+    metadata_current: bool,
+    runs_table_ready: bool,
+    past_degraded_cap: bool,
+) -> HeldWaitStep {
+    if metadata_current && runs_table_ready {
+        HeldWaitStep::ServeCurrent
+    } else if past_degraded_cap && runs_table_ready {
+        HeldWaitStep::ServeDegraded
+    } else {
+        HeldWaitStep::Wait
+    }
+}
+
+/// The bootstrap-milestone probe: the holder's `initialise_db` (schema
+/// applied, empty) has run against the db at `db_path`. Read-only open so an
+/// absent file is never lazily created as an empty db.
+fn runs_table_exists(db_path: &Path) -> bool {
+    rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'",
+                [],
+                |_row| Ok(()),
+            )
+        })
+        .is_ok()
+}
+
 /// Ensure the isolated store exists, then spawn `loomweave worktree analyze`
 /// for it **only when no analyze attempt has written a run row** — per the
 /// design, "serve on a linked worktree WITH NO INDEX ... spawn". A worktree
@@ -179,7 +244,16 @@ fn bootstrap_linked_worktree(
             worktree_ctx.primary_root.display()
         );
     }
-    let should_spawn =
+    // Retry the lock in a loop rather than deciding once: the observed holder
+    // can release (analyze finished) or die (fs2 releases on process exit —
+    // e.g. a SessionStart analyze crashing between lock acquisition and
+    // `initialise_db`), and this serve must then become the initializer
+    // itself instead of failing. serve never hard-fails on a merely-slow
+    // concurrent analyze; before the Held arm existed it always served with
+    // the index-building gate active, and that survivability is preserved.
+    let wait_started = std::time::Instant::now();
+    let mut last_wait_log: Option<std::time::Instant> = None;
+    let should_spawn = loop {
         match crate::analyze_lock::try_acquire_analyze_lock_for_context(worktree_ctx)? {
             crate::analyze_lock::TryAnalyzeLock::Acquired(_initialization_guard) => {
                 loomweave_cli::worktree::store::ensure_isolated_store(worktree_ctx)
@@ -191,7 +265,7 @@ fn bootstrap_linked_worktree(
                         )
                     })?;
 
-                match rusqlite::Connection::open_with_flags(
+                break match rusqlite::Connection::open_with_flags(
                     &worktree_ctx.store_paths.db,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 ) {
@@ -209,43 +283,69 @@ fn bootstrap_linked_worktree(
                         );
                         true
                     }
-                }
+                };
             }
-            crate::analyze_lock::TryAnalyzeLock::Held { .. } => {
-                // A SessionStart/manual analyze owns the stable lock. It is the
-                // initializer and builder; never race it with ensure/migrations or
-                // launch a redundant child. The store schema is published near the
-                // start of that process, so wait only for that bounded bootstrap
-                // milestone before opening the reader pool below.
-                let start = std::time::Instant::now();
-                loop {
-                    let ready = rusqlite::Connection::open_with_flags(
-                        &worktree_ctx.store_paths.db,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                    )
-                    .and_then(|conn| {
-                        conn.query_row(
-                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'",
-                            [],
-                            |_row| Ok(()),
-                        )
-                    })
-                    .is_ok();
-                    if ready {
-                        break;
-                    }
-                    if start.elapsed() > std::time::Duration::from_secs(5) {
-                        bail!(
-                            "another analyze holds the worktree lock, but its isolated store at {} \
-                         did not finish initialization within 5 seconds",
-                            worktree_ctx.store_paths.db.display()
+            crate::analyze_lock::TryAnalyzeLock::Held { lock_path } => {
+                // A SessionStart/manual analyze owns the stable lock. It is
+                // the initializer and builder; never race it with
+                // ensure/migrations or launch a redundant child. But its
+                // `ensure_isolated_store` call may be about to
+                // delete-and-rebuild the store, so a bare "does the db have a
+                // schema" probe can pass against the OLD, doomed generation —
+                // and a `ReaderPool` connection opened against that file
+                // before the unlink would pin the deleted generation for the
+                // whole session. Probe the metadata generation FIRST (a
+                // rebuilding holder deletes metadata.json before writing the
+                // new one — see `isolated_store_metadata_is_current`), and
+                // only then the schema milestone, so a pass proves the
+                // current on-disk generation is the one the holder keeps.
+                let metadata_current =
+                    loomweave_cli::worktree::store::isolated_store_metadata_is_current(
+                        worktree_ctx,
+                    );
+                let runs_table_ready = runs_table_exists(&worktree_ctx.store_paths.db);
+                match held_wait_step(
+                    metadata_current,
+                    runs_table_ready,
+                    wait_started.elapsed() > HELD_WAIT_DEGRADED_CAP,
+                ) {
+                    HeldWaitStep::ServeCurrent => break false,
+                    HeldWaitStep::ServeDegraded => {
+                        // A schema-bearing db exists but its metadata does not
+                        // match this binary's expectations — most plausibly a
+                        // holder built from a different Loomweave version. Its
+                        // rebuild (if any) would have happened long before the
+                        // cap. Serve what exists, behind the gate, rather than
+                        // killing the MCP session over a version skew.
+                        tracing::warn!(
+                            lock = %lock_path.display(),
+                            db = %worktree_ctx.store_paths.db.display(),
+                            waited_secs = wait_started.elapsed().as_secs(),
+                            "worktree bootstrap: analyze lock still held and the store's \
+                             metadata.json does not match this binary; serving the existing \
+                             store behind the index gate instead of failing"
                         );
+                        break false;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    HeldWaitStep::Wait => {
+                        if last_wait_log
+                            .is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(5))
+                        {
+                            last_wait_log = Some(std::time::Instant::now());
+                            tracing::info!(
+                                lock = %lock_path.display(),
+                                waited_secs = wait_started.elapsed().as_secs(),
+                                "worktree bootstrap: waiting for the analyze holding the \
+                                 worktree lock to publish the store schema (or release the \
+                                 lock)"
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
                 }
-                false
             }
-        };
+        }
+    };
 
     if !should_spawn {
         tracing::info!(
@@ -1194,5 +1294,145 @@ mod tests {
              materialization worktree-index isolation forbids: {}",
             forbidden_log.display()
         );
+    }
+
+    // ---------------------------------------------------------------
+    // The Held-analyze-lock wait: generation-aware, and it never
+    // hard-fails on a transient concurrent-analyze condition.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn held_wait_step_never_trusts_a_bare_schema_probe() {
+        use HeldWaitStep::{ServeCurrent, ServeDegraded, Wait};
+        // Current generation with the schema milestone published: serve.
+        assert_eq!(held_wait_step(true, true, false), ServeCurrent);
+        assert_eq!(held_wait_step(true, true, true), ServeCurrent);
+        // The finding-1 regression pin: a runs table alone can belong to the
+        // OLD generation of a holder mid-delete-and-rebuild — it must never
+        // break the wait on its own.
+        assert_eq!(held_wait_step(false, true, false), Wait);
+        // ...until the degraded cap converts a persistent metadata mismatch
+        // (version-skewed holder) into a gated session instead of a dead one.
+        assert_eq!(held_wait_step(false, true, true), ServeDegraded);
+        // No schema milestone yet: always wait — there is nothing servable,
+        // and the caller's lock retry self-heals a crashed holder. No input
+        // combination maps to an error.
+        assert_eq!(held_wait_step(true, false, false), Wait);
+        assert_eq!(held_wait_step(false, false, false), Wait);
+        assert_eq!(held_wait_step(true, false, true), Wait);
+        assert_eq!(held_wait_step(false, false, true), Wait);
+    }
+
+    fn hold_analyze_lock(ctx: &WorktreeContext) -> crate::analyze_lock::AnalyzeLockGuard {
+        match crate::analyze_lock::try_acquire_analyze_lock_for_context(ctx)
+            .expect("acquire analyze lock for test")
+        {
+            crate::analyze_lock::TryAnalyzeLock::Acquired(guard) => guard,
+            crate::analyze_lock::TryAnalyzeLock::Held { lock_path } => {
+                panic!("test fixture must own the lock at {}", lock_path.display())
+            }
+        }
+    }
+
+    /// Finding 1: with the lock Held and the on-disk store belonging to a
+    /// STALE generation (mismatched metadata — exactly what the holder's
+    /// `ensure_isolated_store` is about to delete-and-rebuild), the wait must
+    /// NOT break just because the old db has a `runs` table and a completed
+    /// run row. The pre-fix probe returned instantly here and pinned the
+    /// doomed file into the reader pool.
+    #[test]
+    #[cfg(unix)]
+    fn held_wait_does_not_serve_a_doomed_store_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        install_primary(&ctx);
+
+        // A real store with a completed run row — maximally deceptive: the
+        // bare schema probe passes AND the run row reads as Ready.
+        loomweave_cli::worktree::store::ensure_isolated_store(&ctx).expect("ensure store");
+        let conn = rusqlite::Connection::open(&ctx.store_paths.db).expect("open store db");
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status) \
+             VALUES ('r1', '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', '{}', '{}', \
+             'completed')",
+            [],
+        )
+        .expect("seed completed run");
+        drop(conn);
+        // Mark the generation stale: the next `ensure_isolated_store` (the
+        // lock holder's) will delete-and-rebuild this whole directory.
+        fs::write(ctx.effective_store.join("metadata.json"), "not json").unwrap();
+
+        let argv_dump = tmp.path().join("argv.txt");
+        let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
+        let guard = hold_analyze_lock(&ctx);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.send(bootstrap_linked_worktree(&ctx, Some(&stub), None))
+                    .expect("report bootstrap result");
+            });
+            assert!(
+                rx.recv_timeout(StdDuration::from_millis(400)).is_err(),
+                "bootstrap proceeded against a stale (doomed) store generation while the \
+                 analyze lock was still held"
+            );
+            // The holder releases (finished or died): bootstrap must acquire
+            // the lock itself and rebuild rather than trust the stale store.
+            drop(guard);
+            rx.recv_timeout(StdDuration::from_secs(10))
+                .expect("bootstrap finishes once the lock frees")
+                .expect("bootstrap succeeds after acquiring the freed lock");
+        });
+
+        assert!(
+            loomweave_cli::worktree::store::isolated_store_metadata_is_current(&ctx),
+            "the stale generation must have been rebuilt"
+        );
+        // The rebuilt store is empty (the seeded run row died with the old
+        // generation), so the bootstrap spawn must fire — proving serve did
+        // not trust the doomed generation's completed run row.
+        wait_for_file(&argv_dump, StdDuration::from_secs(5));
+    }
+
+    /// Finding 2(a): a holder that crashes between lock acquisition and
+    /// `initialise_db` releases the fs2 lock with no store on disk. The old
+    /// wait probed only the db and bailed after 5 seconds with a misleading
+    /// "did not finish initialization" error; it must instead re-try the
+    /// now-free lock, become the initializer, and self-recover.
+    #[test]
+    #[cfg(unix)]
+    fn held_lock_released_before_init_self_heals_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        install_primary(&ctx);
+        // No store on disk at all — the "holder crashed before creating
+        // anything" state.
+        let argv_dump = tmp.path().join("argv.txt");
+        let stub = write_argv_dump_stub(tmp.path(), &argv_dump);
+        let guard = hold_analyze_lock(&ctx);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.send(bootstrap_linked_worktree(&ctx, Some(&stub), None))
+                    .expect("report bootstrap result");
+            });
+            assert!(
+                rx.recv_timeout(StdDuration::from_millis(300)).is_err(),
+                "bootstrap must wait while the lock is genuinely held"
+            );
+            drop(guard); // the "crash": fs2 releases on process/file close
+            rx.recv_timeout(StdDuration::from_secs(10))
+                .expect("bootstrap finishes once the lock frees")
+                .expect("bootstrap must self-recover by taking the freed lock, not error");
+        });
+
+        assert!(
+            ctx.store_paths.db.is_file(),
+            "self-recovery must have created the isolated store"
+        );
+        wait_for_file(&argv_dump, StdDuration::from_secs(5));
     }
 }

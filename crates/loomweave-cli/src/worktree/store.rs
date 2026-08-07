@@ -61,8 +61,11 @@ const METADATA_FILE_NAME: &str = "metadata.json";
 /// stores under) and, cross-crate, with `loomweave-cli`'s bin target
 /// (`install.rs`'s `--force` guard and `doctor.rs`'s additive worktree-store
 /// report both need the same directory name; worktree-index Task 7), so this
-/// is `pub` rather than `pub(crate)`.
-pub const WORKTREES_DIR_NAME: &str = "worktrees";
+/// is `pub` rather than `pub(crate)`. The name itself is defined in
+/// loomweave-core (`worktree::paths`), where it also anchors the analyze
+/// lock-path contract `analyze_lock.rs` and `loomweave-mcp` share; this
+/// re-export keeps the CLI's existing import paths working.
+pub use loomweave_core::worktree::WORKTREES_DIR_NAME;
 
 const ISO8601_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
@@ -256,11 +259,7 @@ fn ensure_isolated_store_with(
             create_fresh(&candidate, stable_id, admin_identity, &source_root)?;
             return Ok(StoreOutcome::Created);
         }
-        MetadataState::Valid(meta)
-            if meta.schema == METADATA_SCHEMA
-                && meta.stable_id == stable_id
-                && meta.source_root == source_root =>
-        {
+        MetadataState::Valid(meta) if metadata_matches(&meta, stable_id, &source_root) => {
             return Ok(StoreOutcome::Reused);
         }
         // Name exactly which of the three validity checks failed
@@ -322,6 +321,55 @@ fn ensure_isolated_store_with(
 
     create_fresh(&candidate, stable_id, admin_identity, &source_root)?;
     Ok(StoreOutcome::Rebuilt { reason })
+}
+
+/// The three-way validity check [`ensure_isolated_store`] gates reuse on —
+/// extracted so [`isolated_store_metadata_is_current`] answers the *same*
+/// question a lock-holding analyze's `ensure_isolated_store` call is about to
+/// answer, and the two can never drift apart.
+fn metadata_matches(meta: &Metadata, stable_id: &str, source_root: &str) -> bool {
+    meta.schema == METADATA_SCHEMA && meta.stable_id == stable_id && meta.source_root == source_root
+}
+
+/// Whether the isolated store's on-disk `metadata.json` currently matches
+/// `ctx` — i.e. whether [`ensure_isolated_store`] run against this context
+/// would take the `Reused` path rather than delete-and-rebuild the store.
+///
+/// This is the *generation probe* `serve`'s Held-analyze-lock wait uses
+/// (`serve.rs::bootstrap_linked_worktree`): while another process holds the
+/// analyze lock and may be mid-`ensure_isolated_store`, a bare "does the db
+/// have a schema" check can pass against the OLD, about-to-be-deleted
+/// generation. Metadata that matches proves the opposite: a rebuilding
+/// holder deletes the whole store directory (metadata included) *before*
+/// `create_fresh` writes the new `metadata.json`, so a matching file means
+/// the current on-disk generation is either being reused as-is or is the
+/// freshly rebuilt one — never the doomed one. (A holder running a
+/// *different binary version* with a different `METADATA_SCHEMA` can still
+/// disagree with this probe; callers must treat `false` as "wait", not
+/// "corrupt".)
+///
+/// Returns `true` for a non-isolated context (no `stable_id`): there is no
+/// per-worktree generation to be stale. Returns `false` when the store (or
+/// its metadata) does not exist yet — the holder has not finished creating
+/// it.
+#[must_use]
+pub fn isolated_store_metadata_is_current(ctx: &WorktreeContext) -> bool {
+    let Some(stable_id) = ctx.stable_id.as_deref() else {
+        return true;
+    };
+    let Some(source_root) = ctx.source_root.to_str() else {
+        // `WorktreeContext::resolve` rejects non-UTF-8 source roots, so this
+        // is unreachable in practice; fail toward "not current" (wait).
+        return false;
+    };
+    let candidate = ctx
+        .repository_store
+        .join(WORKTREES_DIR_NAME)
+        .join(stable_id);
+    match read_metadata(&candidate) {
+        MetadataState::Valid(meta) => metadata_matches(&meta, stable_id, source_root),
+        MetadataState::Absent | MetadataState::Unreadable(_) => false,
+    }
 }
 
 /// The result of reading `<candidate>/metadata.json`.
@@ -413,7 +461,9 @@ fn initialise_db(db_path: &Path) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{METADATA_FILE_NAME, StoreOutcome, ensure_isolated_store};
+    use super::{
+        METADATA_FILE_NAME, StoreOutcome, ensure_isolated_store, isolated_store_metadata_is_current,
+    };
     use loomweave_core::worktree::WorktreeContext;
     use std::path::Path;
     use std::process::Command;
@@ -456,6 +506,56 @@ mod tests {
         );
         let linked = root.join("linked");
         WorktreeContext::resolve(&linked).expect("resolves as Linked")
+    }
+
+    /// The generation probe `serve`'s Held-lock wait relies on: it must
+    /// answer exactly the reuse-vs-rebuild question `ensure_isolated_store`
+    /// itself would, so a store a lock-holding analyze is about to
+    /// delete-and-rebuild can never read as "current".
+    #[test]
+    fn metadata_is_current_tracks_ensure_reuse_vs_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+
+        // Before the store exists there is no current generation.
+        assert!(
+            !isolated_store_metadata_is_current(&ctx),
+            "an absent store must not read as current"
+        );
+
+        ensure_isolated_store(&ctx).expect("ensure store");
+        assert!(
+            isolated_store_metadata_is_current(&ctx),
+            "a freshly created store must read as current"
+        );
+
+        // Corrupt the metadata — exactly the state that makes the next
+        // `ensure_isolated_store` delete-and-rebuild the whole directory.
+        std::fs::write(ctx.effective_store.join(METADATA_FILE_NAME), "not json").unwrap();
+        assert!(
+            !isolated_store_metadata_is_current(&ctx),
+            "a store whose metadata fails validation is a doomed generation, never current"
+        );
+
+        let outcome = ensure_isolated_store(&ctx).expect("rebuild store");
+        assert!(matches!(outcome, StoreOutcome::Rebuilt { .. }));
+        assert!(
+            isolated_store_metadata_is_current(&ctx),
+            "the rebuilt generation must read as current again"
+        );
+    }
+
+    #[test]
+    fn metadata_is_current_is_vacuously_true_without_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        let ctx = WorktreeContext::resolve(&repo).expect("resolves as Main");
+        assert!(ctx.stable_id.is_none(), "fixture sanity: not isolated");
+        assert!(
+            isolated_store_metadata_is_current(&ctx),
+            "no stable_id means no per-worktree generation to be stale"
+        );
     }
 
     #[test]

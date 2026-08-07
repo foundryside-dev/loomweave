@@ -41,6 +41,18 @@
 //! administrative directory cannot be read once resolved, the sweep aborts
 //! and deletes nothing — never partial, never a best-effort subset.
 //!
+//! **Old Linux kernels (pre-5.6).** Linux is the supported platform
+//! (`docs/operator/README.md`), but the pinned root handle is itself an
+//! `openat2(2)` open, and a kernel older than 5.6 fails it with `ENOSYS`.
+//! That one failure degrades instead of aborting: the sweep keeps full
+//! report-only visibility through an unpinned `read_dir` view, and every
+//! actual deletion is refused as
+//! [`crate::worktree::confine::DeleteOutcome::UnsupportedPlatform`] — the
+//! same graceful posture `confine.rs`'s module docs promise. The candidate
+//! list a *deletion* acts on always comes from the pinned root; only the
+//! report side may use the unpinned fallback (see the private `SweepRoot`
+//! enum).
+//!
 //! **The override case.** A `[loomweave].store_dir` override is not scoped
 //! to one repository: an absolute override can be shared between unrelated
 //! repositories, so under an active override this repository's registered
@@ -77,7 +89,10 @@ use loomweave_core::worktree::{
 };
 use tracing::{debug, info, warn};
 
-use crate::worktree::confine::{DeleteOutcome, WorktreesRoot};
+use crate::worktree::confine::{
+    DeleteOutcome, WorktreesRoot, error_signals_missing_openat2, refuse_unsupported,
+    unpinned_candidate_names,
+};
 use crate::worktree::store::WORKTREES_DIR_NAME;
 
 /// The non-blocking advisory lock that serializes concurrent sweeps —
@@ -113,6 +128,12 @@ pub enum SweepOutcome {
     /// while enumerating store candidates — aborted, nothing deleted.
     /// Distinct from [`Self::AdminDirUnreadable`]: this
     /// is Loomweave's own store directory, not Git's administrative one.
+    ///
+    /// One pin failure is deliberately **not** this outcome: a Linux kernel
+    /// without `openat2` (pre-5.6, `ENOSYS`) degrades to an unpinned,
+    /// report-only enumeration instead — the sweep still runs and reports,
+    /// with every deletion refused as
+    /// [`DeleteOutcome::UnsupportedPlatform`] (see `SweepRoot`'s docs).
     StoreDirUnreadable,
     /// A `[loomweave].store_dir` override is active for `ctx.primary_root`:
     /// candidates were enumerated and logged, nothing was deleted.
@@ -198,6 +219,75 @@ fn pin_sweep_root(
     WorktreesRoot::open(&root_path)
 }
 
+/// The sweep's view into `<repository-store>/worktrees/` — either the
+/// pinned, confinement-checked handle, or the degraded report-only view a
+/// pre-5.6 Linux kernel gets.
+#[derive(Debug)]
+enum SweepRoot {
+    /// [`WorktreesRoot::open`] succeeded: this handle carries both report
+    /// visibility *and* deletion authority, and the candidate list any
+    /// deletion decision uses comes from this pinned inode (see
+    /// `candidate_enumeration_stays_on_pinned_root_after_path_replacement`
+    /// in `confine.rs`).
+    Pinned(WorktreesRoot),
+    /// The pin failed with `ENOSYS` — this kernel predates `openat2(2)`
+    /// (Linux < 5.6), so no confined-deletion mechanism exists at all.
+    /// Candidates are enumerated through a plain, unpinned `read_dir`
+    /// ([`unpinned_candidate_names`]) purely so report-only outcomes
+    /// (override, symlinked store, and the "would have deleted" log lines)
+    /// keep working; every actual deletion is refused as
+    /// [`DeleteOutcome::UnsupportedPlatform`], exactly the posture
+    /// `confine.rs`'s module docs promise for a missing `openat2`.
+    UnpinnedReportOnly,
+}
+
+impl SweepRoot {
+    /// Enumerate the candidate set through whichever view this is. The
+    /// unpinned view is only ever *reported from*; the deletion loop below
+    /// refuses every candidate under it.
+    fn candidate_names(&self, worktrees_dir: &Path) -> io::Result<Vec<String>> {
+        match self {
+            Self::Pinned(root) => root.candidate_names(),
+            Self::UnpinnedReportOnly => unpinned_candidate_names(worktrees_dir),
+        }
+    }
+
+    /// Attempt one confined deletion, or refuse it outright when no pinned
+    /// root exists (the missing-`openat2` kernel).
+    fn delete_worktree_store(&self, candidate_name: &str, reason: &str) -> DeleteOutcome {
+        match self {
+            Self::Pinned(root) => root.delete_worktree_store(candidate_name, reason),
+            Self::UnpinnedReportOnly => refuse_unsupported(candidate_name, reason),
+        }
+    }
+}
+
+/// Turn [`pin_sweep_root`]'s result into the sweep's working view — the
+/// degradation decision, isolated here so it is unit-testable: a real
+/// `ENOSYS` cannot be provoked on a modern kernel, but this function can be
+/// fed one directly (see
+/// `enosys_pin_failure_selects_the_unpinned_report_only_root`).
+///
+/// Exactly one failure degrades instead of aborting: `ENOSYS`, meaning the
+/// kernel has no `openat2` and the pin *cannot* exist — report-only
+/// visibility survives, deletion stays refused. Every other failure means
+/// the store directory itself is unreadable and propagates as an abort
+/// ([`SweepOutcome::StoreDirUnreadable`] at the call site).
+fn sweep_root_after_pin(pin_result: io::Result<WorktreesRoot>) -> io::Result<SweepRoot> {
+    match pin_result {
+        Ok(root) => Ok(SweepRoot::Pinned(root)),
+        Err(err) if error_signals_missing_openat2(&err) => {
+            warn!(
+                error = %err,
+                "worktree cleanup sweep: this kernel has no openat2 (pre-5.6); continuing with \
+                 an unpinned report-only view — deletions will be refused as unsupported"
+            );
+            Ok(SweepRoot::UnpinnedReportOnly)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
     let worktrees_dir = ctx.repository_store.join(WORKTREES_DIR_NAME);
     if !worktrees_dir.is_dir() {
@@ -224,7 +314,7 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
         }
     };
 
-    let root = match pin_sweep_root(&worktrees_dir, store_path_is_symlinked) {
+    let root = match sweep_root_after_pin(pin_sweep_root(&worktrees_dir, store_path_is_symlinked)) {
         Ok(root) => root,
         Err(err) => {
             warn!(
@@ -284,7 +374,7 @@ pub fn sweep_worktree_stores(ctx: &WorktreeContext) -> SweepOutcome {
     // store swept promptly" as correct (see the module docs, "The accepted
     // race" — nothing can rebuild that store once the worktree is gone
     // either way, one sweep cycle earlier changes nothing).
-    let candidates = match root.candidate_names() {
+    let candidates = match root.candidate_names(&worktrees_dir) {
         Ok(names) => names,
         Err(err) => {
             warn!(
@@ -554,5 +644,72 @@ mod tests {
                 "{hazardous} must never be SET on the git_common_dir command; envs={envs:?}"
             );
         }
+    }
+
+    /// An `ENOSYS` os error, as `openat2` reports it on a pre-5.6 kernel —
+    /// injected because a real one cannot be provoked on a modern kernel.
+    #[cfg(unix)]
+    fn enosys_error() -> io::Error {
+        io::Error::from_raw_os_error(rustix::io::Errno::NOSYS.raw_os_error())
+    }
+
+    /// The regression this seam exists for: a missing-`openat2` kernel
+    /// (`ENOSYS` from the pinned open) must degrade to the unpinned
+    /// report-only view, never abort the sweep as `StoreDirUnreadable` —
+    /// and that fallback view must actually enumerate candidates, so
+    /// report-only runs keep full visibility on old kernels.
+    #[test]
+    #[cfg(unix)]
+    fn enosys_pin_failure_selects_the_unpinned_report_only_root() {
+        let root = sweep_root_after_pin(Err(enosys_error()))
+            .expect("ENOSYS must degrade, not abort the sweep");
+        assert!(
+            matches!(root, SweepRoot::UnpinnedReportOnly),
+            "expected the unpinned report-only view, got {root:?}"
+        );
+
+        // Report-only enumeration works through the fallback path.
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = format!("wt-{}", "a".repeat(64));
+        fs::create_dir(tmp.path().join(&candidate)).unwrap();
+        fs::write(tmp.path().join(GC_LOCK_FILE_NAME), b"").unwrap();
+        fs::create_dir(tmp.path().join("not-a-candidate")).unwrap();
+
+        let names = root
+            .candidate_names(tmp.path())
+            .expect("the unpinned view must still enumerate");
+        assert_eq!(
+            names,
+            vec![candidate.clone()],
+            "the fallback must apply the same wt-[0-9a-f]{{64}} grammar filter"
+        );
+
+        // And deletion through the fallback view is refused, untouched.
+        assert_eq!(
+            root.delete_worktree_store(&candidate, "test"),
+            DeleteOutcome::UnsupportedPlatform,
+            "no pinned root means no deletion authority, ever"
+        );
+        assert!(
+            tmp.path().join(&candidate).is_dir(),
+            "a refused deletion must leave the candidate in place"
+        );
+    }
+
+    /// Every non-`ENOSYS` pin failure keeps the pre-existing abort
+    /// semantics: it propagates, and the caller turns it into
+    /// [`SweepOutcome::StoreDirUnreadable`].
+    #[test]
+    fn other_pin_failures_still_abort_the_sweep() {
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(
+            sweep_root_after_pin(Err(err)).is_err(),
+            "a permission failure must abort, not silently degrade to report-only"
+        );
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        assert!(
+            sweep_root_after_pin(Err(missing)).is_err(),
+            "a missing store directory must abort, not silently degrade to report-only"
+        );
     }
 }

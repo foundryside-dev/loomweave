@@ -231,6 +231,24 @@ pub struct ToolMetadata {
     pub may_call_llm: bool,
 }
 
+/// The source-root-missing gate decision, shared by the MCP worktree gate
+/// (`consult_worktree_gate`, `worktree_gate_block_reason`) and the CLI's HTTP
+/// twin (`require_worktree_ready`).
+///
+/// Uses [`Path::try_exists`] rather than [`Path::exists`] so a transient stat
+/// failure (EACCES from a permission hiccup, ELOOP, an automount that has not
+/// come back yet) is NOT reported as a permanently-removed root: the gate's
+/// `source-root-missing` answer is non-retryable and tells a conforming
+/// client to stop polling and start a new serve, so it must only fire on a
+/// confirmed `Ok(false)` (NotFound-style resolution). On `Err` the request
+/// proceeds — the check is per-request, so a genuinely-broken root fails
+/// downstream with a retryable error and the gate self-heals once the stat
+/// hiccup clears.
+#[must_use]
+pub fn source_root_confirmed_missing(root: &Path) -> bool {
+    matches!(root.try_exists(), Ok(false))
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
 fn is_false(flag: &bool) -> bool {
     !*flag
@@ -1822,9 +1840,11 @@ impl ServerState {
     /// behavior change) — no cached flag, no background timer, no per-tool
     /// forking across `graph.rs`/`orientation.rs`/`catalogue/*`.
     ///
-    /// `source-root-missing` is checked first and applies to *every* tool,
+    /// `source-root-missing` is checked first (via
+    /// [`source_root_confirmed_missing`], so a transient stat error never
+    /// masquerades as a removed root) and applies to *every* tool,
     /// including `project_status_get`/`analyze_status_get`: once the worktree
-    /// itself is gone there is no "remain available while building" case
+    /// itself is confirmed gone there is no "remain available while building" case
     /// left to serve — the design's accepted race for `git worktree remove`
     /// under a live `serve`. Building/build-failed then exempts exactly
     /// `project_status_get`, `analyze_status_get`, and `analyze_cancel` so an
@@ -1834,7 +1854,7 @@ impl ServerState {
     async fn consult_worktree_gate(&self, id: &Value, canonical_name: &str) -> Option<Value> {
         let gate = self.worktree_gate.as_ref()?;
 
-        if !self.project_root.exists() {
+        if source_root_confirmed_missing(&self.project_root) {
             let envelope = tool_error_envelope_with_diagnostics(
                 McpErrorCode::SourceRootMissing,
                 &format!(
@@ -1857,9 +1877,23 @@ impl ServerState {
             return None;
         }
 
+        // The liveness-repair variant: a `running` row whose builder is
+        // provably dead (nothing holds the per-worktree analyze lock) is
+        // converted to `failed` on the spot, so this gate reports the
+        // non-retryable build-failed envelope below — with the explicit
+        // recovery command — instead of retryable `index-building` forever
+        // (see `read_worktree_readiness_with_liveness_repair`).
+        let repair_db_path = gate.store_paths.db.clone();
         let read = self
             .readers
-            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .with_reader(move |conn| {
+                Ok(
+                    worktree_bootstrap::read_worktree_readiness_with_liveness_repair(
+                        conn,
+                        &repair_db_path,
+                    ),
+                )
+            })
             .await;
         // A storage-layer read failure here is not this gate's to report —
         // fall through to normal dispatch, which will hit the same failure
@@ -2248,13 +2282,24 @@ impl ServerState {
     /// `McpErrorCode`) or `None` when the resource should read the store
     /// normally.
     async fn worktree_gate_block_reason(&self) -> Option<&'static str> {
-        self.worktree_gate.as_ref()?;
-        if !self.project_root.exists() {
+        let gate = self.worktree_gate.as_ref()?;
+        if source_root_confirmed_missing(&self.project_root) {
             return Some("source-root-missing");
         }
+        // Same liveness-repair consult as `consult_worktree_gate`: a dead
+        // builder's abandoned `running` row must not report `index-building`
+        // through this door either.
+        let repair_db_path = gate.store_paths.db.clone();
         let read = self
             .readers
-            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .with_reader(move |conn| {
+                Ok(
+                    worktree_bootstrap::read_worktree_readiness_with_liveness_repair(
+                        conn,
+                        &repair_db_path,
+                    ),
+                )
+            })
             .await;
         let Ok(read) = read else {
             // A storage-layer failure is not this gate's to report — fall
