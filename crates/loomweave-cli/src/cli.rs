@@ -659,6 +659,13 @@ pub enum HookCommand {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Git-hook entry point: spawn a detached background re-analyze when the
+    /// index is stale. Silent and always exits 0 — safe under `|| true`.
+    GitSync {
+        /// Project directory containing .weft/loomweave/loomweave.db.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

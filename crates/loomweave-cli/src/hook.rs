@@ -76,6 +76,26 @@ fn trigger_background_analyze(project_root: &Path) {
     }
 }
 
+/// Git-hook entry point (`loomweave hook git-sync`): spawn the same detached
+/// background analyze the `SessionStart` hook uses, when — and only when — the
+/// index is present and stale. Silent on the happy path (the managed git-hook
+/// block discards output anyway) and never errors: a hook must not block git.
+///
+/// # Errors
+///
+/// Never returns an error today; the `anyhow::Result` keeps the signature
+/// uniform with the other hook entry points.
+#[allow(clippy::unnecessary_wraps)]
+pub fn git_sync(path: &Path) -> anyhow::Result<()> {
+    let outcome = load_snapshot(path);
+    if should_trigger_background_analyze(&outcome)
+        && let Err(err) = spawn_detached_analyze(path)
+    {
+        tracing::warn!(error = %err, "git-sync background analyze spawn failed");
+    }
+    Ok(())
+}
+
 /// Spawn `loomweave analyze <project_root>` as a fire-and-forget child:
 /// stdio to `/dev/null`, in its own process group, never waited on.
 ///
@@ -95,6 +115,15 @@ fn spawn_detached_analyze(project_root: &Path) -> std::io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Strip repository-selector env before spawning. When this runs from a git
+    // hook, git exports GIT_DIR / GIT_INDEX_FILE / GIT_WORK_TREE etc.; the
+    // analyze child runs its own git for SEI extraction, and inheriting those
+    // would repoint or poison it (mid-operation index files especially).
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&key);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;

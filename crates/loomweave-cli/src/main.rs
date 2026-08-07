@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod db;
 mod doctor;
+mod git_hooks;
 mod guidance;
 mod hook;
 mod hooks_settings;
@@ -118,6 +119,7 @@ fn main() -> Result<()> {
         cli::Command::Serve { path, config } => serve::run(&path, config.as_deref()),
         cli::Command::Hook { command } => match command {
             cli::HookCommand::SessionStart { path } => hook::session_start(&path),
+            cli::HookCommand::GitSync { path } => hook::git_sync(&path),
         },
         cli::Command::Db { command } => match command {
             cli::DbCommand::Backup {
