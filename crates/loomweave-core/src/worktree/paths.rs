@@ -28,6 +28,62 @@ const RUNS_DIR: &str = "runs";
 /// The advisory-lock leaf name (`analyze_lock.rs`'s convention).
 const LOCK_FILE: &str = "loomweave.lock";
 
+/// The directory under a repository store that namespaces every linked
+/// worktree's isolated store and its analyze lock:
+/// `<repository-store>/worktrees/`. Shared by the CLI's store bootstrap and
+/// cleanup sweep and by [`linked_worktree_analyze_lock_path`] — one name, one
+/// definition, so the layout and the lock contract can never drift apart.
+pub const WORKTREES_DIR_NAME: &str = "worktrees";
+
+/// The linked-worktree analyze lock path:
+/// `<repository-store>/worktrees/<stable-id>.lock`.
+///
+/// This is the single encoding of the lock-path contract. The lock file is a
+/// stable *sibling* of the replaceable store directory
+/// (`<repository-store>/worktrees/<stable-id>/`), not a leaf inside it, so
+/// deleting and re-creating the store cannot orphan a held lock. A live
+/// `loomweave worktree analyze` holds an exclusive `fs2` lock on this file
+/// for its whole run — acquired before it writes any `runs` row and released
+/// only after its final transaction lands — which is what lets other
+/// processes use the lock as a builder-liveness probe. Producers
+/// (`loomweave-cli`'s `analyze_lock.rs`) and probers (`loomweave-mcp`'s
+/// `worktree_bootstrap.rs`, via [`linked_worktree_analyze_lock_path_for_store`])
+/// must both route through this module rather than re-deriving the path.
+#[must_use]
+pub fn linked_worktree_analyze_lock_path(repository_store: &Path, stable_id: &str) -> PathBuf {
+    repository_store
+        .join(WORKTREES_DIR_NAME)
+        .join(format!("{stable_id}.lock"))
+}
+
+/// Recover the analyze lock path from a linked worktree's *effective store*
+/// directory (`<repository-store>/worktrees/<stable-id>/`) — the inverse of
+/// [`linked_worktree_analyze_lock_path`], for callers that hold only the
+/// store's paths (e.g. an MCP gate configured with [`StorePaths`]) and not
+/// the full resolved context.
+///
+/// Returns `None` when `effective_store` is not shaped like a linked
+/// worktree's isolated store (its parent directory is not named
+/// [`WORKTREES_DIR_NAME`], or the path is too shallow to inspect) — e.g. a
+/// primary or standalone store, whose analyze lock lives at
+/// `<store>/loomweave.lock` instead and is not this contract's concern.
+#[must_use]
+pub fn linked_worktree_analyze_lock_path_for_store(effective_store: &Path) -> Option<PathBuf> {
+    // Stable IDs are always `wt-<hex>` (UTF-8 by construction); a non-UTF-8
+    // name here is not a linked store, and lossy-decoding it could route the
+    // probe to a lock nobody actually holds.
+    let stable_id = effective_store.file_name()?.to_str()?;
+    let worktrees_dir = effective_store.parent()?;
+    if worktrees_dir.file_name()? != std::ffi::OsStr::new(WORKTREES_DIR_NAME) {
+        return None;
+    }
+    let repository_store = worktrees_dir.parent()?;
+    Some(linked_worktree_analyze_lock_path(
+        repository_store,
+        stable_id,
+    ))
+}
+
 /// Explicit leaf paths under one store root directory.
 ///
 /// Every command and service that reads or writes Loomweave's runtime state
@@ -82,5 +138,38 @@ mod tests {
         assert_eq!(paths.port, root.join("ephemeral.port"));
         assert_eq!(paths.runs, root.join("runs"));
         assert_eq!(paths.lock, root.join("loomweave.lock"));
+    }
+
+    #[test]
+    fn linked_lock_path_is_a_stable_sibling_of_the_store() {
+        assert_eq!(
+            linked_worktree_analyze_lock_path(Path::new("/repo/.weft/loomweave"), "wt-abc"),
+            Path::new("/repo/.weft/loomweave/worktrees/wt-abc.lock")
+        );
+    }
+
+    #[test]
+    fn lock_path_for_store_inverts_the_forward_derivation() {
+        let repository_store = Path::new("/repo/.weft/loomweave");
+        let forward = linked_worktree_analyze_lock_path(repository_store, "wt-abc");
+        let store = repository_store.join(WORKTREES_DIR_NAME).join("wt-abc");
+        assert_eq!(
+            linked_worktree_analyze_lock_path_for_store(&store),
+            Some(forward)
+        );
+    }
+
+    #[test]
+    fn lock_path_for_store_rejects_non_worktree_store_shapes() {
+        // A primary/standalone store: parent is not `worktrees/`.
+        assert_eq!(
+            linked_worktree_analyze_lock_path_for_store(Path::new("/repo/.weft/loomweave")),
+            None
+        );
+        // Too shallow to inspect.
+        assert_eq!(
+            linked_worktree_analyze_lock_path_for_store(Path::new("/")),
+            None
+        );
     }
 }

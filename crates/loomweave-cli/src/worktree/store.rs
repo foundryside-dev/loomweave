@@ -61,8 +61,11 @@ const METADATA_FILE_NAME: &str = "metadata.json";
 /// stores under) and, cross-crate, with `loomweave-cli`'s bin target
 /// (`install.rs`'s `--force` guard and `doctor.rs`'s additive worktree-store
 /// report both need the same directory name; worktree-index Task 7), so this
-/// is `pub` rather than `pub(crate)`.
-pub const WORKTREES_DIR_NAME: &str = "worktrees";
+/// is `pub` rather than `pub(crate)`. The name itself is defined in
+/// loomweave-core (`worktree::paths`), where it also anchors the analyze
+/// lock-path contract `analyze_lock.rs` and `loomweave-mcp` share; this
+/// re-export keeps the CLI's existing import paths working.
+pub use loomweave_core::worktree::WORKTREES_DIR_NAME;
 
 const ISO8601_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");

@@ -83,7 +83,7 @@ pub use query::{
 };
 pub use reader::ReaderPool;
 pub use retry::{RetryPolicy, begin_immediate};
-pub use runs::mark_stale_running_runs_failed;
+pub use runs::{mark_abandoned_running_runs_failed, mark_stale_running_runs_failed};
 pub use sei::{
     BindingStatus, GitRename, GitRenameSource, LineageEvent, NewEntityDescriptor, SEI_PREFIX,
     SeiBinding, SeiBindingRecord, SeiDecision, SeiLineageEntry, SeiLineageRow, SeiLookupResult,
