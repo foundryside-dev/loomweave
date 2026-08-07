@@ -11,4 +11,7 @@ pub use context::{
     ConfigOrigin, WorktreeContext, WorktreeContextError, WorktreeKind,
     stable_id_for_admin_identity, stable_id_for_shared_store_project,
 };
-pub use paths::StorePaths;
+pub use paths::{
+    StorePaths, WORKTREES_DIR_NAME, linked_worktree_analyze_lock_path,
+    linked_worktree_analyze_lock_path_for_store,
+};

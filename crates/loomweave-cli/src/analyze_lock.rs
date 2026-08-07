@@ -46,14 +46,23 @@ pub(crate) enum TryAnalyzeLock {
 
 fn lock_path_for_context(ctx: &WorktreeContext) -> Result<PathBuf> {
     if let Some(stable_id) = ctx.stable_id.as_deref() {
-        let namespace = ctx.repository_store.join("worktrees");
-        std::fs::create_dir_all(&namespace).with_context(|| {
+        // The path contract (`<repository-store>/worktrees/<stable-id>.lock`)
+        // is defined once, in loomweave-core, and shared with the MCP
+        // server's builder-liveness probe — never re-derived here.
+        let lock_path = loomweave_core::worktree::linked_worktree_analyze_lock_path(
+            &ctx.repository_store,
+            stable_id,
+        );
+        let namespace = lock_path
+            .parent()
+            .expect("linked_worktree_analyze_lock_path always nests under worktrees/");
+        std::fs::create_dir_all(namespace).with_context(|| {
             format!(
                 "create worktree analyze-lock namespace {}",
                 namespace.display()
             )
         })?;
-        Ok(namespace.join(format!("{stable_id}.lock")))
+        Ok(lock_path)
     } else {
         Ok(ctx.effective_store.join(LOCK_FILE_NAME))
     }

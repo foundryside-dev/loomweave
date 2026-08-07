@@ -1857,9 +1857,23 @@ impl ServerState {
             return None;
         }
 
+        // The liveness-repair variant: a `running` row whose builder is
+        // provably dead (nothing holds the per-worktree analyze lock) is
+        // converted to `failed` on the spot, so this gate reports the
+        // non-retryable build-failed envelope below — with the explicit
+        // recovery command — instead of retryable `index-building` forever
+        // (see `read_worktree_readiness_with_liveness_repair`).
+        let repair_db_path = gate.store_paths.db.clone();
         let read = self
             .readers
-            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .with_reader(move |conn| {
+                Ok(
+                    worktree_bootstrap::read_worktree_readiness_with_liveness_repair(
+                        conn,
+                        &repair_db_path,
+                    ),
+                )
+            })
             .await;
         // A storage-layer read failure here is not this gate's to report —
         // fall through to normal dispatch, which will hit the same failure
@@ -2248,13 +2262,24 @@ impl ServerState {
     /// `McpErrorCode`) or `None` when the resource should read the store
     /// normally.
     async fn worktree_gate_block_reason(&self) -> Option<&'static str> {
-        self.worktree_gate.as_ref()?;
+        let gate = self.worktree_gate.as_ref()?;
         if !self.project_root.exists() {
             return Some("source-root-missing");
         }
+        // Same liveness-repair consult as `consult_worktree_gate`: a dead
+        // builder's abandoned `running` row must not report `index-building`
+        // through this door either.
+        let repair_db_path = gate.store_paths.db.clone();
         let read = self
             .readers
-            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .with_reader(move |conn| {
+                Ok(
+                    worktree_bootstrap::read_worktree_readiness_with_liveness_repair(
+                        conn,
+                        &repair_db_path,
+                    ),
+                )
+            })
             .await;
         let Ok(read) = read else {
             // A storage-layer failure is not this gate's to report — fall

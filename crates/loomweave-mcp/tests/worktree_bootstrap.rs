@@ -356,6 +356,106 @@ fn count_matching(dir: &Path, prefix: &str) -> usize {
         .count()
 }
 
+/// The per-worktree analyze lock file (`<repository-store>/worktrees/
+/// <stable-id>.lock`) a live builder holds for its whole run — the liveness
+/// signal the readiness gate's dead-builder repair probes.
+fn analyze_lock_path(ctx: &WorktreeContext) -> PathBuf {
+    ctx.repository_store.join("worktrees").join(format!(
+        "{}.lock",
+        ctx.stable_id.as_deref().expect("linked fixture")
+    ))
+}
+
+/// Dead-child wedge (review finding): a bootstrap analyze child that dies
+/// uncleanly (OOM-kill, `kill -9`, reboot) AFTER writing its `BeginRun`
+/// `status='running'` row must not leave the worktree in retryable
+/// `index-building` forever. A `running` row whose owning process is provably
+/// gone — nothing holds the per-worktree analyze lock — must be converted to
+/// a failed row so the gate reports the non-retryable `index-build-failed`
+/// envelope with the explicit recovery command.
+#[tokio::test]
+async fn dead_builder_running_row_repairs_to_build_failed_not_building_forever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    // The dead child's own `running` row; no process holds the analyze lock.
+    seed_run(
+        &ctx.store_paths.db,
+        "r-dead",
+        "2026-01-01T00:00:00.000Z",
+        "running",
+    );
+    let state = linked_state(&ctx);
+
+    let resp = call_tool(&state, "entity_find", json!({"pattern": "x"})).await;
+    assert_eq!(resp["ok"], false, "{resp:?}");
+    assert_eq!(
+        resp["error"]["code"], "index-build-failed",
+        "a running row with no live lock holder is a dead builder, not a build in progress: \
+         {resp:?}"
+    );
+    assert_eq!(
+        resp["error"]["retryable"], false,
+        "no automatic recovery — the explicit fallback command is the documented path: {resp:?}"
+    );
+    assert_eq!(
+        resp["diagnostics"][0]["fallback_command"],
+        fallback_command_json(&ctx),
+        "{resp:?}"
+    );
+
+    // The repair persisted: the abandoned row is now terminally `failed`.
+    let conn = Connection::open(&ctx.store_paths.db).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM runs WHERE id = 'r-dead'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        status, "failed",
+        "the abandoned row must be repaired on disk"
+    );
+}
+
+/// The inverse guard for the repair above: a `running` row whose builder IS
+/// alive (holds the per-worktree analyze lock) must keep gating reads as
+/// retryable `index-building` — the repair must never shoot a live build.
+#[tokio::test]
+async fn live_builder_holding_the_lock_still_gates_as_building() {
+    use fs2::FileExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(analyze_lock_path(&ctx))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    seed_run(
+        &ctx.store_paths.db,
+        "r-live",
+        "2026-01-01T00:00:00.000Z",
+        "running",
+    );
+    let state = linked_state(&ctx);
+
+    let resp = call_tool(&state, "entity_find", json!({"pattern": "x"})).await;
+    assert_eq!(resp["error"]["code"], "index-building", "{resp:?}");
+    assert_eq!(resp["error"]["retryable"], true, "{resp:?}");
+
+    let conn = Connection::open(&ctx.store_paths.db).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM runs WHERE id = 'r-live'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "running", "a live builder's row must be left alone");
+}
+
 #[tokio::test]
 async fn failed_build_returns_index_build_failed_with_fallback_command() {
     let tmp = tempfile::tempdir().unwrap();
@@ -425,11 +525,24 @@ async fn status_index_state_distinguishes_building_spawn_failed_and_ready() {
 
 #[tokio::test]
 async fn manual_recovery_run_overrides_session_static_bootstrap_spawn_failure() {
+    use fs2::FileExt as _;
+
     let tmp = tempfile::tempdir().unwrap();
     let ctx = linked_context(tmp.path());
     init_effective_store(&ctx);
     let state = linked_state_with_spawn_outcome(&ctx, true);
 
+    // A real manual recovery run holds the per-worktree analyze lock for its
+    // whole run; without it the gate's dead-builder repair would (correctly)
+    // classify the row below as abandoned.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(analyze_lock_path(&ctx))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
     seed_run(
         &ctx.store_paths.db,
         "manual-recovery",
