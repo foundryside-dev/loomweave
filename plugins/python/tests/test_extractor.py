@@ -2818,11 +2818,19 @@ class TestUnlisted:
 def _wardline_vocabulary(
     *,
     confidence_basis: Literal["descriptor", "descriptor_version_skew"] = "descriptor",
+    schema: str = "wardline.vocabulary/v1",
+    version: str = "wardline-generic-2",
+    facets_by_name: dict[str, DescriptorEntry] | None = None,
 ) -> WardlineVocabulary:
+    # `facets_by_name` defaults to None rather than to a literal `{}` because a
+    # mutable parameter default is a ruff B006 red under the plugin's
+    # `select = ["ALL"]`; the effective default is still the v1 empty map.
     return WardlineVocabulary(
-        version="wardline-generic-2",
+        version=version,
+        schema=schema,
         source="project",
         confidence_basis=confidence_basis,
+        facets_by_name={} if facets_by_name is None else facets_by_name,
         entries_by_name={
             "external_boundary": DescriptorEntry(
                 canonical_name="external_boundary",
@@ -2927,6 +2935,69 @@ def compute():
 
     compute = next(e for e in entities if e["id"] == "python:function:service.compute")
     assert compute["wardline"]["confidence_basis"] == "descriptor_version_skew"
+
+
+def _v2_vocabulary() -> WardlineVocabulary:
+    return _wardline_vocabulary(
+        schema="wardline.vocabulary/v2",
+        version="wardline-generic-3",
+        facets_by_name={
+            "audit_record": DescriptorEntry(canonical_name="audit_record", group=3, attrs={}),
+        },
+    )
+
+
+def test_wardline_facet_decorator_is_attributed_with_tag() -> None:
+    source = """\
+from weft_markers import audit_record
+
+@audit_record
+def settle():
+    return 1
+"""
+
+    entities, _ = extract(source, "service.py", wardline_vocabulary=_v2_vocabulary())
+
+    settle = next(e for e in entities if e["id"] == "python:function:service.settle")
+    assert settle["wardline"]["decorators"] == [
+        {
+            "canonical_name": "audit_record",
+            "qualified_name": "audit_record",
+            "group": 3,
+            "attrs": {},
+            "line": 3,
+            "kind": "facet",
+        },
+    ]
+    assert "wardline" in settle["tags"]
+    assert "wardline:audit_record" in settle["tags"]
+
+
+def test_wardline_entry_decorator_record_omits_kind() -> None:
+    # The other direction of the `kind` rule: a SEEDING entry's record stays
+    # byte-identical to the pre-facet shape even when facets are in play, so no
+    # exact-dict assertion anywhere moves.
+    source = """\
+from weft_markers import trusted
+
+@trusted
+def compute():
+    return 1
+"""
+
+    entities, _ = extract(source, "service.py", wardline_vocabulary=_v2_vocabulary())
+
+    compute = next(e for e in entities if e["id"] == "python:function:service.compute")
+    assert compute["wardline"]["decorators"] == [
+        {
+            "canonical_name": "trusted",
+            "qualified_name": "trusted",
+            "group": 1,
+            "attrs": {"_wardline_level": "TaintState"},
+            "line": 3,
+        },
+    ]
+    assert "kind" not in compute["wardline"]["decorators"][0]
 
 
 def test_module_source_range_no_trailing_newline() -> None:

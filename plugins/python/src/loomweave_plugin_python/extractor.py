@@ -176,6 +176,10 @@ class WardlineDecoratorMetadata(TypedDict):
     group: int
     attrs: dict[str, str]
     line: int
+    # Present only on facets (declaration-surface-v2 §7): a decorator that is
+    # attributed but seeds no taint. Absent means a seeding entry, so every
+    # pre-facet record is byte-identical and no exact-dict assertion moves.
+    kind: NotRequired[Literal["facet"]]
 
 
 class WardlineEntityMetadata(TypedDict):
@@ -1298,19 +1302,25 @@ def _attach_wardline_entity_metadata(
         qualified_name = _expr_qualified_name(decorator)
         if qualified_name is None:
             continue
+        # Entries resolve FIRST; facets only when that misses, so no seeding
+        # marker can ever be re-labelled a facet by a name collision (and the
+        # parser already rejects such a collision at load).
         entry = vocabulary.entry_for_decorator(qualified_name)
-        if entry is None:
+        facet = None if entry is not None else vocabulary.facet_for_decorator(qualified_name)
+        marker = entry if entry is not None else facet
+        if marker is None:
             continue
-        decorators.append(
-            {
-                "canonical_name": entry.canonical_name,
-                "qualified_name": qualified_name,
-                "group": entry.group,
-                "attrs": dict(entry.attrs),
-                "line": decorator.lineno,
-            },
-        )
-        tags.update({"wardline", f"wardline:{entry.canonical_name}"})
+        record: WardlineDecoratorMetadata = {
+            "canonical_name": marker.canonical_name,
+            "qualified_name": qualified_name,
+            "group": marker.group,
+            "attrs": dict(marker.attrs),
+            "line": decorator.lineno,
+        }
+        if facet is not None:
+            record["kind"] = "facet"
+        decorators.append(record)
+        tags.update({"wardline", f"wardline:{marker.canonical_name}"})
     if decorators:
         entity["wardline"] = {
             "descriptor_version": vocabulary.version,
