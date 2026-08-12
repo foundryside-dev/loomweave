@@ -25,8 +25,29 @@ pair while dropping one of its sections would report full ``confidence_basis:
 "descriptor"`` confidence over a half-understood descriptor — an
 accept-and-ignore fail-open. So when Wardline adds a section to a schema this
 reader accepts, the reader is extended in the SAME consumer-first change (spec
-P6), and a section that the declared schema does not define fails closed rather
-than being tolerated as an unknown key.
+P6).
+
+That obligation is currently enforced for exactly ONE section: a ``facets:`` key
+under the v1 schema, whose shape is known exactly, fails closed. Any OTHER unknown
+top-level key is silently ignored — including under an accepted pair, where the
+descriptor still reports full ``confidence_basis: "descriptor"``. Measured, not
+assumed: a v2/generic-3 descriptor carrying an extra ``contracts:`` section parses
+to ``enabled``/``descriptor`` with the section dropped and no signal. The designated
+tripwire is the preview fixture's top-level key-set test (declaration-surface-v2
+§13.1), which watches an artifact in THIS repository and so cannot fire on a section
+arriving in a producer descriptor at runtime.
+
+A second gap sits beside it: the ``facets:`` guard keys on "is v1?", not "is v2?",
+so a schema this reader does NOT accept still has its ``facets:`` section parsed
+under v2's grammar (measured: ``wardline.vocabulary/v3`` + a v2-shaped ``facets:``
+yields ``version_skew`` with the facet parsed and attributed, while the same
+descriptor without the section yields ``version_skew`` with no facets). The
+confidence basis correctly degrades to ``descriptor_version_skew``, so this is
+interpret-what-you-do-not-understand at reduced confidence rather than at full.
+
+Both are tracked as residuals rather than closed here: rejecting unknown top-level
+keys would fail-close this reader on every future additive Wardline section, and
+that blast radius has not been measured. See filigree for the owning issue.
 """
 
 from __future__ import annotations
