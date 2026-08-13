@@ -37,17 +37,17 @@ tripwire is the preview fixture's top-level key-set test (declaration-surface-v2
 §13.1), which watches an artifact in THIS repository and so cannot fire on a section
 arriving in a producer descriptor at runtime.
 
-A second gap sits beside it: the ``facets:`` guard keys on "is v1?", not "is v2?",
-so a schema this reader does NOT accept still has its ``facets:`` section parsed
-under v2's grammar (measured: ``wardline.vocabulary/v3`` + a v2-shaped ``facets:``
-yields ``version_skew`` with the facet parsed and attributed, while the same
-descriptor without the section yields ``version_skew`` with no facets). The
-confidence basis correctly degrades to ``descriptor_version_skew``, so this is
-interpret-what-you-do-not-understand at reduced confidence rather than at full.
+The sibling gap — the ``facets:`` guard keying on "is v1?" rather than "is this the
+schema whose facet grammar I know?", which let an unaccepted schema's section be
+parsed under v2's rules — is CLOSED; see ``_parse_facets``.
 
-Both are tracked as residuals rather than closed here: rejecting unknown top-level
-keys would fail-close this reader on every future additive Wardline section, and
-that blast radius has not been measured. See filigree for the owning issue.
+The remaining gap is tracked as a residual rather than closed here. Rejecting
+unknown top-level keys would fail-close this reader on every future additive
+Wardline section, which is the inverse of the consumer-first property the dual-
+accept design exists to deliver, and that blast radius has not been measured. It
+is a producer/consumer contract question — what the runtime tripwire should be —
+and belongs in the declaration-surface spec, not in a reader's guard. See filigree
+for the owning issue.
 """
 
 from __future__ import annotations
@@ -65,6 +65,10 @@ import yaml
 EXPECTED_DESCRIPTOR_VERSION = "wardline-generic-2"
 # Pre-schema descriptors (no `schema:` key) are the v1 era by definition.
 _DEFAULT_SCHEMA = "wardline.vocabulary/v1"
+# The ONLY schema whose ``facets:`` grammar this reader knows. Kept separate from
+# ACCEPTED_DESCRIPTORS on purpose: acceptance is keyed on the (schema, version)
+# PAIR, while knowing how to read a section is a property of the SCHEMA alone.
+_FACETS_SCHEMA = "wardline.vocabulary/v2"
 # Consumer-first dual-accept (wardline declaration-surface-v2 §13.1 item 1): the
 # (schema, version) PAIR gates acceptance — generic-3 is accepted only under
 # the v2 schema, BEFORE wardline emits it. EXPECTED_DESCRIPTOR_VERSION remains
@@ -292,8 +296,28 @@ def _parse_facets(
     A ``facets:`` key under the v1 schema is a contract violation, not an
     unknown key: v1's shape is known exactly, and honouring a section the
     declared schema does not have is the fail-open this reader exists to avoid.
+
+    Under any OTHER schema — one this reader has never accepted — the section is
+    neither honoured nor rejected: it is simply not interpreted. The guard used to
+    key on "is v1?", which meant every unaccepted schema fell through into v2's
+    facet grammar, so a ``wardline.vocabulary/v3`` descriptor had its facets parsed
+    and attributed under rules written for a different version. That is
+    interpret-what-you-do-not-understand, the mirror of accept-and-ignore, and it
+    failed in both directions at once: a v3 facet whose shape legitimately differed
+    (non-empty ``attrs``, or a mapping instead of a list) was rejected hard enough
+    to drop the WHOLE descriptor to ``absent``, losing entries the reader could
+    have kept. Returning an empty map restores the pre-facets posture for unknown
+    schemas — ``version_skew`` with entries preserved and no facets claimed —
+    which is the honest answer: this reader does not know what a v3 ``facets:``
+    section means, and says so by declining to read it rather than by guessing.
     """
     if "facets" not in descriptor:
+        return {}
+    # A TUPLE, not a set: membership against a set requires a hashable operand,
+    # and this reader parses untrusted YAML. `schema` is str-checked upstream so a
+    # set would be safe today, but the containment test should not be one refactor
+    # away from raising TypeError on a descriptor that ought to degrade.
+    if schema not in (_FACETS_SCHEMA, _DEFAULT_SCHEMA):
         return {}
     if schema == _DEFAULT_SCHEMA:
         msg = "descriptor carries a facets section under the v1 schema"

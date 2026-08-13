@@ -4,6 +4,7 @@ import builtins
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from loomweave_plugin_python.wardline_descriptor import (
@@ -450,6 +451,106 @@ def test_version_skew_preserves_parsed_facets(tmp_path: Path) -> None:
     assert state.vocabulary.confidence_basis == "descriptor_version_skew"
     assert sorted(state.vocabulary.facets_by_name) == ["audit_record"]
     assert state.vocabulary.facets_by_name["audit_record"].group == 3
+
+
+_FACETS_SECTION = "facets:\n- canonical_name: audit_record\n  group: 3\n"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "wardline.vocabulary/v3",
+        "wardline.vocabulary/V2",  # case-perturbed: not the v2 schema
+        # YAML-quoted, so this is a genuine empty STRING. An unquoted `schema:`
+        # parses as null, which means the pre-schema v1 era by definition and
+        # takes the v1 contract-violation path instead — a different case,
+        # pinned separately by test_null_schema_with_facets_is_the_v1_violation.
+        "''",
+        "totally-unknown",
+    ],
+)
+def test_facets_under_an_unknown_schema_are_not_interpreted(tmp_path: Path, schema: str) -> None:
+    """The guard keys on "is this the schema whose facet grammar I know?", not "is
+    this v1?".
+
+    Keying on v1 meant every schema this reader has never accepted fell THROUGH
+    into v2's facet grammar, so a v3 descriptor had its facets parsed and
+    attributed under rules written for a different version — the accept-and-ignore
+    fail-open inverted into interpret-what-you-do-not-understand. Declining to read
+    the section is the honest answer: the reader does not know what a v3 ``facets:``
+    means, and says so rather than guessing.
+    """
+    planted = _V2_BODY.replace("schema: wardline.vocabulary/v2", f"schema: {schema}")
+    _plant(tmp_path, planted + _FACETS_SECTION)
+    state = load_wardline_descriptor(tmp_path)
+
+    assert state.status == "version_skew"
+    assert state.vocabulary is not None
+    assert state.vocabulary.facets_by_name == {}
+    # Entries survive — declining to read one section must not cost the rest.
+    assert sorted(state.vocabulary.entries_by_name) == ["trusted"]
+
+
+@pytest.mark.parametrize(
+    ("label", "facets_text"),
+    [
+        # v2 rejects a facet carrying attrs; under an unknown schema that rule
+        # does not apply, because it is not this reader's rule to enforce there.
+        (
+            "non_empty_attrs",
+            "facets:\n- canonical_name: audit_record\n  group: 3\n  attrs:\n    x: y\n",
+        ),
+        # v2 requires a list; a mapping is a different shape entirely.
+        ("mapping_not_list", "facets:\n  audit_record: {group: 3}\n"),
+    ],
+)
+def test_unknown_schema_facet_shapes_do_not_destroy_the_descriptor(
+    tmp_path: Path, label: str, facets_text: str
+) -> None:
+    """The over-strict half of the same defect, and the one that cost entries.
+
+    Enforcing v2's exact facet SHAPE on a schema whose shape is unknown dropped
+    the whole descriptor to ``absent``/``invalid_descriptor`` — strictly worse
+    than the ``version_skew`` the same descriptor gets with no facets section at
+    all. A future v3 whose facets legitimately differ must degrade to skew with
+    its entries intact, not vanish.
+    """
+    planted = _V2_BODY.replace("schema: wardline.vocabulary/v2", "schema: wardline.vocabulary/v3")
+    _plant(tmp_path, planted + facets_text)
+    state = load_wardline_descriptor(tmp_path)
+
+    assert state.status == "version_skew", label
+    assert state.vocabulary is not None
+    assert sorted(state.vocabulary.entries_by_name) == ["trusted"], label
+
+
+def test_null_schema_with_facets_is_the_v1_violation_not_an_unknown_schema(tmp_path: Path) -> None:
+    """A bare ``schema:`` is null, and null means the pre-schema v1 era BY
+    DEFINITION — not "an unknown schema".
+
+    Worth pinning because the two look alike in a fixture and behave oppositely:
+    an unknown schema declines to read the section (skew, entries kept), while v1
+    treats it as a contract violation (absent). Reading a null as "unknown" would
+    silently convert every pre-schema descriptor carrying a stray section from a
+    hard failure into a soft one.
+    """
+    _plant(tmp_path, "schema:\n" + _V2_BODY.split("\n", 1)[1] + _FACETS_SECTION)
+    state = load_wardline_descriptor(tmp_path)
+    assert state.status == "absent"
+    assert state.reason == "invalid_descriptor"
+
+
+def test_v2_still_enforces_its_own_facet_grammar(tmp_path: Path) -> None:
+    # The control for the two tests above: declining to interpret an UNKNOWN
+    # schema's facets must not relax the rules under the schema this reader DOES
+    # know. A facet carrying attrs is still a v2 contract violation.
+    _plant(
+        tmp_path,
+        _V2_BODY + "facets:\n- canonical_name: audit_record\n  group: 3\n  attrs:\n    x: y\n",
+    )
+    state = load_wardline_descriptor(tmp_path)
+    assert state.status == "absent"
+    assert state.reason == "invalid_descriptor"
 
 
 def test_generic_3_preview_fixture_declares_only_known_sections() -> None:
