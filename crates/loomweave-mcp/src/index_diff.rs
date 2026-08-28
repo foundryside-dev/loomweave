@@ -515,8 +515,7 @@ pub(crate) fn compute_freshness(
     let mut dirty_indexed_count = 0usize;
     for entry in &git.dirty {
         let indexed = normalize_source_path(project_root, &entry.rel_path)
-            .ok()
-            .is_some_and(|rel| indexed_rel.contains(&rel));
+            .is_ok_and(|rel| indexed_rel.contains(&rel));
         if indexed {
             dirty_indexed_count += 1;
         }

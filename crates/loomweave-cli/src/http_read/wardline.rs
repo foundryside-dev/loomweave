@@ -379,6 +379,9 @@ pub(crate) async fn post_wardline_taint_facts(
 ///
 /// Returns `Err(Response)` only when the DB read itself fails; per-qualname
 /// "not found" is conveyed in-band via `exists: false`.
+// `Err(Response)` is the early-return HTTP reply, not a value callers inspect;
+// boxing it would only move the allocation into every caller.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn respond_taint_facts(
     state: &AppState,
     qualnames: Vec<String>,
@@ -533,6 +536,9 @@ pub(crate) async fn post_wardline_taint_facts_batch_get(
 /// whole-file `current_content_hash` from the fact's `source_file_path`. File
 /// hashing is DEDUPED per request by path. All DB work + hashing run in ONE
 /// pooled-connection checkout. A SEI with no stored fact → `exists: false`.
+// `Err(Response)` is the early-return HTTP reply, not a value callers inspect;
+// boxing it would only move the allocation into every caller.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn respond_taint_facts_by_sei(
     state: &AppState,
     seis: Vec<String>,

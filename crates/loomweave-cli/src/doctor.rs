@@ -1969,14 +1969,12 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
             }));
     }
 
-    let identity_secret_present = http.identity_token_env.as_deref().is_some_and(|name| {
-        std::env::var(name)
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    let bearer_secret_present = std::env::var(&http.token_env)
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let identity_secret_present = http
+        .identity_token_env
+        .as_deref()
+        .is_some_and(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+    let bearer_secret_present =
+        std::env::var(&http.token_env).is_ok_and(|value| !value.trim().is_empty());
     let configured_mode = if http.identity_token_env.is_some() {
         "hmac"
     } else if bearer_secret_present {

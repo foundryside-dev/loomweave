@@ -17,8 +17,9 @@ use crate::{
 
 impl ServerState {
     // Uniform async dispatch with the other tools; the body is sync (spawn +
-    // registry insert), hence no await.
-    #[allow(clippy::unused_async)]
+    // registry insert), hence no await. (clippy 1.98 reports this under the
+    // new `unused_async_trait_impl` id as well.)
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub(crate) async fn tool_analyze_start(
         &self,
         _arguments: &serde_json::Map<String, Value>,
