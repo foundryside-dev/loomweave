@@ -37,6 +37,57 @@ class UnresolvedCallSite(TypedDict):
     callee_expr: str
 
 
+class FacetCoverageWire(TypedDict):
+    """Wire shape of one resolution facet's coverage claim (host contract)."""
+
+    status: Literal["complete", "degraded"]
+    reason: NotRequired[str]
+    transient: bool
+
+
+class ResolutionCoverageWire(TypedDict):
+    calls: FacetCoverageWire
+    references: FacetCoverageWire
+
+
+@dataclass(frozen=True)
+class FacetCoverage:
+    """How much of one resolution facet (calls / references) a file received.
+
+    The resolver degrades to EMPTY evidence -- not an error -- when pyright is
+    unavailable, times out, or has been poisoned for the rest of the run. The
+    host cannot tell that apart from a genuinely call-free file, so it treated
+    the empty result as a completed analysis and its incremental skip pinned
+    the hole for as long as the file's bytes stayed unchanged
+    (clarion-3e517d4aff). This claim rides every ``analyze_file`` result so the
+    host can re-dispatch a ``degraded`` + ``transient`` file next run and name
+    the hole on its read surface.
+
+    ``transient`` is True when re-running the unchanged file could plausibly
+    recover coverage (resolver timeout, crash, poison, unavailable binary) and
+    False for content-determined limits a re-run would hit again (syntax
+    error, per-file site cap, nesting too complex).
+    """
+
+    status: Literal["complete", "degraded"] = "complete"
+    reason: str | None = None
+    transient: bool = False
+
+    @classmethod
+    def degraded(cls, reason: str, *, transient: bool) -> FacetCoverage:
+        return cls(status="degraded", reason=reason, transient=transient)
+
+    @property
+    def is_degraded(self) -> bool:
+        return self.status == "degraded"
+
+    def to_wire(self) -> FacetCoverageWire:
+        wire: FacetCoverageWire = {"status": self.status, "transient": self.transient}
+        if self.reason is not None:
+            wire["reason"] = self.reason
+        return wire
+
+
 @dataclass
 class CallResolutionResult:
     edges: list[CallsRawEdge] = field(default_factory=list)
@@ -45,6 +96,7 @@ class CallResolutionResult:
     pyright_query_latency_ms: list[int] = field(default_factory=list)
     pyright_index_parse_latency_ms: list[int] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    coverage: FacetCoverage = field(default_factory=FacetCoverage)
 
 
 class CallResolver(Protocol):

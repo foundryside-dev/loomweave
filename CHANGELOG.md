@@ -97,6 +97,28 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
+- **A transient pyright failure no longer leaves a permanent hole in the call
+  graph** (clarion-3e517d4aff). The Python plugin degraded to *empty* call /
+  reference evidence — not an error — whenever pyright timed out, crashed, or
+  tripped its restart cap (after which every later file in the run silently
+  got nothing). The host persisted that as a completed analysis and the
+  incremental skip then pinned the byte-identical file forever, so
+  `entity_callers_list` answered `[]` with `traversal_complete: true` for
+  callees whose callers were never extracted (elspeth: 617 of 2,779
+  function-bearing files). Now every `analyze_file` result carries a per-file
+  `resolution_coverage` claim (`calls` / `references`: `complete` |
+  `degraded`, with a `transient` flag); the host records it in a new
+  `source_file_resolution_coverage` table (migration 0013) and force-
+  re-dispatches `degraded && transient` files on the next incremental run.
+  Indexes built by an older binary self-heal: a file with no coverage row
+  that owns symbols yet carries zero `calls` edges and zero unresolved sites
+  is re-dispatched once. The completion line and `runs.stats`
+  (`resolution_degraded_files`) say how many files degraded this run; the
+  caller-navigation tools add `"degraded-call-resolution"` to
+  `scope_excludes` (withdrawing `traversal_complete`) plus a
+  `degraded_call_coverage_files` count while any such file exists; and
+  `loomweave doctor` gains an `index.resolution_coverage` check. The external
+  SQLite read ceiling advances to `user_version` 13 (additive table only).
 - **Stale syntax findings now retire when files are fixed.** A file whose
   parse error was fixed no longer keeps its old `*-SYNTAX-ERROR` finding
   forever: a per-plugin sweep retires findings for files whose

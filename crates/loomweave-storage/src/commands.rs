@@ -403,6 +403,17 @@ pub enum WriterCmd {
         sites: Vec<UnresolvedCallSiteRecord>,
         ack: Ack<()>,
     },
+    /// Record the per-file call / reference resolution coverage the plugin
+    /// claimed for `source_file_id` (clarion-3e517d4aff). Rides the active run
+    /// transaction so a crash cannot leave a file's edges replaced without its
+    /// coverage claim; a transient-degraded claim makes the incremental skip
+    /// re-dispatch the file next run.
+    UpsertSourceFileResolutionCoverage {
+        source_file_id: String,
+        coverage: crate::resolution_coverage::SourceFileResolutionCoverage,
+        updated_at: String,
+        ack: Ack<()>,
+    },
     /// Commit the in-flight transaction, update the run row to the given
     /// terminal status + `completed_at` + `stats_json`, and clear per-run
     /// state.

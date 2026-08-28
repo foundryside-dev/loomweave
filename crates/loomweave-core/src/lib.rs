@@ -30,6 +30,7 @@ pub use plugin::{
     AnalyzeFileStats,
     BriefingBlockReason,
     CapExceeded,
+    CoverageStatus,
     // breaker (Task 7) — callers drive crash-loop accounting
     CrashLoopBreaker,
     CrashLoopState,
@@ -39,6 +40,7 @@ pub use plugin::{
     DiscoveryError,
     EdgeConfidence,
     FINDING_DISABLED_CRASH_LOOP,
+    FacetCoverage,
     HostError,
     HostFinding,
     // jail / limits errors — callers may want to match on these
@@ -48,6 +50,7 @@ pub use plugin::{
     ManifestError,
     OntologyEntityRole,
     PluginHost,
+    ResolutionCoverage,
     UnresolvedCallSite,
     discover,
     parse_manifest,

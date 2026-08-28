@@ -1137,6 +1137,9 @@ def test_pyright_session_reference_resolution_timeout(
     assert result.reference_sites_total == 1
     assert result.unresolved_reference_sites_total == 1
     assert FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+    assert result.coverage.is_degraded
+    assert result.coverage.reason == "pyright_timeout"
+    assert result.coverage.transient is True
 
 
 def test_pyright_session_reference_lookup_cache_includes_source_position(tmp_path: Path) -> None:
@@ -1808,6 +1811,9 @@ def test_pyright_session_unavailable_binary_missing(tmp_path: Path) -> None:
     assert result.edges == []
     assert result.unresolved_call_sites_total == 1
     assert FINDING_PYRIGHT_UNAVAILABLE in _finding_codes(result.findings)
+    assert result.coverage.is_degraded
+    assert result.coverage.reason == "pyright_unavailable"
+    assert result.coverage.transient is True
 
 
 def test_pyright_session_install_failure(tmp_path: Path) -> None:
@@ -1995,6 +2001,11 @@ def test_pyright_session_call_resolution_timeout(tmp_path: Path, pyright_langser
 
     assert result.edges == []
     assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+    # clarion-3e517d4aff: empty evidence from a timeout is NOT a call-free
+    # file; the claim must be degraded + transient so the host re-dispatches.
+    assert result.coverage.is_degraded
+    assert result.coverage.reason == "pyright_timeout"
+    assert result.coverage.transient is True
 
 
 def test_pyright_session_caps_per_file_pyright_budget(tmp_path: Path) -> None:

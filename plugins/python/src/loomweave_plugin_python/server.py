@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from loomweave_plugin_python import __version__
-from loomweave_plugin_python.extractor import extract_with_stats
+from loomweave_plugin_python.extractor import ExtractionStats, extract_with_stats
 from loomweave_plugin_python.pyright_session import PyrightRunState, PyrightSession
 from loomweave_plugin_python.stdout_guard import install_stdio
 from loomweave_plugin_python.wardline_descriptor import WardlineVocabulary, load_wardline_descriptor
@@ -194,6 +194,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "pyright_query_latency_ms": [],
         "pyright_index_parse_latency_ms": [],
         "extractor_parse_latency_ms": 0,
+        "resolution_coverage": ExtractionStats().resolution_coverage_wire(),
     }
     file_path_raw = params.get("file_path")
     if not isinstance(file_path_raw, str):
@@ -237,6 +238,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "pyright_query_latency_ms": result.stats.pyright_query_latency_ms,
         "pyright_index_parse_latency_ms": result.stats.pyright_index_parse_latency_ms,
         "extractor_parse_latency_ms": result.stats.extractor_parse_latency_ms,
+        "resolution_coverage": result.stats.resolution_coverage_wire(),
     }
     return {
         "entities": result.entities,

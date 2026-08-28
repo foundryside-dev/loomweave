@@ -5082,6 +5082,81 @@ async fn callers_of_with_no_skipped_candidate_reports_traversal_complete() {
 }
 
 #[tokio::test]
+async fn callers_of_names_degraded_call_resolution_and_withdraws_traversal_complete() {
+    // clarion-3e517d4aff: a file whose plugin reported degraded call
+    // resolution contributed neither `calls` edges nor unresolved sites, so an
+    // empty callers list over such an index is NOT a true negative. The
+    // navigation surface must name the hole and withdraw traversal_complete
+    // at every confidence tier — `inferred` has no recorded sites to attempt.
+    let (project, db_path) = open_project();
+    {
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        conn.execute(
+            "INSERT INTO source_file_resolution_coverage (
+                source_file_id, calls_status, calls_reason, calls_transient,
+                references_status, references_reason, references_transient,
+                run_id, updated_at
+             ) VALUES (
+                'core:file:demo.py', 'degraded', 'pyright_timeout', 1,
+                'complete', NULL, 0, 'run-1', '2026-08-29T00:00:00.000Z'
+             )",
+            [],
+        )
+        .expect("seed degraded coverage");
+    }
+    let state = state_for(project.path(), &db_path);
+
+    for confidence in ["resolved", "ambiguous", "inferred"] {
+        let envelope = call_tool(
+            &state,
+            "callers_of",
+            json!({"id": "python:function:demo.target", "confidence": confidence}),
+        )
+        .await;
+        assert_eq!(envelope["ok"], true, "{confidence}: {envelope}");
+        let excludes = envelope["result"]["scope_excludes"]
+            .as_array()
+            .expect("scope_excludes array");
+        assert!(
+            excludes.iter().any(|v| v == "degraded-call-resolution"),
+            "{confidence}: degraded coverage must be named, got {excludes:?}"
+        );
+        assert_eq!(
+            envelope["result"]["traversal_complete"], false,
+            "{confidence}: a degraded index cannot claim completeness: {envelope}"
+        );
+        assert_eq!(
+            envelope["result"]["degraded_call_coverage_files"], 1,
+            "{confidence}: {envelope}"
+        );
+    }
+
+    let neighborhood = call_tool(
+        &state,
+        "neighborhood",
+        json!({"id": "python:function:demo.target"}),
+    )
+    .await;
+    assert_eq!(
+        neighborhood["result"]["traversal_complete"], false,
+        "{neighborhood}"
+    );
+    assert_eq!(neighborhood["result"]["degraded_call_coverage_files"], 1);
+
+    let paths = call_tool(
+        &state,
+        "execution_paths_from",
+        json!({"id": "python:function:demo.entry", "confidence": "inferred"}),
+    )
+    .await;
+    assert_eq!(
+        paths["result"]["scope_excludes"],
+        json!(["degraded-call-resolution"]),
+        "{paths}"
+    );
+}
+
+#[tokio::test]
 async fn execution_paths_from_resolved_flags_attribute_receiver_scope_exclusion() {
     let (project, db_path) = open_project();
     let state = state_for(project.path(), &db_path);

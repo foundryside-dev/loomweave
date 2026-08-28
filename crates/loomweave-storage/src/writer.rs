@@ -389,6 +389,22 @@ fn run_actor(
                 });
                 reply(ack, res);
             }
+            WriterCmd::UpsertSourceFileResolutionCoverage {
+                source_file_id,
+                coverage,
+                updated_at,
+                ack,
+            } => {
+                let res = upsert_resolution_coverage_in_run(
+                    conn,
+                    &mut state,
+                    &source_file_id,
+                    &coverage,
+                    &updated_at,
+                    commits_observed,
+                );
+                reply(ack, res);
+            }
             WriterCmd::ReplaceUnresolvedCallSitesForCaller {
                 caller_entity_id,
                 caller_content_hash,
@@ -1133,6 +1149,45 @@ fn replace_anchored_edges_for_source_file(
     conn.execute(
         "DELETE FROM entity_unresolved_call_sites WHERE source_file_id = ?1",
         params![source_file_id],
+    )?;
+    // The coverage claim travels with the anchored evidence it describes: a
+    // re-analysed file rewrites it immediately after, a vanished file loses it.
+    conn.execute(
+        "DELETE FROM source_file_resolution_coverage WHERE source_file_id = ?1",
+        params![source_file_id],
+    )?;
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+fn upsert_resolution_coverage_in_run(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    source_file_id: &str,
+    coverage: &crate::resolution_coverage::SourceFileResolutionCoverage,
+    updated_at: &str,
+    commits_observed: &AtomicUsize,
+) -> Result<()> {
+    let Some(run_id) = state.current_run.clone() else {
+        return Err(StorageError::WriterProtocol(
+            "UpsertSourceFileResolutionCoverage received without a preceding BeginRun".to_owned(),
+        ));
+    };
+    if !state.in_tx {
+        begin_write_tx(conn, state)?;
+        state.in_tx = true;
+    }
+    validate_source_file_anchor(
+        conn,
+        Some(source_file_id),
+        "UpsertSourceFileResolutionCoverage source_file_id",
+    )?;
+    crate::resolution_coverage::upsert_source_file_resolution_coverage(
+        conn,
+        source_file_id,
+        coverage,
+        &run_id,
+        updated_at,
     )?;
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())

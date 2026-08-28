@@ -852,12 +852,25 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // entity (module first) resolved from the already-committed rows, seeded
     // into the scan outcome for every skipped file below.
     let incremental = !options.no_incremental;
+    // Files the incremental partition must re-dispatch even though their bytes
+    // are unchanged (clarion-3e517d4aff): the last run recorded transient
+    // degraded call/reference resolution for them, or they were indexed before
+    // coverage was recorded and look like the failure shape. Keyed like
+    // `prior_file_hashes` (canonical absolute `source_file_path`).
+    let mut forced_redispatch_files: HashSet<String> = HashSet::new();
     let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot, prior_anchor_by_file) =
         if incremental {
             match Connection::open(&db_path) {
                 Ok(conn) => {
                     let files =
                         loomweave_storage::previously_analyzed_files(&conn).unwrap_or_default();
+                    match loomweave_storage::files_needing_resolution_redispatch(&conn) {
+                        Ok(forced) => forced_redispatch_files = forced,
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "cannot read resolution coverage; degraded files will not be re-dispatched"
+                        ),
+                    }
                     let locs = loomweave_storage::prior_locators_by_file(&conn).unwrap_or_default();
                     let snapshot = loomweave_storage::load_prior_index(&conn).unwrap_or_default();
                     // Anchor continuity for a skipped secret-bearing file
@@ -895,6 +908,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 HashMap::new(),
             )
         };
+    if !forced_redispatch_files.is_empty() {
+        tracing::info!(
+            file_count = forced_redispatch_files.len(),
+            "re-dispatching unchanged files whose last call/reference resolution was degraded"
+        );
+    }
     // clarion-e12d424f1d: the per-plugin tag-schema markers from the last
     // successful run, keyed by plugin_id. Each plugin's live manifest
     // (version, ontology_version) is compared against its stored marker below;
@@ -955,6 +974,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut references_skipped_external_total: u64 = 0;
     let mut references_skipped_cap_total: u64 = 0;
     let mut imports_skipped_external_total: u64 = 0;
+    // Files this run analysed whose plugin reported degraded call or
+    // reference resolution (clarion-3e517d4aff). Loud on the completion line:
+    // each is a call-graph hole the next incremental run will re-dispatch.
+    let mut resolution_degraded_files_total: u64 = 0;
     // Anchored resolving edges (`imports`/`implements`) whose endpoints were
     // never stored this run — dropped-and-counted by the seen-entity-set gate
     // (D1 external / D2 gitignored-superset / D3 mid-run staleness). Flushing
@@ -1102,7 +1125,12 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 (plugin_files, Vec::new())
             } else {
                 plugin_files.into_iter().partition(|path| {
-                    file_needs_reanalysis(&project_root, path, &prior_file_hashes)
+                    file_needs_reanalysis(
+                        &project_root,
+                        path,
+                        &prior_file_hashes,
+                        &forced_redispatch_files,
+                    )
                 })
             };
         plugin_classifier_coverage[coverage_index].record_retained(skipped_files.len());
@@ -1346,6 +1374,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     {
                         Ok(effects) => {
                             plugin_entity_count += effects.entity_count;
+                            if effects.resolution_degraded {
+                                resolution_degraded_files_total += 1;
+                            }
                             plugin_classifier_coverage[coverage_index]
                                 .record_completed_file(effects.degraded_source_files.clone());
                             syntax_classified_source_files
@@ -1851,6 +1882,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "resolution_degraded_files": resolution_degraded_files_total,
                 "plugin_edges_dropped_unseen_total": plugin_edges_dropped_unseen_total,
                 "source_walk_skipped_entries": source_walk_skipped_entries,
                 "source_walk_error_samples": source_walk_error_samples,
@@ -2275,6 +2307,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "resolution_degraded_files": resolution_degraded_files_total,
                 "plugin_edges_dropped_unseen_total": plugin_edges_dropped_unseen_total,
                 "source_walk_skipped_entries": source_walk_skipped_entries,
                 "source_walk_error_samples": source_walk_error_samples,
@@ -2393,6 +2426,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             subsystems,
             edges,
             skipped_files_total,
+            resolution_degraded_files_total,
             emit_marker.as_deref(),
         ),
         None => format!(
@@ -2558,17 +2592,35 @@ struct PlannedSeiWrite {
 /// that skip unchanged files. When unchanged files were skipped, the line is
 /// annotated so an operator does not mistake a fast incremental pass for a graph
 /// that shrank.
+#[allow(clippy::too_many_arguments)]
 fn format_analyze_complete(
     run_id: &str,
     entities: i64,
     subsystems: i64,
     edges: i64,
     skipped_files: u64,
+    resolution_degraded_files: u64,
     emit_marker: Option<&str>,
 ) -> String {
     let incremental = if skipped_files > 0 {
         let noun = if skipped_files == 1 { "file" } else { "files" };
         format!("; incremental: {skipped_files} unchanged {noun} skipped")
+    } else {
+        String::new()
+    };
+    // A degraded resolver is loud too (clarion-3e517d4aff): these files hold
+    // call-graph holes until a later run re-dispatches them, and an operator
+    // reading only this line must not take the graph totals as complete.
+    let degraded = if resolution_degraded_files > 0 {
+        let noun = if resolution_degraded_files == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        format!(
+            "; call resolution degraded: {resolution_degraded_files} {noun} \
+             (re-dispatched next run)"
+        )
     } else {
         String::new()
     };
@@ -2579,7 +2631,7 @@ fn format_analyze_complete(
     let emit = emit_marker.map_or_else(String::new, |m| format!("; {m}"));
     format!(
         "analyze complete: run {run_id} completed \
-         (graph: {entities} entities incl. {subsystems} subsystems, {edges} edges{incremental}){emit}"
+         (graph: {entities} entities incl. {subsystems} subsystems, {edges} edges{incremental}{degraded}){emit}"
     )
 }
 
@@ -5614,6 +5666,28 @@ struct PersistedPluginBatch {
     sei_descriptors: Vec<NewEntityDescriptor>,
     syntax_fallbacks: Vec<FindingRecord>,
     degraded_source_files: BTreeSet<String>,
+    /// The plugin reported degraded call or reference resolution for this
+    /// file (clarion-3e517d4aff); counted into `resolution_degraded_files`.
+    resolution_degraded: bool,
+}
+
+/// Map the plugin's wire-level coverage claim onto the persisted record. A
+/// plugin that makes no claim (`None`) is recorded as complete: it is a purely
+/// syntactic extractor with nothing that can fail transiently.
+fn resolution_coverage_record(
+    coverage: Option<&loomweave_core::ResolutionCoverage>,
+) -> loomweave_storage::SourceFileResolutionCoverage {
+    let facet = |facet: &loomweave_core::FacetCoverage| loomweave_storage::FacetCoverageRecord {
+        degraded: facet.is_degraded(),
+        reason: facet.reason.clone(),
+        transient: facet.transient,
+    };
+    coverage.map_or_else(Default::default, |coverage| {
+        loomweave_storage::SourceFileResolutionCoverage {
+            calls: facet(&coverage.calls),
+            references: facet(&coverage.references),
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -5735,12 +5809,35 @@ async fn persist_plugin_file_batch(
             .with_context(|| format!("ReplaceUnresolvedCallSitesForCaller for {caller_id}"))?;
     }
 
+    // The coverage claim lands in the same run transaction as the evidence it
+    // qualifies (clarion-3e517d4aff): a file whose resolver failed is recorded
+    // as degraded so the next incremental run re-dispatches it instead of
+    // treating the empty evidence as a completed analysis.
+    let coverage = resolution_coverage_record(batch.stats.resolution_coverage.as_ref());
+    let resolution_degraded = coverage.is_degraded();
+    writer
+        .send_wait(|ack| WriterCmd::UpsertSourceFileResolutionCoverage {
+            source_file_id: batch.source_file_id.clone(),
+            coverage,
+            updated_at: iso8601_now(),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| {
+            format!(
+                "UpsertSourceFileResolutionCoverage for {}",
+                batch.source_file_id
+            )
+        })?;
+
     Ok(PersistedPluginBatch {
         entity_count,
         prior_index_entries,
         sei_descriptors,
         syntax_fallbacks,
         degraded_source_files,
+        resolution_degraded,
     })
 }
 
@@ -5812,6 +5909,9 @@ struct BatchStats {
     pyright_query_latency_ms: Vec<u64>,
     pyright_index_parse_latency_ms: Vec<u64>,
     extractor_parse_latency_ms: Vec<u64>,
+    /// Per-file resolution coverage claim (clarion-3e517d4aff). `None` when
+    /// the plugin makes no claim; persisted as `complete`.
+    resolution_coverage: Option<loomweave_core::ResolutionCoverage>,
 }
 
 #[derive(Debug, Clone)]
@@ -6110,6 +6210,7 @@ fn run_plugin_blocking(
                 pyright_query_latency_ms: stats.pyright_query_latency_ms.clone(),
                 pyright_index_parse_latency_ms: stats.pyright_index_parse_latency_ms.clone(),
                 extractor_parse_latency_ms: Vec::new(),
+                resolution_coverage: stats.resolution_coverage.clone(),
             };
             if stats.extractor_parse_latency_ms > 0 {
                 file_stats
@@ -6888,10 +6989,17 @@ fn file_needs_reanalysis(
     project_root: &Path,
     path: &Path,
     prior_file_hashes: &HashMap<String, String>,
+    forced_redispatch_files: &HashSet<String>,
 ) -> bool {
     let Some(key) = canonical_path_key(path) else {
         return true;
     };
+    // A byte-identical file whose last analysis was degraded is NOT done
+    // (clarion-3e517d4aff): its resolver failed, and its empty evidence must
+    // not be pinned by the hash skip.
+    if forced_redispatch_files.contains(&key) {
+        return true;
+    }
     let Some(prior) = prior_file_hashes.get(&key) else {
         return true;
     };
@@ -7320,7 +7428,7 @@ mod tests {
     fn analyze_complete_full_run_reports_whole_graph_totals() {
         // A full run (no unchanged files skipped) reports the graph totals with
         // the subsystem breakdown, matching `project_status` phrasing.
-        let line = format_analyze_complete("run-1", 263, 5, 496, 0, None);
+        let line = format_analyze_complete("run-1", 263, 5, 496, 0, 0, None);
         assert_eq!(
             line,
             "analyze complete: run run-1 completed \
@@ -7332,7 +7440,7 @@ mod tests {
     fn analyze_complete_incremental_run_annotates_skipped_files() {
         // An incremental run that skipped unchanged files reports the SAME graph
         // totals (not the tiny insert delta) plus an explicit incremental marker.
-        let line = format_analyze_complete("run-2", 263, 5, 496, 29, None);
+        let line = format_analyze_complete("run-2", 263, 5, 496, 29, 0, None);
         assert_eq!(
             line,
             "analyze complete: run run-2 completed \
@@ -7342,8 +7450,28 @@ mod tests {
     }
 
     #[test]
+    fn analyze_complete_reports_degraded_call_resolution_loudly() {
+        // clarion-3e517d4aff: a run whose plugin reported degraded resolution
+        // for some files must say so on the completion line — those files are
+        // call-graph holes until the next run re-dispatches them.
+        let line = format_analyze_complete("run-5", 263, 5, 496, 29, 3, None);
+        assert_eq!(
+            line,
+            "analyze complete: run run-5 completed \
+             (graph: 263 entities incl. 5 subsystems, 496 edges; \
+             incremental: 29 unchanged files skipped; \
+             call resolution degraded: 3 files (re-dispatched next run))"
+        );
+        let one = format_analyze_complete("run-6", 10, 0, 4, 0, 1, None);
+        assert!(
+            one.ends_with("call resolution degraded: 1 file (re-dispatched next run))"),
+            "{one}"
+        );
+    }
+
+    #[test]
     fn analyze_complete_incremental_singular_file_uses_singular_noun() {
-        let line = format_analyze_complete("run-3", 10, 0, 4, 1, None);
+        let line = format_analyze_complete("run-3", 10, 0, 4, 1, 0, None);
         assert_eq!(
             line,
             "analyze complete: run run-3 completed \
@@ -7362,6 +7490,7 @@ mod tests {
             10,
             0,
             4,
+            0,
             0,
             Some("emit:unreachable (connection refused)"),
         );

@@ -400,11 +400,95 @@ pub struct AnalyzeFileStats {
     /// Extractor-side `ast.parse` latency for this file in milliseconds.
     #[serde(default)]
     pub extractor_parse_latency_ms: u64,
+    /// Per-file resolution coverage (clarion-3e517d4aff). A plugin whose
+    /// call / reference resolution can fail *transiently* (a language server
+    /// that timed out, crashed, or was poisoned for the rest of the run)
+    /// reports it here instead of returning empty evidence that reads as a
+    /// complete analysis. `None` means the plugin makes no coverage claim
+    /// (a purely syntactic extractor); the host treats that as complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_coverage: Option<ResolutionCoverage>,
+}
+
+/// Coverage status of one resolution facet (`calls` or `references`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageStatus {
+    /// The resolver examined every site it enumerated for this file.
+    #[default]
+    Complete,
+    /// The resolver produced less evidence than the file holds.
+    Degraded,
+}
+
+/// One facet of [`ResolutionCoverage`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FacetCoverage {
+    #[serde(default)]
+    pub status: CoverageStatus,
+    /// Plugin-defined machine token naming why coverage is degraded
+    /// (e.g. `pyright_timeout`, `pyright_poisoned`, `reference_site_cap`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Whether re-dispatching the unchanged file could plausibly recover
+    /// full coverage. `true` for resolver timeouts / crashes; `false` for
+    /// content-determined limits (syntax error, per-file site cap) that a
+    /// re-run would hit again. The host force-re-dispatches only
+    /// `Degraded && transient` files on incremental runs.
+    #[serde(default)]
+    pub transient: bool,
+}
+
+impl FacetCoverage {
+    #[must_use]
+    pub fn complete() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn degraded(reason: impl Into<String>, transient: bool) -> Self {
+        Self {
+            status: CoverageStatus::Degraded,
+            reason: Some(reason.into()),
+            transient,
+        }
+    }
+
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.status == CoverageStatus::Degraded
+    }
+}
+
+/// Per-file call / reference resolution coverage claim.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolutionCoverage {
+    #[serde(default)]
+    pub calls: FacetCoverage,
+    #[serde(default)]
+    pub references: FacetCoverage,
+}
+
+impl ResolutionCoverage {
+    /// True when either facet is degraded and transient — the file should be
+    /// re-dispatched on the next incremental run even though its bytes are
+    /// unchanged.
+    #[must_use]
+    pub fn needs_redispatch(&self) -> bool {
+        (self.calls.is_degraded() && self.calls.transient)
+            || (self.references.is_degraded() && self.references.transient)
+    }
+
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.calls.is_degraded() || self.references.is_degraded()
+    }
 }
 
 impl AnalyzeFileStats {
     fn is_empty(&self) -> bool {
-        self.unresolved_call_sites_total == 0
+        self.resolution_coverage.is_none()
+            && self.unresolved_call_sites_total == 0
             && self.reference_sites_total == 0
             && self.references_resolved_total == 0
             && self.references_skipped_external_total == 0
@@ -669,6 +753,48 @@ mod tests {
     // ── Protocol test 6: round-trip for all 5 methods' param+result structs ───
 
     #[test]
+    fn resolution_coverage_round_trips_and_defaults_to_no_claim() {
+        // clarion-3e517d4aff: the per-file coverage claim is optional on the
+        // wire (a syntactic extractor makes none) and, when present, carries
+        // enough for the host to decide re-dispatch (`transient`).
+        let stats = AnalyzeFileStats {
+            resolution_coverage: Some(ResolutionCoverage {
+                calls: FacetCoverage::degraded("pyright_timeout", true),
+                references: FacetCoverage::complete(),
+            }),
+            ..AnalyzeFileStats::default()
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(
+            json["resolution_coverage"],
+            serde_json::json!({
+                "calls": {"status": "degraded", "reason": "pyright_timeout", "transient": true},
+                "references": {"status": "complete", "transient": false},
+            })
+        );
+        let back: AnalyzeFileStats = serde_json::from_value(json).unwrap();
+        assert_eq!(back, stats);
+        assert!(
+            back.resolution_coverage
+                .as_ref()
+                .unwrap()
+                .needs_redispatch()
+        );
+
+        // Absent on the wire → no claim; a content-determined limit is not
+        // transient and must not trigger re-dispatch.
+        let absent: AnalyzeFileStats = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.resolution_coverage, None);
+        let capped = ResolutionCoverage {
+            calls: FacetCoverage::complete(),
+            references: FacetCoverage::degraded("reference_site_cap", false),
+        };
+        assert!(capped.is_degraded());
+        assert!(!capped.needs_redispatch());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn proto_06_all_method_param_result_structs_round_trip() {
         // initialize params
         let p = InitializeParams {
@@ -729,6 +855,7 @@ mod tests {
                 pyright_query_latency_ms: vec![10, 20, 30],
                 pyright_index_parse_latency_ms: vec![8, 13],
                 extractor_parse_latency_ms: 5,
+                resolution_coverage: None,
             },
             findings: vec![AnalyzeFileFinding {
                 subcode: "LMWV-PY-PYRIGHT-RESTART".to_owned(),

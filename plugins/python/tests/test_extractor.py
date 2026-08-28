@@ -1105,6 +1105,24 @@ def test_syntax_error_emits_degraded_module_entity_and_logs_to_stderr(
     assert "broken.py" in captured.err
 
 
+def test_syntax_error_reports_degraded_non_transient_coverage() -> None:
+    """clarion-3e517d4aff: an unparseable file examined neither facet, and a
+    byte-identical re-run would hit the same limit (not transient)."""
+    result = extract_with_stats("def :", "broken.py")
+    assert result.stats.resolution_coverage_wire() == {
+        "calls": {"status": "degraded", "reason": "syntax_error", "transient": False},
+        "references": {"status": "degraded", "reason": "syntax_error", "transient": False},
+    }
+
+
+def test_clean_file_reports_complete_coverage_by_default() -> None:
+    result = extract_with_stats("def hello():\n    pass\n", "clean.py")
+    assert result.stats.resolution_coverage_wire() == {
+        "calls": {"status": "complete", "transient": False},
+        "references": {"status": "complete", "transient": False},
+    }
+
+
 def test_src_prefix_stripped() -> None:
     """UQ-WP3-05: `src/pkg/module.py` → dotted module `pkg.module`."""
     entities, _ = extract("def hello():\n    pass\n", "src/pkg/module.py")

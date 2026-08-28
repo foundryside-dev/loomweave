@@ -1344,11 +1344,11 @@ fn doctor_reports_external_sqlite_current_legacy_and_older_states() {
     let current_check = check(&json, "federation.sqlite_compatibility");
     assert_eq!(current_check["status"], "ok", "{current_check}");
     assert_eq!(current_check["details"]["compatibility"], "compatible");
-    assert_eq!(current_check["details"]["user_version"], 12);
+    assert_eq!(current_check["details"]["user_version"], 13);
     let (_, text) = doctor(current.path(), false);
     assert!(
         text.contains("federation.sqlite_compatibility")
-            && text.contains("compatible at user_version=12"),
+            && text.contains("compatible at user_version=13"),
         "text output must carry the same current compatibility verdict:\n{text}"
     );
 
@@ -1538,7 +1538,7 @@ fn doctor_rejects_foreign_and_too_new_external_sqlite_before_catalogue_queries()
     write_healthy_db(too_new.path());
     Connection::open(too_new.path().join(".weft/loomweave/loomweave.db"))
         .unwrap()
-        .execute_batch("PRAGMA user_version = 13;")
+        .execute_batch("PRAGMA user_version = 14;")
         .unwrap();
     let (code, json) = doctor_json(too_new.path(), false);
     let incompatible = check(&json, "federation.sqlite_compatibility");
