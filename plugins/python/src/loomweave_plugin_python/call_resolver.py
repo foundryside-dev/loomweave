@@ -43,6 +43,7 @@ class FacetCoverageWire(TypedDict):
     status: Literal["complete", "degraded"]
     reason: NotRequired[str]
     transient: bool
+    collateral: bool
 
 
 class ResolutionCoverageWire(TypedDict):
@@ -72,17 +73,25 @@ class FacetCoverage:
     status: Literal["complete", "degraded"] = "complete"
     reason: str | None = None
     transient: bool = False
+    # The resolver was already disabled by an EARLIER file's failure when this
+    # file arrived: the hole is collateral, not this file's doing. The host
+    # dispatches collateral files first so the troublemaker goes last.
+    collateral: bool = False
 
     @classmethod
-    def degraded(cls, reason: str, *, transient: bool) -> FacetCoverage:
-        return cls(status="degraded", reason=reason, transient=transient)
+    def degraded(cls, reason: str, *, transient: bool, collateral: bool = False) -> FacetCoverage:
+        return cls(status="degraded", reason=reason, transient=transient, collateral=collateral)
 
     @property
     def is_degraded(self) -> bool:
         return self.status == "degraded"
 
     def to_wire(self) -> FacetCoverageWire:
-        wire: FacetCoverageWire = {"status": self.status, "transient": self.transient}
+        wire: FacetCoverageWire = {
+            "status": self.status,
+            "transient": self.transient,
+            "collateral": self.collateral,
+        }
         if self.reason is not None:
             wire["reason"] = self.reason
         return wire

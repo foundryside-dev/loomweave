@@ -46,18 +46,18 @@
       "reason": null,
       "application_id": 1280137046,
       "min_user_version": 5,
-      "max_user_version": 13,
+      "max_user_version": 14,
       "legacy_application_id": false,
       "missing_surface": [],
       "status": "compatible",
-      "user_version": 13
+      "user_version": 14
     },
     "older_supported": {
       "schema": "loomweave.external-sqlite.v1",
       "reason": null,
       "application_id": 1280137046,
       "min_user_version": 5,
-      "max_user_version": 13,
+      "max_user_version": 14,
       "legacy_application_id": false,
       "missing_surface": [],
       "status": "older_supported",
@@ -68,11 +68,11 @@
       "reason": "too_new",
       "application_id": 1280137046,
       "min_user_version": 5,
-      "max_user_version": 13,
+      "max_user_version": 14,
       "legacy_application_id": false,
       "missing_surface": [],
       "status": "incompatible",
-      "user_version": 14
+      "user_version": 15
     }
   }
 }

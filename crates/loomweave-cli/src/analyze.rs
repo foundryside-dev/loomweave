@@ -771,6 +771,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         if let Err(error) = writer
             .send_wait(|ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
                 source_file_id: source_file_id.clone(),
+                prune_resolution_coverage: true,
                 ack,
             })
             .await
@@ -858,6 +859,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // coverage was recorded and look like the failure shape. Keyed like
     // `prior_file_hashes` (canonical absolute `source_file_path`).
     let mut forced_redispatch_files: HashSet<String> = HashSet::new();
+    // The subset of `forced_redispatch_files` whose OWN resolution failed
+    // (timeout / crash on that file, not collateral from an earlier one).
+    // Dispatched last so a troublemaker can only poison what follows it.
+    let mut self_inflicted_redispatch_files: HashSet<String> = HashSet::new();
     let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot, prior_anchor_by_file) =
         if incremental {
             match Connection::open(&db_path) {
@@ -865,7 +870,15 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     let files =
                         loomweave_storage::previously_analyzed_files(&conn).unwrap_or_default();
                     match loomweave_storage::files_needing_resolution_redispatch(&conn) {
-                        Ok(forced) => forced_redispatch_files = forced,
+                        Ok(candidates) => {
+                            for candidate in candidates {
+                                if candidate.self_inflicted {
+                                    self_inflicted_redispatch_files
+                                        .insert(candidate.source_file_path.clone());
+                                }
+                                forced_redispatch_files.insert(candidate.source_file_path);
+                            }
+                        }
                         Err(err) => tracing::warn!(
                             error = %err,
                             "cannot read resolution coverage; degraded files will not be re-dispatched"
@@ -911,6 +924,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     if !forced_redispatch_files.is_empty() {
         tracing::info!(
             file_count = forced_redispatch_files.len(),
+            self_inflicted = self_inflicted_redispatch_files.len(),
             "re-dispatching unchanged files whose last call/reference resolution was degraded"
         );
     }
@@ -1120,7 +1134,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // keyed on the core `file` entity, not per language plugin, so there is
         // nothing plugin-scoped to clear; overriding the partition is both the
         // correct scope and the safe one.
-        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
+        let (mut plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
             if plugin_index_contract_changed {
                 (plugin_files, Vec::new())
             } else {
@@ -1133,6 +1147,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     )
                 })
             };
+        // Dispatch order (clarion-3e517d4aff): files whose own resolution
+        // failed last run go LAST. When one of them exhausts the resolver's
+        // restart budget, only the files after it are poisoned — so the
+        // collateral set (dispatched first) heals instead of being re-poisoned
+        // behind the same file every run. Stable, so walk order is otherwise
+        // preserved.
+        order_self_inflicted_last(&mut plugin_files, &self_inflicted_redispatch_files);
         plugin_classifier_coverage[coverage_index].record_retained(skipped_files.len());
         // Locators of THIS plugin's skipped-unchanged entities. These rows stay in
         // the committed DB untouched this run (they are guarded against orphan
@@ -5681,6 +5702,7 @@ fn resolution_coverage_record(
         degraded: facet.is_degraded(),
         reason: facet.reason.clone(),
         transient: facet.transient,
+        collateral: facet.collateral,
     };
     coverage.map_or_else(Default::default, |coverage| {
         loomweave_storage::SourceFileResolutionCoverage {
@@ -5784,6 +5806,7 @@ async fn persist_plugin_file_batch(
     writer
         .send_wait(|ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
             source_file_id: batch.source_file_id.clone(),
+            prune_resolution_coverage: false,
             ack,
         })
         .await
@@ -6985,6 +7008,17 @@ fn canonical_path_key(path: &Path) -> Option<String> {
 /// fail-toward-work direction — on any uncertainty: the path cannot be
 /// canonicalised, the prior run recorded no whole-file hash for it (a new file),
 /// or the file is unhashable now. Skips only on a confident byte-identical match.
+/// Stable-partition `files` so paths in `self_inflicted` (canonical keys) come
+/// after every other path. See the dispatch-order note at the call site.
+fn order_self_inflicted_last(files: &mut [PathBuf], self_inflicted: &HashSet<String>) {
+    if self_inflicted.is_empty() {
+        return;
+    }
+    files.sort_by_cached_key(|path| {
+        canonical_path_key(path).is_some_and(|key| self_inflicted.contains(&key))
+    });
+}
+
 fn file_needs_reanalysis(
     project_root: &Path,
     path: &Path,

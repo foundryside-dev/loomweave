@@ -300,8 +300,9 @@ fn default_next_action(id: &str) -> String {
             }
             "index.resolution_coverage" => {
                 "Run `loomweave analyze <project>`: transient-degraded files are re-dispatched \
-                 automatically. Content-determined ones need the source fixed (syntax error) \
-                 or the per-file site cap raised."
+                 automatically. Files that exhausted the re-dispatch budget, and \
+                 content-determined ones (syntax error / site cap), need the source fixed or \
+                 a `--no-incremental` pass once the resolver is healthy."
                     .to_owned()
             }
             "index.freshness" => {
@@ -2331,24 +2332,36 @@ fn check_resolution_coverage_json(project_root: &Path) -> DoctorJsonCheck {
         }));
     }
     match loomweave_storage::degraded_resolution_coverage_summary(&conn) {
-        Ok((0, 0, _)) => DoctorJsonCheck::ok(
-            ID,
-            "every analysed file reports complete call and reference resolution",
-        ),
-        Ok((calls, references, transient)) => {
-            let persistent = calls.max(references).saturating_sub(transient);
+        Ok(summary) if summary.degraded_calls == 0 && summary.degraded_references == 0 => {
+            DoctorJsonCheck::ok(
+                ID,
+                "every analysed file reports complete call and reference resolution",
+            )
+        }
+        Ok(summary) => {
+            let calls = summary.degraded_calls;
+            let references = summary.degraded_references;
+            let transient = summary.transient;
+            let exhausted = summary.exhausted;
+            let persistent = calls
+                .max(references)
+                .saturating_sub(transient)
+                .saturating_sub(exhausted);
             DoctorJsonCheck::warning(
                 ID,
                 format!(
                     "{calls} file(s) with degraded call resolution, {references} with degraded \
                      reference resolution ({transient} transient, re-dispatched by the next \
-                     analyze; {persistent} content-determined: syntax error / site cap)"
+                     analyze; {exhausted} exhausted the re-dispatch budget; {persistent} \
+                     content-determined: syntax error / site cap)"
                 ),
             )
             .with_details(serde_json::json!({
                 "degraded_calls_files": calls,
                 "degraded_references_files": references,
                 "transient_files": transient,
+                "exhausted_files": exhausted,
+                "max_redispatch_attempts": loomweave_storage::MAX_REDISPATCH_ATTEMPTS,
             }))
         }
         Err(err) => DoctorJsonCheck::warning(

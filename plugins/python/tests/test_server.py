@@ -499,8 +499,8 @@ def test_analyze_file_reports_call_resolver_stats(
         "pyright_query_latency_ms": [11, 29, 31],
         "pyright_index_parse_latency_ms": [5, 7],
         "resolution_coverage": {
-            "calls": {"status": "complete", "transient": False},
-            "references": {"status": "complete", "transient": False},
+            "calls": {"status": "complete", "transient": False, "collateral": False},
+            "references": {"status": "complete", "transient": False, "collateral": False},
         },
     }
     assert response["findings"] == [
@@ -563,8 +563,18 @@ def test_analyze_file_reports_degraded_resolution_coverage(
     response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
 
     assert response["stats"]["resolution_coverage"] == {
-        "calls": {"status": "degraded", "reason": "pyright_poisoned", "transient": True},
-        "references": {"status": "degraded", "reason": "reference_site_cap", "transient": False},
+        "calls": {
+            "status": "degraded",
+            "reason": "pyright_poisoned",
+            "transient": True,
+            "collateral": False,
+        },
+        "references": {
+            "status": "degraded",
+            "reason": "reference_site_cap",
+            "transient": False,
+            "collateral": False,
+        },
     }
 
 

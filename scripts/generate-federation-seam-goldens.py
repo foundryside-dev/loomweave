@@ -448,7 +448,7 @@ def external_sqlite_fixture() -> dict[str, object]:
         "reason": None,
         "application_id": 0x4C4D5756,
         "min_user_version": 5,
-        "max_user_version": 13,
+        "max_user_version": 14,
         "legacy_application_id": False,
         "missing_surface": [],
     }
@@ -456,13 +456,13 @@ def external_sqlite_fixture() -> dict[str, object]:
         "schema": "loomweave.external-sqlite-fixture.v1",
         "required_surface": surface,
         "reports": {
-            "current": {**base, "status": "compatible", "user_version": 13},
+            "current": {**base, "status": "compatible", "user_version": 14},
             "older_supported": {**base, "status": "older_supported", "user_version": 5},
             "future": {
                 **base,
                 "status": "incompatible",
                 "reason": "too_new",
-                "user_version": 14,
+                "user_version": 15,
             },
         },
     }

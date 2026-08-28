@@ -1779,6 +1779,13 @@ def test_pyright_session_restart_cap(tmp_path: Path, pyright_langserver: str) ->
     assert poisoned.unresolved_call_sites_total == 1
     assert continued.edges == []
     assert continued.unresolved_call_sites_total == 1
+    # clarion-3e517d4aff: once the run is poisoned, every later file is
+    # collateral -- degraded, transient, and NOT this file's doing. The host
+    # dispatches collateral files first so the troublemaker goes last.
+    assert continued.coverage.is_degraded
+    assert continued.coverage.reason == "pyright_poisoned"
+    assert continued.coverage.transient is True
+    assert continued.coverage.collateral is True
 
 
 def _write_executable(tmp_path: Path, body: str) -> Path:

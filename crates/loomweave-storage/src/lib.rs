@@ -84,7 +84,8 @@ pub use query::{
 };
 pub use reader::ReaderPool;
 pub use resolution_coverage::{
-    FacetCoverageRecord, SourceFileResolutionCoverage, degraded_call_coverage_file_count,
+    FacetCoverageRecord, MAX_REDISPATCH_ATTEMPTS, RedispatchCandidate, ResolutionCoverageSummary,
+    SourceFileResolutionCoverage, degraded_call_coverage_file_count,
     degraded_resolution_coverage_summary, files_needing_resolution_redispatch,
     upsert_source_file_resolution_coverage,
 };

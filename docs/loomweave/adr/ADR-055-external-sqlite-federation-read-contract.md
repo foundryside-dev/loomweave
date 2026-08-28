@@ -30,8 +30,8 @@ Loomweave publishes `loomweave.external-sqlite.v1`, implemented by
 The v1 header contract is:
 
 - `PRAGMA application_id` is either `0x4c4d5756` (`LMWV`) or legacy `0`;
-- `PRAGMA user_version` is in the deliberately frozen range `5..=13`;
-- version `13` is `compatible` (current), versions `5..=12` are
+- `PRAGMA user_version` is in the deliberately frozen range `5..=14`;
+- version `14` is `compatible` (current), versions `5..=13` are
   `older_supported`, and every other version is `incompatible`;
 - legacy application ID `0` plus a matching structure establishes format
   compatibility, not authenticity or provenance.

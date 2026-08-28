@@ -194,6 +194,12 @@ pub enum WriterCmd {
     /// invariants.
     ReplaceAnchoredEdgesForSourceFile {
         source_file_id: String,
+        /// Also drop the file's resolution-coverage row. `true` for a file
+        /// that vanished from disk; `false` on the per-file re-analysis path,
+        /// where the row is about to be upserted and its
+        /// `redispatch_attempts` history must survive
+        /// (clarion-3e517d4aff).
+        prune_resolution_coverage: bool,
         ack: Ack<()>,
     },
     /// Replace the persisted Phase 3 subsystem projection with the current
