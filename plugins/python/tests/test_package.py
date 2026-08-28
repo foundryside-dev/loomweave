@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Any
 
 import loomweave_plugin_python
-from loomweave_plugin_python.wardline_descriptor import EXPECTED_DESCRIPTOR_VERSION
+from loomweave_plugin_python.wardline_descriptor import (
+    ACCEPTED_DESCRIPTORS,
+    EXPECTED_DESCRIPTOR_VERSION,
+)
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,6 +50,14 @@ def test_manifest_declares_current_v1_ontology_only() -> None:
     assert manifest["integrations"]["wardline"]["expected_descriptor_version"] == (
         EXPECTED_DESCRIPTOR_VERSION
     )
+    # The manifest's declared accepted set must be exactly the runtime's. It is
+    # a space-separated STRING of `schema@version` pairs, never a TOML array:
+    # manifest.rs:137 deserialises [integrations.wardline] as
+    # BTreeMap<String, String>, so an array is a hard manifest-parse failure.
+    declared = manifest["integrations"]["wardline"]["accepted_descriptors"]
+    assert isinstance(declared, str)
+    decoded = {tuple(token.split("@", 1)) for token in declared.split()}
+    assert decoded == set(ACCEPTED_DESCRIPTORS)
     assert manifest["ontology"]["ontology_version"] == "0.12.0"
     assert manifest["ontology"]["classifier_tags"] == [
         "cli-command",

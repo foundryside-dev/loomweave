@@ -76,6 +76,12 @@ classifier_tags = [
 
 [integrations.wardline]
 expected_descriptor_version = "wardline-generic-2"
+# The dual-accept set, as `schema@version` PAIRS. A version-only list would
+# destroy the schema/version association the gate rests on (re-admitting
+# "version alone unlocks v2 parsing"). A space-separated STRING, never a TOML
+# array: manifest.rs:137 deserialises this table as BTreeMap<String, String>,
+# so an array value is a hard manifest-parse failure.
+accepted_descriptors = "wardline.vocabulary/v1@wardline-generic-2 wardline.vocabulary/v2@wardline-generic-3"
 
 [ontology.roles]
 file_scope = ["module"]

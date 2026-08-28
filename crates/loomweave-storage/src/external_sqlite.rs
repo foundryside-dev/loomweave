@@ -24,7 +24,7 @@ pub const EXTERNAL_READ_MIN_USER_VERSION: u32 = 5;
 /// This is intentionally not an alias of the internal current schema version:
 /// a new migration is not externally compatible until its safe projection has
 /// been reviewed and this constant is deliberately advanced.
-pub const EXTERNAL_READ_MAX_USER_VERSION: u32 = 12;
+pub const EXTERNAL_READ_MAX_USER_VERSION: u32 = 13;
 
 const _: () = assert!(EXTERNAL_READ_MAX_USER_VERSION <= crate::schema::CURRENT_SCHEMA_VERSION);
 

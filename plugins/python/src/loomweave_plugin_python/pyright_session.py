@@ -26,6 +26,7 @@ from loomweave_plugin_python import __version__
 from loomweave_plugin_python.call_resolver import (
     CallResolutionResult,
     CallsRawEdge,
+    FacetCoverage,
     Finding,
     UnresolvedCallSite,
 )
@@ -242,6 +243,10 @@ class PyrightSession:
         self._function_indexes: dict[Path, _FunctionIndex] = {}
         self._index_parse_latency_ms: list[int] = []
         self._file_deadlines: dict[Path, float] = {}
+        # Set by ``_resolve_references_with_pyright`` when a per-site or
+        # file-budget timeout skipped sites (clarion-3e517d4aff): the pass
+        # still returns normally, but its coverage is degraded.
+        self._reference_pass_timed_out = False
 
     def __enter__(self) -> Self:
         return self
@@ -289,6 +294,7 @@ class PyrightSession:
                 unresolved_call_sites_total=len(function_ids),
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
+                coverage=FacetCoverage.degraded("syntax_error", transient=False),
             )
         requested = [
             index.by_id[function_id] for function_id in function_ids if function_id in index.by_id
@@ -301,14 +307,19 @@ class PyrightSession:
             )
 
         if not self._ensure_process():
+            # No pyright: nothing was examined. Say so (clarion-3e517d4aff) --
+            # returning only the site COUNT reads to the host as a completed
+            # analysis of a call-free file.
             return CallResolutionResult(
                 unresolved_call_sites_total=ast_call_sites_total,
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
+                coverage=FacetCoverage.degraded(self._unavailable_reason(), transient=True),
             )
 
         deadline = self._deadline_for_file(path)
         latency_started = time.perf_counter()
+        coverage = FacetCoverage()
         try:
             edges, unresolved, unresolved_sites = self._resolve_with_pyright(
                 path,
@@ -325,11 +336,13 @@ class PyrightSession:
             edges = []
             unresolved = ast_call_sites_total
             unresolved_sites = []
+            coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
             self._record_restart_or_poison(str(exc))
             edges = []
             unresolved = ast_call_sites_total
             unresolved_sites = []
+            coverage = FacetCoverage.degraded("pyright_transport_failure", transient=True)
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
 
         return CallResolutionResult(
@@ -339,7 +352,16 @@ class PyrightSession:
             pyright_query_latency_ms=[latency_ms],
             pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
             findings=self._pop_findings(),
+            coverage=coverage,
         )
+
+    def _unavailable_reason(self) -> str:
+        """Why ``_ensure_process`` returned False, as a coverage reason token."""
+        if self._run_state.disabled:
+            if self._run_state.restart_count > self.max_restarts_per_run:
+                return "pyright_poisoned"
+            return "pyright_unavailable"
+        return "pyright_spawn_failed"
 
     def resolve_references(
         self,
@@ -355,6 +377,7 @@ class PyrightSession:
                 unresolved_reference_sites_total=reference_sites_total,
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
+                coverage=FacetCoverage.degraded("syntax_error", transient=False),
             )
         if not sites:
             return ReferenceResolutionResult(
@@ -374,6 +397,7 @@ class PyrightSession:
                 unresolved_reference_sites_total=reference_sites_total,
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
+                coverage=FacetCoverage.degraded("reference_site_cap", transient=False),
             )
         if not self._ensure_process():
             return ReferenceResolutionResult(
@@ -381,10 +405,13 @@ class PyrightSession:
                 unresolved_reference_sites_total=reference_sites_total,
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
+                coverage=FacetCoverage.degraded(self._unavailable_reason(), transient=True),
             )
 
         deadline = self._deadline_for_file(path)
         latency_started = time.perf_counter()
+        coverage = FacetCoverage()
+        self._reference_pass_timed_out = False
         try:
             edges, resolved, skipped_external, unresolved = self._resolve_references_with_pyright(
                 path,
@@ -392,6 +419,8 @@ class PyrightSession:
                 sites,
                 deadline,
             )
+            if self._reference_pass_timed_out:
+                coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
         except LspTimeoutError as exc:
             self._record_finding(
                 FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
@@ -402,12 +431,14 @@ class PyrightSession:
             resolved = 0
             skipped_external = 0
             unresolved = reference_sites_total
+            coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
             self._record_restart_or_poison(str(exc))
             edges = []
             resolved = 0
             skipped_external = 0
             unresolved = reference_sites_total
+            coverage = FacetCoverage.degraded("pyright_transport_failure", transient=True)
         finally:
             self._file_deadlines.pop(path, None)
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
@@ -421,6 +452,7 @@ class PyrightSession:
             pyright_query_latency_ms=[latency_ms],
             pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
             findings=self._pop_findings(),
+            coverage=coverage,
         )
 
     def _resolve_with_pyright(
@@ -550,6 +582,7 @@ class PyrightSession:
             for site_index, site in enumerate(sites):
                 if self._file_budget_expired(deadline):
                     unresolved_total += len(sites) - site_index
+                    self._reference_pass_timed_out = True
                     self._record_finding(
                         FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
                         "pyright reference query timed out: analyze_file budget",
@@ -580,6 +613,7 @@ class PyrightSession:
                             saw_external = saw_external or fallback_external
                         candidate_ids = _filter_relation_candidates(site, candidate_ids)
                     except LspTimeoutError as exc:
+                        self._reference_pass_timed_out = True
                         self._record_finding(
                             FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
                             f"pyright reference query timed out: {exc.method}",

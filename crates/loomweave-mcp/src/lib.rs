@@ -3998,13 +3998,25 @@ fn call_graph_scope_excludes(confidence: EdgeConfidence) -> Vec<&'static str> {
 pub(crate) fn navigation_scope_excludes(
     confidence: EdgeConfidence,
     live_unresolved_sites: bool,
+    degraded_call_coverage: bool,
 ) -> Vec<&'static str> {
     let mut excludes = call_graph_scope_excludes(confidence);
     if live_unresolved_sites && confidence != EdgeConfidence::Inferred {
         excludes.push("unresolved-static-calls");
     }
+    if degraded_call_coverage {
+        excludes.push(DEGRADED_CALL_RESOLUTION_SCOPE_EXCLUDE);
+    }
     excludes
 }
+
+/// `scope_excludes` marker for an index in which at least one analysed file's
+/// plugin reported degraded call resolution (clarion-3e517d4aff). Those files
+/// contributed NO `calls` edges and NO unresolved call sites, so every caller
+/// traversal is blind to them at every confidence tier — including `inferred`,
+/// whose dispatch pass has no recorded sites to attempt. Cleared by the next
+/// `analyze`, which re-dispatches transient-degraded files automatically.
+pub(crate) const DEGRADED_CALL_RESOLUTION_SCOPE_EXCLUDE: &str = "degraded-call-resolution";
 
 /// Per-query scope excludes for `entity_callers_list` / `entity_neighborhood_get`
 /// (clarion-76c31b730a). Unlike [`navigation_scope_excludes`] (which flags the
@@ -4019,14 +4031,23 @@ pub(crate) fn navigation_scope_excludes(
 fn caller_navigation_scope_excludes(
     confidence: EdgeConfidence,
     skipped_a_candidate: bool,
+    degraded_call_coverage: bool,
 ) -> Vec<&'static str> {
-    if !skipped_a_candidate || confidence == EdgeConfidence::Inferred {
-        return Vec::new();
+    let mut excludes = if !skipped_a_candidate || confidence == EdgeConfidence::Inferred {
+        Vec::new()
+    } else {
+        // A skipped candidate is, by construction, an attribute-receiver or
+        // dynamic call site the static resolver could not bind — name both
+        // blind-spot categories that the traversal therefore did not search.
+        vec!["attribute-receiver-calls", "unresolved-static-calls"]
+    };
+    // A file whose resolver failed recorded neither edges nor unresolved sites
+    // (clarion-3e517d4aff): its callers were never candidates at ANY tier, so
+    // the traversal cannot claim completeness while such files exist.
+    if degraded_call_coverage {
+        excludes.push(DEGRADED_CALL_RESOLUTION_SCOPE_EXCLUDE);
     }
-    // A skipped candidate is, by construction, an attribute-receiver or dynamic
-    // call site the static resolver could not bind — name both blind-spot
-    // categories that the traversal therefore did not search.
-    vec!["attribute-receiver-calls", "unresolved-static-calls"]
+    excludes
 }
 
 /// The `unresolved_name_matches` count + `next_action` recovery pointer for a
@@ -5671,8 +5692,28 @@ fn build_call_sites(
         "sites": site_values,
         "unresolved_sites": unresolved_values,
         "truncated": truncated,
-        "scope_excludes": call_graph_scope_excludes(confidence)
+        // `entity_call_site_list` SEARCHES the unresolved-site table, but a
+        // file whose resolver failed recorded no sites to search
+        // (clarion-3e517d4aff) — that hole is a blind spot even here.
+        "scope_excludes": call_site_scope_excludes(
+            confidence,
+            loomweave_storage::degraded_call_coverage_file_count(conn)? > 0,
+        )
     })))
+}
+
+/// Scope excludes for `entity_call_site_list`: the base call-graph vocabulary
+/// plus the degraded-resolution marker when the index holds files whose plugin
+/// reported degraded call coverage.
+fn call_site_scope_excludes(
+    confidence: EdgeConfidence,
+    degraded_call_coverage: bool,
+) -> Vec<&'static str> {
+    let mut excludes = call_graph_scope_excludes(confidence);
+    if degraded_call_coverage {
+        excludes.push(DEGRADED_CALL_RESOLUTION_SCOPE_EXCLUDE);
+    }
+    excludes
 }
 
 #[derive(Clone)]

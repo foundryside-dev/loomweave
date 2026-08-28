@@ -16,7 +16,7 @@ import textwrap
 from typing import IO, TYPE_CHECKING, Any, cast
 
 from loomweave_plugin_python import server as server_module
-from loomweave_plugin_python.call_resolver import CallResolutionResult
+from loomweave_plugin_python.call_resolver import CallResolutionResult, FacetCoverage
 from loomweave_plugin_python.pyright_session import (
     FINDING_PYRIGHT_RESTART,
     PyrightRunState,
@@ -498,6 +498,10 @@ def test_analyze_file_reports_call_resolver_stats(
         "unresolved_reference_sites_total": 4,
         "pyright_query_latency_ms": [11, 29, 31],
         "pyright_index_parse_latency_ms": [5, 7],
+        "resolution_coverage": {
+            "calls": {"status": "complete", "transient": False},
+            "references": {"status": "complete", "transient": False},
+        },
     }
     assert response["findings"] == [
         {
@@ -508,6 +512,60 @@ def test_analyze_file_reports_call_resolver_stats(
         }
     ]
     assert any(edge["kind"] == "references" for edge in response["edges"])
+
+
+def test_analyze_file_reports_degraded_resolution_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clarion-3e517d4aff: a resolver that produced nothing must SAY so.
+
+    The host cannot tell empty evidence from a call-free file; the per-file
+    coverage claim is what lets it re-dispatch the unchanged file next run.
+    """
+
+    class PoisonedPyrightSession:
+        def __init__(self, project_root: Path, **_kwargs: Any) -> None:
+            self.project_root = project_root
+
+        def resolve_calls(
+            self,
+            file_path: str,
+            function_ids: list[str],
+        ) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult(
+                unresolved_call_sites_total=1,
+                coverage=FacetCoverage.degraded("pyright_poisoned", transient=True),
+            )
+
+        def resolve_references(
+            self,
+            file_path: str,
+            sites: Sequence[ReferenceSite],
+        ) -> ReferenceResolutionResult:
+            _ = file_path
+            return ReferenceResolutionResult(
+                reference_sites_total=len(sites),
+                references_skipped_cap_total=len(sites),
+                unresolved_reference_sites_total=len(sites),
+                coverage=FacetCoverage.degraded("reference_site_cap", transient=False),
+            )
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(server_module, "PyrightSession", PoisonedPyrightSession, raising=False)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def world():\n    return 42\n\nCONST_REF = world\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+
+    response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    assert response["stats"]["resolution_coverage"] == {
+        "calls": {"status": "degraded", "reason": "pyright_poisoned", "transient": True},
+        "references": {"status": "degraded", "reason": "reference_site_cap", "transient": False},
+    }
 
 
 def test_analyze_file_restarts_pyright_after_file_budget(

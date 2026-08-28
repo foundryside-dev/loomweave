@@ -318,6 +318,7 @@ file_scope = ["module"]
 #[cfg(unix)]
 const PHASE3_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
 import json
+import os
 import pathlib
 import sys
 
@@ -377,6 +378,15 @@ while True:
         path = msg["params"]["file_path"]
         stem = pathlib.Path(path).stem
         module_id = f"phase3fixture:module:{stem}"
+        # clarion-3e517d4aff: `LOOMWEAVE_PHASE3_DEGRADE_STEM=<stem>` makes the
+        # plugin report transient-degraded call resolution for that file — the
+        # shape a timed-out / poisoned resolver produces.
+        stats = {}
+        if os.environ.get("LOOMWEAVE_PHASE3_DEGRADE_STEM") == stem:
+            stats["resolution_coverage"] = {
+                "calls": {"status": "degraded", "reason": "fixture_timeout", "transient": True},
+                "references": {"status": "complete", "transient": False},
+            }
         edges = [
             {
                 "kind": "imports",
@@ -402,7 +412,7 @@ while True:
                     },
                 ],
                 "edges": edges,
-                "stats": {},
+                "stats": stats,
             },
         })
     elif method == "shutdown":
@@ -4720,6 +4730,151 @@ fn analyze_incremental_repeated_unchanged_runs_keep_skipping() {
         latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
         Some(2),
         "third run must still skip both — the prior index must not decay after a skip"
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_redispatches_file_whose_resolution_was_degraded() {
+    // clarion-3e517d4aff: a byte-identical file whose last analysis reported
+    // transient-degraded call resolution is NOT done. Run 1 degrades `hole`;
+    // run 2 must re-dispatch it (skipping only `ok`) even though nothing
+    // changed on disk; once run 2 reports it complete, run 3 skips both.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("hole.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("ok.p3"), b"module\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let coverage = |file: &str| -> (String, i64) {
+        Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT calls_status, calls_transient FROM source_file_resolution_coverage \
+                 WHERE source_file_id = ?1",
+                [format!("core:file:{file}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("coverage row")
+    };
+
+    let output = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "hole")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("analyze stdout is utf8");
+    assert!(
+        stdout.contains("call resolution degraded: 1 file (re-dispatched next run)"),
+        "completion line must be loud about degraded resolution: {stdout}"
+    );
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(stats["resolution_degraded_files"].as_u64(), Some(1));
+    assert_eq!(coverage("hole.p3"), ("degraded".to_owned(), 1));
+    assert_eq!(coverage("ok.p3"), ("complete".to_owned(), 0));
+
+    // Run 2: the plugin recovers; `hole` must be re-dispatched, `ok` skipped.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "the degraded file must be re-dispatched; only the healthy one skips"
+    );
+    assert_eq!(stats["resolution_degraded_files"].as_u64(), Some(0));
+    assert_eq!(coverage("hole.p3"), ("complete".to_owned(), 0));
+
+    // Run 3: both complete and unchanged → both skipped.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2)
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_bootstraps_redispatch_for_uncovered_failure_shaped_files() {
+    // clarion-3e517d4aff: an index analysed by a pre-fix binary has no coverage
+    // rows at all. A file that owns a callable-looking entity yet carries zero
+    // `calls` edges and zero unresolved sites is the failure shape, and must
+    // be re-dispatched once so the fixed plugin can (re)claim coverage.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("legacy.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("plain.p3"), b"module\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    // Simulate the pre-fix index: no coverage rows, and `legacy` owns a
+    // function-like child entity with no call evidence.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("DELETE FROM source_file_resolution_coverage;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, parent_id, \
+             source_file_id, source_file_path, properties, created_at, updated_at) \
+             VALUES ('phase3fixture:function:legacy.f', 'phase3fixture', 'function', \
+             'legacy.f', 'f', 'phase3fixture:module:legacy', 'core:file:legacy.p3', \
+             ?1, '{}', 't', 't')",
+            [project_dir
+                .path()
+                .join("legacy.p3")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, properties, source_file_id) \
+             VALUES ('contains', 'phase3fixture:module:legacy', \
+             'phase3fixture:function:legacy.f', 'resolved', '{}', 'core:file:legacy.p3')",
+            [],
+        )
+        .unwrap();
+    }
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(1),
+        "`legacy` (failure shape, no coverage row) re-dispatches; `plain` (module only) skips"
+    );
+    // The re-dispatch wrote a coverage row, so the bootstrap does not repeat.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2)
     );
 }
 

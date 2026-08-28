@@ -45,9 +45,10 @@ pub use manifest::{Manifest, ManifestError, OntologyEntityRole, parse_manifest};
 // guarantee. External consumers should build envelopes directly and
 // handle the serde error.
 pub use protocol::{
-    AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence,
-    ExitNotification, InitializeParams, InitializeResult, InitializedNotification, JsonRpcVersion,
-    NotificationEnvelope, ProtocolError, RequestEnvelope, ResponseEnvelope, ResponsePayload,
-    ShutdownParams, ShutdownResult, UnresolvedCallSite,
+    AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, CoverageStatus,
+    EdgeConfidence, ExitNotification, FacetCoverage, InitializeParams, InitializeResult,
+    InitializedNotification, JsonRpcVersion, NotificationEnvelope, ProtocolError, RequestEnvelope,
+    ResolutionCoverage, ResponseEnvelope, ResponsePayload, ShutdownParams, ShutdownResult,
+    UnresolvedCallSite,
 };
 pub use transport::{Frame, TransportError, read_frame, write_frame};

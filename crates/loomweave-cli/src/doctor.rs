@@ -103,6 +103,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += emit_json_check_text(&check_http_authentication_json(&project_root));
     tally += emit_json_check_text(&instance_id);
     tally += check_index_integrity(&project_root, fix);
+    tally += emit_json_check_text(&check_resolution_coverage_json(&project_root));
     if let Some(check) = check_worktree_stores_json(&project_root) {
         tally += emit_json_check_text(&check);
     }
@@ -242,6 +243,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_filigree_url_json(project_root),
         check_llm_provider_json(project_root),
         check_sei_population_json(project_root),
+        check_resolution_coverage_json(project_root),
         check_wardline_taint_capability_json(project_root),
         check_mcp_hygiene_json(),
         check_integration_bindings_json(project_root, fix),
@@ -294,6 +296,12 @@ fn default_next_action(id: &str) -> String {
                 "Run `loomweave install` + `loomweave analyze <project>` to create or \
                  rebuild the index. If the DB is corrupt, remove `.weft/loomweave/loomweave.db` \
                  first."
+                    .to_owned()
+            }
+            "index.resolution_coverage" => {
+                "Run `loomweave analyze <project>`: transient-degraded files are re-dispatched \
+                 automatically. Content-determined ones need the source fixed (syntax error) \
+                 or the per-file site cap raised."
                     .to_owned()
             }
             "index.freshness" => {
@@ -1961,14 +1969,12 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
             }));
     }
 
-    let identity_secret_present = http.identity_token_env.as_deref().is_some_and(|name| {
-        std::env::var(name)
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    let bearer_secret_present = std::env::var(&http.token_env)
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let identity_secret_present = http
+        .identity_token_env
+        .as_deref()
+        .is_some_and(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+    let bearer_secret_present =
+        std::env::var(&http.token_env).is_ok_and(|value| !value.trim().is_empty());
     let configured_mode = if http.identity_token_env.is_some() {
         "hmac"
     } else if bearer_secret_present {
@@ -2298,6 +2304,56 @@ fn check_sei_population_json(project_root: &Path) -> DoctorJsonCheck {
         Err(err) => DoctorJsonCheck::warning(
             "sei.population",
             format!("SEI population could not be checked: {err}"),
+        ),
+    }
+}
+
+/// Files whose last analysis reported degraded call / reference resolution
+/// (clarion-3e517d4aff). Each is a call-graph hole; transient ones are
+/// re-dispatched by the next `analyze` automatically, content-determined ones
+/// (syntax error, per-file site cap) persist until the source changes.
+fn check_resolution_coverage_json(project_root: &Path) -> DoctorJsonCheck {
+    const ID: &str = "index.resolution_coverage";
+    let db = loomweave_core::store::db_path(project_root);
+    if !db.exists() {
+        return DoctorJsonCheck::warning(ID, "loomweave.db is absent");
+    }
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return DoctorJsonCheck::warning(ID, "loomweave.db is absent or unreadable");
+    };
+    if let Err(err) = validate_external_sqlite_read_gate(&conn) {
+        return DoctorJsonCheck::problem(
+            ID,
+            format!("resolution coverage unavailable: {}", err.message()),
+        )
+        .with_details(serde_json::json!({
+            "external_sqlite": err.details(),
+        }));
+    }
+    match loomweave_storage::degraded_resolution_coverage_summary(&conn) {
+        Ok((0, 0, _)) => DoctorJsonCheck::ok(
+            ID,
+            "every analysed file reports complete call and reference resolution",
+        ),
+        Ok((calls, references, transient)) => {
+            let persistent = calls.max(references).saturating_sub(transient);
+            DoctorJsonCheck::warning(
+                ID,
+                format!(
+                    "{calls} file(s) with degraded call resolution, {references} with degraded \
+                     reference resolution ({transient} transient, re-dispatched by the next \
+                     analyze; {persistent} content-determined: syntax error / site cap)"
+                ),
+            )
+            .with_details(serde_json::json!({
+                "degraded_calls_files": calls,
+                "degraded_references_files": references,
+                "transient_files": transient,
+            }))
+        }
+        Err(err) => DoctorJsonCheck::warning(
+            ID,
+            format!("resolution coverage could not be checked: {err}"),
         ),
     }
 }
