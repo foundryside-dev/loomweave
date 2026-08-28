@@ -387,6 +387,20 @@ while True:
                 "calls": {"status": "degraded", "reason": "fixture_timeout", "transient": True},
                 "references": {"status": "complete", "transient": False},
             }
+        # `LOOMWEAVE_PHASE3_COLLATERAL_STEMS=a,b`: those files report the
+        # collateral shape (resolver already disabled by an earlier file).
+        if stem in os.environ.get("LOOMWEAVE_PHASE3_COLLATERAL_STEMS", "").split(","):
+            stats["resolution_coverage"] = {
+                "calls": {"status": "degraded", "reason": "fixture_poisoned",
+                          "transient": True, "collateral": True},
+                "references": {"status": "complete", "transient": False},
+            }
+        # `LOOMWEAVE_PHASE3_ORDER_LOG=<path>`: append each dispatched stem so a
+        # test can assert the host's dispatch order.
+        order_log = os.environ.get("LOOMWEAVE_PHASE3_ORDER_LOG")
+        if order_log:
+            with open(order_log, "a", encoding="utf-8") as handle:
+                handle.write(stem + "\n")
         edges = [
             {
                 "kind": "imports",
@@ -4803,6 +4817,122 @@ fn analyze_incremental_redispatches_file_whose_resolution_was_degraded() {
         latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
         Some(2)
     );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_dispatches_collateral_files_before_the_troublemaker() {
+    // clarion-3e517d4aff: when one file's own resolution failed (self-inflicted)
+    // and others were degraded as collateral behind it, the re-dispatch must
+    // put the troublemaker LAST so it can only poison what follows it.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    // Walk order is alphabetical: `aaa_trouble` would naturally go first.
+    std::fs::write(project_dir.path().join("aaa_trouble.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("mmm_victim.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("zzz_victim.p3"), b"module\n").unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "aaa_trouble")
+        .env("LOOMWEAVE_PHASE3_COLLATERAL_STEMS", "mmm_victim,zzz_victim")
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["resolution_degraded_files"].as_u64(),
+        Some(3)
+    );
+
+    let order_log = project_dir.path().join("dispatch-order.log");
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_ORDER_LOG", &order_log)
+        .assert()
+        .success();
+    let order = std::fs::read_to_string(&order_log).expect("dispatch order log");
+    let stems: Vec<&str> = order.lines().collect();
+    assert_eq!(
+        stems,
+        vec!["mmm_victim", "zzz_victim", "aaa_trouble"],
+        "collateral files first, the self-inflicted troublemaker last"
+    );
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "all three were degraded last run, so all three re-dispatch"
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_stops_redispatching_after_the_budget_is_spent() {
+    // clarion-3e517d4aff: a file that stays transient-degraded run after run
+    // must stop forcing re-dispatch after MAX_REDISPATCH_ATTEMPTS, or one
+    // pathological file makes every incremental run pay the full cost. It
+    // stays degraded (doctor + read surface) — only the re-dispatch stops.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("stuck.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("fine.p3"), b"module\n").unwrap();
+    let degraded_run = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "stuck")
+            .assert()
+            .success();
+        latest_run_stats(project_dir.path())["skipped_files"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(degraded_run(), 0, "run 1: fresh index, nothing skippable");
+    // Budget is 3 attempts: runs 2, 3, 4 re-dispatch `stuck` (attempts 1..=3).
+    for run in 2..=4 {
+        assert_eq!(
+            degraded_run(),
+            1,
+            "run {run}: `stuck` re-dispatches, `fine` skips"
+        );
+    }
+    // Run 5: the budget is spent — `stuck` is skipped like any unchanged file.
+    assert_eq!(
+        degraded_run(),
+        2,
+        "run 5: exhausted file no longer re-dispatches"
+    );
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    let (status, attempts): (String, i64) = conn
+        .query_row(
+            "SELECT calls_status, redispatch_attempts FROM source_file_resolution_coverage \
+             WHERE source_file_id = 'core:file:stuck.p3'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "degraded", "exhausted, but still honestly degraded");
+    assert_eq!(attempts, 3);
+
+    // Editing the file re-arms it: the content change re-dispatches it and,
+    // with the plugin healthy again, the row heals and the counter resets.
+    std::fs::write(project_dir.path().join("stuck.p3"), b"module\nchanged\n").unwrap();
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    let (status, attempts): (String, i64) = conn
+        .query_row(
+            "SELECT calls_status, redispatch_attempts FROM source_file_resolution_coverage \
+             WHERE source_file_id = 'core:file:stuck.p3'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((status.as_str(), attempts), ("complete", 0));
 }
 
 #[test]

@@ -314,7 +314,11 @@ class PyrightSession:
                 unresolved_call_sites_total=ast_call_sites_total,
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
-                coverage=FacetCoverage.degraded(self._unavailable_reason(), transient=True),
+                coverage=FacetCoverage.degraded(
+                    self._unavailable_reason(),
+                    transient=True,
+                    collateral=self._run_state.disabled,
+                ),
             )
 
         deadline = self._deadline_for_file(path)
@@ -405,7 +409,11 @@ class PyrightSession:
                 unresolved_reference_sites_total=reference_sites_total,
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
-                coverage=FacetCoverage.degraded(self._unavailable_reason(), transient=True),
+                coverage=FacetCoverage.degraded(
+                    self._unavailable_reason(),
+                    transient=True,
+                    collateral=self._run_state.disabled,
+                ),
             )
 
         deadline = self._deadline_for_file(path)

@@ -437,6 +437,12 @@ pub struct FacetCoverage {
     /// `Degraded && transient` files on incremental runs.
     #[serde(default)]
     pub transient: bool,
+    /// The degradation was caused by an EARLIER file's failure (the resolver
+    /// was already disabled when this file arrived), not by this file's own
+    /// content. The host dispatches collateral files before self-inflicted
+    /// ones so a troublemaker can only poison what follows it.
+    #[serde(default)]
+    pub collateral: bool,
 }
 
 impl FacetCoverage {
@@ -451,7 +457,16 @@ impl FacetCoverage {
             status: CoverageStatus::Degraded,
             reason: Some(reason.into()),
             transient,
+            collateral: false,
         }
+    }
+
+    /// Mark this facet's degradation as collateral damage from an earlier
+    /// file (see [`Self::collateral`]).
+    #[must_use]
+    pub fn as_collateral(mut self) -> Self {
+        self.collateral = true;
+        self
     }
 
     #[must_use]
@@ -768,8 +783,8 @@ mod tests {
         assert_eq!(
             json["resolution_coverage"],
             serde_json::json!({
-                "calls": {"status": "degraded", "reason": "pyright_timeout", "transient": true},
-                "references": {"status": "complete", "transient": false},
+                "calls": {"status": "degraded", "reason": "pyright_timeout", "transient": true, "collateral": false},
+                "references": {"status": "complete", "transient": false, "collateral": false},
             })
         );
         let back: AnalyzeFileStats = serde_json::from_value(json).unwrap();

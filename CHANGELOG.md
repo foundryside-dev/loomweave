@@ -117,8 +117,14 @@ only when an incompatible change is made to that surface. See
   caller-navigation tools add `"degraded-call-resolution"` to
   `scope_excludes` (withdrawing `traversal_complete`) plus a
   `degraded_call_coverage_files` count while any such file exists; and
-  `loomweave doctor` gains an `index.resolution_coverage` check. The external
-  SQLite read ceiling advances to `user_version` 13 (additive table only).
+  `loomweave doctor` gains an `index.resolution_coverage` check. Re-dispatch
+  is ordered and bounded (migration 0014): files whose *own* resolution
+  failed are dispatched last (a `collateral` flag on the claim marks files
+  that were merely behind the troublemaker), and a file that stays degraded
+  for 3 consecutive runs stops forcing re-dispatch until its bytes change —
+  so one pathological file cannot make every incremental run pay the full
+  cost. The external SQLite read ceiling advances to `user_version` 14
+  (additive columns only).
 - **Stale syntax findings now retire when files are fixed.** A file whose
   parse error was fixed no longer keeps its old `*-SYNTAX-ERROR` finding
   forever: a per-plugin sweep retires findings for files whose

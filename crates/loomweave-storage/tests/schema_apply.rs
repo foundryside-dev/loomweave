@@ -883,6 +883,7 @@ fn schema_migrations_records_each_applied_migration() {
             "0011_plugin_index_meta",
             "0012_plugin_syntax_finding_contract",
             "0013_source_file_resolution_coverage",
+            "0014_resolution_coverage_redispatch_budget",
         ]
     );
 }

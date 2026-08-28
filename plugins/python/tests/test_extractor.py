@@ -1110,16 +1110,26 @@ def test_syntax_error_reports_degraded_non_transient_coverage() -> None:
     byte-identical re-run would hit the same limit (not transient)."""
     result = extract_with_stats("def :", "broken.py")
     assert result.stats.resolution_coverage_wire() == {
-        "calls": {"status": "degraded", "reason": "syntax_error", "transient": False},
-        "references": {"status": "degraded", "reason": "syntax_error", "transient": False},
+        "calls": {
+            "status": "degraded",
+            "reason": "syntax_error",
+            "transient": False,
+            "collateral": False,
+        },
+        "references": {
+            "status": "degraded",
+            "reason": "syntax_error",
+            "transient": False,
+            "collateral": False,
+        },
     }
 
 
 def test_clean_file_reports_complete_coverage_by_default() -> None:
     result = extract_with_stats("def hello():\n    pass\n", "clean.py")
     assert result.stats.resolution_coverage_wire() == {
-        "calls": {"status": "complete", "transient": False},
-        "references": {"status": "complete", "transient": False},
+        "calls": {"status": "complete", "transient": False, "collateral": False},
+        "references": {"status": "complete", "transient": False, "collateral": False},
     }
 
 

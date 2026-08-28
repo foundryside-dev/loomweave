@@ -204,12 +204,14 @@ fn run_actor(
             }
             WriterCmd::ReplaceAnchoredEdgesForSourceFile {
                 source_file_id,
+                prune_resolution_coverage,
                 ack,
             } => {
                 let res = replace_anchored_edges_for_source_file(
                     conn,
                     &mut state,
                     &source_file_id,
+                    prune_resolution_coverage,
                     commits_observed,
                 );
                 reply(ack, res);
@@ -1124,6 +1126,7 @@ fn replace_anchored_edges_for_source_file(
     conn: &mut Connection,
     state: &mut ActorState,
     source_file_id: &str,
+    prune_resolution_coverage: bool,
     commits_observed: &AtomicUsize,
 ) -> Result<()> {
     if state.current_run.is_none() {
@@ -1150,12 +1153,15 @@ fn replace_anchored_edges_for_source_file(
         "DELETE FROM entity_unresolved_call_sites WHERE source_file_id = ?1",
         params![source_file_id],
     )?;
-    // The coverage claim travels with the anchored evidence it describes: a
-    // re-analysed file rewrites it immediately after, a vanished file loses it.
-    conn.execute(
-        "DELETE FROM source_file_resolution_coverage WHERE source_file_id = ?1",
-        params![source_file_id],
-    )?;
+    // A vanished file loses its coverage claim with its evidence. A
+    // re-analysed file keeps the row: the upsert that follows overwrites it
+    // and needs the prior `redispatch_attempts` to count consecutive runs.
+    if prune_resolution_coverage {
+        conn.execute(
+            "DELETE FROM source_file_resolution_coverage WHERE source_file_id = ?1",
+            params![source_file_id],
+        )?;
+    }
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())
 }
