@@ -12,6 +12,10 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.5.0] — 2026-08-29
+
 ### Added
 
 - **Isolated worktree indexes.** A linked Git worktree now gets its own
@@ -1590,7 +1594,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...v1.5.0
 [1.2.1]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/foundryside-dev/loomweave/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/foundryside-dev/loomweave/compare/v1.0.1...v1.1.0
