@@ -181,6 +181,9 @@ file as changed and un-sticks every mark.
 
 **Per-request grant (2026-08-29, clarion-5d83413c36).** `PYRIGHT_CALL_TIMEOUT_SECS` is 30 s, not 5 s: the first query on a large file pays for pyright's whole-file analysis and routinely exceeded 5 s, which read as a self-inflicted `pyright_timeout` although the file completes in ~11 s once warm. The effective grant is still `min(30 s, remaining file budget)`, so a truly wedged server is still detected — the three-file wedge breaker above still counts files, not requests, and the mechanism is unchanged — but time-to-detect scales with the grant: worst case is now ~180 s (3 files x 2 passes x 30 s) instead of the pre-change ~30 s.
 
+**Bounded writes (2026-08-29, clarion-e3ab8a4131).** The budget machinery above bounds *reads* only. A request that gives up leaves pyright — single-threaded — still computing the abandoned query and no longer reading its stdin; the next pass's `didOpen` of a large file then filled the 64 KiB pipe and blocked in an unbounded `write()` for minutes, until the host's 120 s watchdog SIGKILLed the plugin and lost the run. Every LSP write is now bounded by the same deadline its read would get: the plugin's end of the pipe is non-blocking and `_write_all` writes the raw fd through `select`, raising `LspTimeoutError("<method> (write)")` when the deadline passes with bytes unwritten. A write timeout is attributed exactly like a read timeout — self-inflicted `pyright_timeout`, transient, not collateral — and adds **no** restart policy: the wedge breaker and the restart caps are unchanged. The bound is opportunistic (a write is attempted before the clock is consulted), so a healthy server still drains teardown `didClose` traffic after the file budget is spent, while a wedged one is cut off on its first `EAGAIN` and the pass returns degraded instead of blocking again.
+
+
 ## Alternatives considered
 
 - **Restart on timeout too** (the ticket's literal grouping). Rejected: a

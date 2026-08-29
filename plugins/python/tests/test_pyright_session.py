@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import errno
 import os
 import shutil
@@ -8,12 +9,14 @@ import stat
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from loomweave_plugin_python import pyright_session as pyright_session_module
 from loomweave_plugin_python.call_resolver import CallResolutionResult, FacetCoverage
 from loomweave_plugin_python.pyright_session import (
     FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS,
@@ -47,6 +50,7 @@ from loomweave_plugin_python.pyright_session import (
     _FunctionIndex,
     _FunctionInfo,
     _merge_reference_site,
+    _position_to_byte,
     _reference_accumulator_to_edge,
     _unresolved_call_site_total_for_function,
     _unresolved_call_sites_for_function,
@@ -92,6 +96,7 @@ def test_unresolved_call_site_details_omit_expressions_over_host_cap() -> None:
     index = _FunctionIndex(
         source=source,
         line_starts=(0, len(b"def caller():\n")),
+        lines=tuple(source.splitlines(keepends=True)),
         parse_latency_ms=0,
         module_id="python:module:demo",
         by_id={},
@@ -1037,8 +1042,8 @@ class PartialReferenceTimeoutSession(PyrightSession):
     def _ensure_process(self) -> bool:
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = (method, params)
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = (method, params, deadline)
 
     def _reference_target_ids(
         self,
@@ -1064,8 +1069,8 @@ class CountingReferenceSession(PyrightSession):
     def _ensure_process(self) -> bool:
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = (method, params)
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = (method, params, deadline)
 
     def _reference_target_ids(
         self,
@@ -1088,8 +1093,8 @@ class ExternalReferenceSession(PyrightSession):
     def _ensure_process(self) -> bool:
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = (method, params)
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = (method, params, deadline)
 
     def _reference_target_ids(
         self,
@@ -1118,8 +1123,8 @@ class MappedReferenceSession(PyrightSession):
     def _ensure_process(self) -> bool:
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = (method, params)
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = (method, params, deadline)
 
     def _reference_target_ids(
         self,
@@ -1995,8 +2000,8 @@ class BudgetProbeSession(PyrightSession):
     def _ensure_process(self) -> bool:
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = (method, params)
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = (method, params, deadline)
 
     def _request(self, method: str, params: dict[str, object], timeout_secs: float) -> object:
         _ = (method, params)
@@ -2259,8 +2264,8 @@ class _IgnoresShutdownSession(PyrightSession):
             raise LspTimeoutError(method)
         return None
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = (method, params)
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = (method, params, deadline)
 
 
 def test_close_uses_the_shutdown_timeout_not_the_call_timeout(tmp_path: Path) -> None:
@@ -2367,9 +2372,9 @@ class ScriptedCallSession(PyrightSession):
             return super()._spawn_and_initialize(init_timeout_secs)
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
         if not self.fake_spawn and method in ("initialized", "exit"):
-            super()._notify(method, params)
+            super()._notify(method, params, deadline=deadline)
             return
         if method == "textDocument/didClose":
             self.closed_documents += 1
@@ -2657,8 +2662,8 @@ class DidOpenTransportFailureSession(PyrightSession):
     def _ensure_process(self) -> bool:
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = params
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = (params, deadline)
         if method == "textDocument/didOpen":
             raise LspTransportClosedError(method)
 
@@ -2785,7 +2790,8 @@ class RestartProbeSession(PyrightSession):
         self._process = cast("Any", self.fake_process)
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = deadline
         self._live_process()
         if method == "textDocument/didOpen":
             document = cast("dict[str, str]", params["textDocument"])
@@ -3837,11 +3843,12 @@ class ChattyTransportSession(PyrightSession):
         self._process = cast("Any", self.fake_process)
         return True
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = (method, params)
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
+        _ = (method, params, deadline)
         self._live_process()
 
-    def _write_message(self, message: dict[str, object]) -> None:
+    def _write_message(self, message: dict[str, object], deadline: float) -> None:
+        _ = deadline
         self._live_process()
         method = message.get("method")
         if isinstance(method, str) and method in self.responders:
@@ -4004,3 +4011,187 @@ def test_timeout_finding_recorded_during_a_files_pass_rides_that_files_result(
     ]
     assert timeout_findings[0]["message"] == "pyright query timed out: LSP read"
     assert buffered == [], "a finding left in the session buffer would ride the NEXT file's result"
+
+
+class _BlockedPipeProcess:
+    """A live peer whose stdin pipe is full and never drained (clarion-e3ab8a4131).
+
+    Models a single-threaded pyright still computing an abandoned query: it
+    holds the read end open (so the write never sees ``EPIPE``) but never
+    reads, so the 64 KiB pipe buffer stays full and every further write must
+    wait. ``fill()`` primes the buffer so even a tiny message blocks.
+    """
+
+    def __init__(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        self._read_fd = read_fd
+        self.stdin = os.fdopen(write_fd, "wb", buffering=0)
+        self.returncode: int | None = None
+        self.killed = False
+
+    def fill(self) -> None:
+        chunk = b"\0" * 65536
+        while True:
+            try:
+                os.write(self.stdin.fileno(), chunk)
+            except BlockingIOError:
+                return
+
+    def close_fds(self) -> None:
+        with contextlib.suppress(OSError):
+            self.stdin.close()
+        with contextlib.suppress(OSError):
+            os.close(self._read_fd)
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        _ = timeout
+        return self.returncode if self.returncode is not None else 0
+
+
+def _run_bounded(target: Callable[[], None], *, join_secs: float = 5.0) -> tuple[bool, float]:
+    """Run ``target`` on a daemon thread; return (finished, wall seconds).
+
+    The plugin has no pytest-timeout, and the pre-fix code path blocks in
+    ``write()`` forever -- a direct call would hang the whole suite.
+    """
+    started = time.monotonic()
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(join_secs)
+    return not worker.is_alive(), time.monotonic() - started
+
+
+def test_write_message_times_out_when_the_peer_stops_reading(tmp_path: Path) -> None:
+    """clarion-e3ab8a4131: an LSP write must be bounded like an LSP read.
+
+    Pre-fix this blocked in ``process.stdin.write`` until the host's 120 s
+    per-file watchdog SIGKILLed the plugin and lost the whole run.
+    """
+    session = PyrightSession(tmp_path, executable=sys.executable)
+    process = _BlockedPipeProcess()
+    session._process = cast("Any", process)  # noqa: SLF001
+    process.fill()
+    outcome: list[BaseException | None] = []
+
+    def write_it() -> None:
+        try:
+            session._write_message(  # noqa: SLF001
+                {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {"text": "x" * (1 << 20)}},
+                },
+                deadline=session._now() + 0.5,  # noqa: SLF001
+            )
+        except Exception as exc:  # noqa: BLE001
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    finished, elapsed = _run_bounded(write_it)
+    process.close_fds()
+
+    assert finished, "the stdin write outlived its deadline: the write is still unbounded"
+    assert elapsed < 2.0, f"write took {elapsed:.2f}s for a 0.5s deadline"
+    raised = outcome[0]
+    assert isinstance(raised, LspTimeoutError)
+    assert "textDocument/didOpen" in raised.method
+
+
+class DidOpenWriteTimeoutSession(PyrightSession):
+    """A live pyright that has stopped reading stdin: every ``didOpen`` write times out."""
+
+    def __init__(self, project_root: Path, **kwargs: Any) -> None:
+        kwargs.setdefault("executable", sys.executable)
+        super().__init__(project_root, **kwargs)
+        self._process = cast("Any", _FakeProcess())
+        self.written: list[str] = []
+
+    def _ensure_process(self) -> bool:
+        return True
+
+    def _write_message(self, message: dict[str, object], deadline: float) -> None:
+        _ = deadline
+        method = str(message.get("method"))
+        self.written.append(method)
+        if method == "textDocument/didOpen":
+            label = f"{method} (write)"
+            raise LspTimeoutError(label)
+
+
+def test_reference_pass_didopen_write_timeout_is_reported_as_pyright_timeout(
+    tmp_path: Path,
+) -> None:
+    """A write timeout is attributed exactly like a read timeout (ADR-057 §1).
+
+    It is this file's own budget expiring against a live process, so:
+    self-inflicted ``pyright_timeout``, transient, not collateral -- and the
+    pass RETURNS instead of blocking in ``write()``.
+    """
+    source = "def alpha():\n    pass\n\nFIRST = alpha\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(source, from_id="python:module:demo", needle="alpha", occurrence=1)
+
+    run_state = PyrightRunState()
+    session = DidOpenWriteTimeoutSession(tmp_path, run_state=run_state)
+    results: list[Any] = []
+    finished, _elapsed = _run_bounded(
+        lambda: results.append(session.resolve_references(module, [site]))
+    )
+
+    assert finished, "resolve_references blocked on the didOpen write"
+    result = results[0]
+    assert result.coverage == FacetCoverage.degraded("pyright_timeout", transient=True)
+    assert result.coverage.collateral is False
+    assert result.edges == []
+    assert result.unresolved_reference_sites_total == 1
+    assert FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+    assert run_state.restart_count == 0
+
+
+def test_close_bounds_its_shutdown_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``close()``'s teardown traffic is bounded by the shutdown grant, then kills."""
+    monkeypatch.setattr(pyright_session_module, "PYRIGHT_SHUTDOWN_TIMEOUT_SECS", 0.5)
+    session = PyrightSession(tmp_path, executable=sys.executable)
+    process = _BlockedPipeProcess()
+    session._process = cast("Any", process)  # noqa: SLF001
+    process.fill()
+
+    finished, elapsed = _run_bounded(session.close)
+    killed = process.killed
+    process.close_fds()
+
+    assert finished, "close() blocked writing shutdown to a peer that stopped reading"
+    assert elapsed < 2.0, f"close() took {elapsed:.2f}s for a 0.5s shutdown grant"
+    assert killed
+
+
+def test_position_to_byte_uses_the_cached_lines(tmp_path: Path) -> None:
+    """The per-file line split is built once, not re-split per call site.
+
+    Pre-fix ``_position_to_byte`` ran ``source.splitlines(keepends=True)``
+    every call -- twice per unresolved site, 4,473 sites on elspeth's
+    13.6k-line ``tool_batch.py``.
+    """
+    source = "".join(f"value_{n} = {n}\n" for n in range(20000))
+    index = _build_function_index(tmp_path, tmp_path / "big.py", source)
+
+    assert len(index.lines) == 20000
+
+    started = time.monotonic()
+    for line in range(5000):
+        assert _position_to_byte(index, line, 3) == index.line_starts[line] + 3
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0, f"5000 _position_to_byte calls took {elapsed:.2f}s"
