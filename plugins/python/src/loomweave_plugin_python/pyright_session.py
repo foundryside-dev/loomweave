@@ -1641,8 +1641,18 @@ class PyrightSession:
                 "params": params,
             },
         )
+        # ``timeout_secs`` bounds the WHOLE request, not each read
+        # (clarion-7fc41105ea). Server-initiated traffic between the request
+        # and its response -- logMessage, publishDiagnostics,
+        # workspace/configuration -- must never reset the clock: with a fresh
+        # grant per message, a chatty pyright stretches a single "budgeted"
+        # query arbitrarily far past the file deadline, and with it past the
+        # host-watchdog ceiling every headroom computation in this file is
+        # built on. That is how elspeth's service.py call outlived its own
+        # 105s window and was killed by the host's 120s watchdog.
+        deadline = self._now() + timeout_secs
         while True:
-            response = self._read_message(timeout_secs)
+            response = self._read_message(deadline - self._now())
             if "method" in response:
                 self._handle_server_message(response)
                 continue

@@ -3730,3 +3730,214 @@ def test_pyright_session_wedge_restart_at_ceiling_is_deferred_to_the_next_file(
     assert session.spawns == 2
     assert after.coverage == FacetCoverage()
     assert not _restart_findings(after.findings)
+
+
+class ChattyTransportSession(PyrightSession):
+    """Fakes the transport at the ``_read_message`` seam with a simulated clock.
+
+    Unlike ``RestartProbeSession`` this does NOT override ``_request``: the
+    request read loop itself is under test (clarion-7fc41105ea, the elspeth
+    watchdog overrun). Incoming traffic is scripted per outgoing request as
+    ``(gap_secs, payload)`` pairs -- notifications, the matching response, or
+    a ``{"_crash": True}`` marker that kills the fake process and raises the
+    transport EOF the real reader raises. A read whose granted timeout is
+    smaller than the next message's gap consumes the whole grant and raises
+    the same ``LspTimeoutError("LSP read")`` as the real ``_wait_readable``.
+    Wall time moves only on the fake clock.
+    """
+
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        spawn_latency_secs: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(project_root, executable=sys.executable, **kwargs)
+        self.clock = 5000.0
+        self.spawn_latency_secs = spawn_latency_secs
+        self.spawns = 0
+        self.fake_process: _FakeProcess | None = None
+        self.responders: dict[
+            str, Callable[[dict[str, Any]], list[tuple[float, dict[str, Any]]]]
+        ] = {}
+        self.pending: list[tuple[float, dict[str, Any]]] = []
+
+    def _now(self) -> float:
+        return self.clock
+
+    def _spawn_and_initialize(self, init_timeout_secs: float | None = None) -> bool:
+        _ = init_timeout_secs
+        self.spawns += 1
+        self.clock += self.spawn_latency_secs
+        self.fake_process = _FakeProcess()
+        self._process = cast("Any", self.fake_process)
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = (method, params)
+        self._live_process()
+
+    def _write_message(self, message: dict[str, object]) -> None:
+        self._live_process()
+        method = message.get("method")
+        if isinstance(method, str) and method in self.responders:
+            self.pending = list(self.responders[method](cast("dict[str, Any]", message)))
+
+    def _read_message(self, timeout_secs: float) -> dict[str, Any]:
+        read_timeout_method = "LSP read"
+        if not self.pending:
+            self.clock += max(timeout_secs, 0.0)
+            raise LspTimeoutError(read_timeout_method)
+        gap, payload = self.pending[0]
+        if gap > timeout_secs:
+            self.clock += max(timeout_secs, 0.0)
+            raise LspTimeoutError(read_timeout_method)
+        self.pending.pop(0)
+        self.clock += gap
+        if payload.get("_crash"):
+            assert self.fake_process is not None
+            self.fake_process.die()
+            message = "EOF while reading LSP header"
+            raise LspTransportClosedError(message)
+        return payload
+
+    def request_for_test(
+        self, method: str, params: dict[str, object], timeout_secs: float
+    ) -> object:
+        return self._request(method, params, timeout_secs)
+
+
+def _log_message() -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 3, "message": "x"}}
+
+
+def _lsp_response(request: dict[str, Any], result: object) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+
+
+def _chatty_responder(
+    *, notifications: int, gap_secs: float, result: object
+) -> Callable[[dict[str, Any]], list[tuple[float, dict[str, Any]]]]:
+    """A response preceded by ``notifications`` server messages ``gap_secs`` apart."""
+
+    def responder(request: dict[str, Any]) -> list[tuple[float, dict[str, Any]]]:
+        script: list[tuple[float, dict[str, Any]]] = [
+            (gap_secs, _log_message()) for _ in range(notifications)
+        ]
+        script.append((gap_secs, _lsp_response(request, result)))
+        return script
+
+    return responder
+
+
+def test_lsp_request_total_wall_time_is_bounded_by_its_timeout(tmp_path: Path) -> None:
+    """clarion-7fc41105ea root cause: the request timeout must bound the WHOLE request.
+
+    Server-initiated traffic (logMessage, publishDiagnostics,
+    workspace/configuration) between the request and its response must not
+    reset the read clock: with a fresh grant per message, a single
+    "budgeted" query stretches arbitrarily far past the file deadline and
+    the host-watchdog ceiling built on it -- the elspeth service.py kill.
+    """
+    with ChattyTransportSession(tmp_path) as session:
+        assert session._ensure_process()  # noqa: SLF001
+        # 40 notifications, each arriving 4s apart, then the response: a
+        # correct implementation times out once the 5s total grant is spent.
+        session.responders["textDocument/prepareCallHierarchy"] = _chatty_responder(
+            notifications=40, gap_secs=4.0, result=[]
+        )
+        before = session.clock
+        with pytest.raises(LspTimeoutError):
+            session.request_for_test("textDocument/prepareCallHierarchy", {}, 5.0)
+        elapsed = session.clock - before
+
+    assert elapsed <= 5.0 + 1e-9, (
+        f"a 5s request consumed {elapsed}s of wall time: per-message timeout resets "
+        "let chatter carry it past its budget"
+    )
+
+
+def test_analyze_file_shaped_sequence_stays_under_host_watchdog_ceiling(tmp_path: Path) -> None:
+    """The invariant the host watchdog relies on (clarion-7fc41105ea).
+
+    For one analyze_file-shaped sequence (resolve_calls then
+    resolve_references on the same path) the session's total wall time --
+    including the arrival spawn, an in-flight crash with its inline respawn,
+    cold post-restart queries, and a chatty references pass -- stays under
+    ``host_file_watchdog_secs`` minus the terminal safety margin, anchored at
+    the calls pass entry.
+    """
+    source = "def callee():\n    pass\n\ndef caller():\n    callee()\n    callee()\n"
+    module = _write_module(tmp_path, source, "svc.py")
+    sites = [
+        _reference_site(source, from_id="python:function:svc.caller", needle="callee", occurrence=i)
+        for i in range(1, 3)
+    ]
+    prepare_calls = 0
+
+    with ChattyTransportSession(tmp_path, spawn_latency_secs=8.0) as session:
+
+        def prepare_responder(request: dict[str, Any]) -> list[tuple[float, dict[str, Any]]]:
+            nonlocal prepare_calls
+            prepare_calls += 1
+            if prepare_calls == 1:
+                # In-flight pyright death 3s into this file's first query.
+                return [(3.0, {"_crash": True})]
+            return _chatty_responder(notifications=40, gap_secs=4.0, result=[])(request)
+
+        session.responders["textDocument/prepareCallHierarchy"] = prepare_responder
+        # Cold post-restart reference queries on a chatty transport.
+        session.responders["textDocument/definition"] = _chatty_responder(
+            notifications=40, gap_secs=4.0, result=[]
+        )
+
+        started = session.clock
+        calls = session.resolve_calls(module, ["python:function:svc.caller"])
+        references = session.resolve_references(module, sites)
+        total = session.clock - started
+
+    window = session.host_file_watchdog_secs - FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS
+    assert total <= window, (
+        f"analyze_file-shaped sequence consumed {total}s of the {session.host_file_watchdog_secs}s "
+        f"host watchdog; the plugin must stay under {window}s so the host never kills the call"
+    )
+    # Honesty is preserved while staying inside the window: the crash restarted
+    # pyright inline and the starved queries report unresolved, not resolved.
+    assert session.spawns == 2
+    assert calls.coverage.is_degraded
+    assert references.unresolved_reference_sites_total == len(sites)
+
+
+def test_timeout_finding_recorded_during_a_files_pass_rides_that_files_result(
+    tmp_path: Path,
+) -> None:
+    """Deliverable 1c of clarion-7fc41105ea: no finding outlives its file's pop.
+
+    A timeout finding recorded during file B's pass must come back in B's own
+    result (the host anchors findings to the analyzed path of the response
+    they ride in) and must leave nothing buffered in the session afterwards.
+    """
+    clean = _write_module(tmp_path, "def caller():\n    pass\n", "clean_a.py")
+    trouble = _write_module(tmp_path, "def caller():\n    pass\n", "trouble_b.py")
+
+    with ChattyTransportSession(tmp_path) as session:
+        session.responders["textDocument/prepareCallHierarchy"] = _chatty_responder(
+            notifications=0, gap_secs=0.1, result=[]
+        )
+        first = session.resolve_calls(clean, ["python:function:clean_a.caller"])
+        # File B's transport goes silent: its query times out at the read.
+        session.responders.clear()
+        second = session.resolve_calls(trouble, ["python:function:trouble_b.caller"])
+        buffered = list(session._findings)  # noqa: SLF001
+
+    assert _finding_codes(first.findings) == set()
+    codes = _finding_codes(second.findings)
+    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in codes
+    timeout_findings = [
+        finding
+        for finding in second.findings
+        if finding["subcode"] == FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT
+    ]
+    assert timeout_findings[0]["message"] == "pyright query timed out: LSP read"
+    assert buffered == [], "a finding left in the session buffer would ride the NEXT file's result"
