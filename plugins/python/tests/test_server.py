@@ -18,11 +18,13 @@ from typing import IO, TYPE_CHECKING, Any, cast
 from loomweave_plugin_python import server as server_module
 from loomweave_plugin_python.call_resolver import CallResolutionResult, FacetCoverage
 from loomweave_plugin_python.pyright_session import (
+    FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
     FINDING_PYRIGHT_RESTART,
     PyrightRunState,
     PyrightSession,
 )
 from loomweave_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
+from tests.test_pyright_session import ScriptedCallSession
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -575,6 +577,64 @@ def test_analyze_file_reports_degraded_resolution_coverage(
             "transient": False,
             "collateral": False,
         },
+    }
+
+
+def test_analyze_file_hands_back_partial_call_edges_alongside_degraded_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clarion-7f527d3d32: a mid-file pyright timeout keeps the edges already resolved.
+
+    Drives the real ``PyrightSession`` calls pass (only the LSP transport is
+    scripted) through ``handle_analyze_file`` so the wire result the host
+    persists is what is asserted: the first function's ``calls`` edge is in
+    ``edges`` next to a degraded/transient ``calls`` claim, and the second
+    function's site is the one counted unresolved. Before the fix the
+    ``except LspTimeoutError`` arm in ``resolve_calls`` zeroed ``edges``.
+    """
+    demo = tmp_path / "demo.py"
+    demo.write_text(
+        "def callee():\n    pass\n\ndef first():\n    callee()\n\ndef second():\n    callee()\n",
+        encoding="utf-8",
+    )
+    # The server resolves every function in the file, `callee` (no call sites)
+    # included, so the script table covers all three.
+    callee = "python:function:demo.callee"
+    functions = [callee, "python:function:demo.first", "python:function:demo.second"]
+
+    def scripted_session(project_root: Path, **kwargs: Any) -> ScriptedCallSession:
+        return ScriptedCallSession(
+            project_root,
+            module=demo,
+            callee_by_caller=dict.fromkeys(functions, callee),
+            fail_on="python:function:demo.second",
+            **kwargs,
+        )
+
+    monkeypatch.setattr(server_module, "PyrightSession", scripted_session, raising=False)
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+
+    response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    call_edges = [edge for edge in response["edges"] if edge["kind"] == "calls"]
+    assert [(edge["from_id"], edge["to_id"]) for edge in call_edges] == [
+        ("python:function:demo.first", "python:function:demo.callee"),
+    ]
+    stats = response["stats"]
+    assert stats["resolution_coverage"]["calls"] == {
+        "status": "degraded",
+        "reason": "pyright_timeout",
+        "transient": True,
+        "collateral": False,
+    }
+    # Arithmetic closure on the wire: one site resolved, one unresolved.
+    assert stats["unresolved_call_sites_total"] == 1
+    assert [site["caller_entity_id"] for site in stats["unresolved_call_sites"]] == [
+        "python:function:demo.second",
+    ]
+    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in {
+        finding["subcode"] for finding in response["findings"]
     }
 
 

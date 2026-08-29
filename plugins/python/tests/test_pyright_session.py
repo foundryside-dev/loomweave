@@ -8,11 +8,13 @@ import stat
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from loomweave_plugin_python.call_resolver import CallResolutionResult, FacetCoverage
 from loomweave_plugin_python.pyright_session import (
     FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
     FINDING_PYRIGHT_INIT_TIMEOUT,
@@ -25,7 +27,9 @@ from loomweave_plugin_python.pyright_session import (
     FINDING_PYRIGHT_SPAWN_DEFERRED,
     FINDING_PYRIGHT_UNAVAILABLE,
     MAX_CONSECUTIVE_SPAWN_DEFERRALS,
+    PYRIGHT_FILE_TIMEOUT_CAP_SECS,
     LspTimeoutError,
+    LspTransportClosedError,
     PyrightRunState,
     PyrightSession,
     _build_function_index,
@@ -1973,7 +1977,8 @@ class BudgetProbeSession(PyrightSession):
             project_root,
             executable=sys.executable,
             call_timeout_secs=10.0,
-            file_timeout_secs=0.01,
+            file_timeout_base_secs=0.01,
+            file_timeout_per_function_secs=0.0,
         )
         self.request_timeouts: list[float] = []
 
@@ -2180,3 +2185,394 @@ def test_pyright_session_answers_workspace_configuration_requests(tmp_path: Path
 
     assert result.edges == []
     assert marker.read_text(encoding="utf-8") == "ok"
+
+
+# --- clarion-7f527d3d32: partial evidence on abort + size-proportional budget
+
+
+def test_pyright_session_file_deadline_scales_with_function_count(tmp_path: Path) -> None:
+    session = PyrightSession(
+        tmp_path,
+        executable=sys.executable,
+        file_timeout_base_secs=2.0,
+        file_timeout_per_function_secs=0.5,
+    )
+    path = tmp_path / "demo.py"
+
+    before = time.monotonic()
+    deadline = session._deadline_for_file(path, n_functions=6)  # noqa: SLF001
+    after = time.monotonic()
+
+    assert before + 5.0 <= deadline <= after + 5.0
+    # The deadline is memoised per file: the references pass re-asks with the
+    # same path and must share the calls pass's budget, not restart it.
+    assert session._deadline_for_file(path, n_functions=1000) == deadline  # noqa: SLF001
+
+
+def test_pyright_session_file_deadline_is_capped_for_very_large_files(tmp_path: Path) -> None:
+    session = PyrightSession(
+        tmp_path,
+        executable=sys.executable,
+        file_timeout_base_secs=2.0,
+        file_timeout_per_function_secs=0.5,
+        file_timeout_cap_secs=10.0,
+    )
+
+    before = time.monotonic()
+    deadline = session._deadline_for_file(tmp_path / "demo.py", n_functions=1000)  # noqa: SLF001
+    after = time.monotonic()
+
+    assert before + 10.0 <= deadline <= after + 10.0
+
+
+def test_pyright_session_default_file_timeout_cap_stays_under_the_host_watchdog() -> None:
+    # The host's DEFAULT_PLUGIN_FILE_TIMEOUT (crates/loomweave-cli/src/analyze.rs)
+    # kills an analyze_file call at 120s; the plugin must hand back its partial
+    # result before that, or the evidence it kept is lost with the call.
+    host_watchdog_secs = 120.0
+    assert host_watchdog_secs > PYRIGHT_FILE_TIMEOUT_CAP_SECS
+
+
+_TWO_CALLER_MODULE = """
+def callee():
+    pass
+
+def first():
+    callee()
+
+def second():
+    callee()
+"""
+
+
+class ScriptedCallSession(PyrightSession):
+    """A fake pyright for the calls pass.
+
+    Every call site of a requested function resolves to
+    ``callee_by_caller[function]``. The function named ``fail_on`` raises
+    ``failure`` when it reaches ``fail_at`` (for ``callHierarchy/outgoingCalls``
+    only the item with ordinal ``fail_on_item``). ``items_per_function`` lets a
+    test drive the per-item sub-loop with more than one call-hierarchy item.
+    """
+
+    def __init__(  # noqa: PLR0913 - each knob selects one abort shape under test.
+        self,
+        project_root: Path,
+        *,
+        module: Path,
+        callee_by_caller: dict[str, str],
+        fail_on: str | None = None,
+        fail_at: str = "textDocument/prepareCallHierarchy",
+        fail_on_item: int = 0,
+        items_per_function: int = 1,
+        failure: Callable[[str], Exception] = LspTimeoutError,
+        budget_expires_after: str | None = None,
+        run_state: PyrightRunState | None = None,
+    ) -> None:
+        super().__init__(project_root, executable=sys.executable, run_state=run_state)
+        self.module = module
+        self.callee_by_caller = callee_by_caller
+        self.fail_on = fail_on
+        self.fail_at = fail_at
+        self.fail_on_item = fail_on_item
+        self.items_per_function = items_per_function
+        self.failure = failure
+        self.budget_expires_after = budget_expires_after
+        self.budget_expired = False
+        self.visited: list[str] = []
+        self.closed_documents = 0
+
+    def _ensure_process(self) -> bool:
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = params
+        if method == "textDocument/didClose":
+            self.closed_documents += 1
+
+    def _file_budget_expired(self, deadline: float) -> bool:
+        return self.budget_expired or super()._file_budget_expired(deadline)
+
+    def _maybe_fail(self, caller: str, method: str, item_ordinal: int) -> None:
+        if caller != self.fail_on or method != self.fail_at:
+            return
+        if method == "callHierarchy/outgoingCalls" and item_ordinal != self.fail_on_item:
+            return
+        raise self.failure(method)
+
+    def _request(self, method: str, params: dict[str, object], timeout_secs: float) -> object:
+        _ = timeout_secs
+        index = self._function_index_for_path(self.module)
+        if method == "textDocument/prepareCallHierarchy":
+            position = cast("dict[str, int]", params["position"])
+            function = index.by_name_position[(position["line"], position["character"])]
+            self.visited.append(function.entity_id)
+            self._maybe_fail(function.entity_id, method, 0)
+            return [
+                {"caller": function.entity_id, "ordinal": ordinal}
+                for ordinal in range(self.items_per_function)
+            ]
+        if method == "callHierarchy/outgoingCalls":
+            item = cast("dict[str, object]", params["item"])
+            caller = cast("str", item["caller"])
+            ordinal = cast("int", item["ordinal"])
+            self._maybe_fail(caller, method, ordinal)
+            function = index.by_id[caller]
+            callee = index.by_id[self.callee_by_caller[caller]]
+            if ordinal == self.items_per_function - 1 and caller == self.budget_expires_after:
+                self.budget_expired = True
+            return [
+                {
+                    "to": {
+                        "uri": self.module.as_uri(),
+                        "selectionRange": {
+                            "start": {"line": callee.line, "character": callee.character},
+                            "end": {"line": callee.line, "character": callee.end_character},
+                        },
+                    },
+                    "fromRanges": [
+                        {
+                            "start": {"line": site.line, "character": site.character},
+                            "end": {"line": site.end_line, "character": site.end_character},
+                        }
+                        for site in function.call_sites
+                    ],
+                },
+            ]
+        msg = f"unexpected request {method}"
+        raise AssertionError(msg)
+
+
+_TWO_CALLERS = ["python:function:demo.first", "python:function:demo.second"]
+_CALLEE_BY_CALLER = dict.fromkeys(_TWO_CALLERS, "python:function:demo.callee")
+
+
+def _ast_call_sites_total(session: PyrightSession, module: Path, function_ids: list[str]) -> int:
+    # Same expression ``resolve_calls`` uses for its own total.
+    index = session._function_index_for_path(module)  # noqa: SLF001
+    return sum(len(index.by_id[function_id].call_sites) for function_id in function_ids)
+
+
+def _assert_partial_call_evidence(
+    session: ScriptedCallSession,
+    module: Path,
+    result: object,
+    *,
+    reason: str,
+) -> None:
+    assert isinstance(result, CallResolutionResult)
+    total = _ast_call_sites_total(session, module, _TWO_CALLERS)
+    # Arithmetic closure is the load-bearing check: it catches a double-count
+    # (edges kept AND the same sites counted unresolved) that "first function's
+    # edge is present" cannot.
+    assert len(result.edges) + result.unresolved_call_sites_total == total
+    assert [edge["from_id"] for edge in result.edges] == ["python:function:demo.first"]
+    assert result.edges[0]["to_id"] == "python:function:demo.callee"
+    assert [site["caller_entity_id"] for site in result.unresolved_call_sites] == [
+        "python:function:demo.second",
+    ]
+    assert result.coverage == FacetCoverage.degraded(reason, transient=True)
+    assert session.closed_documents == 1
+
+
+def test_pyright_session_call_resolution_timeout_before_any_function_is_visited_is_fully_unresolved(
+    tmp_path: Path,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller=_CALLEE_BY_CALLER,
+        fail_on="python:function:demo.first",
+    ) as session:
+        result = session.resolve_calls(module, _TWO_CALLERS)
+
+    assert result.edges == []
+    assert result.unresolved_call_sites_total == _ast_call_sites_total(
+        session, module, _TWO_CALLERS
+    )
+    assert {site["caller_entity_id"] for site in result.unresolved_call_sites} == set(_TWO_CALLERS)
+    assert result.coverage == FacetCoverage.degraded("pyright_timeout", transient=True)
+    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+
+
+def test_pyright_session_call_resolution_timeout_keeps_edges_resolved_before_the_timeout(
+    tmp_path: Path,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller=_CALLEE_BY_CALLER,
+        fail_on="python:function:demo.second",
+    ) as session:
+        result = session.resolve_calls(module, _TWO_CALLERS)
+
+    _assert_partial_call_evidence(session, module, result, reason="pyright_timeout")
+    assert session.visited == _TWO_CALLERS
+    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+
+
+def test_pyright_session_call_resolution_timeout_mid_function_item_loop_keeps_arithmetic_closure(
+    tmp_path: Path,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller=_CALLEE_BY_CALLER,
+        fail_on="python:function:demo.second",
+        fail_at="callHierarchy/outgoingCalls",
+        items_per_function=2,
+        fail_on_item=1,
+    ) as session:
+        result = session.resolve_calls(module, _TWO_CALLERS)
+
+    # ``second``'s first call-hierarchy item resolved a genuine candidate before
+    # its second item timed out. A function's edges are appended only after its
+    # whole item sub-loop finishes, so that partial per-item state must be
+    # discarded (counted unresolved), never kept AND counted.
+    _assert_partial_call_evidence(session, module, result, reason="pyright_timeout")
+
+
+def test_pyright_session_call_resolution_file_budget_expiry_keeps_edges_resolved_before_it(
+    tmp_path: Path,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller=_CALLEE_BY_CALLER,
+        budget_expires_after="python:function:demo.first",
+    ) as session:
+        result = session.resolve_calls(module, _TWO_CALLERS)
+
+    _assert_partial_call_evidence(session, module, result, reason="pyright_timeout")
+    # The budget check runs before ``second`` is ever asked about.
+    assert session.visited == ["python:function:demo.first"]
+    timeout_findings = [
+        finding
+        for finding in result.findings
+        if finding["subcode"] == FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT
+    ]
+    assert [finding["metadata"]["method"] for finding in timeout_findings] == [
+        "analyze_file budget",
+    ]
+
+
+def test_pyright_session_call_resolution_transport_failure_keeps_edges_resolved_before_it(
+    tmp_path: Path,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+    run_state = PyrightRunState()
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller=_CALLEE_BY_CALLER,
+        fail_on="python:function:demo.second",
+        failure=LspTransportClosedError,
+        run_state=run_state,
+    ) as session:
+        result = session.resolve_calls(module, _TWO_CALLERS)
+
+    _assert_partial_call_evidence(session, module, result, reason="pyright_transport_failure")
+    assert run_state.restart_count == 1
+    assert FINDING_PYRIGHT_RESTART in _finding_codes(result.findings)
+
+
+class PartialReferenceTransportFailureSession(PartialReferenceTimeoutSession):
+    def _reference_target_ids(
+        self,
+        uri: str,
+        site: ReferenceSite,
+        *,
+        deadline: float,
+        method: str = "textDocument/definition",
+    ) -> tuple[list[str], bool]:
+        _ = (uri, deadline)
+        self.requested_starts.append(site.source_byte_start)
+        if site.source_byte_start == self.timeout_start:
+            raise LspTransportClosedError(method)
+        return self.targets_by_start[site.source_byte_start], False
+
+
+def test_pyright_session_reference_transport_failure_keeps_edges_resolved_before_it(
+    tmp_path: Path,
+) -> None:
+    source = textwrap.dedent(
+        """
+        def alpha():
+            pass
+
+        def beta():
+            pass
+
+        def gamma():
+            pass
+
+        FIRST = alpha
+        BROKEN = beta
+        THIRD = gamma
+        """,
+    ).lstrip()
+    module = _write_module(tmp_path, source)
+    first = _reference_site(source, from_id="python:module:demo", needle="alpha", occurrence=1)
+    broken = _reference_site(source, from_id="python:module:demo", needle="beta", occurrence=1)
+    third = _reference_site(source, from_id="python:module:demo", needle="gamma", occurrence=1)
+
+    with PartialReferenceTransportFailureSession(
+        tmp_path,
+        targets_by_start={
+            first.source_byte_start: ["python:function:demo.alpha"],
+            third.source_byte_start: ["python:function:demo.gamma"],
+        },
+        timeout_start=broken.source_byte_start,
+    ) as session:
+        result = session.resolve_references(module, [first, broken, third])
+
+    assert [edge["to_id"] for edge in result.edges] == ["python:function:demo.alpha"]
+    # The pipe is dead after ``broken``: ``third`` is never asked about.
+    assert session.requested_starts == [first.source_byte_start, broken.source_byte_start]
+    assert result.reference_sites_total == 3
+    assert result.references_resolved_total == 1
+    assert result.unresolved_reference_sites_total == 2
+    assert (
+        result.references_resolved_total + result.unresolved_reference_sites_total
+        == result.reference_sites_total
+    )
+    assert result.coverage == FacetCoverage.degraded("pyright_transport_failure", transient=True)
+    assert FINDING_PYRIGHT_RESTART in _finding_codes(result.findings)
+
+
+class DidOpenTransportFailureSession(PyrightSession):
+    def _ensure_process(self) -> bool:
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = params
+        if method == "textDocument/didOpen":
+            raise LspTransportClosedError(method)
+
+
+def test_pyright_session_reference_transport_failure_before_any_site_is_visited_is_fully_unresolved(
+    tmp_path: Path,
+) -> None:
+    source = "def alpha():\n    pass\n\nFIRST = alpha\n"
+    module = _write_module(tmp_path, source)
+    first = _reference_site(source, from_id="python:module:demo", needle="alpha", occurrence=1)
+
+    run_state = PyrightRunState()
+    with DidOpenTransportFailureSession(
+        tmp_path, executable=sys.executable, run_state=run_state
+    ) as session:
+        result = session.resolve_references(module, [first])
+
+    assert result.edges == []
+    assert result.unresolved_reference_sites_total == 1
+    assert result.coverage == FacetCoverage.degraded("pyright_transport_failure", transient=True)
+    assert run_state.restart_count == 1

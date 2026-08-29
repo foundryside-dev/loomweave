@@ -100,8 +100,7 @@ pub(crate) fn acquire_analyze_lock_for_context(ctx: &WorktreeContext) -> Result<
 ///   an error containing the lock-file path so the operator can identify
 ///   the conflict.
 pub(crate) fn acquire_analyze_lock(loomweave_dir: &Path) -> Result<AnalyzeLockGuard> {
-    let lock_path = loomweave_dir.join(LOCK_FILE_NAME);
-    match try_acquire_lock_path(&lock_path)? {
+    match try_acquire_analyze_lock(loomweave_dir)? {
         TryAnalyzeLock::Acquired(guard) => Ok(guard),
         TryAnalyzeLock::Held { lock_path } => bail!(
             "another `loomweave analyze` is already in progress against this project \
@@ -109,6 +108,15 @@ pub(crate) fn acquire_analyze_lock(loomweave_dir: &Path) -> Result<AnalyzeLockGu
             lock_path.display()
         ),
     }
+}
+
+/// Non-blocking twin of [`acquire_analyze_lock`] that keeps "another
+/// process holds the lock" (`Ok(Held)`, transient) distinct from "the lock
+/// could not be taken at all" (`Err`: the sentinel cannot be opened, or the
+/// filesystem refuses advisory locks — persistent, needs an operator). Callers
+/// that report severity must not collapse the two.
+pub(crate) fn try_acquire_analyze_lock(loomweave_dir: &Path) -> Result<TryAnalyzeLock> {
+    try_acquire_lock_path(&loomweave_dir.join(LOCK_FILE_NAME))
 }
 
 fn try_acquire_lock_path(lock_path: &Path) -> Result<TryAnalyzeLock> {
@@ -187,6 +195,29 @@ mod tests {
         let second = acquire_analyze_lock(loomweave_dir)
             .expect("second acquire must succeed after first drops");
         drop(second);
+    }
+
+    /// The non-blocking probe must keep contention (`Held`) apart from a
+    /// lock file that cannot be opened (`Err`): doctor grades them differently.
+    #[test]
+    fn try_acquire_distinguishes_held_from_unopenable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = acquire_analyze_lock(tmp.path()).expect("first acquire");
+        match try_acquire_analyze_lock(tmp.path()).expect("contention is Ok(Held)") {
+            TryAnalyzeLock::Held { lock_path } => {
+                assert_eq!(lock_path, tmp.path().join(LOCK_FILE_NAME));
+            }
+            TryAnalyzeLock::Acquired(_) => panic!("second acquire must not succeed"),
+        }
+        drop(first);
+
+        let blocked = tempfile::tempdir().unwrap();
+        // A directory squatting on the sentinel path: open() fails, no lock
+        // is ever attempted, and that must surface as Err, not Held.
+        std::fs::create_dir(blocked.path().join(LOCK_FILE_NAME)).unwrap();
+        let err = try_acquire_analyze_lock(blocked.path()).expect_err("unopenable sentinel");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("open analyze lock file"), "{msg}");
     }
 
     /// Missing `.weft/loomweave/` directory must surface as an IO error, not a

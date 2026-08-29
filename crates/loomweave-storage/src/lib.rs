@@ -87,7 +87,7 @@ pub use resolution_coverage::{
     FacetCoverageRecord, MAX_REDISPATCH_ATTEMPTS, RedispatchCandidate, ResolutionCoverageSummary,
     SourceFileResolutionCoverage, degraded_call_coverage_file_count,
     degraded_resolution_coverage_summary, files_needing_resolution_redispatch,
-    upsert_source_file_resolution_coverage,
+    reset_exhausted_redispatch_budget, upsert_source_file_resolution_coverage,
 };
 pub use retry::{RetryPolicy, begin_immediate};
 pub use runs::{mark_abandoned_running_runs_failed, mark_stale_running_runs_failed};

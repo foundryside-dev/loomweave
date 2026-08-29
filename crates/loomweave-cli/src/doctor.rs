@@ -37,7 +37,7 @@ use loomweave_core::{ClassifierCoverage, PluginCoverageStatus};
 use loomweave_federation::config::{McpConfig, ProviderSelection, select_provider_with_env};
 use loomweave_storage::{
     ExternalSqliteCompatibility, ExternalSqliteCompatibilityStatus, LatestClassifierCoverage,
-    external_sqlite_compatibility, latest_classifier_coverage,
+    ResolutionCoverageSummary, external_sqlite_compatibility, latest_classifier_coverage,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -103,7 +103,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += emit_json_check_text(&check_http_authentication_json(&project_root));
     tally += emit_json_check_text(&instance_id);
     tally += check_index_integrity(&project_root, fix);
-    tally += emit_json_check_text(&check_resolution_coverage_json(&project_root));
+    tally += emit_json_check_text(&check_resolution_coverage_json(&project_root, fix));
     if let Some(check) = check_worktree_stores_json(&project_root) {
         tally += emit_json_check_text(&check);
     }
@@ -243,7 +243,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_filigree_url_json(project_root),
         check_llm_provider_json(project_root),
         check_sei_population_json(project_root),
-        check_resolution_coverage_json(project_root),
+        check_resolution_coverage_json(project_root, fix),
         check_wardline_taint_capability_json(project_root),
         check_mcp_hygiene_json(),
         check_integration_bindings_json(project_root, fix),
@@ -300,9 +300,11 @@ fn default_next_action(id: &str) -> String {
             }
             "index.resolution_coverage" => {
                 "Run `loomweave analyze <project>`: transient-degraded files are re-dispatched \
-                 automatically. Files that exhausted the re-dispatch budget, and \
-                 content-determined ones (syntax error / site cap), need the source fixed or \
-                 a `--no-incremental` pass once the resolver is healthy."
+                 automatically. Run `loomweave doctor --fix --path <project>` to reset the \
+                 re-dispatch budget of files that exhausted it (retry once no other analyze / \
+                 doctor --fix holds the lock), then analyze again. Content-determined ones \
+                 (syntax error / site cap) need the source fixed or a `--no-incremental` pass \
+                 once the resolver is healthy."
                     .to_owned()
             }
             "index.freshness" => {
@@ -2309,11 +2311,66 @@ fn check_sei_population_json(project_root: &Path) -> DoctorJsonCheck {
     }
 }
 
+/// Reset the re-dispatch budget for every file that exhausted it
+/// (`doctor --fix`, clarion-7f527d3d32). Returns the number of rows reset
+/// and the coverage summary re-read on the *same* connection right after
+/// the update, so the report cannot pair the reset count with counts from
+/// before it. The re-read is fallible independently of the reset: once the
+/// `UPDATE` has committed, a failure to re-read must not turn a successful
+/// repair into a "repair failed" verdict — the caller reports it as such.
+fn repair_resolution_redispatch_budget(
+    db_path: &Path,
+) -> Result<(u64, Result<ResolutionCoverageSummary, String>)> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open index {} for repair", db_path.display()))?;
+    loomweave_storage::pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let count = loomweave_storage::reset_exhausted_redispatch_budget(&conn)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let after =
+        loomweave_storage::degraded_resolution_coverage_summary(&conn).map_err(|e| e.to_string());
+    Ok((count, after))
+}
+
+/// What the `--fix` half of [`check_resolution_coverage_json`] did.
+enum RedispatchBudgetReset {
+    /// Dry run, or `--fix` with no exhausted file to reset.
+    NotAttempted,
+    /// Another `analyze` / `doctor --fix` held the lock (`WouldBlock`);
+    /// nothing ran. Carries the lock path. This is the ONLY lock outcome that
+    /// is transient — a lock file that cannot be opened or a filesystem that
+    /// refuses advisory locks never reaches this variant (it is a `problem`).
+    LockContended(std::path::PathBuf),
+    /// The reset committed `count` rows. `after` is the post-reset summary,
+    /// or why it could not be re-read (the reset still happened).
+    ///
+    /// A reset only re-arms the counter: the files are still degraded on
+    /// disk until the next `analyze` re-dispatches them, so the check stays
+    /// a `warning` (with `fixed: true` and an explicit next action) rather
+    /// than `fixed`, which would drop it from the report's `next_actions`.
+    Reset {
+        count: u64,
+        after: Result<ResolutionCoverageSummary, String>,
+    },
+}
+
 /// Files whose last analysis reported degraded call / reference resolution
 /// (clarion-3e517d4aff). Each is a call-graph hole; transient ones are
 /// re-dispatched by the next `analyze` automatically, content-determined ones
 /// (syntax error, per-file site cap) persist until the source changes.
-fn check_resolution_coverage_json(project_root: &Path) -> DoctorJsonCheck {
+///
+/// Under `--fix`, files that exhausted the re-dispatch budget
+/// ([`loomweave_storage::MAX_REDISPATCH_ATTEMPTS`] consecutive transient
+/// failures) get their budget reset so the next incremental `analyze`
+/// re-dispatches them (clarion-7f527d3d32). Rows still under budget are left
+/// alone — they already re-dispatch, and wiping their counter would let a
+/// chronically flaky file dodge the anti-thrash budget.
+///
+/// Severity: lock contention with a concurrent `analyze` / `doctor --fix` is
+/// transient and retriable, so it is a `warning`. A lock that cannot be
+/// taken for any other reason (sentinel unopenable, filesystem without
+/// advisory locks) and an actual repair failure (the update itself errors)
+/// are `problem`s — persistent, needing an operator, never "just retry".
+fn check_resolution_coverage_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     const ID: &str = "index.resolution_coverage";
     let db = loomweave_core::store::db_path(project_root);
     if !db.exists() {
@@ -2331,44 +2388,220 @@ fn check_resolution_coverage_json(project_root: &Path) -> DoctorJsonCheck {
             "external_sqlite": err.details(),
         }));
     }
-    match loomweave_storage::degraded_resolution_coverage_summary(&conn) {
-        Ok(summary) if summary.degraded_calls == 0 && summary.degraded_references == 0 => {
-            DoctorJsonCheck::ok(
+    let before = match loomweave_storage::degraded_resolution_coverage_summary(&conn) {
+        Ok(summary) => summary,
+        Err(err) => {
+            return DoctorJsonCheck::warning(
                 ID,
-                "every analysed file reports complete call and reference resolution",
-            )
+                format!("resolution coverage could not be checked: {err}"),
+            );
         }
-        Ok(summary) => {
-            let calls = summary.degraded_calls;
-            let references = summary.degraded_references;
-            let transient = summary.transient;
-            let exhausted = summary.exhausted;
-            let persistent = calls
-                .max(references)
-                .saturating_sub(transient)
-                .saturating_sub(exhausted);
-            DoctorJsonCheck::warning(
-                ID,
+    };
+
+    let reset = if fix && before.exhausted > 0 {
+        // Release the read-only handle before opening the write connection.
+        drop(conn);
+        // Same STO-01 advisory lock `analyze` takes, scoped to this repair
+        // only (see `index_integrity_outcome` for why not all of `--fix`).
+        let loomweave_dir = loomweave_core::store::store_dir(project_root);
+        match crate::analyze_lock::try_acquire_analyze_lock(&loomweave_dir) {
+            Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(_guard)) => {
+                match repair_resolution_redispatch_budget(&db) {
+                    Ok((count, after)) => RedispatchBudgetReset::Reset { count, after },
+                    // The lock WAS held and the write itself failed: a real
+                    // repair failure, correctly a problem.
+                    Err(err) => {
+                        return DoctorJsonCheck::problem(
+                            ID,
+                            format!("resolution re-dispatch budget repair failed: {err}"),
+                        );
+                    }
+                }
+            }
+            Ok(crate::analyze_lock::TryAnalyzeLock::Held { lock_path }) => {
+                RedispatchBudgetReset::LockContended(lock_path)
+            }
+            // Not contention: the sentinel could not be opened (permissions,
+            // read-only or missing store dir) or the filesystem refused the
+            // advisory lock (NFS without lockd — unsupported for the store,
+            // see CLAUDE.md). Retrying will not help; say so.
+            Err(err) => {
+                return DoctorJsonCheck::problem(
+                    ID,
+                    format!(
+                        "{} file(s) exhausted the re-dispatch budget but the analyze lock \
+                         could not be taken: {err:#} (not lock contention — check the \
+                         permissions and filesystem of {}; advisory locks are required, \
+                         NFS is unsupported)",
+                        before.exhausted,
+                        loomweave_dir.display()
+                    ),
+                )
+                .with_details(serde_json::json!({
+                    "exhausted_files": before.exhausted,
+                    "analyze_lock_error": format!("{err:#}"),
+                }))
+                .with_next_action(format!(
+                    "Make {} writable on a filesystem that supports advisory locks (not \
+                     NFS), then re-run `loomweave doctor --fix --path <project>`.",
+                    loomweave_dir.display()
+                ));
+            }
+        }
+    } else {
+        RedispatchBudgetReset::NotAttempted
+    };
+
+    render_resolution_coverage_check(fix, &before, reset)
+}
+
+/// Pure half of [`check_resolution_coverage_json`]: turn the pre-reset
+/// summary plus what `--fix` did into the report.
+///
+/// A reset is reported as `warning` + `fixed: true`, never as status
+/// `fixed`: `json_report` builds `next_actions` from `problem` / `warning`
+/// checks only, and the reset files stay degraded on disk until the next
+/// `analyze` re-dispatches them — an agent that reads only `next_actions`
+/// must still be told to run it. Status `fixed` is reserved for a repair
+/// that leaves the checked condition healthy in the same step (compare
+/// `repair_index_integrity`, `mark_classifier_repair`).
+///
+/// Every count in the report comes from ONE read: `before` when no reset
+/// ran, the post-reset re-read when one did. A reset whose re-read failed
+/// must not fall back to `before` — that would print the exhausted count the
+/// reset just zeroed next to `reset_redispatch_budget_files`, contradicting
+/// itself. It reports the reset count, says the current counts are
+/// unavailable, and carries the pre-reset counts under an explicit
+/// `before_reset` key instead.
+fn render_resolution_coverage_check(
+    fix: bool,
+    before: &ResolutionCoverageSummary,
+    reset: RedispatchBudgetReset,
+) -> DoctorJsonCheck {
+    const ID: &str = "index.resolution_coverage";
+    let (summary, reset_count, lock_contended) = match reset {
+        RedispatchBudgetReset::NotAttempted => (before, None, None),
+        RedispatchBudgetReset::LockContended(err) => (before, None, Some(err)),
+        RedispatchBudgetReset::Reset {
+            count,
+            after: Ok(ref after),
+        } => (after, Some(count), None),
+        RedispatchBudgetReset::Reset {
+            count,
+            after: Err(err),
+        } => {
+            return reset_pending_analyze(
+                count,
                 format!(
-                    "{calls} file(s) with degraded call resolution, {references} with degraded \
-                     reference resolution ({transient} transient, re-dispatched by the next \
-                     analyze; {exhausted} exhausted the re-dispatch budget; {persistent} \
-                     content-determined: syntax error / site cap)"
+                    "reset the re-dispatch budget for {count} exhausted file(s); they will \
+                     re-dispatch on the next incremental analyze — current coverage counts \
+                     could not be re-read after the reset ({err}); re-run doctor for them"
                 ),
-            )
-            .with_details(serde_json::json!({
-                "degraded_calls_files": calls,
-                "degraded_references_files": references,
-                "transient_files": transient,
-                "exhausted_files": exhausted,
-                "max_redispatch_attempts": loomweave_storage::MAX_REDISPATCH_ATTEMPTS,
-            }))
+                serde_json::json!({
+                    "reset_redispatch_budget_files": count,
+                    "max_redispatch_attempts": loomweave_storage::MAX_REDISPATCH_ATTEMPTS,
+                    "post_reset_summary_error": err,
+                    "before_reset": coverage_summary_details(before),
+                }),
+            );
         }
-        Err(err) => DoctorJsonCheck::warning(
+    };
+
+    if summary.degraded_calls == 0 && summary.degraded_references == 0 {
+        return DoctorJsonCheck::ok(
             ID,
-            format!("resolution coverage could not be checked: {err}"),
-        ),
+            "every analysed file reports complete call and reference resolution",
+        );
     }
+    let calls = summary.degraded_calls;
+    let references = summary.degraded_references;
+    let transient = summary.transient;
+    let exhausted = summary.exhausted;
+    let persistent = calls
+        .max(references)
+        .saturating_sub(transient)
+        .saturating_sub(exhausted);
+
+    // `reset_redispatch_budget_files` is present iff a reset ran — absent
+    // (not null) on a dry run, a lock-contended run, or a --fix with nothing
+    // exhausted, so "was anything reset" is a key-presence check.
+    let mut details = coverage_summary_details(summary);
+    details.insert(
+        "max_redispatch_attempts".into(),
+        loomweave_storage::MAX_REDISPATCH_ATTEMPTS.into(),
+    );
+    if let Some(count) = reset_count {
+        details.insert("reset_redispatch_budget_files".into(), count.into());
+    }
+    let details = Value::Object(details);
+
+    let summary_clause = format!(
+        "{calls} file(s) with degraded call resolution, {references} with degraded reference \
+         resolution ({transient} transient, re-dispatched by the next analyze; {exhausted} \
+         exhausted the re-dispatch budget; {persistent} content-determined: syntax error / \
+         site cap)"
+    );
+
+    if let Some(count) = reset_count {
+        reset_pending_analyze(
+            count,
+            format!(
+                "reset the re-dispatch budget for {count} exhausted file(s); they re-dispatch \
+                 on the next incremental analyze, which has not run yet ({summary_clause})"
+            ),
+            details,
+        )
+    } else if let Some(lock_path) = lock_contended {
+        DoctorJsonCheck::warning(
+            ID,
+            format!(
+                "{exhausted} file(s) exhausted the re-dispatch budget but the reset could not \
+                 run: another analyze / doctor --fix holds the lock on {} (retry once it \
+                 finishes — transient, not a repair failure)",
+                lock_path.display()
+            ),
+        )
+        .with_details(details)
+    } else if fix {
+        DoctorJsonCheck::warning(
+            ID,
+            format!(
+                "{summary_clause}; --fix ran but no file had exhausted the re-dispatch \
+                 budget, so nothing was reset"
+            ),
+        )
+        .with_details(details)
+    } else {
+        DoctorJsonCheck::warning(ID, summary_clause).with_details(details)
+    }
+}
+
+/// The four per-file counts of a [`ResolutionCoverageSummary`] as report
+/// details.
+/// A committed budget reset that still needs `analyze` to take effect: the
+/// `--fix` action ran (`fixed: true`) but the condition persists (`warning`),
+/// so `json_report` keeps it in `next_actions` with the follow-up spelled out.
+fn reset_pending_analyze(count: u64, message: String, details: Value) -> DoctorJsonCheck {
+    let mut check = DoctorJsonCheck::warning("index.resolution_coverage", message)
+        .with_details(details)
+        .with_next_action(format!(
+            "Run `loomweave analyze <project>`: the {count} file(s) whose re-dispatch budget \
+             was just reset are still degraded until that run re-dispatches them."
+        ));
+    check.fixed = true;
+    check
+}
+
+fn coverage_summary_details(summary: &ResolutionCoverageSummary) -> serde_json::Map<String, Value> {
+    let mut details = serde_json::Map::new();
+    details.insert("degraded_calls_files".into(), summary.degraded_calls.into());
+    details.insert(
+        "degraded_references_files".into(),
+        summary.degraded_references.into(),
+    );
+    details.insert("transient_files".into(), summary.transient.into());
+    details.insert("exhausted_files".into(), summary.exhausted.into());
+    details
 }
 
 fn check_wardline_taint_capability_json(project_root: &Path) -> DoctorJsonCheck {
@@ -3290,5 +3523,311 @@ filigree tracks tasks for this project.\n\
             !marker.exists(),
             "db untrack repair must not run repo-configured fsmonitor"
         );
+    }
+
+    // --- index.resolution_coverage: dry run / --fix / lock-held / no-op ---
+
+    /// A real migrated index at the canonical store path (schema-current, so
+    /// the external-SQLite read gate admits it).
+    fn migrated_db(root: &Path) -> std::path::PathBuf {
+        let db = loomweave_core::store::db_path(root);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let mut conn = Connection::open(&db).unwrap();
+        loomweave_storage::schema::apply_migrations(&mut conn).unwrap();
+        db
+    }
+
+    fn transient_degraded_calls() -> loomweave_storage::SourceFileResolutionCoverage {
+        loomweave_storage::SourceFileResolutionCoverage {
+            calls: loomweave_storage::FacetCoverageRecord {
+                degraded: true,
+                reason: Some("pyright_timeout".to_owned()),
+                transient: true,
+                collateral: false,
+            },
+            references: loomweave_storage::FacetCoverageRecord::default(),
+        }
+    }
+
+    /// Drive one file through enough consecutive degraded runs to exhaust
+    /// `MAX_REDISPATCH_ATTEMPTS`.
+    fn exhaust_one_file(conn: &Connection, source_file_id: &str) {
+        let degraded = transient_degraded_calls();
+        for run in 0..=loomweave_storage::MAX_REDISPATCH_ATTEMPTS {
+            loomweave_storage::upsert_source_file_resolution_coverage(
+                conn,
+                source_file_id,
+                &degraded,
+                &format!("r{run}"),
+                "t",
+            )
+            .unwrap();
+        }
+    }
+
+    /// One transient-degraded row still under budget (attempts == 1).
+    fn under_budget_file(conn: &Connection, source_file_id: &str) {
+        let degraded = transient_degraded_calls();
+        for run in 1..=2 {
+            loomweave_storage::upsert_source_file_resolution_coverage(
+                conn,
+                source_file_id,
+                &degraded,
+                &format!("r{run}"),
+                "t",
+            )
+            .unwrap();
+        }
+    }
+
+    fn redispatch_attempts(conn: &Connection, source_file_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT redispatch_attempts FROM source_file_resolution_coverage \
+             WHERE source_file_id = ?1",
+            rusqlite::params![source_file_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolution_coverage_dry_run_reports_warning_and_does_not_touch_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+        let before = redispatch_attempts(&conn, "core:file:stuck.py");
+        assert_eq!(before, loomweave_storage::MAX_REDISPATCH_ATTEMPTS);
+
+        let check = check_resolution_coverage_json(root, false);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(!check.fixed);
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["exhausted_files"], 1);
+        assert!(
+            details.get("reset_redispatch_budget_files").is_none(),
+            "dry run must not report a reset: {details}"
+        );
+        assert!(!check.message.contains("nothing was reset"));
+        assert_eq!(redispatch_attempts(&conn, "core:file:stuck.py"), before);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_resets_the_exhausted_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+
+        let check = check_resolution_coverage_json(root, true);
+        // The counter is re-armed but the file is still degraded until the
+        // next analyze runs: an action was taken (`fixed`), the condition
+        // persists (`warning`), and the follow-up is spelled out so
+        // `json_report` keeps it in `next_actions`.
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(check.fixed);
+        assert!(
+            check.message.contains("has not run yet"),
+            "must say analyze is still pending: {}",
+            check.message
+        );
+        let next = check.next_action.as_deref().expect("explicit next action");
+        assert!(
+            next.contains("loomweave analyze") && next.contains('1'),
+            "next action must name analyze and the reset count: {next}"
+        );
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["reset_redispatch_budget_files"], 1);
+        assert_eq!(
+            details["exhausted_files"], 0,
+            "summary re-read after the reset"
+        );
+        assert_eq!(details["transient_files"], 1);
+        assert_eq!(redispatch_attempts(&conn, "core:file:stuck.py"), 0);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_lock_that_cannot_be_opened_is_a_problem_not_contention() {
+        // A lock sentinel that cannot be opened (here: a directory squatting
+        // on its path, standing in for permission denied / NFS without
+        // lockd) is persistent. It must not be narrated as "another analyze
+        // holds the lock, retry" — that is a problem needing an operator.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+        std::fs::create_dir(loomweave_core::store::store_dir(root).join("loomweave.lock")).unwrap();
+
+        let check = check_resolution_coverage_json(root, true);
+        assert_eq!(check.status, "problem", "{}", check.message);
+        assert!(!check.fixed);
+        assert!(
+            check.message.contains("not lock contention")
+                && !check.message.contains("retry once it finishes"),
+            "must not be graded as transient contention: {}",
+            check.message
+        );
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["exhausted_files"], 1);
+        assert!(
+            details["analyze_lock_error"]
+                .as_str()
+                .unwrap()
+                .contains("open analyze lock file"),
+            "{details}"
+        );
+        assert!(details.get("reset_redispatch_budget_files").is_none());
+        assert!(check.next_action.is_some());
+        assert_eq!(
+            redispatch_attempts(&conn, "core:file:stuck.py"),
+            loomweave_storage::MAX_REDISPATCH_ATTEMPTS,
+            "repair must not have run"
+        );
+    }
+
+    #[test]
+    fn resolution_coverage_fix_is_a_warning_not_a_problem_when_the_analyze_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+
+        let held =
+            crate::analyze_lock::acquire_analyze_lock(&loomweave_core::store::store_dir(root))
+                .unwrap();
+        let check = check_resolution_coverage_json(root, true);
+        assert_eq!(
+            check.status, "warning",
+            "lock contention is transient, must not fail the gate: {}",
+            check.message
+        );
+        assert!(!check.fixed);
+        assert!(
+            check.message.contains("retry") && check.message.contains("lock"),
+            "{}",
+            check.message
+        );
+        let details = check.details.as_ref().unwrap();
+        assert!(details.get("reset_redispatch_budget_files").is_none());
+        assert_eq!(details["exhausted_files"], 1);
+        assert_eq!(
+            redispatch_attempts(&conn, "core:file:stuck.py"),
+            loomweave_storage::MAX_REDISPATCH_ATTEMPTS,
+            "repair must not have run"
+        );
+
+        drop(held);
+        let check = check_resolution_coverage_json(root, true);
+        assert!(check.fixed, "{}", check.message);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert_eq!(redispatch_attempts(&conn, "core:file:stuck.py"), 0);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_with_nothing_exhausted_is_a_legible_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        under_budget_file(&conn, "core:file:flaky.py");
+        assert_eq!(redispatch_attempts(&conn, "core:file:flaky.py"), 1);
+
+        let check = check_resolution_coverage_json(root, true);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(!check.fixed);
+        assert!(
+            check.message.contains("nothing was reset"),
+            "--fix with nothing exhausted must say so: {}",
+            check.message
+        );
+        let details = check.details.as_ref().unwrap();
+        assert!(details.get("reset_redispatch_budget_files").is_none());
+        assert_eq!(details["transient_files"], 1);
+        assert_eq!(details["exhausted_files"], 0);
+        assert_eq!(redispatch_attempts(&conn, "core:file:flaky.py"), 1);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_whose_post_reset_reread_fails_does_not_report_stale_counts() {
+        // The reset committed but the summary could not be re-read: the
+        // report must not print the pre-reset exhausted count (now zero on
+        // disk) beside `reset_redispatch_budget_files`.
+        let before = ResolutionCoverageSummary {
+            degraded_calls: 1,
+            degraded_references: 0,
+            transient: 0,
+            exhausted: 1,
+        };
+        let check = render_resolution_coverage_check(
+            true,
+            &before,
+            RedispatchBudgetReset::Reset {
+                count: 1,
+                after: Err("database is locked".to_owned()),
+            },
+        );
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(check.fixed);
+        assert!(
+            check
+                .next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("loomweave analyze")),
+            "reset still needs analyze: {:?}",
+            check.next_action
+        );
+        assert!(
+            check.message.contains("reset the re-dispatch budget for 1")
+                && check.message.contains("could not be re-read")
+                && check.message.contains("database is locked"),
+            "{}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("exhausted the re-dispatch budget;"),
+            "must not narrate pre-reset counts as current: {}",
+            check.message
+        );
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["reset_redispatch_budget_files"], 1);
+        assert_eq!(details["post_reset_summary_error"], "database is locked");
+        assert!(
+            details.get("exhausted_files").is_none() && details.get("transient_files").is_none(),
+            "current counts are unknown and must be absent, not stale: {details}"
+        );
+        assert_eq!(details["before_reset"]["exhausted_files"], 1);
+        assert_eq!(details["before_reset"]["degraded_calls_files"], 1);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_reread_succeeds_on_the_write_connection() {
+        // The re-read rides the same connection as the UPDATE, so the
+        // reported counts are the post-reset ones even though no second
+        // read-only handle is ever opened.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+
+        let (count, after) = repair_resolution_redispatch_budget(&db).unwrap();
+        assert_eq!(count, 1);
+        let after = after.unwrap();
+        assert_eq!((after.exhausted, after.transient), (0, 1));
+    }
+
+    #[test]
+    fn resolution_coverage_fix_on_an_empty_coverage_table_is_a_safe_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        migrated_db(root);
+        let check = check_resolution_coverage_json(root, true);
+        assert_eq!(check.status, "ok", "{}", check.message);
+        assert!(!check.fixed);
+        assert!(check.details.is_none());
     }
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import contextlib
 import ctypes
 import ctypes.util
 import errno
@@ -90,12 +91,19 @@ MAX_CONSECUTIVE_SPAWN_DEFERRALS = 50
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 PYRIGHT_CALL_TIMEOUT_SECS = 5.0
-# Per-file wall-clock budget for reference resolution. Large, heavily-typed
-# files (e.g. numpy/torch-vectorised ML code) can starve a tighter budget and
-# surface LMWV-PY-REFERENCE-RESOLUTION-TIMEOUT findings with edges left
-# unresolved. Such files are rare enough that the extra ceiling is worth the
-# more-complete graph.
-PYRIGHT_FILE_TIMEOUT_SECS = 10.0
+# Per-file wall-clock budget, shared by the calls and references passes for
+# one file: ``base + per_function * n_functions``, capped
+# (clarion-7f527d3d32). A flat budget starved large, heavily-typed files
+# (numpy/torch-vectorised ML code) and pinned them as degraded; scaling with
+# the function count buys a big file the time its size demands without
+# handing a small one a budget it will never use.
+PYRIGHT_FILE_TIMEOUT_BASE_SECS = 10.0
+PYRIGHT_FILE_TIMEOUT_PER_FUNCTION_SECS = 0.25
+# The host watchdog (``DEFAULT_PLUGIN_FILE_TIMEOUT`` in
+# crates/loomweave-cli/src/analyze.rs) kills an ``analyze_file`` call at 120s.
+# Stay well under it so the plugin always hands back the partial evidence it
+# resolved before the deadline instead of losing it with the killed call.
+PYRIGHT_FILE_TIMEOUT_CAP_SECS = 90.0
 STDERR_TAIL_LIMIT = 65536
 PYRIGHT_EXCLUDE_PATTERNS = [
     "**/.weft/**",
@@ -137,6 +145,20 @@ class LspTimeoutError(TimeoutError):
 
 class LspTransportClosedError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _CallPassAbort:
+    """Why the calls pass stopped early, carried with the evidence it kept.
+
+    A token rather than the caught exception because ``LspTimeoutError`` is a
+    ``TimeoutError`` and therefore an ``OSError``: dispatching on the
+    exception type would misfile a timeout as a transport failure.
+    """
+
+    reason: Literal["pyright_timeout", "pyright_transport_failure"]
+    method: str | None
+    message: str
 
 
 @dataclass(frozen=True)
@@ -216,7 +238,9 @@ class PyrightSession:
         install_check: Callable[[str], bool] | None = None,
         init_timeout_secs: float = PYRIGHT_INIT_TIMEOUT_SECS,
         call_timeout_secs: float = PYRIGHT_CALL_TIMEOUT_SECS,
-        file_timeout_secs: float = PYRIGHT_FILE_TIMEOUT_SECS,
+        file_timeout_base_secs: float = PYRIGHT_FILE_TIMEOUT_BASE_SECS,
+        file_timeout_per_function_secs: float = PYRIGHT_FILE_TIMEOUT_PER_FUNCTION_SECS,
+        file_timeout_cap_secs: float = PYRIGHT_FILE_TIMEOUT_CAP_SECS,
         max_restarts_per_run: int = MAX_PYRIGHT_RESTARTS_PER_RUN,
         max_reference_sites_per_file: int = MAX_REFERENCE_SITES_PER_FILE,
         run_state: PyrightRunState | None = None,
@@ -227,7 +251,9 @@ class PyrightSession:
         self.install_check = install_check
         self.init_timeout_secs = init_timeout_secs
         self.call_timeout_secs = call_timeout_secs
-        self.file_timeout_secs = file_timeout_secs
+        self.file_timeout_base_secs = file_timeout_base_secs
+        self.file_timeout_per_function_secs = file_timeout_per_function_secs
+        self.file_timeout_cap_secs = file_timeout_cap_secs
         self.max_restarts_per_run = max_restarts_per_run
         self.max_reference_sites_per_file = max_reference_sites_per_file
         # Run-wide health budget: shared across session recycles when the caller
@@ -247,6 +273,11 @@ class PyrightSession:
         # file-budget timeout skipped sites (clarion-3e517d4aff): the pass
         # still returns normally, but its coverage is degraded.
         self._reference_pass_timed_out = False
+        # Likewise for a pyright transport failure mid-pass
+        # (clarion-7f527d3d32). Deliberately flag-based like its sibling above,
+        # rather than the ``_CallPassAbort`` token the calls pass returns: the
+        # references loop already reports through flags.
+        self._reference_pass_transport_failed = False
 
     def __enter__(self) -> Self:
         return self
@@ -321,16 +352,20 @@ class PyrightSession:
                 ),
             )
 
-        deadline = self._deadline_for_file(path)
+        deadline = self._deadline_for_file(path, len(index.functions))
         latency_started = time.perf_counter()
         coverage = FacetCoverage()
         try:
-            edges, unresolved, unresolved_sites = self._resolve_with_pyright(
+            edges, unresolved, unresolved_sites, abort = self._resolve_with_pyright(
                 path,
                 index,
                 requested,
                 deadline,
             )
+        # These two arms remain reachable only from the ``didOpen`` notify
+        # that precedes the per-function loop: nothing was visited yet, so
+        # zero evidence is exact. Aborts inside the loop come back as a token
+        # with the evidence resolved before them (clarion-7f527d3d32).
         except LspTimeoutError as exc:
             self._record_finding(
                 FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
@@ -347,6 +382,17 @@ class PyrightSession:
             unresolved = ast_call_sites_total
             unresolved_sites = []
             coverage = FacetCoverage.degraded("pyright_transport_failure", transient=True)
+        else:
+            if abort is not None:
+                if abort.reason == "pyright_timeout":
+                    self._record_finding(
+                        FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
+                        f"pyright query timed out: {abort.method}",
+                        method=abort.method,
+                    )
+                else:
+                    self._record_restart_or_poison(abort.message)
+                coverage = FacetCoverage.degraded(abort.reason, transient=True)
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
 
         return CallResolutionResult(
@@ -416,10 +462,11 @@ class PyrightSession:
                 ),
             )
 
-        deadline = self._deadline_for_file(path)
+        deadline = self._deadline_for_file(path, len(index.functions))
         latency_started = time.perf_counter()
         coverage = FacetCoverage()
         self._reference_pass_timed_out = False
+        self._reference_pass_transport_failed = False
         try:
             edges, resolved, skipped_external, unresolved = self._resolve_references_with_pyright(
                 path,
@@ -427,8 +474,15 @@ class PyrightSession:
                 sites,
                 deadline,
             )
-            if self._reference_pass_timed_out:
+            if self._reference_pass_transport_failed:
+                coverage = FacetCoverage.degraded("pyright_transport_failure", transient=True)
+            elif self._reference_pass_timed_out:
                 coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
+        # Both arms below are reachable only from the ``didOpen`` notify that
+        # precedes the per-site loop: every timeout or transport failure inside
+        # the loop is caught per site (evidence kept, flags set above). Keep
+        # them as the net for "pyright died before the document even opened",
+        # where zero evidence is exact.
         except LspTimeoutError as exc:
             self._record_finding(
                 FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT,
@@ -469,7 +523,7 @@ class PyrightSession:
         index: _FunctionIndex,
         functions: Sequence[_FunctionInfo],
         deadline: float,
-    ) -> tuple[list[CallsRawEdge], int, list[UnresolvedCallSite]]:
+    ) -> tuple[list[CallsRawEdge], int, list[UnresolvedCallSite], _CallPassAbort | None]:
         uri = path.as_uri()
         self._notify(
             "textDocument/didOpen",
@@ -486,77 +540,128 @@ class PyrightSession:
             edges: list[CallsRawEdge] = []
             unresolved_total = 0
             unresolved_sites: list[UnresolvedCallSite] = []
-            for function in functions:
-                self._ensure_file_budget(deadline)
-                grouped: dict[tuple[int, int, int, int], set[str]] = {}
-                prepared = self._request(
-                    "textDocument/prepareCallHierarchy",
-                    {
-                        "textDocument": {"uri": uri},
-                        "position": {"line": function.line, "character": function.character},
-                    },
-                    self._budgeted_timeout(deadline),
-                )
-                items = prepared if isinstance(prepared, list) else []
-                for item in items:
-                    self._ensure_file_budget(deadline)
-                    outgoing = self._request(
-                        "callHierarchy/outgoingCalls",
-                        {"item": item},
-                        self._budgeted_timeout(deadline),
+            abort: _CallPassAbort | None = None
+            remaining_start = len(functions)
+            for position, function in enumerate(functions):
+                try:
+                    function_edges, resolved_ranges = self._resolve_function_with_pyright(
+                        uri,
+                        index,
+                        function,
+                        deadline,
                     )
-                    calls = outgoing if isinstance(outgoing, list) else []
-                    for call in calls:
-                        if not isinstance(call, dict):
-                            continue
-                        to_id = self._target_id_from_call(call)
-                        if to_id is None:
-                            continue
-                        from_ranges = call.get("fromRanges")
-                        if not isinstance(from_ranges, list):
-                            continue
-                        for from_range in from_ranges:
-                            key = _range_key(from_range)
-                            if key is not None and _range_within_function(key, function):
-                                grouped.setdefault(key, set()).add(to_id)
-
-                for range_key, candidates in _ambiguous_dict_dispatches(index, function).items():
-                    grouped.setdefault(range_key, set()).update(candidates)
-                for range_key, candidates in _dunder_call_dispatches(index, function).items():
-                    grouped.setdefault(range_key, set()).update(candidates)
-
-                for range_key in sorted(grouped):
-                    candidate_ids = sorted(grouped[range_key])
-                    if not candidate_ids:
-                        continue
-                    start_line, start_character, end_line, end_character = range_key
-                    start_byte = _position_to_byte(index, start_line, start_character)
-                    end_byte = _position_to_byte(index, end_line, end_character)
-                    edge: CallsRawEdge = {
-                        "kind": "calls",
-                        "from_id": function.entity_id,
-                        "to_id": candidate_ids[0],
-                        "source_byte_start": start_byte,
-                        "source_byte_end": end_byte,
-                        "confidence": "resolved" if len(candidate_ids) == 1 else "ambiguous",
-                    }
-                    if len(candidate_ids) > 1:
-                        edge["properties"] = {"candidates": candidate_ids}
-                    edges.append(edge)
-
-                function_unresolved_sites = _unresolved_call_sites_for_function(
-                    index,
-                    function,
-                    set(grouped),
-                )
+                except LspTimeoutError as exc:
+                    abort = _CallPassAbort("pyright_timeout", exc.method, str(exc))
+                    remaining_start = position
+                    break
+                except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
+                    abort = _CallPassAbort("pyright_transport_failure", None, str(exc))
+                    remaining_start = position
+                    break
+                edges.extend(function_edges)
                 unresolved_total += _unresolved_call_site_total_for_function(
                     function,
-                    set(grouped),
+                    resolved_ranges,
                 )
-                unresolved_sites.extend(function_unresolved_sites)
-            return edges, unresolved_total, unresolved_sites
+                unresolved_sites.extend(
+                    _unresolved_call_sites_for_function(index, function, resolved_ranges),
+                )
+            if abort is not None:
+                # INVARIANT: this fallback is only correct because a function is
+                # atomic with respect to ``edges`` -- its edges land in one
+                # ``extend`` after ``_resolve_function_with_pyright`` returned,
+                # i.e. after its whole outgoingCalls item sub-loop finished
+                # without raising. So a function either already contributed
+                # edges (before ``remaining_start``) or contributed none (this
+                # range). If a future edit inserts an LSP-touching call between
+                # the ``extend`` and the accounting above, ``remaining_start =
+                # position`` double-counts that function (edges kept AND all
+                # its sites unresolved); track "functions with edges appended"
+                # explicitly instead of relying on ``position`` if you add one.
+                for function in functions[remaining_start:]:
+                    unresolved_total += _unresolved_call_site_total_for_function(function, set())
+                    unresolved_sites.extend(
+                        _unresolved_call_sites_for_function(index, function, set()),
+                    )
+            return edges, unresolved_total, unresolved_sites, abort
         finally:
-            self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+            # The pipe may be the very thing that just failed: a notify over a
+            # dead transport must not raise and discard the evidence above.
+            with contextlib.suppress(LspTransportClosedError, BrokenPipeError, OSError):
+                self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    def _resolve_function_with_pyright(
+        self,
+        uri: str,
+        index: _FunctionIndex,
+        function: _FunctionInfo,
+        deadline: float,
+    ) -> tuple[list[CallsRawEdge], set[tuple[int, int, int, int]]]:
+        """Resolve one function's call sites; the edges and the ranges they cover.
+
+        Raises ``LspTimeoutError`` (per-query or file budget) or a transport
+        error mid-way; the caller treats the function as wholly unresolved
+        then -- nothing partial escapes from here.
+        """
+        self._ensure_file_budget(deadline)
+        function_edges: list[CallsRawEdge] = []
+        grouped: dict[tuple[int, int, int, int], set[str]] = {}
+        prepared = self._request(
+            "textDocument/prepareCallHierarchy",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": function.line, "character": function.character},
+            },
+            self._budgeted_timeout(deadline),
+        )
+        items = prepared if isinstance(prepared, list) else []
+        for item in items:
+            self._ensure_file_budget(deadline)
+            outgoing = self._request(
+                "callHierarchy/outgoingCalls",
+                {"item": item},
+                self._budgeted_timeout(deadline),
+            )
+            calls = outgoing if isinstance(outgoing, list) else []
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                to_id = self._target_id_from_call(call)
+                if to_id is None:
+                    continue
+                from_ranges = call.get("fromRanges")
+                if not isinstance(from_ranges, list):
+                    continue
+                for from_range in from_ranges:
+                    key = _range_key(from_range)
+                    if key is not None and _range_within_function(key, function):
+                        grouped.setdefault(key, set()).add(to_id)
+
+        for range_key, candidates in _ambiguous_dict_dispatches(index, function).items():
+            grouped.setdefault(range_key, set()).update(candidates)
+        for range_key, candidates in _dunder_call_dispatches(index, function).items():
+            grouped.setdefault(range_key, set()).update(candidates)
+
+        for range_key in sorted(grouped):
+            candidate_ids = sorted(grouped[range_key])
+            if not candidate_ids:
+                continue
+            start_line, start_character, end_line, end_character = range_key
+            start_byte = _position_to_byte(index, start_line, start_character)
+            end_byte = _position_to_byte(index, end_line, end_character)
+            edge: CallsRawEdge = {
+                "kind": "calls",
+                "from_id": function.entity_id,
+                "to_id": candidate_ids[0],
+                "source_byte_start": start_byte,
+                "source_byte_end": end_byte,
+                "confidence": "resolved" if len(candidate_ids) == 1 else "ambiguous",
+            }
+            if len(candidate_ids) > 1:
+                edge["properties"] = {"candidates": candidate_ids}
+            function_edges.append(edge)
+
+        return function_edges, set(grouped)
 
     def _resolve_references_with_pyright(
         self,
@@ -606,20 +711,11 @@ class PyrightSession:
                 cached = lookup_cache.get(cache_key)
                 if cached is None:
                     try:
-                        candidate_ids, saw_external = self._reference_target_ids(
+                        candidate_ids, saw_external = self._lookup_reference_site(
                             uri,
                             site,
-                            deadline=deadline,
+                            deadline,
                         )
-                        if not candidate_ids and site.kind == "annotation" and not saw_external:
-                            candidate_ids, fallback_external = self._reference_target_ids(
-                                uri,
-                                site,
-                                method="textDocument/typeDefinition",
-                                deadline=deadline,
-                            )
-                            saw_external = saw_external or fallback_external
-                        candidate_ids = _filter_relation_candidates(site, candidate_ids)
                     except LspTimeoutError as exc:
                         self._reference_pass_timed_out = True
                         self._record_finding(
@@ -633,6 +729,14 @@ class PyrightSession:
                         )
                         unresolved_total += 1
                         continue
+                    except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
+                        # The pipe is gone: every remaining site is unresolved,
+                        # but the sites resolved so far stay resolved
+                        # (clarion-7f527d3d32).
+                        self._reference_pass_transport_failed = True
+                        self._record_restart_or_poison(str(exc))
+                        unresolved_total += len(sites) - site_index
+                        break
                     lookup_cache[cache_key] = (candidate_ids, saw_external)
                 else:
                     candidate_ids, saw_external = cached
@@ -653,7 +757,29 @@ class PyrightSession:
                 unresolved_total,
             )
         finally:
-            self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+            with contextlib.suppress(LspTransportClosedError, BrokenPipeError, OSError):
+                self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    def _lookup_reference_site(
+        self,
+        uri: str,
+        site: ReferenceSite,
+        deadline: float,
+    ) -> tuple[list[str], bool]:
+        candidate_ids, saw_external = self._reference_target_ids(
+            uri,
+            site,
+            deadline=deadline,
+        )
+        if not candidate_ids and site.kind == "annotation" and not saw_external:
+            candidate_ids, fallback_external = self._reference_target_ids(
+                uri,
+                site,
+                method="textDocument/typeDefinition",
+                deadline=deadline,
+            )
+            saw_external = saw_external or fallback_external
+        return _filter_relation_candidates(site, candidate_ids), saw_external
 
     def _reference_target_ids(
         self,
@@ -679,11 +805,15 @@ class PyrightSession:
             precise_only=site.kind in ("base", "decorator"),
         )
 
-    def _deadline_for_file(self, path: Path) -> float:
+    def _deadline_for_file(self, path: Path, n_functions: int) -> float:
         return self._file_deadlines.setdefault(
             path,
-            time.monotonic() + self.file_timeout_secs,
+            time.monotonic() + self._file_timeout_for(n_functions),
         )
+
+    def _file_timeout_for(self, n_functions: int) -> float:
+        budget = self.file_timeout_base_secs + self.file_timeout_per_function_secs * n_functions
+        return min(budget, self.file_timeout_cap_secs)
 
     def _budgeted_timeout(self, deadline: float) -> float:
         remaining = deadline - time.monotonic()

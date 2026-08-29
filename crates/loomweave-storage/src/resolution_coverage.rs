@@ -13,7 +13,9 @@
 //! - the MCP caller-navigation surface can name a degraded index instead of
 //!   asserting `traversal_complete: true` over a hole
 //!   ([`degraded_call_coverage_file_count`]); and
-//! - `doctor` can report the residual ([`degraded_resolution_coverage_summary`]).
+//! - `doctor` can report the residual ([`degraded_resolution_coverage_summary`])
+//!   and, under `--fix`, re-arm files that exhausted the budget
+//!   ([`reset_exhausted_redispatch_budget`]).
 //!
 //! Rows are keyed by the core `file` entity id and replaced in the same per-file
 //! transaction as the file's anchored edges; the vanished-file prune drops them.
@@ -24,7 +26,8 @@ use crate::Result;
 
 /// Consecutive transient-degraded runs after which a byte-identical file stops
 /// forcing re-dispatch. It stays `degraded` on the read surface; a content
-/// change (or `--no-incremental`) re-arms it.
+/// change, `--no-incremental`, or `doctor --fix`
+/// ([`reset_exhausted_redispatch_budget`]) re-arms it.
 pub const MAX_REDISPATCH_ATTEMPTS: i64 = 3;
 
 /// One resolution facet's persisted coverage claim.
@@ -312,6 +315,30 @@ pub fn degraded_resolution_coverage_summary(
         },
     )
     .map_err(Into::into)
+}
+
+/// Reset `redispatch_attempts` to 0 for every row that has exhausted
+/// [`MAX_REDISPATCH_ATTEMPTS`] on a transient-degraded facet (calls or
+/// references), so the next incremental `analyze` re-dispatches it. Rows
+/// still under budget, complete, or permanently degraded (syntax error /
+/// site cap) are untouched — this only re-arms files the budget itself gave
+/// up on; it does not wipe the failure counter of anything still under it,
+/// so a chronically flaky file cannot dodge the anti-thrash budget by having
+/// `doctor --fix` run periodically. Returns the number of rows reset.
+///
+/// # Errors
+///
+/// Returns [`crate::StorageError::Sqlite`] if the update fails.
+pub fn reset_exhausted_redispatch_budget(conn: &Connection) -> Result<u64> {
+    let rows = conn.execute(
+        "UPDATE source_file_resolution_coverage \
+         SET redispatch_attempts = 0 \
+         WHERE redispatch_attempts >= ?1 \
+           AND ((calls_status = 'degraded' AND calls_transient = 1) \
+             OR (references_status = 'degraded' AND references_transient = 1))",
+        params![MAX_REDISPATCH_ATTEMPTS],
+    )?;
+    Ok(u64::try_from(rows).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -686,5 +713,145 @@ mod tests {
             ResolutionCoverageSummary::default()
         );
         assert_eq!(degraded_call_coverage_file_count(&conn).unwrap(), 0);
+    }
+
+    fn exhaust(conn: &Connection, id: &str) {
+        let transient = SourceFileResolutionCoverage {
+            calls: degraded(true),
+            references: FacetCoverageRecord::default(),
+        };
+        for run in 0..=MAX_REDISPATCH_ATTEMPTS {
+            upsert_source_file_resolution_coverage(conn, id, &transient, &format!("r{run}"), "t")
+                .unwrap();
+        }
+    }
+
+    fn attempts(conn: &Connection, id: &str) -> i64 {
+        conn.query_row(
+            "SELECT redispatch_attempts FROM source_file_resolution_coverage \
+             WHERE source_file_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reset_exhausted_redispatch_budget_zeroes_only_rows_at_or_over_the_budget() {
+        let conn = migrated_conn();
+        for (id, path) in [
+            ("core:file:a.py", "/p/a.py"),
+            ("core:file:b.py", "/p/b.py"),
+            ("core:file:c.py", "/p/c.py"),
+        ] {
+            insert_entity(&conn, id, "core", "file", path, None, None);
+        }
+        exhaust(&conn, "core:file:a.py");
+        // b.py: transient, one degraded re-run, still under budget.
+        let transient = SourceFileResolutionCoverage {
+            calls: degraded(true),
+            references: FacetCoverageRecord::default(),
+        };
+        upsert_source_file_resolution_coverage(&conn, "core:file:b.py", &transient, "r1", "t")
+            .unwrap();
+        upsert_source_file_resolution_coverage(&conn, "core:file:b.py", &transient, "r2", "t")
+            .unwrap();
+        // c.py: permanently degraded (content-determined), never counted.
+        let permanent = SourceFileResolutionCoverage {
+            calls: FacetCoverageRecord::default(),
+            references: degraded(false),
+        };
+        upsert_source_file_resolution_coverage(&conn, "core:file:c.py", &permanent, "r1", "t")
+            .unwrap();
+        assert_eq!(attempts(&conn, "core:file:a.py"), MAX_REDISPATCH_ATTEMPTS);
+        assert_eq!(attempts(&conn, "core:file:b.py"), 1);
+        assert_eq!(attempts(&conn, "core:file:c.py"), 0);
+
+        assert_eq!(reset_exhausted_redispatch_budget(&conn).unwrap(), 1);
+
+        assert_eq!(
+            attempts(&conn, "core:file:a.py"),
+            0,
+            "exhausted row re-armed"
+        );
+        assert_eq!(
+            attempts(&conn, "core:file:b.py"),
+            1,
+            "under-budget row untouched"
+        );
+        assert_eq!(
+            attempts(&conn, "core:file:c.py"),
+            0,
+            "permanent row untouched"
+        );
+        let (status, transient_flag): (String, i64) = conn
+            .query_row(
+                "SELECT references_status, references_transient \
+                 FROM source_file_resolution_coverage WHERE source_file_id = 'core:file:c.py'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), transient_flag), ("degraded", 0));
+    }
+
+    #[test]
+    fn reset_exhausted_redispatch_budget_makes_the_file_eligible_for_redispatch_again() {
+        let conn = migrated_conn();
+        insert_entity(
+            &conn,
+            "core:file:a.py",
+            "core",
+            "file",
+            "/p/a.py",
+            None,
+            None,
+        );
+        exhaust(&conn, "core:file:a.py");
+        assert!(
+            files_needing_resolution_redispatch(&conn)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            degraded_resolution_coverage_summary(&conn)
+                .unwrap()
+                .exhausted,
+            1
+        );
+
+        assert_eq!(reset_exhausted_redispatch_budget(&conn).unwrap(), 1);
+
+        assert_eq!(
+            paths(&files_needing_resolution_redispatch(&conn).unwrap()),
+            vec![("/p/a.py", true)]
+        );
+        let summary = degraded_resolution_coverage_summary(&conn).unwrap();
+        assert_eq!((summary.transient, summary.exhausted), (1, 0));
+    }
+
+    #[test]
+    fn reset_exhausted_redispatch_budget_returns_zero_when_nothing_is_exhausted() {
+        let conn = migrated_conn();
+        assert_eq!(reset_exhausted_redispatch_budget(&conn).unwrap(), 0);
+        insert_entity(
+            &conn,
+            "core:file:a.py",
+            "core",
+            "file",
+            "/p/a.py",
+            None,
+            None,
+        );
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:a.py",
+            &SourceFileResolutionCoverage::default(),
+            "r1",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(reset_exhausted_redispatch_budget(&conn).unwrap(), 0);
+        assert_eq!(attempts(&conn, "core:file:a.py"), 0);
     }
 }

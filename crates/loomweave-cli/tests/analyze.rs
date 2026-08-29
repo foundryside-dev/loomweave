@@ -4937,6 +4937,189 @@ fn analyze_incremental_stops_redispatching_after_the_budget_is_spent() {
 
 #[test]
 #[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_persists_edges_alongside_a_degraded_transient_coverage_claim() {
+    // clarion-7f527d3d32 pins the HOST half of partial evidence: the fixture
+    // plugin answers with edges AND a transient-degraded `calls` claim in one
+    // `analyze_file` result, and the store must keep both — the coverage
+    // claim is a statement about completeness, not a reason to drop what
+    // was resolved. This is a host invariant that predates the ticket (the
+    // writer never gated edge persistence on coverage); it is pinned here
+    // because the plugin-side fix relies on it. The PLUGIN half — that the
+    // Python plugin actually hands back the edges it resolved before a
+    // mid-file pyright timeout instead of discarding them — is not reachable
+    // from this fixture and is covered by
+    // plugins/python/tests/test_server.py
+    // (`test_analyze_file_hands_back_partial_call_edges_alongside_degraded_coverage`)
+    // and the `ScriptedCallSession` tests in test_pyright_session.py.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("auth_a.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("auth_b.p3"), b"module\n").unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "auth_a")
+        .assert()
+        .success();
+
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let (status, transient): (String, i64) = conn
+        .query_row(
+            "SELECT calls_status, calls_transient FROM source_file_resolution_coverage \
+             WHERE source_file_id = 'core:file:auth_a.p3'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((status.as_str(), transient), ("degraded", 1));
+
+    let edge_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'imports' \
+             AND from_id = 'phase3fixture:module:auth_a' \
+             AND to_id = 'phase3fixture:module:auth_b'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        edge_count, 1,
+        "degraded coverage must not drop edges the plugin already emitted"
+    );
+    // The transient claim is what makes the next incremental run re-dispatch
+    // the file; the kept edge must survive as the file's evidence until then.
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_redispatches_after_doctor_resets_an_exhausted_budget() {
+    // clarion-7f527d3d32: once a file has spent MAX_REDISPATCH_ATTEMPTS it
+    // stops re-dispatching. `doctor --fix` resets that budget so the next
+    // incremental run picks the file up again; a dry-run `doctor` must not.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("stuck.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("fine.p3"), b"module\n").unwrap();
+    let degraded_run = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "stuck")
+            .assert()
+            .success();
+    };
+    // Run 1 is fresh; runs 2..=4 spend the three re-dispatch attempts; run 5
+    // proves the budget is exhausted (stuck is skipped).
+    for _ in 1..=5 {
+        degraded_run();
+    }
+
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let row = || -> (String, i64) {
+        Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT calls_status, redispatch_attempts FROM source_file_resolution_coverage \
+                 WHERE source_file_id = 'core:file:stuck.p3'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row(), ("degraded".to_owned(), 3), "budget exhausted");
+
+    let doctor_check = |fix: bool| -> serde_json::Value {
+        let mut cmd = loomweave_bin();
+        cmd.arg("doctor");
+        if fix {
+            cmd.arg("--fix");
+        }
+        let output = cmd
+            .args(["--format", "json"])
+            .arg("--path")
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<serde_json::Value>(&output).expect("doctor json")
+    };
+    let coverage_check = |report: &serde_json::Value| -> serde_json::Value {
+        report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "index.resolution_coverage")
+            .expect("resolution_coverage check present")
+            .clone()
+    };
+
+    // Dry run: reports the exhausted file, resets nothing.
+    let dry_run = coverage_check(&doctor_check(false));
+    assert_eq!(dry_run["status"], "warning", "{dry_run}");
+    assert_eq!(dry_run["details"]["exhausted_files"], 1, "{dry_run}");
+    assert!(
+        dry_run["details"]
+            .get("reset_redispatch_budget_files")
+            .is_none(),
+        "dry run must not report a reset: {dry_run}"
+    );
+    assert_eq!(
+        row(),
+        ("degraded".to_owned(), 3),
+        "dry run must not touch the budget counter"
+    );
+
+    // --fix: resets the budget and says how many rows it reset.
+    let fixed_report = doctor_check(true);
+    let fixed = coverage_check(&fixed_report);
+    // An action ran (`fixed: true`) but the file stays degraded until the
+    // next analyze, so the check remains a warning and keeps its place in
+    // `next_actions` — never status `fixed`.
+    assert_eq!(fixed["status"], "warning", "{fixed}");
+    assert_eq!(fixed["fixed"], true, "{fixed}");
+    assert_eq!(
+        fixed["details"]["reset_redispatch_budget_files"], 1,
+        "{fixed}"
+    );
+    assert!(
+        fixed_report["next_actions"]
+            .as_array()
+            .expect("next_actions array")
+            .iter()
+            .any(|action| action
+                .as_str()
+                .is_some_and(|a| a.contains("loomweave analyze"))),
+        "an agent reading only next_actions must still be told to analyze: {fixed_report}"
+    );
+    assert_eq!(row(), ("degraded".to_owned(), 0), "budget re-armed");
+
+    // Next incremental run (plugin healthy): only `fine` skips; `stuck` is
+    // re-dispatched and heals.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(1),
+        "only `fine.p3` should skip; `stuck.p3` must be re-dispatched by the reset budget"
+    );
+    assert_eq!(row(), ("complete".to_owned(), 0));
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
 fn analyze_incremental_bootstraps_redispatch_for_uncovered_failure_shaped_files() {
     // clarion-3e517d4aff: an index analysed by a pre-fix binary has no coverage
     // rows at all. A file that owns a callable-looking entity yet carries zero
