@@ -1099,6 +1099,20 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let plugin_version = plugin.manifest.plugin.version.clone();
         let ontology_version = plugin.manifest.ontology.ontology_version.clone();
         let prior_plugin_marker = prior_plugin_markers.get(&plugin_id);
+        // clarion-5cf9643de9: the interpreter pyright resolves against is part
+        // of the evidence contract. A change (or an unrecorded prior) forces the
+        // same full re-dispatch as a plugin/ontology bump. `None` for plugins
+        // that declare no language-server runtime, so they are never affected.
+        let resolver_environment =
+            loomweave_core::resolver_environment_for(&plugin.manifest, &project_root);
+        let resolver_environment_changed = match prior_plugin_marker {
+            Some(prior) => prior.resolver_environment != resolver_environment,
+            // No stored marker at all — the same fail-toward-work direction the
+            // tag-schema comparison takes below. `is_some()` rather than `true`
+            // so a non-language-server plugin is not dragged into a re-dispatch
+            // by a signal that can never apply to it.
+            None => resolver_environment.is_some(),
+        };
         let plugin_tag_schema_changed = match prior_plugin_marker {
             Some(prior) => {
                 prior.plugin_version != plugin_version || prior.ontology_version != ontology_version
@@ -1112,23 +1126,39 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let host_syntax_finding_contract_changed = prior_plugin_marker.is_none_or(|prior| {
             prior.host_syntax_finding_contract != HOST_SYNTAX_FINDING_CONTRACT_VERSION
         });
-        let plugin_index_contract_changed =
-            plugin_tag_schema_changed || host_syntax_finding_contract_changed;
+        let plugin_index_contract_changed = plugin_tag_schema_changed
+            || host_syntax_finding_contract_changed
+            || resolver_environment_changed;
         if incremental && plugin_index_contract_changed && !prior_plugin_markers.is_empty() {
             tracing::info!(
                 plugin_id = %plugin_id,
                 plugin_version = %plugin_version,
                 ontology_version = %ontology_version,
                 host_syntax_finding_contract_changed,
+                resolver_environment_changed,
                 "plugin index contract changed since last run; forcing full re-dispatch \
                  of this plugin's files"
             );
+            if resolver_environment_changed {
+                // Name the new fingerprint so an operator reading the log can
+                // see WHICH interpreter this run's evidence was resolved
+                // against — the whole point of the marker.
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    resolver_environment = resolver_environment.as_deref().unwrap_or("<none>"),
+                    prior_resolver_environment = prior_plugin_marker
+                        .and_then(|prior| prior.resolver_environment.as_deref())
+                        .unwrap_or("<none>"),
+                    "resolver environment moved since last run"
+                );
+            }
         }
         current_plugin_markers.push(loomweave_storage::PluginIndexMarker {
             plugin_id: plugin_id.clone(),
             plugin_version,
             ontology_version,
             host_syntax_finding_contract: HOST_SYNTAX_FINDING_CONTRACT_VERSION,
+            resolver_environment,
         });
 
         // Wave 2 / T3.1: partition into files to re-analyse (changed, new,
