@@ -677,6 +677,10 @@ class PyrightSession:
                     self._record_file_attributed_restart(path, abort.message)
                 coverage = FacetCoverage.degraded(abort.reason, transient=True)
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
+        # Deliberately the UNWRAPPED coverage: the wedge breaker keys its
+        # consecutive-timeout streak on the real reason and resets on a
+        # completing calls pass. An interpreter-qualified value here would
+        # silently stop that reset under an unpinned interpreter.
         self._note_calls_facet_outcome(path, coverage)
 
         return CallResolutionResult(
