@@ -104,6 +104,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += emit_json_check_text(&instance_id);
     tally += check_index_integrity(&project_root, fix);
     tally += emit_json_check_text(&check_resolution_coverage_json(&project_root, fix));
+    tally += emit_json_check_text(&check_runs_json(&project_root, fix));
     if let Some(check) = check_worktree_stores_json(&project_root) {
         tally += emit_json_check_text(&check);
     }
@@ -244,6 +245,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_llm_provider_json(project_root),
         check_sei_population_json(project_root),
         check_resolution_coverage_json(project_root, fix),
+        check_runs_json(project_root, fix),
         check_wardline_taint_capability_json(project_root),
         check_mcp_hygiene_json(),
         check_integration_bindings_json(project_root, fix),
@@ -302,9 +304,15 @@ fn default_next_action(id: &str) -> String {
                 "Run `loomweave analyze <project>`: transient-degraded files are re-dispatched \
                  automatically. Run `loomweave doctor --fix --path <project>` to reset the \
                  re-dispatch budget of files that exhausted it (retry once no other analyze / \
-                 doctor --fix holds the lock), then analyze again. Content-determined ones \
-                 (syntax error / site cap) need the source fixed or a `--no-incremental` pass \
-                 once the resolver is healthy."
+                 doctor --fix holds the lock), then analyze again. Content- or \
+                 environment-determined ones (syntax error / site cap / `interpreter_unpinned` \
+                 — set `LOOMWEAVE_PYTHON_INTERPRETER` or create `.venv`) need the source fixed \
+                 or a `--no-incremental` pass once the resolver is healthy."
+                    .to_owned()
+            }
+            "index.runs" => {
+                "Run `loomweave doctor --fix --path <project>` to mark abandoned `running` \
+                 runs failed (only when no live analyze holds the lock)."
                     .to_owned()
             }
             "index.freshness" => {
@@ -2604,6 +2612,99 @@ fn coverage_summary_details(summary: &ResolutionCoverageSummary) -> serde_json::
     details
 }
 
+/// `runs` rows left `running` by a builder that died uncleanly (OOM-kill,
+/// `kill -9`, reboot) — clarion-5cf9643de9 aside. `analyze` itself only
+/// sweeps rows whose heartbeat is >24 h old (`mark_stale_running_runs_failed`);
+/// a fresher abandoned row poisons `project_status_get` / the hook snapshot
+/// until then. The analyze lock is the liveness proof: every `analyze` holds
+/// it from before `BeginRun` to after its last transaction, so if `doctor`
+/// can take it, no builder is alive and every `running` row is abandoned.
+fn check_runs_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    const ID: &str = "index.runs";
+    let db = loomweave_core::store::db_path(project_root);
+    if !db.exists() {
+        return DoctorJsonCheck::warning(ID, "loomweave.db is absent");
+    }
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return DoctorJsonCheck::warning(ID, "loomweave.db is absent or unreadable");
+    };
+    if let Err(err) = validate_external_sqlite_read_gate(&conn) {
+        return DoctorJsonCheck::problem(ID, format!("runs unavailable: {}", err.message()))
+            .with_details(serde_json::json!({ "external_sqlite": err.details() }));
+    }
+    let running = match running_runs(&conn) {
+        Ok(rows) => rows,
+        Err(err) => return DoctorJsonCheck::warning(ID, format!("runs could not be read: {err}")),
+    };
+    if running.is_empty() {
+        return DoctorJsonCheck::ok(ID, "no analyze run is recorded as running");
+    }
+    drop(conn);
+    let loomweave_dir = loomweave_core::store::store_dir(project_root);
+    let details = serde_json::json!({ "running_rows": running.len(), "runs": running });
+    match crate::analyze_lock::try_acquire_analyze_lock(&loomweave_dir) {
+        Ok(crate::analyze_lock::TryAnalyzeLock::Held { .. }) => DoctorJsonCheck::ok(
+            ID,
+            format!(
+                "{} running run(s); an analyze holds the analyze lock, so they are live",
+                running.len()
+            ),
+        )
+        .with_details(details),
+        Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(_guard)) if fix => {
+            match repair_abandoned_runs(&db) {
+                Ok(count) => DoctorJsonCheck::fixed(
+                    ID,
+                    format!(
+                        "marked {count} abandoned running run(s) failed (no live analyze holds the lock)"
+                    ),
+                )
+                .with_details(serde_json::json!({ "repaired_rows": count, "runs": running })),
+                Err(err) => DoctorJsonCheck::problem(ID, format!("abandoned run repair failed: {err}")),
+            }
+        }
+        Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(_guard)) => DoctorJsonCheck::warning(
+            ID,
+            format!(
+                "{} run(s) recorded as running but no analyze holds the lock (abandoned)",
+                running.len()
+            ),
+        )
+        .with_details(details)
+        .with_next_action("Run `loomweave doctor --fix --path <project>` to mark the abandoned runs failed."),
+        Err(err) => DoctorJsonCheck::problem(
+            ID,
+            format!(
+                "{} running run(s) and the analyze lock could not be taken: {err:#}",
+                running.len()
+            ),
+        )
+        .with_details(details),
+    }
+}
+
+fn running_runs(conn: &Connection) -> rusqlite::Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, started_at, owner_pid, heartbeat_at FROM runs WHERE status = 'running' ORDER BY started_at",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "started_at": row.get::<_, String>(1)?,
+            "owner_pid": row.get::<_, Option<i64>>(2)?,
+            "heartbeat_at": row.get::<_, Option<String>>(3)?,
+        }))
+    })?;
+    rows.collect()
+}
+
+fn repair_abandoned_runs(db_path: &Path) -> Result<usize> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open index {} for repair", db_path.display()))?;
+    loomweave_storage::pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    loomweave_storage::mark_abandoned_running_runs_failed(&conn).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 fn check_wardline_taint_capability_json(project_root: &Path) -> DoctorJsonCheck {
     let Some(config) = read_loomweave_yaml(project_root) else {
         return DoctorJsonCheck::warning(
@@ -3831,5 +3932,89 @@ filigree tracks tasks for this project.\n\
         assert_eq!(check.status, "ok", "{}", check.message);
         assert!(!check.fixed);
         assert!(check.details.is_none());
+    }
+
+    // --- index.runs: dry run / --fix / lock-held ---
+
+    fn seed_run(conn: &Connection, id: &str, status: &str, owner_pid: Option<i64>) {
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status, owner_pid) \
+             VALUES (?1, '2026-01-01T00:00:00.000Z', NULL, '{}', '{}', ?2, ?3)",
+            rusqlite::params![id, status, owner_pid],
+        )
+        .unwrap();
+    }
+
+    fn run_status(conn: &Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT status FROM runs WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn runs_check_is_ok_when_nothing_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrated_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seed_run(&conn, "done", "completed", None);
+        let check = check_runs_json(dir.path(), false);
+        assert_eq!(check.status, "ok", "{}", check.message);
+    }
+
+    #[test]
+    fn runs_dry_run_warns_and_lists_abandoned_rows_without_touching_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrated_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seed_run(&conn, "stuck", "running", Some(99_999_999));
+        let check = check_runs_json(dir.path(), false);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(!check.fixed);
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["running_rows"], 1);
+        assert_eq!(details["runs"][0]["id"], "stuck");
+        assert_eq!(details["runs"][0]["owner_pid"], 99_999_999);
+        assert_eq!(run_status(&conn, "stuck"), "running");
+    }
+
+    #[test]
+    fn runs_fix_marks_every_running_row_failed_while_holding_the_analyze_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrated_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seed_run(&conn, "stuck-a", "running", Some(1));
+        seed_run(&conn, "stuck-b", "running", None);
+        seed_run(&conn, "done", "completed", None);
+        let check = check_runs_json(dir.path(), true);
+        assert_eq!(check.status, "fixed", "{}", check.message);
+        assert!(check.fixed);
+        assert_eq!(check.details.as_ref().unwrap()["repaired_rows"], 2);
+        assert_eq!(run_status(&conn, "stuck-a"), "failed");
+        assert_eq!(run_status(&conn, "stuck-b"), "failed");
+        assert_eq!(run_status(&conn, "done"), "completed");
+    }
+
+    #[test]
+    fn runs_check_is_ok_not_warning_when_a_live_analyze_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrated_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seed_run(&conn, "live", "running", Some(std::process::id().into()));
+        let store = loomweave_core::store::store_dir(dir.path());
+        let _guard = match crate::analyze_lock::try_acquire_analyze_lock(&store).unwrap() {
+            crate::analyze_lock::TryAnalyzeLock::Acquired(guard) => guard,
+            crate::analyze_lock::TryAnalyzeLock::Held { .. } => {
+                panic!("lock free in a fresh tempdir")
+            }
+        };
+        for fix in [false, true] {
+            let check = check_runs_json(dir.path(), fix);
+            assert_eq!(check.status, "ok", "fix={fix}: {}", check.message);
+            assert!(check.message.contains("analyze lock"), "{}", check.message);
+        }
+        assert_eq!(run_status(&conn, "live"), "running");
     }
 }
