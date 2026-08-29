@@ -209,8 +209,10 @@ PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 #   change. The teardown ``shutdown`` request in ``close()`` uses
 #   ``PYRIGHT_SHUTDOWN_TIMEOUT_SECS`` instead, not this constant.
 PYRIGHT_CALL_TIMEOUT_SECS = 30.0
-# Per-LSP-request grant for the ``shutdown`` request issued by ``close()``
-# only -- deliberately NOT ``PYRIGHT_CALL_TIMEOUT_SECS``. ADR-035 —
+# Grant for the WHOLE of ``close()``'s LSP teardown -- the ``shutdown``
+# request and the ``exit`` notification that follows it share one deadline,
+# so 5 s is the cap on teardown, not the cap per message. Deliberately NOT
+# ``PYRIGHT_CALL_TIMEOUT_SECS``. ADR-035 —
 # Basis: this is the pre-clarion-5d83413c36 grant. A healthy server answers
 #   ``shutdown`` in milliseconds; an unresponsive one is killed by close()'s
 #   fallback anyway, so there is nothing to gain by waiting as long as an
@@ -220,7 +222,12 @@ PYRIGHT_CALL_TIMEOUT_SECS = 30.0
 # Coupling: the ``MAX_FILES_PER_PYRIGHT_SESSION`` recycle (server.py) and
 #   plugin shutdown (server.py) both go through ``close()``; deliberately
 #   independent of ``PYRIGHT_CALL_TIMEOUT_SECS`` so raising the analyze-path
-#   grant cannot silently slow every recycle and shutdown.
+#   grant cannot silently slow every recycle and shutdown. The recycle runs
+#   INSIDE an ``analyze_file`` call, so this grant is spent under the host's
+#   120 s watchdog: worst case is the file's own ceiling (anchor + 105 s, i.e.
+#   watchdog - FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS) + 5 s here + <=2 s
+#   of stderr-drain join ~= 112 s. Raising it eats that margin one second per
+#   second.
 PYRIGHT_SHUTDOWN_TIMEOUT_SECS = 5.0
 # Per-file wall-clock budget, shared by the calls and references passes for
 # one file: ``base + per_function * n_functions``, capped
@@ -322,6 +329,23 @@ class LspTimeoutError(TimeoutError):
         self.method = method
 
 
+class LspWriteTimeoutError(LspTimeoutError):
+    """An LSP write that ran out of its deadline, and how far it got.
+
+    ``bytes_written > 0`` means a PARTIAL frame reached pyright: it has
+    consumed a ``Content-Length: N`` header and part of an N-byte body, and
+    will splice whatever is written next onto that half-message. The stream
+    can never resynchronise, so the transport must be invalidated rather than
+    reused (clarion-e3ab8a4131). Writes below ``PIPE_BUF`` (4096 on Linux) --
+    every notification except ``didOpen`` -- are atomic and can only ever
+    report 0.
+    """
+
+    def __init__(self, method: str, bytes_written: int) -> None:
+        super().__init__(method)
+        self.bytes_written = bytes_written
+
+
 class LspTransportClosedError(RuntimeError):
     pass
 
@@ -377,6 +401,11 @@ class _EntityInfo:
 class _FunctionIndex:
     source: str
     line_starts: tuple[int, ...]
+    # ``source.splitlines(keepends=True)``, split once per file. Re-splitting
+    # per call was the second hotspot on elspeth's 13.6k-line tool_batch.py:
+    # ``_position_to_byte`` runs twice per unresolved site, 4,473 sites
+    # (clarion-e3ab8a4131).
+    lines: tuple[str, ...]
     parse_latency_ms: int
     module_id: str
     by_id: dict[str, _FunctionInfo]
@@ -466,6 +495,11 @@ class PyrightSession:
         self._function_indexes: dict[Path, _FunctionIndex] = {}
         self._index_parse_latency_ms: list[int] = []
         self._file_deadlines: dict[Path, float] = {}
+        # The file whose pass owns the transport right now. Only
+        # ``_invalidate_partial_frame`` reads it: a kill charged to the wrong
+        # path would let ``_own_deferred_restart_blocks`` guard the wrong
+        # file's watchdog window.
+        self._path_in_flight: Path | None = None
         # When each file was first touched by this session (its calls pass, or
         # its references pass when called alone): the anchor for the
         # host-watchdog ceiling any restart-driven deadline extension respects.
@@ -512,9 +546,16 @@ class PyrightSession:
     def close(self) -> None:
         process = self._process
         if process is not None and process.poll() is None:
+            # ONE deadline across the whole teardown, not one per message:
+            # ``close()`` runs inside an ``analyze_file`` call at the
+            # ``MAX_FILES_PER_PYRIGHT_SESSION`` recycle (server.py), so a
+            # per-message grant would let a wedged server spend
+            # 2 x PYRIGHT_SHUTDOWN_TIMEOUT_SECS of the file deadline's
+            # terminal safety margin (clarion-e3ab8a4131).
+            close_deadline = self._now() + PYRIGHT_SHUTDOWN_TIMEOUT_SECS
             try:
-                self._request("shutdown", {}, PYRIGHT_SHUTDOWN_TIMEOUT_SECS)
-                self._notify("exit", {})
+                self._request("shutdown", {}, max(0.0, close_deadline - self._now()))
+                self._notify("exit", {}, deadline=close_deadline)
             except (LspTimeoutError, LspTransportClosedError, BrokenPipeError, OSError):
                 process.kill()
             try:
@@ -532,6 +573,11 @@ class PyrightSession:
         function_ids: Sequence[str],
     ) -> CallResolutionResult:
         path = Path(file_path).resolve()
+        # ``_invalidate_partial_frame`` charges its kill to this path. Only
+        # ``didOpen`` exceeds PIPE_BUF, so a partial write can only happen
+        # inside a ``resolve_*`` call that just set this field -- any future
+        # large write outside these paths must set and clear it too.
+        self._path_in_flight = path
         # The calls pass is a file's first facet: start its shared window
         # fresh so a stale deadline from an earlier visit is never reused.
         self._file_deadlines.pop(path, None)
@@ -669,6 +715,7 @@ class PyrightSession:
         sites: Sequence[ReferenceSite],
     ) -> ReferenceResolutionResult:
         path = Path(file_path).resolve()
+        self._path_in_flight = path
         self._file_started_at.setdefault(path, self._now())
         try:
             return self._resolve_references_for_file(path, sites)
@@ -677,6 +724,7 @@ class PyrightSession:
             # deadline and its anchor end here on every exit path.
             self._file_deadlines.pop(path, None)
             self._file_started_at.pop(path, None)
+            self._path_in_flight = None
 
     def _resolve_references_for_file(
         self,
@@ -801,6 +849,7 @@ class PyrightSession:
                     "text": index.source,
                 },
             },
+            deadline=self._write_deadline(deadline),
         )
         try:
             edges: list[CallsRawEdge] = []
@@ -854,7 +903,11 @@ class PyrightSession:
             # The pipe may be the very thing that just failed: a notify over a
             # dead transport must not raise and discard the evidence above.
             with contextlib.suppress(LspTransportClosedError, BrokenPipeError, OSError):
-                self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+                self._notify(
+                    "textDocument/didClose",
+                    {"textDocument": {"uri": uri}},
+                    deadline=self._write_deadline(deadline),
+                )
 
     def _resolve_function_with_pyright(
         self,
@@ -947,6 +1000,7 @@ class PyrightSession:
                     "text": index.source,
                 },
             },
+            deadline=self._write_deadline(deadline),
         )
         try:
             accumulators: dict[tuple[str, str, str], _ReferenceEdgeAccumulator] = {}
@@ -1024,7 +1078,11 @@ class PyrightSession:
             )
         finally:
             with contextlib.suppress(LspTransportClosedError, BrokenPipeError, OSError):
-                self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+                self._notify(
+                    "textDocument/didClose",
+                    {"textDocument": {"uri": uri}},
+                    deadline=self._write_deadline(deadline),
+                )
 
     def _note_reference_pass_failure(self, exc: BaseException) -> None:
         if self._in_flight_failure_reason(exc) == "pyright_transport_failure":
@@ -1122,6 +1180,21 @@ class PyrightSession:
             method = "analyze_file budget"
             raise LspTimeoutError(method)
         return min(self.call_timeout_secs, remaining)
+
+    def _write_deadline(self, deadline: float) -> float:
+        """The bound for an analyze-path write: the same grant a request gets.
+
+        Deliberately NOT ``_budgeted_timeout``, which RAISES on an expired
+        file budget: a write is attempted first and only bounded once the
+        peer says "would block" (``_write_all``). A healthy pyright drains a
+        teardown ``didClose`` in microseconds, and refusing to send it just
+        because the budget ran out would leak that document into the server's
+        open set for nothing. A wedged one blocks immediately and is cut off
+        at once -- which is what requirement 4 of clarion-e3ab8a4131 asks for:
+        after a write timeout the pipe is still full, so the ``didClose`` in
+        the ``finally`` cannot block a second time either.
+        """
+        return min(deadline, self._now() + self.call_timeout_secs)
 
     def _ensure_file_budget(self, deadline: float) -> None:
         if self._file_budget_expired(deadline):
@@ -1456,6 +1529,17 @@ class PyrightSession:
 
     def _start_process(self, init_timeout_secs: float | None = None) -> bool:
         """Spawn + initialize; ``init_timeout_secs`` bounds the handshake below the default."""
+        # ANY spawn consumes the one-shot uncharged-restart flag, not just the
+        # ones reached through ``_ensure_process``. The flag buys exactly one
+        # free respawn (ADR-057 §3) and a spawn is happening here, so leaving
+        # it armed would let it swallow a LATER, unrelated dead-on-arrival --
+        # costing that death its FINDING_PYRIGHT_RESTART and its
+        # MAX_PYRIGHT_RESTARTS_PER_RUN slot. The route that reaches this
+        # without ``_ensure_process`` is the wedge breaker's
+        # ``_restart_process_for_file``. ``_ensure_process``'s own branches
+        # already consumed it, so this is idempotent there; a respawn whose
+        # bounded handshake times out re-arms it immediately afterwards.
+        self._consume_deferred_restart()
         started = self._now()
         try:
             ok = self._spawn_and_initialize(init_timeout_secs)
@@ -1526,6 +1610,12 @@ class PyrightSession:
         except OSError as exc:
             return self._handle_spawn_oserror(exc, executable)
 
+        if process.stdin is not None:
+            # Bounded writes need a pipe that reports "would block" instead of
+            # blocking. Set on the parent's write end only: O_NONBLOCK lives
+            # on the open file description, and the child's read end is a
+            # different one, so pyright still sees an ordinary blocking stdin.
+            os.set_blocking(process.stdin.fileno(), False)
         self._process = process
         self._start_stderr_drain(process)
         try:
@@ -1615,6 +1705,7 @@ class PyrightSession:
         return False
 
     def _initialize(self, timeout_secs: float | None = None) -> None:
+        bound = self.init_timeout_secs if timeout_secs is None else timeout_secs
         result = self._request(
             "initialize",
             {
@@ -1626,10 +1717,10 @@ class PyrightSession:
                 "capabilities": {"workspace": {"configuration": True}},
                 "clientInfo": {"name": "loomweave-plugin-python", "version": __version__},
             },
-            self.init_timeout_secs if timeout_secs is None else timeout_secs,
+            bound,
         )
         _ = result
-        self._notify("initialized", {})
+        self._notify("initialized", {}, deadline=self._now() + bound)
 
     def _resolve_executable(self) -> str | None:
         candidate = Path(self.executable)
@@ -1668,6 +1759,9 @@ class PyrightSession:
         process = self._live_process()
         request_id = self._next_id
         self._next_id += 1
+        # One deadline for the whole request, write included: the write is the
+        # half that blocked on elspeth (clarion-e3ab8a4131).
+        deadline = self._now() + timeout_secs
         self._write_message(
             {
                 "jsonrpc": "2.0",
@@ -1675,6 +1769,7 @@ class PyrightSession:
                 "method": method,
                 "params": params,
             },
+            deadline,
         )
         # ``timeout_secs`` bounds the WHOLE request, not each read
         # (clarion-7fc41105ea). Server-initiated traffic between the request
@@ -1685,11 +1780,10 @@ class PyrightSession:
         # host-watchdog ceiling every headroom computation in this file is
         # built on. That is how elspeth's service.py call outlived its own
         # 105s window and was killed by the host's 120s watchdog.
-        deadline = self._now() + timeout_secs
         while True:
             response = self._read_message(deadline - self._now())
             if "method" in response:
-                self._handle_server_message(response)
+                self._handle_server_message(response, deadline)
                 continue
             if response.get("id") != request_id:
                 continue
@@ -1698,7 +1792,7 @@ class PyrightSession:
             process.poll()
             return response.get("result")
 
-    def _handle_server_message(self, message: dict[str, Any]) -> None:
+    def _handle_server_message(self, message: dict[str, Any], deadline: float) -> None:
         if "id" not in message:
             return
         request_id = message["id"]
@@ -1707,7 +1801,9 @@ class PyrightSession:
             result = self._workspace_configuration_result(message)
         else:
             result = None
-        self._write_message({"jsonrpc": "2.0", "id": request_id, "result": result})
+        # The reply rides the originating request's own deadline: it is
+        # answered inside that request's read loop and must not outlive it.
+        self._write_message({"jsonrpc": "2.0", "id": request_id, "result": result}, deadline)
 
     def _workspace_configuration_result(self, message: dict[str, Any]) -> list[object]:
         params = message.get("params")
@@ -1732,9 +1828,9 @@ class PyrightSession:
             return {}
         return None
 
-    def _notify(self, method: str, params: dict[str, object]) -> None:
+    def _notify(self, method: str, params: dict[str, object], *, deadline: float) -> None:
         self._live_process()
-        self._write_message({"jsonrpc": "2.0", "method": method, "params": params})
+        self._write_message({"jsonrpc": "2.0", "method": method, "params": params}, deadline)
 
     def _live_process(self) -> subprocess.Popen[bytes]:
         if self._process is None or self._process.poll() is not None:
@@ -1742,16 +1838,68 @@ class PyrightSession:
             raise LspTransportClosedError(message)
         return self._process
 
-    def _write_message(self, message: dict[str, object]) -> None:
+    def _write_message(self, message: dict[str, object], deadline: float) -> None:
+        """Frame and send one LSP message, bounded by ``deadline``.
+
+        Every write is bounded for the same reason every read is: pyright is
+        single-threaded, so a query it is still computing after we abandoned
+        it stops it reading stdin. The 64 KiB pipe then fills on the next
+        ``didOpen`` of a large file and an unbounded ``write()`` blocks for
+        minutes -- past the host's per-file watchdog, which SIGKILLs the
+        plugin and loses the whole run (clarion-e3ab8a4131). Nothing in the
+        ADR-057 budget machinery sees that: it bounds reads only.
+
+        The pipe is non-blocking (``_spawn_and_initialize``) and the raw fd is
+        written directly: an ``O_NONBLOCK`` fd behind ``stdin``'s
+        ``BufferedWriter`` would desynchronise the framing, dropping or
+        half-writing a message instead of blocking.
+        """
         process = self._live_process()
-        if process.stdin is None:
+        stdin = process.stdin
+        if stdin is None:
             error_message = "pyright stdin is closed"
             raise LspTransportClosedError(error_message)
         body = json.dumps(message, separators=(",", ":")).encode("utf-8")
         header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        process.stdin.write(header)
-        process.stdin.write(body)
-        process.stdin.flush()
+        try:
+            _write_all(
+                stdin.fileno(),
+                header + body,
+                deadline - self._now(),
+                _write_label(message),
+            )
+        except LspWriteTimeoutError as exc:
+            if exc.bytes_written:
+                self._invalidate_partial_frame()
+            raise
+
+    def _invalidate_partial_frame(self) -> None:
+        """Kill pyright after a half-written frame reached it.
+
+        A partial body cannot be taken back: pyright is mid-message and will
+        splice the next file's ``didOpen`` onto it, so every later request
+        read-times-out until the ADR-057 wedge breaker respawns three files
+        later -- and those three files carry sticky SELF-INFLICTED
+        ``pyright_timeout`` marks for a corruption they did not cause. Killing
+        here converts that into one honest self-inflicted timeout on the file
+        that actually overran (clarion-e3ab8a4131).
+
+        This is transport invalidation, not a restart policy: nothing is
+        charged to ``MAX_PYRIGHT_RESTARTS_PER_RUN`` and no finding is emitted.
+        Dropping the handle (``_terminate_process``) means the next
+        ``_ensure_process`` takes its ``_process is None`` branch, which
+        spawns silently -- so the next file is NOT dead-on-arrival and is
+        never marked collateral ``pyright_restarting``. The one-shot
+        ``restart_already_charged_to_file`` flag (ADR-057 §3) is armed against
+        the in-flight path so this file's own later facet still respects the
+        watchdog ceiling before respawning; the next file's spawn consumes it
+        silently.
+        """
+        path = self._path_in_flight
+        self._terminate_process()
+        state = self._run_state
+        state.restart_already_charged_to_file = True
+        state.restart_charged_to_path = None if path is None else str(path)
 
     def _read_message(self, timeout_secs: float) -> dict[str, Any]:
         process = self._live_process()
@@ -1853,6 +2001,7 @@ def _build_function_index(project_root: Path, path: Path, source: str) -> _Funct
     source_lines = source.splitlines()
     _collect_entities(tree, [tree], dotted_module, source_lines, functions, entities, set())
     line_starts = _line_starts(source)
+    lines = tuple(source.splitlines(keepends=True))
     module_id = entity_id("python", "module", dotted_module)
     by_id = {function.entity_id: function for function in functions}
     by_name_position = {(function.line, function.character): function for function in functions}
@@ -1864,6 +2013,7 @@ def _build_function_index(project_root: Path, path: Path, source: str) -> _Funct
     return _FunctionIndex(
         source=source,
         line_starts=line_starts,
+        lines=lines,
         parse_latency_ms=parse_latency_ms,
         module_id=module_id,
         by_id=by_id,
@@ -2488,7 +2638,10 @@ def _position_to_byte(index: _FunctionIndex, line: int, character: int) -> int:
     if line >= len(index.line_starts):
         return len(index.source.encode("utf-8"))
     line_start = index.line_starts[line]
-    line_text = index.source.splitlines(keepends=True)[line] if index.source else ""
+    # ``line_starts`` has one more entry than ``lines`` (the end-of-source
+    # offset), so the guard above admits ``line == len(lines)``: that position
+    # sits at EOF and has no line text.
+    line_text = index.lines[line] if line < len(index.lines) else ""
     return line_start + _utf16_col_to_byte(line_text, character)
 
 
@@ -2568,6 +2721,55 @@ def _path_from_uri(uri: str) -> Path | None:
     if parsed.scheme != "file":
         return None
     return Path(unquote(parsed.path)).resolve()
+
+
+def _write_label(message: dict[str, object]) -> str:
+    """Name the message for an ``LspTimeoutError``, mirroring ``"LSP read"``.
+
+    Returns the bare identifier; ``_write_all`` appends ``(write)`` or
+    ``(partial write)`` so the finding says which of the two happened.
+    """
+    method = message.get("method")
+    if isinstance(method, str):
+        return method
+    request_id = message.get("id")
+    return "LSP response" if request_id is None else f"LSP response (id {request_id})"
+
+
+def _write_all(fd: int, payload: bytes, timeout_secs: float, method: str) -> None:
+    """Write ``payload`` to a non-blocking ``fd``, bounded by ``timeout_secs``.
+
+    Opportunistic by design: a write is always ATTEMPTED before the clock is
+    consulted, so a healthy peer is never refused a message merely because the
+    file budget is spent (a teardown ``didClose`` still lands). Only a peer
+    that answers ``EAGAIN`` -- pyright still computing an abandoned query, no
+    longer reading its stdin -- is put on a deadline, and it is cut off there
+    instead of blocking past the host's watchdog (clarion-e3ab8a4131).
+
+    ``timeout_secs`` is re-anchored on ``time.monotonic`` exactly as
+    ``_read_message`` re-anchors its own bound, so a session with a simulated
+    clock cannot hand ``select`` a deadline that never arrives.
+
+    Raises ``LspWriteTimeoutError`` carrying the byte count already delivered:
+    a non-zero count is a half-written frame the peer can never resynchronise
+    from, and the caller invalidates the transport.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_secs)
+    view = memoryview(payload)
+    offset = 0
+    while offset < len(payload):
+        try:
+            offset += os.write(fd, view[offset:])
+            continue
+        except BlockingIOError:
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if writable:
+                continue
+        label = f"{method} (write)" if offset == 0 else f"{method} (partial write)"
+        raise LspWriteTimeoutError(label, offset)
 
 
 def _read_line(fd: int, deadline: float) -> bytes:
