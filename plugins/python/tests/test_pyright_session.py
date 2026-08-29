@@ -35,6 +35,7 @@ from loomweave_plugin_python.pyright_session import (
     MAX_PYRIGHT_RESTARTS_PER_RUN,
     PYRIGHT_CALL_TIMEOUT_SECS,
     PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+    PYRIGHT_SHUTDOWN_TIMEOUT_SECS,
     LspTimeoutError,
     LspTransportClosedError,
     PyrightRunState,
@@ -2241,6 +2242,42 @@ def test_budgeted_timeout_grants_the_call_timeout_when_the_file_budget_is_larger
     # ...and never more than what is left of the file budget.
     session._file_deadlines[path] = session._now() + 4.0  # noqa: SLF001
     assert session._budgeted_timeout(session._file_deadlines[path]) <= 4.0  # noqa: SLF001
+
+
+class _IgnoresShutdownSession(PyrightSession):
+    """A process that never answers ``shutdown``, recording the timeout used."""
+
+    def __init__(self, project_root: Path) -> None:
+        super().__init__(project_root, executable=sys.executable)
+        self.request_timeouts: list[tuple[str, float]] = []
+        self._process = cast("Any", _FakeProcess())
+
+    def _request(self, method: str, params: dict[str, object], timeout_secs: float) -> object:
+        _ = params
+        self.request_timeouts.append((method, timeout_secs))
+        if method == "shutdown":
+            raise LspTimeoutError(method)
+        return None
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        _ = (method, params)
+
+
+def test_close_uses_the_shutdown_timeout_not_the_call_timeout(tmp_path: Path) -> None:
+    """clarion-5d83413c36 follow-up: close()'s ``shutdown`` request must not
+    inherit the 30 s analyze-path call-timeout grant. An unresponsive server
+    at ``MAX_FILES_PER_PYRIGHT_SESSION`` recycle (server.py) or plugin
+    shutdown (server.py) must still fall back to ``kill()`` within the
+    pre-existing ~5 s budget, not wait up to 30 s.
+    """
+    session = _IgnoresShutdownSession(tmp_path)
+    fake_process = cast("_FakeProcess", session._process)  # noqa: SLF001
+
+    session.close()
+
+    assert session.request_timeouts == [("shutdown", PYRIGHT_SHUTDOWN_TIMEOUT_SECS)]
+    assert PYRIGHT_SHUTDOWN_TIMEOUT_SECS < PYRIGHT_CALL_TIMEOUT_SECS
+    assert fake_process.killed
 
 
 def test_pyright_session_file_deadline_is_capped_for_very_large_files(tmp_path: Path) -> None:
