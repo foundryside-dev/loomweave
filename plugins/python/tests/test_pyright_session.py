@@ -41,6 +41,7 @@ from loomweave_plugin_python.pyright_session import (
     PYRIGHT_SHUTDOWN_TIMEOUT_SECS,
     LspTimeoutError,
     LspTransportClosedError,
+    LspWriteTimeoutError,
     PyrightRunState,
     PyrightSession,
     _build_function_index,
@@ -2280,7 +2281,11 @@ def test_close_uses_the_shutdown_timeout_not_the_call_timeout(tmp_path: Path) ->
 
     session.close()
 
-    assert session.request_timeouts == [("shutdown", PYRIGHT_SHUTDOWN_TIMEOUT_SECS)]
+    # One deadline spans the whole teardown, so the shutdown request is
+    # granted the shutdown budget minus whatever close() already spent.
+    assert [method for method, _ in session.request_timeouts] == ["shutdown"]
+    granted = session.request_timeouts[0][1]
+    assert PYRIGHT_SHUTDOWN_TIMEOUT_SECS - 0.5 <= granted <= PYRIGHT_SHUTDOWN_TIMEOUT_SECS
     assert PYRIGHT_SHUTDOWN_TIMEOUT_SECS < PYRIGHT_CALL_TIMEOUT_SECS
     assert fake_process.killed
 
@@ -4195,3 +4200,165 @@ def test_position_to_byte_uses_the_cached_lines(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
 
     assert elapsed < 2.0, f"5000 _position_to_byte calls took {elapsed:.2f}s"
+
+
+class _BlockedPipeSession(PyrightSession):
+    """A live pyright over a REAL pipe that it has stopped reading.
+
+    No seam is faked below ``_ensure_process``: the didOpen goes through the
+    production ``_notify`` -> ``_write_message`` -> ``_write_all`` path and
+    stalls on a genuine ``EAGAIN``.
+    """
+
+    def __init__(self, project_root: Path, *, prime_full: bool = True, **kwargs: Any) -> None:
+        kwargs.setdefault("executable", sys.executable)
+        super().__init__(project_root, **kwargs)
+        self.blocked = _BlockedPipeProcess()
+        if prime_full:
+            self.blocked.fill()
+        self._process = cast("Any", self.blocked)
+
+    def _ensure_process(self) -> bool:
+        return self._process is not None
+
+
+def test_reference_pass_survives_a_real_blocked_pipe_as_pyright_timeout(tmp_path: Path) -> None:
+    """End-to-end over a real pipe: a stalled didOpen degrades, it does not hang.
+
+    The peer is alive and holding the read end open (no ``EPIPE``), so this is
+    the elspeth shape exactly -- and with the whole message still unwritten
+    there is no half-frame, so the transport is NOT invalidated.
+    """
+    source = "def alpha():\n    pass\n\nFIRST = alpha\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(source, from_id="python:module:demo", needle="alpha", occurrence=1)
+
+    run_state = PyrightRunState()
+    session = _BlockedPipeSession(
+        tmp_path,
+        run_state=run_state,
+        file_timeout_base_secs=0.5,
+        file_timeout_per_function_secs=0.0,
+    )
+    results: list[Any] = []
+    finished, elapsed = _run_bounded(
+        lambda: results.append(session.resolve_references(module, [site])),
+    )
+    killed = session.blocked.killed
+    session.blocked.close_fds()
+
+    assert finished, "the references pass blocked in write() on a real full pipe"
+    assert elapsed < 3.0, f"took {elapsed:.2f}s for a 0.5s file budget"
+    result = results[0]
+    assert result.coverage == FacetCoverage.degraded("pyright_timeout", transient=True)
+    assert result.coverage.collateral is False
+    assert result.unresolved_reference_sites_total == 1
+    # Nothing reached pyright, so the stream is still coherent: no kill, no
+    # restart, no charge.
+    assert not killed
+    assert run_state.restart_count == 0
+    assert run_state.restart_already_charged_to_file is False
+
+
+def test_partial_write_timeout_invalidates_the_transport_without_charging_the_run(
+    tmp_path: Path,
+) -> None:
+    """A half-written frame must kill pyright, uncharged (clarion-e3ab8a4131).
+
+    With room in the pipe the write delivers a ``Content-Length`` header and
+    part of the body before stalling. pyright can never resynchronise from
+    that: it would splice the next file's didOpen onto the half-message, and
+    every later request would read-time-out until the wedge breaker respawned
+    three files later -- pinning three innocent files with sticky
+    SELF-INFLICTED ``pyright_timeout`` marks (ADR-057 §4). So the transport is
+    invalidated here, and because the handle is dropped the next
+    ``_ensure_process`` spawns silently: no run-level restart charge, no
+    collateral ``pyright_restarting`` on the next file.
+    """
+    run_state = PyrightRunState()
+    session = PyrightSession(tmp_path, executable=sys.executable, run_state=run_state)
+    process = _BlockedPipeProcess()  # deliberately NOT primed: ~64 KiB free.
+    session._process = cast("Any", process)  # noqa: SLF001
+    outcome: list[BaseException | None] = []
+
+    def write_it() -> None:
+        try:
+            session._write_message(  # noqa: SLF001
+                {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {"text": "x" * (1 << 20)}},
+                },
+                deadline=session._now() + 0.5,  # noqa: SLF001
+            )
+        except Exception as exc:  # noqa: BLE001
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    finished, elapsed = _run_bounded(write_it)
+    process.close_fds()
+
+    assert finished
+    assert elapsed < 2.0
+    raised = outcome[0]
+    assert isinstance(raised, LspWriteTimeoutError)
+    assert raised.bytes_written > 0, "the pipe had room; this is the partial-frame case"
+    assert raised.method.endswith("(partial write)")
+    # Transport invalidated...
+    assert process.killed
+    assert session._process is None  # noqa: SLF001
+    # ...but nothing is charged: the next spawn is silent (ADR-057 §3).
+    assert run_state.restart_already_charged_to_file is True
+    assert run_state.restart_charged_to_path is None
+    assert run_state.restart_count == 0
+    assert run_state.file_attributed_restart_count == 0
+
+
+class _ExitWriteBlockedSession(PyrightSession):
+    """Answers ``shutdown`` after spending its whole grant, then stops reading.
+
+    Wall time moves only on the simulated clock, so the ``exit`` write's real
+    bound is whatever ``close()`` has left -- 0 s with a shared deadline, a
+    fresh 5 REAL seconds with a per-message one. The test discriminates.
+    """
+
+    def __init__(self, project_root: Path) -> None:
+        super().__init__(project_root, executable=sys.executable)
+        self.clock = 4000.0
+        self.request_timeouts: list[tuple[str, float]] = []
+        self.blocked = _BlockedPipeProcess()
+        self.blocked.fill()
+        self._process = cast("Any", self.blocked)
+
+    def _now(self) -> float:
+        return self.clock
+
+    def _request(self, method: str, params: dict[str, object], timeout_secs: float) -> object:
+        _ = params
+        self.request_timeouts.append((method, timeout_secs))
+        self.clock += timeout_secs
+        return {}
+
+
+def test_close_shares_one_deadline_across_shutdown_and_exit(tmp_path: Path) -> None:
+    """close()'s teardown is capped in total, not per message.
+
+    The recycle at ``MAX_FILES_PER_PYRIGHT_SESSION`` runs inside an
+    ``analyze_file`` call, so a per-message grant would let a wedged server
+    spend twice the shutdown budget out of the file deadline's terminal
+    safety margin under the host's 120 s watchdog.
+    """
+    session = _ExitWriteBlockedSession(tmp_path)
+
+    finished, elapsed = _run_bounded(session.close)
+    killed = session.blocked.killed
+    session.blocked.close_fds()
+
+    assert finished, "close() blocked writing exit to a peer that stopped reading"
+    assert session.request_timeouts == [("shutdown", PYRIGHT_SHUTDOWN_TIMEOUT_SECS)]
+    # The shutdown consumed the whole grant on the simulated clock, so the
+    # exit write has none left and is cut off at once. A fresh per-message
+    # grant would have waited PYRIGHT_SHUTDOWN_TIMEOUT_SECS of REAL time.
+    assert elapsed < 1.0, f"exit write got its own fresh grant: {elapsed:.2f}s"
+    assert killed

@@ -209,8 +209,10 @@ PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 #   change. The teardown ``shutdown`` request in ``close()`` uses
 #   ``PYRIGHT_SHUTDOWN_TIMEOUT_SECS`` instead, not this constant.
 PYRIGHT_CALL_TIMEOUT_SECS = 30.0
-# Per-LSP-request grant for the ``shutdown`` request issued by ``close()``
-# only -- deliberately NOT ``PYRIGHT_CALL_TIMEOUT_SECS``. ADR-035 —
+# Grant for the WHOLE of ``close()``'s LSP teardown -- the ``shutdown``
+# request and the ``exit`` notification that follows it share one deadline,
+# so 5 s is the cap on teardown, not the cap per message. Deliberately NOT
+# ``PYRIGHT_CALL_TIMEOUT_SECS``. ADR-035 —
 # Basis: this is the pre-clarion-5d83413c36 grant. A healthy server answers
 #   ``shutdown`` in milliseconds; an unresponsive one is killed by close()'s
 #   fallback anyway, so there is nothing to gain by waiting as long as an
@@ -220,7 +222,12 @@ PYRIGHT_CALL_TIMEOUT_SECS = 30.0
 # Coupling: the ``MAX_FILES_PER_PYRIGHT_SESSION`` recycle (server.py) and
 #   plugin shutdown (server.py) both go through ``close()``; deliberately
 #   independent of ``PYRIGHT_CALL_TIMEOUT_SECS`` so raising the analyze-path
-#   grant cannot silently slow every recycle and shutdown.
+#   grant cannot silently slow every recycle and shutdown. The recycle runs
+#   INSIDE an ``analyze_file`` call, so this grant is spent under the host's
+#   120 s watchdog: worst case is the file's own ceiling (anchor + 105 s, i.e.
+#   watchdog - FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS) + 5 s here + <=2 s
+#   of stderr-drain join ~= 112 s. Raising it eats that margin one second per
+#   second.
 PYRIGHT_SHUTDOWN_TIMEOUT_SECS = 5.0
 # Per-file wall-clock budget, shared by the calls and references passes for
 # one file: ``base + per_function * n_functions``, capped
@@ -320,6 +327,23 @@ class LspTimeoutError(TimeoutError):
     def __init__(self, method: str) -> None:
         super().__init__(f"{method} timed out")
         self.method = method
+
+
+class LspWriteTimeoutError(LspTimeoutError):
+    """An LSP write that ran out of its deadline, and how far it got.
+
+    ``bytes_written > 0`` means a PARTIAL frame reached pyright: it has
+    consumed a ``Content-Length: N`` header and part of an N-byte body, and
+    will splice whatever is written next onto that half-message. The stream
+    can never resynchronise, so the transport must be invalidated rather than
+    reused (clarion-e3ab8a4131). Writes below ``PIPE_BUF`` (4096 on Linux) --
+    every notification except ``didOpen`` -- are atomic and can only ever
+    report 0.
+    """
+
+    def __init__(self, method: str, bytes_written: int) -> None:
+        super().__init__(method)
+        self.bytes_written = bytes_written
 
 
 class LspTransportClosedError(RuntimeError):
@@ -471,6 +495,11 @@ class PyrightSession:
         self._function_indexes: dict[Path, _FunctionIndex] = {}
         self._index_parse_latency_ms: list[int] = []
         self._file_deadlines: dict[Path, float] = {}
+        # The file whose pass owns the transport right now. Only
+        # ``_invalidate_partial_frame`` reads it: a kill charged to the wrong
+        # path would let ``_own_deferred_restart_blocks`` guard the wrong
+        # file's watchdog window.
+        self._path_in_flight: Path | None = None
         # When each file was first touched by this session (its calls pass, or
         # its references pass when called alone): the anchor for the
         # host-watchdog ceiling any restart-driven deadline extension respects.
@@ -517,9 +546,16 @@ class PyrightSession:
     def close(self) -> None:
         process = self._process
         if process is not None and process.poll() is None:
+            # ONE deadline across the whole teardown, not one per message:
+            # ``close()`` runs inside an ``analyze_file`` call at the
+            # ``MAX_FILES_PER_PYRIGHT_SESSION`` recycle (server.py), so a
+            # per-message grant would let a wedged server spend
+            # 2 x PYRIGHT_SHUTDOWN_TIMEOUT_SECS of the file deadline's
+            # terminal safety margin (clarion-e3ab8a4131).
+            close_deadline = self._now() + PYRIGHT_SHUTDOWN_TIMEOUT_SECS
             try:
-                self._request("shutdown", {}, PYRIGHT_SHUTDOWN_TIMEOUT_SECS)
-                self._notify("exit", {}, deadline=self._now() + PYRIGHT_SHUTDOWN_TIMEOUT_SECS)
+                self._request("shutdown", {}, max(0.0, close_deadline - self._now()))
+                self._notify("exit", {}, deadline=close_deadline)
             except (LspTimeoutError, LspTransportClosedError, BrokenPipeError, OSError):
                 process.kill()
             try:
@@ -537,6 +573,7 @@ class PyrightSession:
         function_ids: Sequence[str],
     ) -> CallResolutionResult:
         path = Path(file_path).resolve()
+        self._path_in_flight = path
         # The calls pass is a file's first facet: start its shared window
         # fresh so a stale deadline from an earlier visit is never reused.
         self._file_deadlines.pop(path, None)
@@ -674,6 +711,7 @@ class PyrightSession:
         sites: Sequence[ReferenceSite],
     ) -> ReferenceResolutionResult:
         path = Path(file_path).resolve()
+        self._path_in_flight = path
         self._file_started_at.setdefault(path, self._now())
         try:
             return self._resolve_references_for_file(path, sites)
@@ -682,6 +720,7 @@ class PyrightSession:
             # deadline and its anchor end here on every exit path.
             self._file_deadlines.pop(path, None)
             self._file_started_at.pop(path, None)
+            self._path_in_flight = None
 
     def _resolve_references_for_file(
         self,
@@ -1807,7 +1846,45 @@ class PyrightSession:
             raise LspTransportClosedError(error_message)
         body = json.dumps(message, separators=(",", ":")).encode("utf-8")
         header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        _write_all(stdin.fileno(), header + body, deadline - self._now(), _write_label(message))
+        try:
+            _write_all(
+                stdin.fileno(),
+                header + body,
+                deadline - self._now(),
+                _write_label(message),
+            )
+        except LspWriteTimeoutError as exc:
+            if exc.bytes_written:
+                self._invalidate_partial_frame()
+            raise
+
+    def _invalidate_partial_frame(self) -> None:
+        """Kill pyright after a half-written frame reached it.
+
+        A partial body cannot be taken back: pyright is mid-message and will
+        splice the next file's ``didOpen`` onto it, so every later request
+        read-times-out until the ADR-057 wedge breaker respawns three files
+        later -- and those three files carry sticky SELF-INFLICTED
+        ``pyright_timeout`` marks for a corruption they did not cause. Killing
+        here converts that into one honest self-inflicted timeout on the file
+        that actually overran (clarion-e3ab8a4131).
+
+        This is transport invalidation, not a restart policy: nothing is
+        charged to ``MAX_PYRIGHT_RESTARTS_PER_RUN`` and no finding is emitted.
+        Dropping the handle (``_terminate_process``) means the next
+        ``_ensure_process`` takes its ``_process is None`` branch, which
+        spawns silently -- so the next file is NOT dead-on-arrival and is
+        never marked collateral ``pyright_restarting``. The one-shot
+        ``restart_already_charged_to_file`` flag (ADR-057 §3) is armed against
+        the in-flight path so this file's own later facet still respects the
+        watchdog ceiling before respawning; the next file's spawn consumes it
+        silently.
+        """
+        path = self._path_in_flight
+        self._terminate_process()
+        state = self._run_state
+        state.restart_already_charged_to_file = True
+        state.restart_charged_to_path = None if path is None else str(path)
 
     def _read_message(self, timeout_secs: float) -> dict[str, Any]:
         process = self._live_process()
@@ -2632,15 +2709,19 @@ def _path_from_uri(uri: str) -> Path | None:
 
 
 def _write_label(message: dict[str, object]) -> str:
-    """Name the message for an ``LspTimeoutError``, mirroring ``"LSP read"``."""
+    """Name the message for an ``LspTimeoutError``, mirroring ``"LSP read"``.
+
+    Returns the bare identifier; ``_write_all`` appends ``(write)`` or
+    ``(partial write)`` so the finding says which of the two happened.
+    """
     method = message.get("method")
     if isinstance(method, str):
-        return f"{method} (write)"
+        return method
     request_id = message.get("id")
-    return "LSP write" if request_id is None else f"LSP write (id {request_id})"
+    return "LSP response" if request_id is None else f"LSP response (id {request_id})"
 
 
-def _write_all(fd: int, payload: bytes, timeout_secs: float, label: str) -> None:
+def _write_all(fd: int, payload: bytes, timeout_secs: float, method: str) -> None:
     """Write ``payload`` to a non-blocking ``fd``, bounded by ``timeout_secs``.
 
     Opportunistic by design: a write is always ATTEMPTED before the clock is
@@ -2653,6 +2734,10 @@ def _write_all(fd: int, payload: bytes, timeout_secs: float, label: str) -> None
     ``timeout_secs`` is re-anchored on ``time.monotonic`` exactly as
     ``_read_message`` re-anchors its own bound, so a session with a simulated
     clock cannot hand ``select`` a deadline that never arrives.
+
+    Raises ``LspWriteTimeoutError`` carrying the byte count already delivered:
+    a non-zero count is a half-written frame the peer can never resynchronise
+    from, and the caller invalidates the transport.
     """
     deadline = time.monotonic() + max(0.0, timeout_secs)
     view = memoryview(payload)
@@ -2664,11 +2749,12 @@ def _write_all(fd: int, payload: bytes, timeout_secs: float, label: str) -> None
         except BlockingIOError:
             pass
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise LspTimeoutError(label)
-        _, writable, _ = select.select([], [fd], [], remaining)
-        if not writable:
-            raise LspTimeoutError(label)
+        if remaining > 0:
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if writable:
+                continue
+        label = f"{method} (write)" if offset == 0 else f"{method} (partial write)"
+        raise LspWriteTimeoutError(label, offset)
 
 
 def _read_line(fd: int, deadline: float) -> bytes:
