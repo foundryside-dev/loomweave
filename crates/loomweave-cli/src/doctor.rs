@@ -2363,8 +2363,10 @@ enum RedispatchBudgetReset {
 
 /// Files whose last analysis reported degraded call / reference resolution
 /// (clarion-3e517d4aff). Each is a call-graph hole; transient ones are
-/// re-dispatched by the next `analyze` automatically, content-determined ones
-/// (syntax error, per-file site cap) persist until the source changes.
+/// re-dispatched by the next `analyze` automatically; content- or
+/// environment-determined ones (syntax error, per-file site cap,
+/// `interpreter_unpinned`) persist until the source or the resolver
+/// environment changes.
 ///
 /// Under `--fix`, files that exhausted the re-dispatch budget
 /// ([`loomweave_storage::MAX_REDISPATCH_ATTEMPTS`] consecutive transient
