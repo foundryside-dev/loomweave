@@ -10,12 +10,13 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from loomweave_plugin_python.call_resolver import CallResolutionResult, FacetCoverage
 from loomweave_plugin_python.pyright_session import (
+    FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS,
     FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
     FINDING_PYRIGHT_INIT_TIMEOUT,
     FINDING_PYRIGHT_INSTALL_FAILURE,
@@ -25,8 +26,13 @@ from loomweave_plugin_python.pyright_session import (
     FINDING_PYRIGHT_RESOURCE_EXHAUSTED,
     FINDING_PYRIGHT_RESTART,
     FINDING_PYRIGHT_SPAWN_DEFERRED,
+    FINDING_PYRIGHT_TOTAL_RESTART_CAP_EXCEEDED,
     FINDING_PYRIGHT_UNAVAILABLE,
+    FINDING_PYRIGHT_WEDGED_RESTART,
+    HOST_FILE_WATCHDOG_SECS,
     MAX_CONSECUTIVE_SPAWN_DEFERRALS,
+    MAX_CONSECUTIVE_TIMEOUT_FILES,
+    MAX_PYRIGHT_RESTARTS_PER_RUN,
     PYRIGHT_FILE_TIMEOUT_CAP_SECS,
     LspTimeoutError,
     LspTransportClosedError,
@@ -42,6 +48,7 @@ from loomweave_plugin_python.pyright_session import (
     _reference_accumulator_to_edge,
     _unresolved_call_site_total_for_function,
     _unresolved_call_sites_for_function,
+    resolve_host_file_watchdog_secs,
 )
 from loomweave_plugin_python.reference_resolver import ReferenceSite, ReferenceSiteKind
 
@@ -1790,6 +1797,7 @@ def test_pyright_session_restart_cap(tmp_path: Path, pyright_langserver: str) ->
     assert continued.coverage.reason == "pyright_poisoned"
     assert continued.coverage.transient is True
     assert continued.coverage.collateral is True
+    assert session.run_state.disabled_reason == "pyright_poisoned"
 
 
 def _write_executable(tmp_path: Path, body: str) -> Path:
@@ -2268,8 +2276,13 @@ class ScriptedCallSession(PyrightSession):
         failure: Callable[[str], Exception] = LspTimeoutError,
         budget_expires_after: str | None = None,
         run_state: PyrightRunState | None = None,
+        fake_spawn: bool = True,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(project_root, executable=sys.executable, run_state=run_state)
+        kwargs.setdefault("executable", sys.executable)
+        super().__init__(project_root, run_state=run_state, **kwargs)
+        self.fake_spawn = fake_spawn
+        self.spawns = 0
         self.module = module
         self.callee_by_caller = callee_by_caller
         self.fail_on = fail_on
@@ -2285,8 +2298,16 @@ class ScriptedCallSession(PyrightSession):
     def _ensure_process(self) -> bool:
         return True
 
+    def _spawn_and_initialize(self, init_timeout_secs: float | None = None) -> bool:
+        self.spawns += 1
+        if not self.fake_spawn:
+            return super()._spawn_and_initialize(init_timeout_secs)
+        return True
+
     def _notify(self, method: str, params: dict[str, object]) -> None:
-        _ = params
+        if not self.fake_spawn and method in ("initialized", "exit"):
+            super()._notify(method, params)
+            return
         if method == "textDocument/didClose":
             self.closed_documents += 1
 
@@ -2301,7 +2322,9 @@ class ScriptedCallSession(PyrightSession):
         raise self.failure(method)
 
     def _request(self, method: str, params: dict[str, object], timeout_secs: float) -> object:
-        _ = timeout_secs
+        if not self.fake_spawn and method in ("initialize", "shutdown"):
+            # A real spawn needs the real handshake over the real transport.
+            return super()._request(method, params, timeout_secs)
         index = self._function_index_for_path(self.module)
         if method == "textDocument/prepareCallHierarchy":
             position = cast("dict[str, int]", params["position"])
@@ -2481,11 +2504,24 @@ def test_pyright_session_call_resolution_transport_failure_keeps_edges_resolved_
         result = session.resolve_calls(module, _TWO_CALLERS)
 
     _assert_partial_call_evidence(session, module, result, reason="pyright_transport_failure")
-    assert run_state.restart_count == 1
+    assert result.coverage.collateral is False
+    # The process died during THIS file's request: file-attributed, restarted
+    # immediately, and not charged to the run-level crash budget.
+    assert run_state.file_attributed_restart_count == 1
+    assert run_state.restart_count == 0
+    assert session.spawns == 1
     assert FINDING_PYRIGHT_RESTART in _finding_codes(result.findings)
 
 
 class PartialReferenceTransportFailureSession(PartialReferenceTimeoutSession):
+    failure: Callable[[str], Exception] = LspTransportClosedError
+    spawns = 0
+
+    def _spawn_and_initialize(self, init_timeout_secs: float | None = None) -> bool:
+        _ = init_timeout_secs
+        self.spawns += 1
+        return True
+
     def _reference_target_ids(
         self,
         uri: str,
@@ -2497,7 +2533,7 @@ class PartialReferenceTransportFailureSession(PartialReferenceTimeoutSession):
         _ = (uri, deadline)
         self.requested_starts.append(site.source_byte_start)
         if site.source_byte_start == self.timeout_start:
-            raise LspTransportClosedError(method)
+            raise self.failure(method)
         return self.targets_by_start[site.source_byte_start], False
 
 
@@ -2545,8 +2581,13 @@ def test_pyright_session_reference_transport_failure_keeps_edges_resolved_before
         result.references_resolved_total + result.unresolved_reference_sites_total
         == result.reference_sites_total
     )
-    assert result.coverage == FacetCoverage.degraded("pyright_transport_failure", transient=True)
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
     assert FINDING_PYRIGHT_RESTART in _finding_codes(result.findings)
+    assert session.run_state.file_attributed_restart_count == 1
+    assert session.run_state.restart_count == 0
+    assert session.spawns == 1
 
 
 class DidOpenTransportFailureSession(PyrightSession):
@@ -2574,5 +2615,1118 @@ def test_pyright_session_reference_transport_failure_before_any_site_is_visited_
 
     assert result.edges == []
     assert result.unresolved_reference_sites_total == 1
-    assert result.coverage == FacetCoverage.degraded("pyright_transport_failure", transient=True)
+    # Nothing of this file was ever asked about: the process was already dead
+    # when it arrived, so the hole is collateral and the run-level budget pays.
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_restarting", transient=True, collateral=True
+    )
     assert run_state.restart_count == 1
+    assert run_state.file_attributed_restart_count == 0
+
+
+# ---------------------------------------------------------------------------
+# clarion-7fc41105ea: restart attribution + immediate restart + safety cap.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProcess:
+    """Stands in for ``subprocess.Popen``: alive until ``die()`` or ``kill()``."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def die(self) -> None:
+        self.returncode = 1
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        _ = timeout
+        return self.returncode if self.returncode is not None else 0
+
+
+class RestartProbeSession(PyrightSession):
+    """A fake pyright that models death and respawn without a subprocess.
+
+    A request named in ``crash_methods`` for a file whose stem is in
+    ``crash_stems`` kills the fake process mid-flight and raises the same
+    ``LspTransportClosedError`` the real transport raises on EOF, after
+    running for ``crash_latency_secs`` of fake clock (so a crash can land
+    late in the file's watchdog window). Every spawn advances the fake clock
+    by ``spawn_latency_secs`` so deadline arithmetic can be asserted without
+    sleeping; a spawn slower than the handshake bound a headroom-limited
+    respawn passes in behaves like the real one -- it burns the bound and
+    times out.
+    """
+
+    def __init__(  # noqa: PLR0913 - each knob selects one restart shape under test.
+        self,
+        project_root: Path,
+        *,
+        crash_stems: set[str] | None = None,
+        crash_methods: set[str] | None = None,
+        timeout_stems: set[str] | None = None,
+        timeout_latency_secs: float = 0.0,
+        spawn_latency_secs: float = 0.0,
+        first_spawn_latency_secs: float | None = None,
+        crash_latency_secs: float = 0.0,
+        spawn_ok: bool = True,
+        run_state: PyrightRunState | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(project_root, executable=sys.executable, run_state=run_state, **kwargs)
+        self.crash_stems = crash_stems or set()
+        # Stems whose first query hangs past its timeout while the fake
+        # process stays alive: the wedged-but-alive shape (ADR-057 breaker).
+        self.timeout_stems = timeout_stems or set()
+        self.timeout_latency_secs = timeout_latency_secs
+        self.crash_latency_secs = crash_latency_secs
+        self.first_spawn_latency_secs = first_spawn_latency_secs
+        self.crash_methods = crash_methods or {
+            "textDocument/prepareCallHierarchy",
+            "textDocument/definition",
+        }
+        self.spawn_latency_secs = spawn_latency_secs
+        self.spawn_ok = spawn_ok
+        self.spawns = 0
+        self.clock = 1000.0
+        self.current_uri: str | None = None
+        self.fake_process: _FakeProcess | None = None
+
+    def _now(self) -> float:
+        return self.clock
+
+    def _spawn_and_initialize(self, init_timeout_secs: float | None = None) -> bool:
+        self.spawns += 1
+        bound = self.init_timeout_secs if init_timeout_secs is None else init_timeout_secs
+        latency = self.spawn_latency_secs
+        if self.spawns == 1 and self.first_spawn_latency_secs is not None:
+            latency = self.first_spawn_latency_secs
+        if latency > bound:
+            # The handshake ran out of its bound: the process exists but
+            # never answered ``initialize``.
+            self.clock += bound
+            self.fake_process = _FakeProcess()
+            self._process = cast("Any", self.fake_process)
+            return self._handle_initialize_timeout(bound)
+        self.clock += latency
+        if not self.spawn_ok:
+            return False
+        self.fake_process = _FakeProcess()
+        self._process = cast("Any", self.fake_process)
+        return True
+
+    def _notify(self, method: str, params: dict[str, object]) -> None:
+        self._live_process()
+        if method == "textDocument/didOpen":
+            document = cast("dict[str, str]", params["textDocument"])
+            self.current_uri = document["uri"]
+
+    def _request(self, method: str, params: dict[str, object], timeout_secs: float) -> object:
+        _ = (params, timeout_secs)
+        self._live_process()
+        if method == "shutdown":
+            return {}
+        assert self.current_uri is not None
+        stem = Path(self.current_uri).stem
+        if stem in self.timeout_stems and method in self.crash_methods:
+            self.clock += self.timeout_latency_secs
+            raise LspTimeoutError(method)
+        if stem in self.crash_stems and method in self.crash_methods:
+            assert self.fake_process is not None
+            self.clock += self.crash_latency_secs
+            self.fake_process.die()
+            message = "EOF while reading LSP header"
+            raise LspTransportClosedError(message)
+        return []
+
+
+def _write_named_module(tmp_path: Path, stem: str) -> Path:
+    return _write_module(
+        tmp_path, "def callee():\n    pass\n\ndef caller():\n    callee()\n", f"{stem}.py"
+    )
+
+
+def _caller_id(stem: str) -> str:
+    return f"python:function:{stem}.caller"
+
+
+def _restart_findings(findings: Sequence[Finding]) -> list[Finding]:
+    return [finding for finding in findings if finding["subcode"] == FINDING_PYRIGHT_RESTART]
+
+
+def test_pyright_session_in_flight_crash_restarts_immediately_and_next_file_is_complete(
+    tmp_path: Path,
+) -> None:
+    trouble = _write_named_module(tmp_path, "trouble")
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(tmp_path, crash_stems={"trouble"}, run_state=run_state) as session:
+        crashed = session.resolve_calls(trouble, [_caller_id("trouble")])
+        assert session.spawns == 2, "the restart must happen before resolve_calls returns"
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+
+    assert crashed.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    restarts = _restart_findings(crashed.findings)
+    assert len(restarts) == 1
+    assert restarts[0]["metadata"]["attribution"] == "in_flight"
+    # File-attributed restarts do not spend the run-level crash budget.
+    assert run_state.file_attributed_restart_count == 1
+    assert run_state.restart_count == 0
+    assert run_state.disabled is False
+    # The next file arrives at a live process: complete, not collateral.
+    assert after.coverage == FacetCoverage()
+    assert _restart_findings(after.findings) == []
+    assert session.spawns == 2
+
+
+def test_pyright_session_found_dead_on_arrival_restarts_under_run_cap_and_file_proceeds(
+    tmp_path: Path,
+) -> None:
+    first = _write_named_module(tmp_path, "first")
+    second = _write_named_module(tmp_path, "second")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(tmp_path, run_state=run_state) as session:
+        assert session.resolve_calls(first, [_caller_id("first")]).coverage == FacetCoverage()
+        assert session.fake_process is not None
+        # pyright dies AFTER answering ``first``; ``second`` discovers it.
+        session.fake_process.die()
+        arrived = session.resolve_calls(second, [_caller_id("second")])
+
+    # Not this file's doing, so it spends the run-level budget, not the
+    # file-attributed one -- and the arriving file still gets a live process.
+    assert run_state.restart_count == 1
+    assert run_state.file_attributed_restart_count == 0
+    assert arrived.coverage == FacetCoverage()
+    restarts = _restart_findings(arrived.findings)
+    assert len(restarts) == 1
+    assert restarts[0]["metadata"]["attribution"] == "arrival"
+    assert "on arrival" in restarts[0]["message"]
+    assert session.spawns == 2
+
+
+def test_pyright_session_calls_transport_failure_before_any_function_is_collateral(
+    tmp_path: Path,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+    run_state = PyrightRunState()
+
+    with DidOpenTransportFailureSession(
+        tmp_path, executable=sys.executable, run_state=run_state
+    ) as session:
+        result = session.resolve_calls(module, _TWO_CALLERS)
+
+    assert result.edges == []
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_restarting", transient=True, collateral=True
+    )
+    assert run_state.restart_count == 1
+    assert run_state.file_attributed_restart_count == 0
+
+
+def test_pyright_session_transient_spawn_failure_is_collateral(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n")
+    monkeypatch.setattr(subprocess, "Popen", _popen_raising(errno.EAGAIN))
+    run_state = PyrightRunState()
+
+    with PyrightSession(tmp_path, executable=sys.executable, run_state=run_state) as session:
+        result = session.resolve_calls(module, ["python:function:demo.caller"])
+
+    assert run_state.disabled is False
+    # The file never got a process for reasons that have nothing to do with
+    # its own content: collateral, so the host dispatches it early next run.
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_spawn_failed", transient=True, collateral=True
+    )
+
+
+def test_pyright_session_pure_timeout_is_self_inflicted_and_does_not_restart(
+    tmp_path: Path,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+    run_state = PyrightRunState()
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller=_CALLEE_BY_CALLER,
+        fail_on="python:function:demo.second",
+        run_state=run_state,
+    ) as session:
+        result = session.resolve_calls(module, _TWO_CALLERS)
+
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_timeout", transient=True, collateral=False
+    )
+    # A timeout means pyright is alive but slow: restarting would throw away
+    # its warm cache for nothing (ADR-057 deviation from the ticket text).
+    # Only a STREAK of ``MAX_CONSECUTIVE_TIMEOUT_FILES`` timed-out files is
+    # read as a wedged process -- see the breaker tests below.
+    assert run_state.restart_count == 0
+    assert run_state.file_attributed_restart_count == 0
+    assert run_state.consecutive_timeout_files == 1
+    assert session.spawns == 0
+
+
+def test_pyright_session_unrelated_read_error_in_flight_is_not_a_restart(
+    tmp_path: Path,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+    run_state = PyrightRunState()
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller=_CALLEE_BY_CALLER,
+        fail_on="python:function:demo.second",
+        failure=FileNotFoundError,
+        run_state=run_state,
+    ) as session:
+        # The process is alive: a bare OSError here is a local read failure on
+        # some target file, not pyright dying.
+        session._process = cast("Any", _FakeProcess())  # noqa: SLF001
+        result = session.resolve_calls(module, _TWO_CALLERS)
+        session._process = None  # noqa: SLF001
+
+    _assert_partial_call_evidence(session, module, result, reason="pyright_local_read_error")
+    assert result.coverage.collateral is False
+    assert run_state.restart_count == 0
+    assert run_state.file_attributed_restart_count == 0
+    assert session.spawns == 0
+    assert FINDING_PYRIGHT_RESTART not in _finding_codes(result.findings)
+
+
+class LocalReadErrorReferenceSession(PartialReferenceTransportFailureSession):
+    failure: Callable[[str], Exception] = FileNotFoundError
+
+
+def test_pyright_session_unrelated_read_error_in_reference_pass_is_not_a_restart(
+    tmp_path: Path,
+) -> None:
+    source = "def alpha():\n    pass\n\ndef beta():\n    pass\n\nFIRST = alpha\nBROKEN = beta\n"
+    module = _write_module(tmp_path, source)
+    first = _reference_site(source, from_id="python:module:demo", needle="alpha", occurrence=1)
+    broken = _reference_site(source, from_id="python:module:demo", needle="beta", occurrence=1)
+
+    with LocalReadErrorReferenceSession(
+        tmp_path,
+        targets_by_start={first.source_byte_start: ["python:function:demo.alpha"]},
+        timeout_start=broken.source_byte_start,
+    ) as session:
+        session._process = cast("Any", _FakeProcess())  # noqa: SLF001
+        result = session.resolve_references(module, [first, broken])
+        session._process = None  # noqa: SLF001
+
+    assert [edge["to_id"] for edge in result.edges] == ["python:function:demo.alpha"]
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_local_read_error", transient=True, collateral=False
+    )
+    assert session.spawns == 0
+    assert FINDING_PYRIGHT_RESTART not in _finding_codes(result.findings)
+
+
+def test_pyright_session_immediate_restart_next_file_uses_fresh_real_process(
+    tmp_path: Path,
+) -> None:
+    """Real subprocess: a langserver that dies on the troublemaker's request."""
+    script = _write_executable(
+        tmp_path,
+        textwrap.dedent(
+            """
+            #!/usr/bin/env python3
+            import json
+            import os
+            import sys
+
+            def read_frame():
+                headers = {}
+                while True:
+                    line = sys.stdin.buffer.readline()
+                    if line in (b"", b"\\r\\n"):
+                        return None
+                    name, value = line.decode("ascii").strip().split(":", 1)
+                    headers[name.lower()] = value.strip()
+                    if sys.stdin.buffer.readline() == b"\\r\\n":
+                        break
+                return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+            def write_frame(message):
+                body = json.dumps(message).encode("utf-8")
+                sys.stdout.buffer.write(
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\\r\\n\\r\\n"
+                )
+                sys.stdout.buffer.write(body)
+                sys.stdout.buffer.flush()
+
+            opened = None
+            while True:
+                frame = read_frame()
+                if frame is None:
+                    break
+                method = frame.get("method")
+                if method == "initialize":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": {}})
+                elif method == "textDocument/didOpen":
+                    opened = frame["params"]["textDocument"]["uri"]
+                elif method == "textDocument/prepareCallHierarchy":
+                    if "trouble" in (opened or ""):
+                        os._exit(1)
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": []})
+                elif method == "callHierarchy/outgoingCalls":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": []})
+                elif method == "shutdown":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": {}})
+                elif method == "exit":
+                    break
+            """,
+        ).lstrip(),
+    )
+    trouble = _write_named_module(tmp_path, "trouble")
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with PyrightSession(
+        tmp_path, executable=str(script), init_timeout_secs=5.0, run_state=run_state
+    ) as session:
+        crashed = session.resolve_calls(trouble, [_caller_id("trouble")])
+        assert session._process is not None  # noqa: SLF001
+        assert session._process.poll() is None, "restart must precede the return"  # noqa: SLF001
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+
+    assert crashed.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    assert run_state.file_attributed_restart_count == 1
+    assert run_state.restart_count == 0
+    assert run_state.pyright_init_latency_total_ms > 0
+    assert after.coverage == FacetCoverage()
+    assert FINDING_PYRIGHT_RESTART not in _finding_codes(after.findings)
+
+
+def test_pyright_session_restart_extends_shared_file_deadline_without_cross_facet_contamination(
+    tmp_path: Path,
+) -> None:
+    source = "def alpha():\n    pass\n\ndef caller():\n    alpha()\n\nFIRST = alpha\n"
+    module = _write_module(tmp_path, source)
+    site = _reference_site(source, from_id="python:module:demo", needle="alpha", occurrence=2)
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems={"demo"},
+        crash_methods={"textDocument/definition"},
+        spawn_latency_secs=3.0,
+        file_timeout_base_secs=10.0,
+        file_timeout_per_function_secs=0.0,
+        run_state=run_state,
+    ) as session:
+        anchor = session.clock
+        calls = session.resolve_calls(module, ["python:function:demo.caller"])
+        deadline_before = session._file_deadlines[module]  # noqa: SLF001
+        references = session.resolve_references(module, [site])
+        assert session.spawns == 2
+
+    assert deadline_before == anchor + 3.0 + 10.0  # initial spawn, then the budget
+    assert calls.coverage == FacetCoverage()
+    assert references.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    assert run_state.file_attributed_restart_count == 1
+    assert "pyright_timeout" not in {
+        finding["metadata"].get("reason") for finding in references.findings
+    }
+    assert FINDING_PYRIGHT_REFERENCE_RESOLUTION_TIMEOUT not in _finding_codes(references.findings)
+
+
+def test_pyright_session_restart_extension_clamped_to_host_watchdog_ceiling(
+    tmp_path: Path,
+) -> None:
+    module = _write_named_module(tmp_path, "trouble")
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems={"trouble"},
+        spawn_latency_secs=40.0,
+        first_spawn_latency_secs=0.0,
+        init_timeout_secs=60.0,
+        file_timeout_base_secs=PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+        file_timeout_per_function_secs=0.0,
+    ) as session:
+        anchor = session.clock
+        session.resolve_calls(module, [_caller_id("trouble")])
+        deadline = session._file_deadlines[module]  # noqa: SLF001
+
+    assert session.spawns == 2
+    ceiling = anchor + HOST_FILE_WATCHDOG_SECS - FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS
+    # Un-clamped this would be anchor + 90 (budget) + 40 (respawn).
+    assert deadline == ceiling
+    assert deadline < anchor + PYRIGHT_FILE_TIMEOUT_CAP_SECS + 40.0
+
+
+def test_pyright_session_second_in_flight_crash_on_same_file_defers_restart_at_ceiling(
+    tmp_path: Path,
+) -> None:
+    source = "def alpha():\n    pass\n\ndef caller():\n    alpha()\n\nFIRST = alpha\n"
+    trouble = _write_module(tmp_path, source, "trouble.py")
+    site = _reference_site(source, from_id="python:module:trouble", needle="alpha", occurrence=2)
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems={"trouble"},
+        spawn_latency_secs=20.0,
+        first_spawn_latency_secs=0.0,
+        # Each crashing request runs 80s before pyright dies: the calls crash
+        # lands at +80 of a 105s window (25s headroom: respawn, 20s), the
+        # references crash at +180 (none: defer).
+        crash_latency_secs=80.0,
+        file_timeout_base_secs=PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+        file_timeout_per_function_secs=0.0,
+        run_state=run_state,
+    ) as session:
+        anchor = session.clock
+        calls = session.resolve_calls(trouble, [_caller_id("trouble")])
+        assert session.spawns == 2
+        assert session.clock == anchor + 100.0
+        references = session.resolve_references(trouble, [site])
+        # No headroom left under this file's watchdog ceiling: the restart is
+        # deferred, the dead process left in place.
+        assert session.spawns == 2
+        assert run_state.restart_already_charged_to_file is True
+        assert run_state.restart_charged_to_path == str(trouble)
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+        assert session.spawns == 3
+
+    assert calls.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    assert references.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    assert run_state.file_attributed_restart_count == 2
+    assert run_state.ceiling_deferred_restart_count == 1
+    # The next file pays the respawn silently: not charged, not degraded.
+    assert run_state.restart_already_charged_to_file is False
+    assert run_state.restart_charged_to_path is None
+    assert run_state.restart_count == 0
+    assert after.coverage == FacetCoverage()
+    assert _restart_findings(after.findings) == []
+
+
+def test_pyright_session_ceiling_deferred_flag_is_consumed_by_a_recycled_session(
+    tmp_path: Path,
+) -> None:
+    # ADR-057 §3: server.py recycles the PyrightSession every
+    # MAX_FILES_PER_PYRIGHT_SESSION files. When that recycle lands right after
+    # a ceiling-deferred restart, the NEXT file is served by a fresh session
+    # whose first spawn is the deferred restart -- it must consume the one-shot
+    # flag, or the flag later masks a genuine arrival-death on an unrelated
+    # file (no finding, no run-level charge).
+    source = "def alpha():\n    pass\n\ndef caller():\n    alpha()\n\nFIRST = alpha\n"
+    trouble = _write_module(tmp_path, source, "trouble.py")
+    site = _reference_site(source, from_id="python:module:trouble", needle="alpha", occurrence=2)
+    clean = _write_named_module(tmp_path, "clean")
+    unrelated = _write_named_module(tmp_path, "unrelated")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems={"trouble"},
+        spawn_latency_secs=20.0,
+        first_spawn_latency_secs=0.0,
+        crash_latency_secs=80.0,
+        file_timeout_base_secs=PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+        file_timeout_per_function_secs=0.0,
+        run_state=run_state,
+    ) as first:
+        first.resolve_calls(trouble, [_caller_id("trouble")])
+        first.resolve_references(trouble, [site])
+        assert run_state.restart_already_charged_to_file is True
+        assert run_state.ceiling_deferred_restart_count == 1
+
+    # The routine recycle: a brand-new session sharing the run state.
+    with RestartProbeSession(tmp_path, run_state=run_state) as second:
+        after = second.resolve_calls(clean, [_caller_id("clean")])
+        assert second.spawns == 1
+        assert run_state.restart_already_charged_to_file is False, (
+            "the recycled session's first spawn IS the deferred restart"
+        )
+        assert after.coverage == FacetCoverage()
+        assert run_state.restart_count == 0
+
+        # Now a GENUINE arrival-death on an unrelated file must be visible:
+        # a RESTART finding and a run-level charge, not a silent respawn.
+        assert second.fake_process is not None
+        second.fake_process.die()
+        later = second.resolve_calls(unrelated, [_caller_id("unrelated")])
+        assert second.spawns == 2
+
+    assert run_state.restart_count == 1
+    # Discovered at _ensure_process, so the arriving file still resolved on
+    # the fresh process -- but the death itself is on the record.
+    assert later.coverage == FacetCoverage()
+    restart_findings = _restart_findings(later.findings)
+    assert [finding["metadata"]["attribution"] for finding in restart_findings] == ["arrival"]
+
+
+def test_resolve_host_file_watchdog_secs_mirrors_the_host_env_override() -> None:
+    # ADR-057 §3: the plugin inherits the host's environment, so the SAME
+    # variable the host's plugin_file_timeout() honours drives the ceiling.
+    assert resolve_host_file_watchdog_secs({}) == HOST_FILE_WATCHDOG_SECS
+    assert resolve_host_file_watchdog_secs({"LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS": "30000"}) == 30.0
+    # The host ignores an unparsable / non-positive value and keeps its default.
+    assert (
+        resolve_host_file_watchdog_secs({"LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS": "soon"})
+        == HOST_FILE_WATCHDOG_SECS
+    )
+    assert (
+        resolve_host_file_watchdog_secs({"LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS": "0"})
+        == HOST_FILE_WATCHDOG_SECS
+    )
+
+
+def test_pyright_session_reads_host_watchdog_override_from_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS", "30000")
+    with RestartProbeSession(tmp_path) as session:
+        assert session.host_file_watchdog_secs == 30.0
+        assert session._watchdog_ceiling_for(1000.0) == 1000.0 + 30.0 - 15.0  # noqa: SLF001
+    # A watchdog too short for the full margin keeps half of itself.
+    with RestartProbeSession(tmp_path, host_file_watchdog_secs=20.0) as short:
+        assert short._watchdog_ceiling_for(1000.0) == 1010.0  # noqa: SLF001
+
+
+def test_pyright_session_shorter_host_watchdog_defers_restart_instead_of_respawning_late(
+    tmp_path: Path,
+) -> None:
+    # ADR-057 §3: with LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS=30000 the real host
+    # deadline is 30s. A crash on a file already 12s in has 3s of headroom
+    # under the 15s ceiling window -- below MIN_RESPAWN_HEADROOM_SECS: the
+    # respawn must be deferred, not attempted in-process where its latency
+    # would get the whole plugin call killed.
+    source = "def alpha():\n    pass\n\ndef caller():\n    alpha()\n"
+    trouble = _write_module(tmp_path, source, "trouble.py")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems={"trouble"},
+        spawn_latency_secs=20.0,
+        first_spawn_latency_secs=0.0,
+        crash_latency_secs=12.0,
+        file_timeout_base_secs=PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+        file_timeout_per_function_secs=0.0,
+        run_state=run_state,
+        host_file_watchdog_secs=30.0,
+    ) as session:
+        anchor = session.clock
+        result = session.resolve_calls(trouble, [_caller_id("trouble")])
+        assert session.spawns == 1, "no in-process respawn past the real host deadline"
+        assert session.clock == anchor + 12.0, "no wall-clock spent on a hopeless respawn"
+
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    assert run_state.ceiling_deferred_restart_count == 1
+    assert run_state.restart_already_charged_to_file is True
+
+
+def test_pyright_session_late_crash_respawn_is_bounded_by_real_headroom(
+    tmp_path: Path,
+) -> None:
+    # The review's case: a 90s budget under a 105s window can never satisfy a
+    # static ``deadline >= ceiling`` check, so a crash 89s in used to respawn
+    # unbounded (up to the 30s init timeout) against 16s of real headroom. The
+    # decision is now made on ``ceiling - now``: the respawn IS attempted, but
+    # its handshake is bounded to the headroom, so a hung pyright is cut off
+    # at the ceiling and deferred -- the host watchdog never fires.
+    trouble = _write_named_module(tmp_path, "trouble")
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems={"trouble"},
+        spawn_latency_secs=20.0,
+        first_spawn_latency_secs=0.0,
+        crash_latency_secs=89.0,
+        file_timeout_base_secs=PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+        file_timeout_per_function_secs=0.0,
+        run_state=run_state,
+    ) as session:
+        anchor = session.clock
+        ceiling = anchor + HOST_FILE_WATCHDOG_SECS - FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS
+        result = session.resolve_calls(trouble, [_caller_id("trouble")])
+        assert session.spawns == 2, "16s of headroom is worth an attempt"
+        assert session.clock == ceiling, "the hung handshake was cut off at the ceiling"
+        assert run_state.disabled is False, "a headroom-bounded timeout is not an install failure"
+        assert run_state.restart_already_charged_to_file is True
+        assert run_state.ceiling_deferred_restart_count == 1
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+        assert session.spawns == 3
+
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    restarts = _restart_findings(result.findings)
+    assert [finding["metadata"]["outcome"] for finding in restarts] == ["deferred_to_next_file"]
+    assert FINDING_PYRIGHT_INIT_TIMEOUT not in _finding_codes(result.findings)
+    assert after.coverage == FacetCoverage()
+    assert run_state.restart_count == 0
+
+
+def test_pyright_session_late_crash_with_fast_respawn_restarts_within_headroom(
+    tmp_path: Path,
+) -> None:
+    # Same late crash, but pyright comes back in 3s: that fits the 16s of
+    # headroom, so the restart completes and the next file is served live.
+    trouble = _write_named_module(tmp_path, "trouble")
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems={"trouble"},
+        spawn_latency_secs=3.0,
+        first_spawn_latency_secs=0.0,
+        crash_latency_secs=89.0,
+        file_timeout_base_secs=PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+        file_timeout_per_function_secs=0.0,
+        run_state=run_state,
+    ) as session:
+        anchor = session.clock
+        result = session.resolve_calls(trouble, [_caller_id("trouble")])
+        assert session.spawns == 2
+        assert session.clock == anchor + 92.0
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+        assert session.spawns == 2
+
+    assert result.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    assert run_state.ceiling_deferred_restart_count == 0
+    assert run_state.restart_already_charged_to_file is False
+    assert after.coverage == FacetCoverage()
+
+
+def test_pyright_session_same_file_references_after_calls_deferral_stays_self_inflicted(
+    tmp_path: Path,
+) -> None:
+    # A restart deferred from a file's calls facet is NOT consumed by that
+    # same file's references facet: both share one watchdog window, and the
+    # deferral already found it exhausted. The references facet reports the
+    # file's own crash (self-inflicted), spends no wall-clock, and leaves the
+    # deferral armed for the next file.
+    source = "def alpha():\n    pass\n\ndef caller():\n    alpha()\n\nFIRST = alpha\n"
+    trouble = _write_module(tmp_path, source, "trouble.py")
+    site = _reference_site(source, from_id="python:module:trouble", needle="alpha", occurrence=2)
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems={"trouble"},
+        # A 10s respawn fits the clean file's 15s window; the trouble file's
+        # crash at +12 leaves 3s, below MIN_RESPAWN_HEADROOM_SECS.
+        spawn_latency_secs=10.0,
+        first_spawn_latency_secs=0.0,
+        crash_latency_secs=12.0,
+        file_timeout_base_secs=PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+        file_timeout_per_function_secs=0.0,
+        run_state=run_state,
+        host_file_watchdog_secs=30.0,
+    ) as session:
+        calls = session.resolve_calls(trouble, [_caller_id("trouble")])
+        assert session.spawns == 1
+        assert run_state.restart_already_charged_to_file is True
+        clock_before = session.clock
+        references = session.resolve_references(trouble, [site])
+        assert session.spawns == 1, "the same file must not respawn against its exhausted window"
+        assert session.clock == clock_before
+        assert run_state.restart_already_charged_to_file is True
+        assert run_state.restart_charged_to_path == str(trouble)
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+        assert session.spawns == 2
+
+    assert calls.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    assert references.coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    assert _restart_findings(references.findings) == [], "no second restart event happened"
+    assert run_state.ceiling_deferred_restart_count == 1
+    assert run_state.file_attributed_restart_count == 1
+    # The next file consumed the deferral silently and resolved live.
+    assert run_state.restart_already_charged_to_file is False
+    assert run_state.restart_charged_to_path is None
+    assert run_state.restart_count == 0
+    assert after.coverage == FacetCoverage()
+    assert _restart_findings(after.findings) == []
+
+
+def test_pyright_session_file_attributed_restarts_do_not_count_against_run_cap(
+    tmp_path: Path,
+) -> None:
+    stems = [f"trouble_{index}" for index in range(MAX_PYRIGHT_RESTARTS_PER_RUN + 2)]
+    modules = {stem: _write_named_module(tmp_path, stem) for stem in stems}
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(tmp_path, crash_stems=set(stems), run_state=run_state) as session:
+        results = {stem: session.resolve_calls(modules[stem], [_caller_id(stem)]) for stem in stems}
+
+    assert run_state.disabled is False
+    assert run_state.restart_count == 0
+    assert run_state.file_attributed_restart_count == len(stems)
+    assert all(
+        result.coverage
+        == FacetCoverage.degraded("pyright_transport_failure", transient=True, collateral=False)
+        for result in results.values()
+    )
+    assert FINDING_PYRIGHT_POISON_FRAME not in {
+        code for result in results.values() for code in _finding_codes(result.findings)
+    }
+
+
+def test_pyright_session_total_restart_count_cap_trips_and_reports_honestly(
+    tmp_path: Path,
+) -> None:
+    stems = ["trouble_a", "trouble_b", "trouble_c"]
+    modules = {stem: _write_named_module(tmp_path, stem) for stem in stems}
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems=set(stems),
+        max_total_restarts_per_run=2,
+        run_state=run_state,
+    ) as session:
+        results = [session.resolve_calls(modules[stem], [_caller_id(stem)]) for stem in stems]
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+
+    assert run_state.disabled is True
+    assert run_state.disabled_reason == "pyright_restart_cap_exceeded"
+    assert FINDING_PYRIGHT_TOTAL_RESTART_CAP_EXCEEDED in _finding_codes(results[-1].findings)
+    # The file whose restart tripped the cap still owns its own hole.
+    assert results[-1].coverage == FacetCoverage.degraded(
+        "pyright_transport_failure", transient=True, collateral=False
+    )
+    # Everything after is honest collateral under the new token, not the old
+    # ``pyright_unavailable`` fallback.
+    assert after.coverage == FacetCoverage.degraded(
+        "pyright_restart_cap_exceeded", transient=True, collateral=True
+    )
+    assert session.spawns == 3  # initial + two restarts; the third was refused
+
+
+def test_pyright_session_total_restart_latency_budget_trips(tmp_path: Path) -> None:
+    stems = ["trouble_a", "trouble_b"]
+    modules = {stem: _write_named_module(tmp_path, stem) for stem in stems}
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        crash_stems=set(stems),
+        spawn_latency_secs=1.0,
+        restart_latency_budget_ms=1500,
+        run_state=run_state,
+    ) as session:
+        first = session.resolve_calls(modules["trouble_a"], [_caller_id("trouble_a")])
+        second = session.resolve_calls(modules["trouble_b"], [_caller_id("trouble_b")])
+
+    # Initial spawn (1s) + one respawn (1s) = 2000ms > 1500ms budget.
+    assert run_state.pyright_init_latency_total_ms == 2000
+    assert FINDING_PYRIGHT_TOTAL_RESTART_CAP_EXCEEDED not in _finding_codes(first.findings)
+    assert FINDING_PYRIGHT_TOTAL_RESTART_CAP_EXCEEDED in _finding_codes(second.findings)
+    assert run_state.disabled_reason == "pyright_restart_cap_exceeded"
+    assert session.spawns == 2
+
+
+_NEVER_ANSWERS_LANGSERVER = textwrap.dedent(
+    """
+    #!/usr/bin/env python3
+    import sys
+    sys.stdin.buffer.read()
+    """,
+).lstrip()
+
+_EXITS_IMMEDIATELY_LANGSERVER = "#!/usr/bin/env python3\nraise SystemExit(1)\n"
+
+
+@pytest.mark.parametrize(
+    "branch",
+    ["missing_executable", "install_check", "init_timeout", "init_transport", "transient_eagain"],
+)
+def test_pyright_session_failed_immediate_respawn_never_clobbers_disabled_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    branch: str,
+) -> None:
+    module = _write_module(tmp_path, _TWO_CALLER_MODULE)
+    run_state = PyrightRunState()
+    kwargs: dict[str, Any] = {"executable": sys.executable}
+    if branch == "missing_executable":
+        kwargs["executable"] = str(tmp_path / "does-not-exist")
+    elif branch == "install_check":
+        kwargs["install_check"] = lambda _executable: False
+    elif branch == "init_timeout":
+        kwargs["executable"] = str(_write_executable(tmp_path, _NEVER_ANSWERS_LANGSERVER))
+        kwargs["init_timeout_secs"] = 0.2
+    elif branch == "init_transport":
+        kwargs["executable"] = str(_write_executable(tmp_path, _EXITS_IMMEDIATELY_LANGSERVER))
+    else:
+        monkeypatch.setattr(subprocess, "Popen", _popen_raising(errno.EAGAIN))
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller=_CALLEE_BY_CALLER,
+        fail_on="python:function:demo.second",
+        failure=LspTransportClosedError,
+        fake_spawn=False,
+        run_state=run_state,
+        **kwargs,
+    ) as session:
+        crashed = session.resolve_calls(module, _TWO_CALLERS)
+
+    # The crashing file's own attribution is unaffected by the respawn outcome.
+    _assert_partial_call_evidence(session, module, crashed, reason="pyright_transport_failure")
+    assert run_state.file_attributed_restart_count == 1
+    assert run_state.file_attributed_respawn_failure_count == 1
+    if branch == "transient_eagain":
+        assert run_state.disabled is False
+        assert run_state.disabled_reason is None
+        expected_reason = "pyright_spawn_failed"
+    else:
+        assert run_state.disabled is True
+        # The original branch's token stands: the cap never overwrites it.
+        assert run_state.disabled_reason == "pyright_unavailable"
+        expected_reason = "pyright_unavailable"
+
+    # The next file sees the honest outcome through the real ``_ensure_process``.
+    with PyrightSession(tmp_path, run_state=run_state, **kwargs) as next_session:
+        after = next_session.resolve_calls(module, _TWO_CALLERS)
+    assert after.coverage == FacetCoverage.degraded(
+        expected_reason, transient=True, collateral=True
+    )
+
+
+def test_pyright_session_run_state_counters_populate_after_a_mixed_run(tmp_path: Path) -> None:
+    trouble = _write_named_module(tmp_path, "trouble")
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path, crash_stems={"trouble"}, spawn_latency_secs=0.5, run_state=run_state
+    ) as session:
+        session.resolve_calls(trouble, [_caller_id("trouble")])  # in-flight crash
+        assert session.fake_process is not None
+        session.fake_process.die()  # dies after answering: found dead on arrival
+        session.resolve_calls(clean, [_caller_id("clean")])
+
+    assert run_state.restart_count == 1
+    assert run_state.file_attributed_restart_count == 1
+    assert run_state.file_attributed_respawn_failure_count == 0
+    assert run_state.ceiling_deferred_restart_count == 0
+    assert run_state.pyright_init_latency_total_ms == 1500  # three spawns at 500ms
+
+
+_TIMEOUT_COVERAGE = FacetCoverage.degraded("pyright_timeout", transient=True, collateral=False)
+
+
+def _wedged_findings(findings: Sequence[Finding]) -> list[Finding]:
+    return [finding for finding in findings if finding["subcode"] == FINDING_PYRIGHT_WEDGED_RESTART]
+
+
+def test_pyright_session_consecutive_timeout_streak_restarts_once_charged_to_run_cap(
+    tmp_path: Path,
+) -> None:
+    stems = [f"slow_{index}" for index in range(MAX_CONSECUTIVE_TIMEOUT_FILES)]
+    modules = {stem: _write_named_module(tmp_path, stem) for stem in stems}
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(tmp_path, timeout_stems=set(stems), run_state=run_state) as session:
+        results = [session.resolve_calls(modules[stem], [_caller_id(stem)]) for stem in stems]
+        spawns_after_streak = session.spawns
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+
+    # Every file in the streak keeps its honest self-inflicted timeout claim.
+    assert all(result.coverage == _TIMEOUT_COVERAGE for result in results)
+    # Exactly one restart, performed before the third file's result returned.
+    assert spawns_after_streak == 2  # initial + the wedged restart
+    assert run_state.restart_count == 1
+    assert run_state.wedged_restart_count == 1
+    assert run_state.file_attributed_restart_count == 0
+    assert run_state.consecutive_timeout_files == 0
+    assert run_state.disabled is False
+    # The finding is anchored to the file that closed the streak and names it.
+    assert not any(_wedged_findings(result.findings) for result in results[:-1])
+    wedged = _wedged_findings(results[-1].findings)
+    assert len(wedged) == 1
+    assert str(MAX_CONSECUTIVE_TIMEOUT_FILES) in wedged[0]["message"]
+    assert wedged[0]["metadata"]["consecutive_timeout_files"] == MAX_CONSECUTIVE_TIMEOUT_FILES
+    assert wedged[0]["metadata"]["outcome"] == "restarted"
+    assert wedged[0]["metadata"]["restart_count"] == 1
+    # The next file arrives at the fresh process and completes.
+    assert after.coverage == FacetCoverage()
+    assert session.spawns == 2
+
+
+def test_pyright_session_completing_file_resets_timeout_streak(tmp_path: Path) -> None:
+    slow_a = _write_named_module(tmp_path, "slow_a")
+    slow_b = _write_named_module(tmp_path, "slow_b")
+    slow_c = _write_named_module(tmp_path, "slow_c")
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        timeout_stems={"slow_a", "slow_b", "slow_c"},
+        max_consecutive_timeout_files=3,
+        run_state=run_state,
+    ) as session:
+        session.resolve_calls(slow_a, [_caller_id("slow_a")])
+        session.resolve_calls(slow_b, [_caller_id("slow_b")])
+        assert run_state.consecutive_timeout_files == 2
+        between = session.resolve_calls(clean, [_caller_id("clean")])
+        assert between.coverage == FacetCoverage()
+        assert run_state.consecutive_timeout_files == 0
+        last = session.resolve_calls(slow_c, [_caller_id("slow_c")])
+
+    # 2 + 1 is not a streak of 3: no restart, nothing charged.
+    assert run_state.consecutive_timeout_files == 1
+    assert run_state.restart_count == 0
+    assert run_state.wedged_restart_count == 0
+    assert session.spawns == 1
+    assert not _wedged_findings(last.findings)
+
+
+def test_pyright_session_persistent_wedge_ends_poisoned_not_in_a_restart_loop(
+    tmp_path: Path,
+) -> None:
+    # Every file wedges the process, including the ones after each restart.
+    # Threshold 2, run-level cap 1: files 1-2 buy the one permitted restart;
+    # files 3-4 trip the cap and poison the run; file 5 is honest collateral.
+    stems = [f"slow_{index}" for index in range(4)]
+    modules = {stem: _write_named_module(tmp_path, stem) for stem in stems}
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        timeout_stems=set(stems),
+        max_consecutive_timeout_files=2,
+        max_restarts_per_run=1,
+        run_state=run_state,
+    ) as session:
+        results = [session.resolve_calls(modules[stem], [_caller_id(stem)]) for stem in stems]
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+
+    assert run_state.disabled is True
+    assert run_state.disabled_reason == "pyright_poisoned"
+    assert run_state.restart_count == 2  # one restart + the charge that tripped the cap
+    assert run_state.wedged_restart_count == 2
+    assert session.spawns == 2  # initial + one restart; the second was refused
+    # The file that tripped the cap still owns its own timeout hole.
+    assert results[-1].coverage == _TIMEOUT_COVERAGE
+    codes = _finding_codes(results[-1].findings)
+    assert FINDING_PYRIGHT_WEDGED_RESTART in codes
+    assert FINDING_PYRIGHT_POISON_FRAME in codes
+    assert _wedged_findings(results[-1].findings)[0]["metadata"]["outcome"] == "cap_exceeded"
+    assert after.coverage == FacetCoverage.degraded(
+        "pyright_poisoned", transient=True, collateral=True
+    )
+
+
+def test_pyright_session_wedge_restart_respects_total_latency_budget(tmp_path: Path) -> None:
+    stems = ["slow_a", "slow_b"]
+    modules = {stem: _write_named_module(tmp_path, stem) for stem in stems}
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        timeout_stems=set(stems),
+        max_consecutive_timeout_files=2,
+        spawn_latency_secs=2.0,  # the initial spawn alone exhausts the budget
+        restart_latency_budget_ms=1_000,
+        run_state=run_state,
+    ) as session:
+        results = [session.resolve_calls(modules[stem], [_caller_id(stem)]) for stem in stems]
+
+    assert run_state.disabled is True
+    assert run_state.disabled_reason == "pyright_restart_cap_exceeded"
+    assert session.spawns == 1
+    assert FINDING_PYRIGHT_TOTAL_RESTART_CAP_EXCEEDED in _finding_codes(results[-1].findings)
+    assert results[-1].coverage == _TIMEOUT_COVERAGE
+
+
+def test_pyright_session_consecutive_timeout_threshold_is_overridable(tmp_path: Path) -> None:
+    slow_a = _write_named_module(tmp_path, "slow_a")
+    slow_b = _write_named_module(tmp_path, "slow_b")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        timeout_stems={"slow_a", "slow_b"},
+        max_consecutive_timeout_files=1,
+        run_state=run_state,
+    ) as session:
+        first = session.resolve_calls(slow_a, [_caller_id("slow_a")])
+        assert session.spawns == 2
+        second = session.resolve_calls(slow_b, [_caller_id("slow_b")])
+
+    assert _wedged_findings(first.findings)
+    assert _wedged_findings(second.findings)
+    assert run_state.restart_count == 2
+    assert session.spawns == 3
+
+
+def test_pyright_session_wedge_restart_at_ceiling_is_deferred_to_the_next_file(
+    tmp_path: Path,
+) -> None:
+    # The streak-closing file's timeout lands with no respawn headroom left
+    # under the host watchdog: the existing deferral mechanism carries the
+    # restart to the next file, which pays the spawn silently.
+    slow_a = _write_named_module(tmp_path, "slow_a")
+    slow_b = _write_named_module(tmp_path, "slow_b")
+    clean = _write_named_module(tmp_path, "clean")
+    run_state = PyrightRunState()
+
+    with RestartProbeSession(
+        tmp_path,
+        timeout_stems={"slow_a", "slow_b"},
+        timeout_latency_secs=118.0,
+        max_consecutive_timeout_files=2,
+        host_file_watchdog_secs=120.0,
+        run_state=run_state,
+    ) as session:
+        session.resolve_calls(slow_a, [_caller_id("slow_a")])
+        second = session.resolve_calls(slow_b, [_caller_id("slow_b")])
+        assert session.spawns == 1
+        assert run_state.restart_already_charged_to_file is True
+        assert run_state.ceiling_deferred_restart_count == 1
+        after = session.resolve_calls(clean, [_caller_id("clean")])
+
+    assert _wedged_findings(second.findings)[0]["metadata"]["outcome"] == "deferred_to_next_file"
+    assert run_state.restart_count == 1
+    assert run_state.consecutive_timeout_files == 0
+    assert session.spawns == 2
+    assert after.coverage == FacetCoverage()
+    assert not _restart_findings(after.findings)

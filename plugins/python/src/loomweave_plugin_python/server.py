@@ -181,6 +181,23 @@ def _resolve_module_path(file_path_raw: str, state: ServerState) -> str:
     return file_path_raw
 
 
+def _pyright_run_stats(run_state: PyrightRunState) -> dict[str, int]:
+    """Run-wide pyright restart accounting (clarion-7fc41105ea).
+
+    These are CUMULATIVE for the run and reported unchanged on every file, so
+    the host must aggregate them with ``max``, never by summing.
+    """
+    return {
+        "pyright_restart_count": run_state.restart_count,
+        "pyright_file_attributed_restart_count": run_state.file_attributed_restart_count,
+        "pyright_file_attributed_respawn_failure_count": (
+            run_state.file_attributed_respawn_failure_count
+        ),
+        "pyright_ceiling_deferred_restart_count": run_state.ceiling_deferred_restart_count,
+        "pyright_init_latency_total_ms": run_state.pyright_init_latency_total_ms,
+    }
+
+
 def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str, Any]:
     """Read the requested file, extract entities + edges, return AnalyzeFileResult shape."""
     empty_stats = {
@@ -194,6 +211,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "pyright_query_latency_ms": [],
         "pyright_index_parse_latency_ms": [],
         "extractor_parse_latency_ms": 0,
+        **_pyright_run_stats(state.pyright_run_state),
         "resolution_coverage": ExtractionStats().resolution_coverage_wire(),
     }
     file_path_raw = params.get("file_path")
@@ -238,6 +256,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "pyright_query_latency_ms": result.stats.pyright_query_latency_ms,
         "pyright_index_parse_latency_ms": result.stats.pyright_index_parse_latency_ms,
         "extractor_parse_latency_ms": result.stats.extractor_parse_latency_ms,
+        **_pyright_run_stats(state.pyright_run_state),
         "resolution_coverage": result.stats.resolution_coverage_wire(),
     }
     return {

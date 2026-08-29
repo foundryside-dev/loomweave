@@ -417,6 +417,10 @@ pub enum WriterCmd {
     UpsertSourceFileResolutionCoverage {
         source_file_id: String,
         coverage: crate::resolution_coverage::SourceFileResolutionCoverage,
+        /// Whether the file's bytes differ from its last-analysed hash.
+        /// Un-sticks the self-inflicted mark (see
+        /// [`crate::resolution_coverage::upsert_source_file_resolution_coverage`]).
+        content_changed: bool,
         updated_at: String,
         ack: Ack<()>,
     },
