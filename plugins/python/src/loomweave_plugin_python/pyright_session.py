@@ -202,10 +202,12 @@ PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 # Coupling: applies to analyze-path requests only. The effective grant there
 #   is ``min(this, remaining file budget)`` (``_budgeted_timeout``), so
 #   ``PYRIGHT_FILE_TIMEOUT_*`` and the host's ``DEFAULT_PLUGIN_FILE_TIMEOUT``
-#   (120 s) still bound a wedged server; the ADR-057 wedge breaker counts
-#   files, not requests, and is unaffected. The teardown ``shutdown`` request
-#   in ``close()`` uses ``PYRIGHT_SHUTDOWN_TIMEOUT_SECS`` instead, not this
-#   constant.
+#   (120 s) still bound a wedged server. The ADR-057 wedge breaker still
+#   counts files, not requests -- the mechanism is unchanged -- but
+#   time-to-detect a wedged server scales with this grant: worst case is
+#   now ~180 s (3 files x 2 passes x 30 s) instead of ~30 s before this
+#   change. The teardown ``shutdown`` request in ``close()`` uses
+#   ``PYRIGHT_SHUTDOWN_TIMEOUT_SECS`` instead, not this constant.
 PYRIGHT_CALL_TIMEOUT_SECS = 30.0
 # Per-LSP-request grant for the ``shutdown`` request issued by ``close()``
 # only -- deliberately NOT ``PYRIGHT_CALL_TIMEOUT_SECS``. ADR-035 —

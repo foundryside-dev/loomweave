@@ -35,8 +35,8 @@ pub use jail::{JailError, jail, jail_to_string};
 pub use limits::{
     BreakerState, CapExceeded, ContentLengthCeiling, DEFAULT_MAX_NOFILE, DEFAULT_MAX_NPROC,
     DEFAULT_MAX_RSS_MIB, EntityCountCap, FINDING_DISABLED_PATH_ESCAPE, FINDING_ENTITY_CAP,
-    FINDING_FRAME_OVERSIZE, FINDING_OOM_KILLED, FINDING_PATH_ESCAPE, PathEscapeBreaker,
-    apply_prlimit_as, apply_prlimit_nofile_nproc, effective_rss_mib,
+    FINDING_FRAME_OVERSIZE, FINDING_OOM_KILLED, FINDING_PATH_ESCAPE, LANGUAGE_SERVER_MAX_AS_MIB,
+    PathEscapeBreaker, apply_prlimit_as, apply_prlimit_nofile_nproc, effective_rss_mib,
 };
 pub use manifest::{Manifest, ManifestError, OntologyEntityRole, parse_manifest};
 // `make_notification` and `make_request` are intentionally omitted —
