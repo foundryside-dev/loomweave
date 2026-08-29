@@ -13,6 +13,11 @@ The order below is a CROSS-LANGUAGE CONTRACT with
 ``crates/loomweave-core/src/plugin/interpreter.rs`` (the host runs the same
 discovery, exports the winner as ``LOOMWEAVE_PYTHON_INTERPRETER``, and keys the
 incremental skip on it). Change both or neither.
+
+Paths are returned as absolute (normalised, no `..`/`.`) but preserve symlinks.
+A venv's ``bin/python`` is typically a symlink to the base interpreter; handing
+pyright the symlink path keeps it within the project's venv site-packages, while
+resolving to the realpath would escape to the base interpreter's site-packages.
 """
 
 from __future__ import annotations
@@ -39,7 +44,13 @@ INTERPRETER_OVERRIDE_ENV: Final = "LOOMWEAVE_PYTHON_INTERPRETER"
 
 InterpreterSource = Literal["override", "dotvenv", "virtual_env", "conda", "path", "none"]
 
-_PINNED_SOURCES: Final[frozenset[str]] = frozenset({"override", "dotvenv", "virtual_env", "conda"})
+_PREFIX_SOURCES: Final[tuple[tuple[str, InterpreterSource], ...]] = (
+    ("VIRTUAL_ENV", "virtual_env"),
+    ("CONDA_PREFIX", "conda"),
+)
+_PINNED_SOURCES: Final[frozenset[InterpreterSource]] = frozenset(
+    {"override", "dotvenv", "virtual_env", "conda"},
+)
 
 
 @dataclass(frozen=True)
@@ -57,7 +68,7 @@ class ProjectInterpreter:
 
 def _usable(candidate: Path) -> Path | None:
     if candidate.is_file() and os.access(candidate, os.X_OK):
-        return candidate.resolve()
+        return candidate.absolute()
     return None
 
 
@@ -77,12 +88,12 @@ def discover_project_interpreter(
         )
     if (hit := _usable(Path(project_root) / ".venv" / "bin" / "python")) is not None:
         return ProjectInterpreter(path=str(hit), source="dotvenv")
-    for var, source in (("VIRTUAL_ENV", "virtual_env"), ("CONDA_PREFIX", "conda")):
+    for var, source in _PREFIX_SOURCES:
         prefix = env.get(var)
         if prefix and (hit := _usable(Path(prefix) / "bin" / "python")) is not None:
-            return ProjectInterpreter(path=str(hit), source=source)  # type: ignore[arg-type]
+            return ProjectInterpreter(path=str(hit), source=source)
     for name in ("python", "python3"):
-        found = shutil.which(name, path=env.get("PATH"))
+        found = shutil.which(name, path=env.get("PATH", ""))
         if found is not None and (hit := _usable(Path(found))) is not None:
             return ProjectInterpreter(path=str(hit), source="path")
     return ProjectInterpreter(path=None, source="none")

@@ -32,7 +32,7 @@ def test_dotvenv_wins_over_virtual_env_and_path(tmp_path: Path) -> None:
 
     found = discover_project_interpreter(tmp_path, environ)
 
-    assert found == ProjectInterpreter(path=str(dotvenv.resolve()), source="dotvenv")
+    assert found == ProjectInterpreter(path=str(dotvenv), source="dotvenv")
     assert found.pinned
 
 
@@ -43,7 +43,7 @@ def test_override_env_wins_over_dotvenv(tmp_path: Path) -> None:
     found = discover_project_interpreter(tmp_path, {INTERPRETER_OVERRIDE_ENV: str(override)})
 
     assert found.source == "override"
-    assert found.path == str(override.resolve())
+    assert found.path == str(override)
     assert found.pinned
 
 
@@ -56,7 +56,7 @@ def test_unusable_override_is_ignored_and_discovery_continues(
     found = discover_project_interpreter(tmp_path, {INTERPRETER_OVERRIDE_ENV: str(missing)})
 
     assert found.source == "dotvenv"
-    assert found.path == str(dotvenv.resolve())
+    assert found.path == str(dotvenv)
     assert INTERPRETER_OVERRIDE_ENV in capsys.readouterr().err
 
 
@@ -72,12 +72,12 @@ def test_virtual_env_then_conda_then_path(tmp_path: Path) -> None:
             "CONDA_PREFIX": str(conda.parent.parent),
             "PATH": str(on_path.parent),
         },
-    ) == ProjectInterpreter(path=str(venv.resolve()), source="virtual_env")
+    ) == ProjectInterpreter(path=str(venv), source="virtual_env")
     assert discover_project_interpreter(
         tmp_path, {"CONDA_PREFIX": str(conda.parent.parent), "PATH": str(on_path.parent)}
-    ) == ProjectInterpreter(path=str(conda.resolve()), source="conda")
+    ) == ProjectInterpreter(path=str(conda), source="conda")
     unpinned = discover_project_interpreter(tmp_path, {"PATH": str(on_path.parent)})
-    assert unpinned == ProjectInterpreter(path=str(on_path.resolve()), source="path")
+    assert unpinned == ProjectInterpreter(path=str(on_path), source="path")
     assert not unpinned.pinned
 
 
@@ -87,7 +87,7 @@ def test_path_prefers_python_over_python3(tmp_path: Path) -> None:
 
     found = discover_project_interpreter(tmp_path, {"PATH": str(tmp_path / "bin")})
 
-    assert found.path == str(py.resolve())
+    assert found.path == str(py)
 
 
 def test_nothing_found_is_none_and_unpinned(tmp_path: Path) -> None:
@@ -113,4 +113,43 @@ def test_environ_defaults_to_os_environ(tmp_path: Path, monkeypatch: pytest.Monk
     dotvenv = _make_python(tmp_path / ".venv" / "bin" / "python")
     monkeypatch.delenv(INTERPRETER_OVERRIDE_ENV, raising=False)
 
-    assert discover_project_interpreter(tmp_path).path == str(dotvenv.resolve())
+    assert discover_project_interpreter(tmp_path).path == str(dotvenv)
+
+
+def test_empty_environ_does_not_leak_to_os_environ(tmp_path: Path) -> None:
+    # With an empty environ (no PATH), even if os.environ has a python on PATH,
+    # the discovery should return "none" because the injected environ takes precedence.
+    found = discover_project_interpreter(tmp_path, {})
+
+    assert found == ProjectInterpreter(path=None, source="none")
+    assert not found.pinned
+
+
+def test_symlink_paths_are_preserved(tmp_path: Path) -> None:
+    # Create a real interpreter at base/python3.12 and symlink .venv/bin/python to it.
+    base_python = _make_python(tmp_path / "base" / "python3.12")
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    symlink_python = venv_bin / "python"
+    symlink_python.symlink_to(base_python)
+
+    found = discover_project_interpreter(tmp_path, {})
+
+    # The result should be the symlink path, not the target.
+    assert found.path == str(symlink_python)
+    assert found.source == "dotvenv"
+
+
+def test_path_with_python_and_python3_in_different_dirs(tmp_path: Path) -> None:
+    # Create python3 in dirA and python in dirB; PATH is dirA:dirB.
+    # The discovery should find python from dirB (preferred over python3).
+    dir_a = tmp_path / "dir_a"
+    dir_b = tmp_path / "dir_b"
+    _make_python(dir_a / "python3")
+    python_b = _make_python(dir_b / "python")
+
+    path_value = f"{dir_a}:{dir_b}"
+    found = discover_project_interpreter(tmp_path, {"PATH": path_value})
+
+    assert found.path == str(python_b)
+    assert found.source == "path"
