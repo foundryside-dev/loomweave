@@ -14,11 +14,11 @@ The order below is a CROSS-LANGUAGE CONTRACT with
 discovery, exports the winner as ``LOOMWEAVE_PYTHON_INTERPRETER``, and keys the
 incremental skip on it). Change both or neither.
 
-Paths are returned as absolute and lexically normalised (``os.path.abspath``):
-``.``/``..`` collapsed, symlinks preserved. A venv's ``bin/python`` is typically
-a symlink to the base interpreter; handing pyright the symlink path keeps it
-within the project's venv site-packages, while resolving to the realpath would
-escape to the base interpreter's site-packages.
+Paths are returned as absolute and lexically normalised (``Path.absolute`` +
+``os.path.normpath``): ``.``/``..`` collapsed, symlinks preserved. A venv's
+``bin/python`` is typically a symlink to the base interpreter; handing pyright
+the symlink path keeps it within the project's venv site-packages, while
+resolving to the realpath would escape to the base interpreter's site-packages.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ class ProjectInterpreter:
 
 def _usable(candidate: Path) -> Path | None:
     if candidate.is_file() and os.access(candidate, os.X_OK):
-        return Path(os.path.abspath(candidate))  # noqa: PTH100 (abspath normalizes without resolving symlinks; resolve() would break venv isolation)
+        return Path(os.path.normpath(candidate.absolute()))
     return None
 
 
