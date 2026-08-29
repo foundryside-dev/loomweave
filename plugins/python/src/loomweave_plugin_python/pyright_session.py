@@ -615,6 +615,12 @@ class PyrightSession:
         ]
         ast_call_sites_total = sum(len(function.call_sites) for function in requested)
         if not requested:
+            # Deliberately NOT routed through ``_environment_qualified``: no
+            # pyright query was issued, so an unpinned interpreter cannot have
+            # cost this facet any evidence and ``complete`` is exact. Demoting
+            # here would report ``interpreter_unpinned`` on every file with no
+            # requested functions -- a hole that does not exist. Symmetric with
+            # ``_resolve_references_for_file``'s ``not sites`` early return.
             return CallResolutionResult(
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),

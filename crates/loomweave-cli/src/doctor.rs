@@ -2619,6 +2619,11 @@ fn coverage_summary_details(summary: &ResolutionCoverageSummary) -> serde_json::
 /// until then. The analyze lock is the liveness proof: every `analyze` holds
 /// it from before `BeginRun` to after its last transaction, so if `doctor`
 /// can take it, no builder is alive and every `running` row is abandoned.
+///
+/// Root-derived like its sibling checks: both the DB and the analyze-lock
+/// directory come from `project_root` via `loomweave_core::store`, so a linked
+/// worktree resolves to the repository store rather than a store of its own
+/// (clarion-f8b577dc48).
 fn check_runs_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     const ID: &str = "index.runs";
     let db = loomweave_core::store::db_path(project_root);

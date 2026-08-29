@@ -48,10 +48,15 @@ files each say must not be changed on one side alone:
 | 5 | first `python` / `python3` on `PATH` | `path` | no |
 | 6 | nothing found | `none` | no |
 
-An empty env value counts as unset at every rung (not just a missing key) —
-both sides filter it explicitly, because an unfiltered empty `PATH` degrades
-to a CWD-relative `python` lookup on both `shutil.which` and the hand-rolled
-Rust `which`.
+An empty env value counts as unset at every rung (not just a missing key),
+but the two sides reach that by different routes. Python filters explicitly on
+the override rung (`if override:`) and on `VIRTUAL_ENV`/`CONDA_PREFIX`
+(`if prefix and ...`); on the `PATH` rung it relies on `shutil.which(name,
+path="")` returning `None` (CPython >= 3.8), so no explicit filter is written
+there. Rust filters explicitly on all four, because it must: an unfiltered
+empty `PATH` degrades to a CWD-relative `python` lookup — `split_paths("")`
+yields one empty entry, and `"".join("python")` is stat'd against whatever
+directory the `analyze` process happened to be started in.
 
 The returned path is **absolute and lexically normalised, never
 symlink-resolved**: Python does `Path.absolute()` + `os.path.normpath`; Rust
@@ -131,10 +136,11 @@ guards pass:
 
 1. the manifest declares `[capabilities.runtime.pyright]` — nothing else
    consumes the variable;
-2. the operator has not already set `LOOMWEAVE_PYTHON_INTERPRETER` in the
-   analyze process's own environment — an existing value already wins the
-   plugin's own discovery (rung 1), and overwriting it would silently ignore
-   an explicit operator pin;
+2. the operator has not already set a NON-EMPTY `LOOMWEAVE_PYTHON_INTERPRETER`
+   in the analyze process's own environment — an existing value already wins
+   the plugin's own discovery (rung 1), and overwriting it would silently
+   ignore an explicit operator pin. An empty value is "unset" here exactly as
+   it is on the discovery rung above, so the host still exports;
 3. the host's own discovery landed on a **pinned** rung. A bare `PATH` guess
    is no better than the plugin's own fallback, and exporting it would
    present a guess to the plugin as an authoritative pin.
@@ -187,6 +193,15 @@ same ticket, not part of the interpreter-discovery mechanism itself.
   another full re-dispatch of that plugin's files. Pinning a `.venv` or
   setting `LOOMWEAVE_PYTHON_INTERPRETER` removes the flap by moving discovery
   onto a pinned, stable rung.
+- **Rebuilding `.venv` in place does not move the fingerprint.** The marker is
+  the interpreter PATH (never symlink-resolved — see §1), so recreating the
+  virtualenv on a different base Python leaves `.venv/bin/python` at the same
+  path. `plugin_index_contract_changed` does not trip, the incremental
+  content-hash skip holds, and evidence resolved against the OLD base
+  interpreter stays pinned until a `--no-incremental` pass. Folding the
+  symlink's target (or the venv's `pyvenv.cfg`) into the fingerprint is a
+  possible follow-up; it was not taken here because it would re-dispatch on
+  every base-interpreter patch bump.
 - **Windows `Scripts\python.exe` layouts are not covered.** Every rung above
   joins `bin/python` (Unix venv/conda layout); a Windows venv's
   `Scripts\python.exe` is not discovered by any rung. Windows operators need

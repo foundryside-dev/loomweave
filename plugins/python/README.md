@@ -42,8 +42,8 @@ plugin points it at the project's own interpreter deterministically, rather
 than trusting whatever happened to be first on the launching process's
 `PATH` (clarion-5cf9643de9). `discover_project_interpreter`
 (`src/loomweave_plugin_python/interpreter.py`) walks a fixed order and stops
-at the first usable candidate — a file that both exists and passes
-`os.access(path, os.X_OK)`:
+at the first usable candidate — a **regular** file (`Path.is_file()`) that
+passes `os.access(path, os.X_OK)`:
 
 | Rung | Source | Pinned? |
 |---|---|---|
