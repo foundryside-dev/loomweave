@@ -84,22 +84,26 @@ impl ProjectInterpreter {
     }
 }
 
-#[cfg(unix)]
-fn is_executable(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-/// Non-unix targets have no mode bits to consult; the plugin host itself is
-/// Linux/macOS-only, so this arm exists only to keep the crate compiling.
-#[cfg(not(unix))]
-fn is_executable(_meta: &std::fs::Metadata) -> bool {
-    true
+/// Executable *for this process*, decided the way Python's `os.access` decides
+/// it — `access(2)` with `X_OK`, real uid/gid, ACLs and `noexec` mounts
+/// included.
+///
+/// Raw mode bits (`mode & 0o111`) are NOT equivalent and would break the
+/// cross-language contract: a `0o100`-mode file owned by another user, or any
+/// executable under a `noexec` mount, passes a mode-bit test and fails
+/// `access(2)`. The host would then export a path the plugin's own `usable()`
+/// rejects, and the plugin would silently fall through to its next rung — the
+/// exact host/plugin disagreement this module exists to prevent.
+fn is_executable(candidate: &Path) -> bool {
+    nix::unistd::access(candidate, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
 fn usable(candidate: &Path) -> Option<PathBuf> {
-    let meta = std::fs::metadata(candidate).ok()?;
-    if !meta.is_file() || !is_executable(&meta) {
+    // `metadata` follows symlinks, so a venv's `bin/python` is judged by the
+    // base interpreter it points at — which is what `access(2)` does too, and
+    // what Python's `Path.is_file()` does. Only the RETURNED path stays
+    // unresolved.
+    if !std::fs::metadata(candidate).is_ok_and(|meta| meta.is_file()) || !is_executable(candidate) {
         return None;
     }
     // NOT canonicalize(): a venv's bin/python symlinks to the base
@@ -137,6 +141,15 @@ fn which(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
 
 /// Resolve the project's interpreter in the contract order (module docs).
 /// `env` abstracts `std::env::var_os` so tests can inject an environment.
+///
+/// `project_root` MUST be canonicalised by the caller. Discovery joins
+/// `.venv/bin/python` onto the root as given and normalises only lexically, so
+/// a symlinked root yields a symlinked interpreter path and a different
+/// [`ProjectInterpreter::fingerprint`]. `analyze` (which records the
+/// fingerprint) and `PluginHost::spawn_unhandshaken` (which exports the
+/// interpreter) both canonicalise first; dropping it at either site would skew
+/// the marker against the exported interpreter and re-dispatch every run. See
+/// `the_root_canonicalisation_at_both_call_sites_is_load_bearing`.
 #[must_use]
 pub fn discover_project_interpreter(
     project_root: &Path,
@@ -190,6 +203,9 @@ pub fn discover_project_interpreter(
 
 /// The resolver-environment fingerprint a plugin's index depends on: `Some`
 /// only for manifests declaring `[capabilities.runtime.pyright]`.
+///
+/// `project_root` must be canonicalised — see
+/// [`discover_project_interpreter`].
 #[must_use]
 pub fn resolver_environment_for(manifest: &Manifest, project_root: &Path) -> Option<String> {
     manifest.capabilities.runtime.pyright.as_ref()?;
@@ -224,6 +240,53 @@ mod tests {
         // fails loudly. Pinning the literal makes a rename a deliberate act
         // with a test to update on both sides.
         assert_eq!(PYTHON_INTERPRETER_ENV, "LOOMWEAVE_PYTHON_INTERPRETER");
+    }
+
+    #[test]
+    fn the_root_canonicalisation_at_both_call_sites_is_load_bearing() {
+        // `analyze` computes the fingerprint from its canonicalised
+        // `project_root`; `PluginHost::spawn_unhandshaken` re-canonicalises the
+        // root it is handed before running the SAME discovery to decide what to
+        // export. They agree only because BOTH canonicalise and canonicalise is
+        // idempotent.
+        //
+        // Discovery itself is deliberately NOT root-invariant: it joins
+        // `.venv/bin/python` onto the root as given and lexically normalises,
+        // so a symlinked root yields a symlinked interpreter path. That is
+        // correct for a venv (see the symlink test below) but it means dropping
+        // the canonicalisation at either call site would silently skew the
+        // recorded marker against the exported interpreter — an index that
+        // re-dispatches every run. This test pins the skew so that removal
+        // fails loudly here rather than quietly in production.
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        let venv = make_python(&real_root.join(".venv/bin/python"));
+        let link_root = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+        let canonical_root = link_root.canonicalize().unwrap();
+
+        assert_eq!(
+            discover_project_interpreter(&canonical_root, &env(&HashMap::new())).path,
+            Some(venv),
+            "a canonical root finds the project .venv at its real path"
+        );
+        // Idempotence — the property the two call sites actually rely on.
+        assert_eq!(
+            discover_project_interpreter(&canonical_root, &env(&HashMap::new())).fingerprint(),
+            discover_project_interpreter(
+                &canonical_root.canonicalize().unwrap(),
+                &env(&HashMap::new())
+            )
+            .fingerprint(),
+            "canonicalising twice must not move the fingerprint"
+        );
+        // And the skew a dropped canonicalisation would introduce.
+        assert_ne!(
+            discover_project_interpreter(&link_root, &env(&HashMap::new())).fingerprint(),
+            discover_project_interpreter(&canonical_root, &env(&HashMap::new())).fingerprint(),
+            "an UNcanonicalised root yields a different fingerprint — which is why both \
+             `analyze` and `spawn_unhandshaken` must canonicalise before discovering"
+        );
     }
 
     #[test]

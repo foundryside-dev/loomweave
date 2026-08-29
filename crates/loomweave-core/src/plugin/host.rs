@@ -150,7 +150,9 @@ fn effective_as_mib(manifest: &Manifest) -> u64 {
 ///   a guess to the plugin as an authoritative pin.
 ///
 /// `env` abstracts `std::env::var_os` so the unit tests below do not read the
-/// developer's own environment.
+/// developer's own environment. `project_root` must be canonicalised (the
+/// caller passes `canonical_root`) — discovery is not root-invariant, and
+/// `analyze` records its marker from the same canonical root.
 fn exported_interpreter(
     manifest: &Manifest,
     project_root: &Path,

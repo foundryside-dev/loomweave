@@ -74,5 +74,5 @@ which = "6"
 xgraph = "2.0.0"
 assert_cmd = "2"
 tempfile = "3"
-nix = { version = "0.28", default-features = false, features = ["resource"] }
+nix = { version = "0.28", default-features = false, features = ["resource", "fs"] }
 rustix = "1.1.4"

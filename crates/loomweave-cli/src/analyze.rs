@@ -1103,6 +1103,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // of the evidence contract. A change (or an unrecorded prior) forces the
         // same full re-dispatch as a plugin/ontology bump. `None` for plugins
         // that declare no language-server runtime, so they are never affected.
+        // `project_root` is canonicalised (line ~355) and `spawn_unhandshaken`
+        // canonicalises the same root before running the same discovery, so the
+        // fingerprint recorded here and the interpreter exported to the child
+        // are computed from an identical base path.
         let resolver_environment =
             loomweave_core::resolver_environment_for(&plugin.manifest, &project_root);
         let resolver_environment_changed = match prior_plugin_marker {

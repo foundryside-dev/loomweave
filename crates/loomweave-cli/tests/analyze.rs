@@ -5962,6 +5962,11 @@ fn analyze_interpreter_change_forces_full_reanalysis() {
             .env_remove("LOOMWEAVE_PYTHON_INTERPRETER")
             .env_remove("LOOMWEAVE_PHASE3_DUMP_ENV_TO");
         if let Some(dump) = dump {
+            // Remove first: the assertions below read this file as evidence of
+            // what THIS run's plugin child saw. A leftover from an earlier run
+            // would let a run that never started a plugin pass a negative
+            // assertion vacuously.
+            let _ = std::fs::remove_file(dump);
             cmd.env("LOOMWEAVE_PHASE3_DUMP_ENV_TO", dump);
         }
         cmd.assert().success();
@@ -6013,13 +6018,13 @@ fn analyze_interpreter_change_forces_full_reanalysis() {
         "a bare PATH guess is recorded as unpinned, so acquiring a venv at the same \
          path still moves the marker"
     );
-    let dumped = std::fs::read_to_string(&env_dump).unwrap();
-    assert!(
-        !dumped
-            .lines()
-            .any(|line| line.starts_with("LOOMWEAVE_PYTHON_INTERPRETER=")),
-        "an unpinned guess must NOT be exported to the plugin as an authoritative pin; \
-         got:\n{dumped}"
+    let dumped = std::fs::read_to_string(&env_dump).expect(
+        "the plugin child must have run and rewritten the dump — an unreadable file \
+         means the negative assertion below would be vacuous",
+    );
+    assert_eq!(
+        dumped, "",
+        "an unpinned guess must NOT be exported to the plugin as an authoritative pin"
     );
 
     // Run 4 (unchanged again): the force-full is one-shot per interpreter
