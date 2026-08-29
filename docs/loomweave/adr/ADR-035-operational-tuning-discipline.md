@@ -139,6 +139,7 @@ PYRIGHT_FILE_TIMEOUT_CAP_SECS    (90.0,   pyright_session.py)
 MAX_REFERENCE_SITES_PER_FILE     (2000,   pyright_session.py:45)
 MAX_UNRESOLVED_CALLEE_EXPR_BYTES (512,    pyright_session.py:43, wire-paired-with Rust same-name)
 STDERR_TAIL_LIMIT                (65536,  pyright_session.py:49, wire-paired-with STDERR_TAIL_BYTES)
+INTERPRETER_OVERRIDE_ENV         (LOOMWEAVE_PYTHON_INTERPRETER, interpreter.py, override surface — not a tunable; wire-paired-with Rust's PYTHON_INTERPRETER_ENV literal, ADR-058)
 ```
 
 Plus the writer-actor cadence constants in `crates/loomweave-storage/src/writer.rs`:

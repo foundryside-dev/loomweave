@@ -146,6 +146,25 @@ only when an incompatible change is made to that surface. See
   installed catalogue has never been analysed or lacks its local instance
   identity. `loomweave doctor --fix` materialises a private project UUID and
   runs an authoritative analysis to regenerate classifier coverage metadata.
+- **The Python plugin no longer trusts the launcher's `PATH` for call
+  resolution** (clarion-5cf9643de9, [ADR-058](docs/loomweave/adr/ADR-058-project-interpreter-discovery.md)).
+  `pyright-langserver` type-checks against whatever `python` it finds unless
+  pinned; under an agent hook that was the system interpreter, which cannot
+  import the project's own editable install, so `tests/` → `src/` call
+  targets came back empty while coverage still said `complete`, and the
+  incremental skip pinned the hole. Both the host and the Python plugin now
+  run the same fixed discovery order (`LOOMWEAVE_PYTHON_INTERPRETER`
+  override → `.venv` → `VIRTUAL_ENV` → `CONDA_PREFIX` → first
+  `python`/`python3` on `PATH` → none) and pin pyright's `python.pythonPath`
+  to the result. An unpinned interpreter now honestly demotes an
+  otherwise-`complete` facet to `degraded` (`interpreter_unpinned`); a new
+  `plugin_index_meta.resolver_environment` fingerprint (migration 0015)
+  forces a full re-dispatch of the plugin's files when the interpreter
+  changes, and `doctor`'s coverage remedy names the fix
+  (`LOOMWEAVE_PYTHON_INTERPRETER` or `.venv`). `doctor` also gains an
+  `index.runs` check that reaps `running` rows abandoned by a dead builder.
+  The external SQLite read ceiling advances to `user_version` 15
+  (`plugin_index_meta` only; not part of the external safe projection).
 
 ## 1.5.0 — 2026-07-12
 
