@@ -24,7 +24,8 @@
 //! # Memory limit
 //!
 //! On Linux/macOS, [`PluginHost::spawn`] calls [`apply_prlimit_as`] inside
-//! `CommandExt::pre_exec` to set `RLIMIT_AS` before `exec()`. On Linux the same
+//! `CommandExt::pre_exec` to set `RLIMIT_AS` before `exec()` (2 GiB by default;
+//! 8 GiB for language-server plugins — see `effective_as_mib`). On Linux the same
 //! closure also applies `RLIMIT_NOFILE` and `RLIMIT_NPROC`. The closure body
 //! only calls `setrlimit(2)`, which is async-signal-safe per POSIX.1-2017
 //! §2.4.3. The `unsafe` block is the minimum required by the `pre_exec` API.
@@ -67,7 +68,9 @@ use crate::plugin::limits::{
 #[cfg(target_os = "linux")]
 use crate::plugin::limits::{DEFAULT_MAX_NOFILE, apply_prlimit_nofile_nproc};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::plugin::limits::{DEFAULT_MAX_RSS_MIB, apply_prlimit_as, effective_rss_mib};
+use crate::plugin::limits::{
+    DEFAULT_MAX_RSS_MIB, LANGUAGE_SERVER_MAX_AS_MIB, apply_prlimit_as, effective_rss_mib,
+};
 // `DEFAULT_MAX_NPROC` is also reached from the unit tests below, so it needs the
 // `test` arm in addition to Linux.
 #[cfg(any(target_os = "linux", test))]
@@ -105,6 +108,24 @@ fn effective_max_nproc(manifest: &Manifest) -> Option<u64> {
         None
     } else {
         Some(DEFAULT_MAX_NPROC)
+    }
+}
+
+/// The `RLIMIT_AS` ceiling (MiB) to apply to a plugin child.
+///
+/// Plugins that declare the `pyright` runtime capability spawn a Node language
+/// server whose V8 heap *reserves* far more virtual address space than it
+/// touches; the manifest's `expected_max_rss_mb` describes resident memory and
+/// must not cap virtual space for them. Every other plugin keeps ADR-021 §2d's
+/// `min(manifest, DEFAULT_MAX_RSS_MIB)`.
+fn effective_as_mib(manifest: &Manifest) -> u64 {
+    if manifest.capabilities.runtime.pyright.is_some() {
+        LANGUAGE_SERVER_MAX_AS_MIB
+    } else {
+        effective_rss_mib(
+            manifest.capabilities.runtime.expected_max_rss_mb,
+            DEFAULT_MAX_RSS_MIB,
+        )
     }
 }
 
@@ -538,10 +559,7 @@ impl
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::process::CommandExt;
-            let rss_mib = effective_rss_mib(
-                manifest.capabilities.runtime.expected_max_rss_mb,
-                DEFAULT_MAX_RSS_MIB,
-            );
+            let rss_mib = effective_as_mib(&manifest);
 
             #[cfg(target_os = "linux")]
             let max_nofile = DEFAULT_MAX_NOFILE;
@@ -1400,6 +1418,35 @@ ontology_version = "0.1.0"
         // Pyright plugins run with no RLIMIT_NPROC cap: the per-UID-global limit
         // is the wrong tool for a language-server plugin (see effective_max_nproc).
         assert_eq!(effective_max_nproc(&pyright_manifest()), None);
+    }
+
+    #[test]
+    fn language_server_plugins_get_the_wide_address_space_ceiling() {
+        use crate::plugin::limits::{DEFAULT_MAX_RSS_MIB, LANGUAGE_SERVER_MAX_AS_MIB};
+        // Ordinary plugins: min(manifest, core default) exactly as before.
+        assert_eq!(
+            effective_as_mib(&compliant_manifest()),
+            effective_rss_mib(
+                compliant_manifest()
+                    .capabilities
+                    .runtime
+                    .expected_max_rss_mb,
+                DEFAULT_MAX_RSS_MIB
+            )
+        );
+        // Language-server plugins: V8 reserves virtual address space far beyond
+        // its RSS (pyright died at 766 MB RSS under the 2 GiB RLIMIT_AS on a
+        // 13.6k-line file), so the manifest's RSS expectation must NOT cap AS.
+        assert_eq!(
+            effective_as_mib(&pyright_manifest()),
+            LANGUAGE_SERVER_MAX_AS_MIB
+        );
+        // Constant-vs-constant: documents the ordering the module doc promises;
+        // clippy flags it as trivially true, which is the point.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(LANGUAGE_SERVER_MAX_AS_MIB > DEFAULT_MAX_RSS_MIB);
+        }
     }
 
     // ── Full end-to-end helper ────────────────────────────────────────────────

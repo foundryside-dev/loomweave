@@ -258,7 +258,38 @@ impl PathEscapeBreaker {
 ///
 /// Applied via `RLIMIT_AS` in the plugin's child process before `exec`.
 /// Task 6 calls `apply_prlimit_as` inside `CommandExt::pre_exec`.
+///
+/// ADR-035 declaration —
+/// **Basis:** ADR-021 §2d; generous for a CPython/tree-sitter working set.
+/// **Override surface:** none (internal; `loomweave.yaml:plugin_limits.max_rss_mib`
+/// is promised by ADR-021 §4 and not yet implemented). Manifests may only lower it.
+/// **Retune trigger:** an `LMWV-INFRA-PLUGIN-OOM-KILLED` finding from a
+/// well-behaved non-language-server plugin.
+/// **Coupling:** language-server plugins are exempt — see
+/// [`LANGUAGE_SERVER_MAX_AS_MIB`] and `host::effective_as_mib`.
 pub const DEFAULT_MAX_RSS_MIB: u64 = 2 * 1024; // 2 GiB
+
+/// Address-space ceiling for plugins that declare
+/// `[capabilities.runtime.pyright]` (they spawn a Node language server):
+/// **8 GiB**, applied via `RLIMIT_AS` instead of [`DEFAULT_MAX_RSS_MIB`].
+///
+/// `RLIMIT_AS` bounds *virtual* address space. V8 reserves virtual regions
+/// (code range, heap sandbox, per-isolate cages) far larger than the memory it
+/// ever touches, so the 2 GiB ceiling killed `pyright-langserver` on a
+/// 13.6k-line file while it was using ~766 MB of real memory — surfacing as a
+/// self-inflicted `pyright_transport_failure` with no stderr (clarion-353c5b9aa5).
+///
+/// ADR-035 declaration —
+/// **Basis:** measured on elspeth 2026-08-29: unlimited AS completed the file
+/// (1,715 calls edges, 21.6 s); 2 GiB died at 766 MB RSS. 8 GiB leaves ~4×
+/// headroom over Node's default old-space size on a 64-bit host.
+/// **Override surface:** none (internal). The manifest's `expected_max_rss_mb`
+/// is ignored for AS on these plugins — it documents RSS, not virtual space.
+/// **Retune trigger:** an OOM-killed finding from a language-server plugin, or a
+/// pyright major bump that changes V8's reservation strategy.
+/// **Coupling:** `host::effective_as_mib`; `host::effective_max_nproc` (the
+/// same manifest capability selects both exemptions); ADR-021 §2d.
+pub const LANGUAGE_SERVER_MAX_AS_MIB: u64 = 8 * 1024; // 8 GiB
 
 /// Compute the effective RSS ceiling as the minimum of the manifest value and
 /// the core default.
