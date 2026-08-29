@@ -573,6 +573,10 @@ class PyrightSession:
         function_ids: Sequence[str],
     ) -> CallResolutionResult:
         path = Path(file_path).resolve()
+        # ``_invalidate_partial_frame`` charges its kill to this path. Only
+        # ``didOpen`` exceeds PIPE_BUF, so a partial write can only happen
+        # inside a ``resolve_*`` call that just set this field -- any future
+        # large write outside these paths must set and clear it too.
         self._path_in_flight = path
         # The calls pass is a file's first facet: start its shared window
         # fresh so a stale deadline from an earlier visit is never reused.
@@ -1525,6 +1529,17 @@ class PyrightSession:
 
     def _start_process(self, init_timeout_secs: float | None = None) -> bool:
         """Spawn + initialize; ``init_timeout_secs`` bounds the handshake below the default."""
+        # ANY spawn consumes the one-shot uncharged-restart flag, not just the
+        # ones reached through ``_ensure_process``. The flag buys exactly one
+        # free respawn (ADR-057 §3) and a spawn is happening here, so leaving
+        # it armed would let it swallow a LATER, unrelated dead-on-arrival --
+        # costing that death its FINDING_PYRIGHT_RESTART and its
+        # MAX_PYRIGHT_RESTARTS_PER_RUN slot. The route that reaches this
+        # without ``_ensure_process`` is the wedge breaker's
+        # ``_restart_process_for_file``. ``_ensure_process``'s own branches
+        # already consumed it, so this is idempotent there; a respawn whose
+        # bounded handshake times out re-arms it immediately afterwards.
+        self._consume_deferred_restart()
         started = self._now()
         try:
             ok = self._spawn_and_initialize(init_timeout_secs)

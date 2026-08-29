@@ -4362,3 +4362,54 @@ def test_close_shares_one_deadline_across_shutdown_and_exit(tmp_path: Path) -> N
     # grant would have waited PYRIGHT_SHUTDOWN_TIMEOUT_SECS of REAL time.
     assert elapsed < 1.0, f"exit write got its own fresh grant: {elapsed:.2f}s"
     assert killed
+
+
+class _SpawnCountingSession(PyrightSession):
+    """Fakes only the spawn; every other lifecycle path is production code."""
+
+    def __init__(self, project_root: Path, *, run_state: PyrightRunState | None = None) -> None:
+        super().__init__(project_root, executable=sys.executable, run_state=run_state)
+        self.spawns = 0
+
+    def _spawn_and_initialize(self, init_timeout_secs: float | None = None) -> bool:
+        _ = init_timeout_secs
+        self.spawns += 1
+        self._process = cast("Any", _FakeProcess())
+        return True
+
+
+def test_any_spawn_consumes_the_one_shot_uncharged_restart_flag(tmp_path: Path) -> None:
+    """The uncharged-restart flag can never outlive the spawn that spends it.
+
+    ``_invalidate_partial_frame`` arms ADR-057 §3's one-shot flag, and the
+    wedge breaker's ``_restart_process_for_file`` reaches ``_start_process``
+    WITHOUT passing through ``_ensure_process`` -- the one route that used to
+    leave it armed. With a live process then in hand, later
+    ``_ensure_process`` calls take their ``poll() is None`` branch and never
+    consume it, so the next genuine dead-on-arrival would be spawned silently:
+    one FINDING_PYRIGHT_RESTART and one MAX_PYRIGHT_RESTARTS_PER_RUN slot lost.
+    """
+    run_state = PyrightRunState()
+    session = _SpawnCountingSession(tmp_path, run_state=run_state)
+    module = tmp_path / "demo.py"
+
+    # A half-written didOpen invalidated the transport: kill + arm the flag.
+    session._path_in_flight = module  # noqa: SLF001
+    session._process = cast("Any", _FakeProcess())  # noqa: SLF001
+    session._invalidate_partial_frame()  # noqa: SLF001
+    assert run_state.restart_already_charged_to_file is True
+    assert session._process is None  # noqa: SLF001
+
+    # The wedge breaker respawns for the same file, bypassing _ensure_process.
+    session._file_started_at[module] = session._now()  # noqa: SLF001
+    assert session._restart_process_for_file(module) == "restarted"  # noqa: SLF001
+    assert session.spawns == 1
+    assert run_state.restart_already_charged_to_file is False, "the flag outlived its spawn"
+    assert run_state.restart_charged_to_path is None
+
+    # ...so an unrelated death later in the run is charged and reported as normal.
+    cast("_FakeProcess", session._process).die()  # noqa: SLF001
+    assert session._ensure_process() is True  # noqa: SLF001
+    assert session.spawns == 2
+    assert run_state.restart_count == 1
+    assert FINDING_PYRIGHT_RESTART in _finding_codes(session._pop_findings())  # noqa: SLF001
