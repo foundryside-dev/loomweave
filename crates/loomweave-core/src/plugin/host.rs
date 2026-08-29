@@ -142,9 +142,12 @@ fn effective_as_mib(manifest: &Manifest) -> u64 {
 /// the index never depends on the launcher's `PATH`. Three guards:
 /// - only plugins declaring `[capabilities.runtime.pyright]` are pointed at an
 ///   interpreter — nothing else consumes the variable;
-/// - an operator's own [`PYTHON_INTERPRETER_ENV`] is left untouched (it already
-///   wins the plugin's own discovery, and overwriting it would silently ignore
-///   an explicit pin);
+/// - an operator's own NON-EMPTY [`PYTHON_INTERPRETER_ENV`] is left untouched
+///   (it already wins the plugin's own discovery, and overwriting it would
+///   silently ignore an explicit pin). An EMPTY value is "unset" here exactly
+///   as it is on both discoveries' override rung, so the host still exports;
+///   treating `""` as a set override would leave the plugin with an empty
+///   variable it also ignores, and no interpreter at all;
 /// - only a PINNED (project-owned) choice is exported. A bare `PATH` guess is
 ///   no better than the plugin's own fallback, and exporting it would present
 ///   a guess to the plugin as an authoritative pin.
@@ -158,7 +161,9 @@ fn exported_interpreter(
     project_root: &Path,
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    if manifest.capabilities.runtime.pyright.is_none() || env(PYTHON_INTERPRETER_ENV).is_some() {
+    if manifest.capabilities.runtime.pyright.is_none()
+        || env(PYTHON_INTERPRETER_ENV).is_some_and(|value| !value.is_empty())
+    {
         return None;
     }
     let chosen = discover_project_interpreter(project_root, env);
@@ -1619,6 +1624,19 @@ ontology_version = "0.1.0"
             exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &overridden),
             None,
             "an operator override must survive untouched"
+        );
+        // ...but an EMPTY value is not an override. Both discoveries treat
+        // `""` as unset on the override rung (`if override:` in Python,
+        // `.filter(|v| !v.is_empty())` in Rust), so a bare `is_some()` guard
+        // here would suppress the export for a variable the plugin then also
+        // ignores — leaving the child with no interpreter at all, which is the
+        // launcher-dependent hole this export exists to close.
+        let empty_override =
+            |key: &str| -> Option<OsString> { (key == PYTHON_INTERPRETER_ENV).then(OsString::new) };
+        assert_eq!(
+            exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &empty_override),
+            Some(venv.clone()),
+            "an empty override is unset: the host still exports its own pinned choice"
         );
         // An UNPINNED (bare `PATH`) choice is not exported: presenting a guess
         // to the plugin as an authoritative pin buys nothing over its own

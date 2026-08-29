@@ -2546,8 +2546,8 @@ fn render_resolution_coverage_check(
     let summary_clause = format!(
         "{calls} file(s) with degraded call resolution, {references} with degraded reference \
          resolution ({transient} transient, re-dispatched by the next analyze; {exhausted} \
-         exhausted the re-dispatch budget; {persistent} content-determined: syntax error / \
-         site cap)"
+         exhausted the re-dispatch budget; {persistent} content- or environment-determined: \
+         syntax error / site cap / interpreter_unpinned)"
     );
 
     if let Some(count) = reset_count {
@@ -2653,14 +2653,10 @@ fn check_runs_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
         .with_details(details),
         Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(_guard)) if fix => {
             match repair_abandoned_runs(&db) {
-                Ok(count) => DoctorJsonCheck::fixed(
-                    ID,
-                    format!(
-                        "marked {count} abandoned running run(s) failed (no live analyze holds the lock)"
-                    ),
-                )
-                .with_details(serde_json::json!({ "repaired_rows": count, "runs": running })),
-                Err(err) => DoctorJsonCheck::problem(ID, format!("abandoned run repair failed: {err}")),
+                Ok(count) => runs_repair_outcome(count, &running),
+                Err(err) => {
+                    DoctorJsonCheck::problem(ID, format!("abandoned run repair failed: {err}"))
+                }
             }
         }
         Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(_guard)) => DoctorJsonCheck::warning(
@@ -2671,7 +2667,9 @@ fn check_runs_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
             ),
         )
         .with_details(details)
-        .with_next_action("Run `loomweave doctor --fix --path <project>` to mark the abandoned runs failed."),
+        .with_next_action(
+            "Run `loomweave doctor --fix --path <project>` to mark the abandoned runs failed.",
+        ),
         Err(err) => DoctorJsonCheck::problem(
             ID,
             format!(
@@ -2681,6 +2679,32 @@ fn check_runs_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
         )
         .with_details(details),
     }
+}
+
+/// Pure half of [`check_runs_json`]'s `--fix` arm: turn the repair's row count
+/// into the report.
+///
+/// `count == 0` is NOT a repair. The `running` rows were read before the
+/// analyze lock was taken, so a run that finished in that window is gone by
+/// the time the UPDATE lands — nothing was abandoned and nothing was marked.
+/// Reporting that as `fixed` with "marked 0 abandoned running run(s) failed"
+/// tells an operator (and `json_report`'s tally) that doctor repaired
+/// something it did not touch, on a run that was healthy all along. It is an
+/// `ok` with the reason named, matching the sibling "no analyze run is
+/// recorded as running" early return.
+fn runs_repair_outcome(count: usize, running: &[Value]) -> DoctorJsonCheck {
+    const ID: &str = "index.runs";
+    if count == 0 {
+        return DoctorJsonCheck::ok(
+            ID,
+            "no analyze run is recorded as running (the run completed before repair)",
+        );
+    }
+    DoctorJsonCheck::fixed(
+        ID,
+        format!("marked {count} abandoned running run(s) failed (no live analyze holds the lock)"),
+    )
+    .with_details(serde_json::json!({ "repaired_rows": count, "runs": running }))
 }
 
 fn running_runs(conn: &Connection) -> rusqlite::Result<Vec<Value>> {
@@ -3907,6 +3931,44 @@ filigree tracks tasks for this project.\n\
     }
 
     #[test]
+    fn resolution_coverage_headline_names_the_environment_determined_reason_too() {
+        // The residual bucket (`persistent`) is everything that is neither
+        // transient nor budget-exhausted, which since ADR-058 includes
+        // `interpreter_unpinned` (`transient == false`, environment- not
+        // content-determined). Calling the whole bucket "content-determined:
+        // syntax error / site cap" told an operator staring at an unpinned
+        // interpreter to go fix their source. The headline must offer the same
+        // three reasons `default_next_action("index.resolution_coverage")`
+        // does, or the two halves of the same check disagree.
+        let before = ResolutionCoverageSummary {
+            degraded_calls: 3,
+            degraded_references: 0,
+            transient: 0,
+            exhausted: 0,
+        };
+        let check =
+            render_resolution_coverage_check(false, &before, RedispatchBudgetReset::NotAttempted);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(
+            check.message.contains(
+                "3 content- or environment-determined: syntax error / site cap / \
+                          interpreter_unpinned"
+            ),
+            "{}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("content-determined: syntax error"),
+            "the old wording mislabelled interpreter_unpinned rows: {}",
+            check.message
+        );
+        assert!(
+            default_next_action("index.resolution_coverage").contains("interpreter_unpinned"),
+            "headline and next action must name the same reasons"
+        );
+    }
+
+    #[test]
     fn resolution_coverage_fix_reread_succeeds_on_the_write_connection() {
         // The re-read rides the same connection as the UPDATE, so the
         // reported counts are the post-reset ones even though no second
@@ -3995,6 +4057,42 @@ filigree tracks tasks for this project.\n\
         assert_eq!(run_status(&conn, "stuck-a"), "failed");
         assert_eq!(run_status(&conn, "stuck-b"), "failed");
         assert_eq!(run_status(&conn, "done"), "completed");
+    }
+
+    #[test]
+    fn runs_repair_that_marked_nothing_is_ok_not_fixed() {
+        // The `running` rows are read BEFORE the analyze lock is taken, so a
+        // run that completed in that window leaves zero rows for the UPDATE.
+        // The race is not deterministically reproducible through
+        // `check_runs_json` (there is no seam between the read and the lock),
+        // so the outcome half is tested directly.
+        let running = vec![serde_json::json!({ "id": "raced" })];
+        let none = runs_repair_outcome(0, &running);
+        assert_eq!(none.status, "ok", "{}", none.message);
+        assert!(!none.fixed, "nothing was repaired");
+        assert!(
+            none.message.contains("completed before repair"),
+            "{}",
+            none.message
+        );
+        assert!(
+            !none.message.contains("marked 0"),
+            "must not narrate a no-op as a repair: {}",
+            none.message
+        );
+        assert!(none.details.is_none());
+
+        let repaired = runs_repair_outcome(2, &running);
+        assert_eq!(repaired.status, "fixed", "{}", repaired.message);
+        assert!(repaired.fixed);
+        assert!(
+            repaired.message.contains("marked 2"),
+            "{}",
+            repaired.message
+        );
+        let details = repaired.details.as_ref().unwrap();
+        assert_eq!(details["repaired_rows"], 2);
+        assert_eq!(details["runs"][0]["id"], "raced");
     }
 
     #[test]

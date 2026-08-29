@@ -98,7 +98,35 @@ fn is_executable(candidate: &Path) -> bool {
     nix::unistd::access(candidate, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
+/// Drop trailing `/` characters, the way `PurePath` does at construction on
+/// the Python side — WITHOUT touching anything else about the path.
+///
+/// Python's `Path('/x/python/')` is already `/x/python` before `is_file()`
+/// ever runs, so the plugin accepts an override written with a trailing
+/// slash. Rust keeps the separator, and both `stat(2)` and `access(2)` then
+/// fail with `ENOTDIR` on a regular file — so the host would reject an
+/// override the plugin accepts, exporting nothing while the plugin pins the
+/// very path the operator asked for. Converging on ACCEPTANCE (rather than
+/// making Python reject) keeps the operator-visible behaviour unchanged.
+///
+/// The root itself is never stripped: `/` stays `/` (and `//` collapses to
+/// `/`), so a candidate can never become the empty path.
+fn strip_trailing_separators(candidate: &Path) -> &Path {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = candidate.as_os_str().as_bytes();
+    let mut end = bytes.len();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    Path::new(std::ffi::OsStr::from_bytes(&bytes[..end]))
+}
+
 fn usable(candidate: &Path) -> Option<PathBuf> {
+    // One stripped value feeds all three of `metadata`, `access(2)` and
+    // `absolute` below: `access(2)` fails ENOTDIR on a trailing separator
+    // exactly as `metadata` does, so stripping for only one of them would
+    // still reject a `…/python/` override.
+    let candidate = strip_trailing_separators(candidate);
     // `metadata` follows symlinks, so a venv's `bin/python` is judged by the
     // base interpreter it points at — which is what `access(2)` does too, and
     // what Python's `Path.is_file()` does. Only the RETURNED path stays
@@ -522,6 +550,39 @@ mod tests {
         let found = discover_project_interpreter(dir.path(), &env(&HashMap::new()));
         assert_eq!(found.path, Some(link), "the symlink path, not its target");
         assert_eq!(found.source, InterpreterSource::DotVenv);
+    }
+
+    #[test]
+    fn an_override_with_a_trailing_separator_is_accepted_like_the_plugin_accepts_it() {
+        // CROSS-LANGUAGE CONTRACT. Python's `Path('/x/python/')` drops the
+        // separator at construction, so `is_file()` succeeds and the plugin
+        // pins the override. Rust's `metadata`/`access(2)` on the raw
+        // `…/python/` fail with ENOTDIR, so without the strip the HOST would
+        // fall through to `.venv` (or export nothing) while the PLUGIN pinned
+        // the operator's path — the two disagreeing on the same environment,
+        // which is the failure mode this module exists to prevent. The
+        // returned path must also be the stripped, normalised one, byte-equal
+        // to what Python's `os.path.normpath` yields. Pinned by the Python
+        // test `test_override_with_a_trailing_separator_matches_the_rust_host`.
+        let dir = tempfile::tempdir().unwrap();
+        let real = make_python(&dir.path().join("real/bin/python"));
+        let with_slash = format!("{}/", real.display());
+        let map = HashMap::from([(PYTHON_INTERPRETER_ENV, with_slash)]);
+        assert_eq!(
+            discover_project_interpreter(dir.path(), &env(&map)),
+            ProjectInterpreter {
+                path: Some(real),
+                source: InterpreterSource::Override
+            }
+        );
+        // The root is never stripped away — `/` must stay a path, not become
+        // the empty one (which `metadata` would answer for the CWD).
+        assert_eq!(strip_trailing_separators(Path::new("/")), Path::new("/"));
+        assert_eq!(strip_trailing_separators(Path::new("//")), Path::new("/"));
+        assert_eq!(
+            strip_trailing_separators(Path::new("/x/python///")),
+            Path::new("/x/python")
+        );
     }
 
     #[test]

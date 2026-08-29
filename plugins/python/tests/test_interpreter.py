@@ -171,3 +171,23 @@ def test_override_path_is_lexically_normalised(tmp_path: Path) -> None:
     # Should normalize to the real path, not keep the "..".
     assert found.path == str(real_python)
     assert found.source == "override"
+
+
+def test_override_with_a_trailing_separator_matches_the_rust_host(tmp_path: Path) -> None:
+    """CROSS-LANGUAGE CONTRACT: ``<dir>/real/bin/python/`` resolves the same on both sides.
+
+    This passes because ``PurePath`` drops trailing separators at
+    *construction* -- ``Path('/x/python/')`` is already ``/x/python`` before
+    ``is_file()`` runs -- not because ``stat(2)`` tolerates them; a raw
+    ``stat("/x/python/")`` fails with ENOTDIR. Rust has no such construction
+    step, so ``interpreter.rs`` strips the separator explicitly
+    (``strip_trailing_separators``) to reach this same answer. The assertion
+    exists to pin the accepted-and-normalised behaviour so a future change on
+    either side has to break a test rather than silently split the two.
+    """
+    real_python = _make_python(tmp_path / "real" / "bin" / "python")
+
+    found = discover_project_interpreter(tmp_path, {INTERPRETER_OVERRIDE_ENV: f"{real_python}/"})
+
+    assert found == ProjectInterpreter(path=str(real_python), source="override")
+    assert found.pinned
