@@ -30,6 +30,7 @@ from typing import IO, Any
 
 from loomweave_plugin_python import __version__
 from loomweave_plugin_python.extractor import ExtractionStats, extract_with_stats
+from loomweave_plugin_python.interpreter import ProjectInterpreter, discover_project_interpreter
 from loomweave_plugin_python.pyright_session import PyrightRunState, PyrightSession
 from loomweave_plugin_python.stdout_guard import install_stdio
 from loomweave_plugin_python.wardline_descriptor import WardlineVocabulary, load_wardline_descriptor
@@ -64,6 +65,7 @@ class ServerState:
     pyright_files_since_restart: int = 0
     pyright_run_state: PyrightRunState = field(default_factory=PyrightRunState)
     wardline_vocabulary: WardlineVocabulary | None = field(default=None)
+    interpreter: ProjectInterpreter | None = field(default=None)
 
 
 def read_frame(stream: IO[bytes]) -> dict[str, Any] | None:
@@ -152,11 +154,19 @@ def handle_initialize(params: dict[str, Any], state: ServerState) -> dict[str, A
             "loomweave-plugin-python: Wardline vocabulary descriptor unavailable; "
             "continuing without Wardline annotation metadata\n",
         )
+    state.interpreter = discover_project_interpreter(state.project_root or Path.cwd())
     return {
         "name": "loomweave-plugin-python",
         "version": __version__,
         "ontology_version": ONTOLOGY_VERSION,
-        "capabilities": {"wardline": wardline.as_capability()},
+        "capabilities": {
+            "wardline": wardline.as_capability(),
+            "python_interpreter": {
+                "path": state.interpreter.path,
+                "source": state.interpreter.source,
+                "pinned": state.interpreter.pinned,
+            },
+        },
     }
 
 
@@ -222,6 +232,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         state.pyright = PyrightSession(
             state.project_root or path.parent,
             run_state=state.pyright_run_state,
+            interpreter=state.interpreter,
         )
     try:
         source = path.read_text(encoding="utf-8")

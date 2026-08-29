@@ -5,6 +5,13 @@ is decided by WHICH catch-site caught the failure, never by message text:
 
 - ``syntax_error`` / ``reference_site_cap`` -- content-determined
   (``transient=False``); a re-run hits them again.
+- ``interpreter_unpinned`` -- environment-determined (``transient=False``,
+  ``collateral=False``): no project-owned interpreter (override / ``.venv`` /
+  ``VIRTUAL_ENV`` / ``CONDA_PREFIX``) was found, so pyright resolved against
+  whatever ``python`` was on ``PATH`` and cross-module targets may be missing
+  (clarion-5cf9643de9). Only applied to a facet that would otherwise be
+  ``complete``. A re-run with the same interpreter cannot recover it; the
+  host re-dispatches when the interpreter fingerprint changes.
 - ``pyright_timeout`` -- this file's own per-query or file budget expired
   while pyright stayed alive. Self-inflicted (``collateral=False``). A single
   timeout does not restart: the process is slow, not dead. A streak of
@@ -65,6 +72,7 @@ from loomweave_plugin_python.call_resolver import (
 )
 from loomweave_plugin_python.entity_id import entity_id
 from loomweave_plugin_python.extractor import module_dotted_name
+from loomweave_plugin_python.interpreter import ProjectInterpreter, discover_project_interpreter
 from loomweave_plugin_python.qualname import reconstruct_qualname
 from loomweave_plugin_python.reference_resolver import (
     ReferenceResolutionResult,
@@ -460,6 +468,7 @@ class PyrightSession:
         max_consecutive_timeout_files: int = MAX_CONSECUTIVE_TIMEOUT_FILES,
         run_state: PyrightRunState | None = None,
         host_file_watchdog_secs: float | None = None,
+        interpreter: ProjectInterpreter | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         # Resolved once per session from the host's env override (see
@@ -471,6 +480,17 @@ class PyrightSession:
         )
         self.executable = executable
         self.env = env
+        # ``self.env`` must be assigned above BEFORE this: ``_subprocess_env()``
+        # merges it over ``os.environ``, so a caller-supplied ``env=`` (tests;
+        # the host's ``LOOMWEAVE_PYTHON_INTERPRETER`` override) steers discovery.
+        self.interpreter = (
+            interpreter
+            if interpreter is not None
+            else discover_project_interpreter(self.project_root, self._subprocess_env())
+        )
+        # Guards the one-per-session stderr announcement in
+        # ``_spawn_and_initialize`` -- one line per process, not per query.
+        self._interpreter_announced = False
         self.install_check = install_check
         self.init_timeout_secs = init_timeout_secs
         self.call_timeout_secs = call_timeout_secs
@@ -666,8 +686,22 @@ class PyrightSession:
             pyright_query_latency_ms=[latency_ms],
             pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
             findings=self._pop_findings(),
-            coverage=coverage,
+            coverage=self._environment_qualified(coverage),
         )
+
+    def _environment_qualified(self, coverage: FacetCoverage) -> FacetCoverage:
+        """Honesty gate for a facet that came back ``complete`` (R1).
+
+        An unpinned interpreter means pyright resolved against whatever
+        ``python`` happened to be on ``PATH``, so a facet that looks
+        ``complete`` may still be missing cross-module targets. Only demotes
+        an already-``complete`` claim -- a facet that is already ``degraded``
+        keeps its real reason (ADR-057): the interpreter is not the cause of
+        that hole and must never mask it.
+        """
+        if coverage.is_degraded or self.interpreter.pinned:
+            return coverage
+        return FacetCoverage.degraded("interpreter_unpinned", transient=False)
 
     def _unavailable_coverage(self) -> FacetCoverage:
         """The coverage for a pass that never got a process.
@@ -828,7 +862,7 @@ class PyrightSession:
             pyright_query_latency_ms=[latency_ms],
             pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
             findings=self._pop_findings(),
-            coverage=coverage,
+            coverage=self._environment_qualified(coverage),
         )
 
     def _resolve_with_pyright(
@@ -1636,7 +1670,19 @@ class PyrightSession:
         # pressure: the per-UID resource squeeze that caused earlier EAGAINs has
         # eased, so the run is healthy again.
         self._run_state.consecutive_spawn_deferrals = 0
+        self._announce_interpreter_once()
         return True
+
+    def _announce_interpreter_once(self) -> None:
+        """Log which interpreter pyright resolved against, once per session."""
+        if self._interpreter_announced:
+            return
+        self._interpreter_announced = True
+        sys.stderr.write(
+            f"loomweave-plugin-python: pyright interpreter "
+            f"{self.interpreter.path or 'none'} "
+            f"(source={self.interpreter.source}, pinned={self.interpreter.pinned})\n",
+        )
 
     def _handle_spawn_oserror(self, exc: OSError, executable: str) -> bool:
         """Triage a ``subprocess.Popen`` failure into transient vs. permanent.
@@ -1821,6 +1867,8 @@ class PyrightSession:
             "useLibraryCodeForTypes": False,
         }
         if section == "python":
+            if self.interpreter.path is not None:
+                return {"pythonPath": self.interpreter.path, "analysis": analysis}
             return {"analysis": analysis}
         if section == "python.analysis":
             return analysis
