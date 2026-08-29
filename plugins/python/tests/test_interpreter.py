@@ -153,3 +153,21 @@ def test_path_with_python_and_python3_in_different_dirs(tmp_path: Path) -> None:
 
     assert found.path == str(python_b)
     assert found.source == "path"
+
+
+def test_override_path_is_lexically_normalised(tmp_path: Path) -> None:
+    # Create a real interpreter and an unnecessary subdirectory for testing.
+    # Pass a path with ".." in it; abspath should normalize it out.
+    real_python = _make_python(tmp_path / "real" / "bin" / "python")
+    _sub = tmp_path / "real" / "sub"
+    _sub.mkdir()
+    # Path with ".." in the middle: real/sub/../bin/python
+    unnormalised_path = tmp_path / "real" / "sub" / ".." / "bin" / "python"
+
+    found = discover_project_interpreter(
+        tmp_path, {INTERPRETER_OVERRIDE_ENV: str(unnormalised_path)}
+    )
+
+    # Should normalize to the real path, not keep the "..".
+    assert found.path == str(real_python)
+    assert found.source == "override"
