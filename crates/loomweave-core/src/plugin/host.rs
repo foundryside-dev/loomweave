@@ -1382,6 +1382,72 @@ ontology_version = "0.4.0"
         crate::plugin::parse_manifest(toml.as_bytes()).expect("valid pyright manifest")
     }
 
+    /// Pyright capability present, but a manifest RSS expectation well BELOW
+    /// the language-server ceiling. Discriminates `effective_as_mib` keying on
+    /// the `pyright` capability from a wrong implementation that keys on the
+    /// manifest's `expected_max_rss_mb` value instead (e.g.
+    /// `if expected_max_rss_mb >= 2048 { LANGUAGE_SERVER_MAX_AS_MIB } else { .. }`,
+    /// which this manifest alone would defeat).
+    fn pyright_small_rss_manifest() -> Manifest {
+        let toml = r#"
+[plugin]
+name = "mock-plugin"
+plugin_id = "mock"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "mock-plugin"
+language = "mock"
+extensions = ["mock"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 64
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[capabilities.runtime.pyright]
+pin = "1.1.409"
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains", "calls"]
+rule_id_prefix = "LMWV-MOCK-"
+ontology_version = "0.4.0"
+"#;
+        crate::plugin::parse_manifest(toml.as_bytes()).expect("valid pyright small-rss manifest")
+    }
+
+    /// No pyright capability, but a manifest RSS expectation AT the
+    /// language-server ceiling's value. Discriminates in the other direction:
+    /// a wrong implementation keyed on `expected_max_rss_mb >= 2048` would
+    /// wrongly grant this ordinary plugin the wide ceiling.
+    fn non_pyright_large_rss_manifest() -> Manifest {
+        let toml = r#"
+[plugin]
+name = "mock-plugin"
+plugin_id = "mock"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "mock-plugin"
+language = "mock"
+extensions = ["mock"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 2048
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains", "calls"]
+rule_id_prefix = "LMWV-MOCK-"
+ontology_version = "0.4.0"
+"#;
+        crate::plugin::parse_manifest(toml.as_bytes())
+            .expect("valid non-pyright large-rss manifest")
+    }
+
     fn reads_outside_manifest() -> Manifest {
         let toml = r#"
 [plugin]
@@ -1440,6 +1506,19 @@ ontology_version = "0.1.0"
         assert_eq!(
             effective_as_mib(&pyright_manifest()),
             LANGUAGE_SERVER_MAX_AS_MIB
+        );
+        // Keying is on the `pyright` capability alone, NOT on the manifest's
+        // `expected_max_rss_mb` value: a pyright plugin with a small manifest
+        // RSS still gets the wide ceiling...
+        assert_eq!(
+            effective_as_mib(&pyright_small_rss_manifest()),
+            LANGUAGE_SERVER_MAX_AS_MIB
+        );
+        // ...and a non-pyright plugin whose manifest RSS happens to equal the
+        // core default does NOT get the wide ceiling.
+        assert_eq!(
+            effective_as_mib(&non_pyright_large_rss_manifest()),
+            DEFAULT_MAX_RSS_MIB
         );
         // Constant-vs-constant: documents the ordering the module doc promises;
         // clippy flags it as trivially true, which is the point.

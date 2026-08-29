@@ -325,6 +325,11 @@ fn setup_language_server_plugin_dir(fixture_bin: &PathBuf) -> TempDir {
     let plugin_dir = TempDir::new().expect("create langsrv plugin tempdir");
     let dest = plugin_dir.path().join("loomweave-plugin-langsrv");
     std::os::unix::fs::symlink(fixture_bin, &dest).expect("symlink loomweave-plugin-langsrv");
+    // plugin_id MUST be "fixture", not "langsrv": the fixture binary hardcodes
+    // its emitted entity id as "fixture:widget:demo.sample" (main.rs:169), and
+    // the host's identity check requires entity_id(plugin_id, kind, qname) to
+    // match that literally — any other plugin_id here would silently drop the
+    // widget entity (identity mismatch), independent of RLIMIT_AS.
     let manifest = r#"
 [plugin]
 name = "loomweave-plugin-langsrv"
@@ -398,7 +403,10 @@ fn wp2_language_server_plugin_survives_a_3gib_virtual_reservation() {
 }
 
 /// The exemption is keyed on the pyright capability alone: the same 3 GiB
-/// reservation from an ordinary plugin still trips ADR-021 §2d's 2 GiB ceiling.
+/// reservation from an ordinary plugin still trips its `RLIMIT_AS` ceiling —
+/// here `min(manifest expected_max_rss_mb = 64 MiB, ADR-021 §2d's 2 GiB
+/// default) = 64 MiB` (see `setup_oom_plugin_dir`), not the 2 GiB default
+/// itself. Either way it is far below the fixture's 3 GiB reservation.
 #[test]
 #[cfg(target_os = "linux")]
 fn wp2_ordinary_plugin_is_still_oom_killed_by_a_3gib_virtual_reservation() {
