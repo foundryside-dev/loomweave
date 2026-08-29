@@ -68,14 +68,28 @@ class FacetCoverage:
     recover coverage (resolver timeout, crash, poison, unavailable binary) and
     False for content-determined limits a re-run would hit again (syntax
     error, per-file site cap, nesting too complex).
+
+    ``collateral`` (clarion-7fc41105ea, ADR-057) is decided by which catch-site
+    built the claim, never by message text. Self-inflicted (``False``) means
+    ONLY: ``pyright_timeout`` on this file's own budget, or
+    ``pyright_transport_failure`` -- pyright died while THIS file's request was
+    in flight (``pyright_local_read_error``, a read error on an unrelated
+    target while pyright stayed alive, is also this file's gap). Everything
+    else is collateral (``True``): ``pyright_restarting`` (found dead on
+    arrival), ``pyright_spawn_failed`` (deferred spawn), and the run-disabled
+    tokens ``pyright_unavailable`` / ``pyright_poisoned`` /
+    ``pyright_restart_cap_exceeded``. The full vocabulary is documented at the
+    top of ``pyright_session.py``.
     """
 
     status: Literal["complete", "degraded"] = "complete"
     reason: str | None = None
     transient: bool = False
-    # The resolver was already disabled by an EARLIER file's failure when this
-    # file arrived: the hole is collateral, not this file's doing. The host
-    # dispatches collateral files first so the troublemaker goes last.
+    # The hole predates this file (pyright already dead, spawn deferred, run
+    # disabled by an EARLIER file's failure): collateral, not this file's
+    # doing. The host dispatches collateral files first so the troublemaker
+    # goes last, and keeps a prior self-inflicted mark sticky across a
+    # collateral run.
     collateral: bool = False
 
     @classmethod

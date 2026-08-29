@@ -400,6 +400,28 @@ pub struct AnalyzeFileStats {
     /// Extractor-side `ast.parse` latency for this file in milliseconds.
     #[serde(default)]
     pub extractor_parse_latency_ms: u64,
+    /// Run-cumulative pyright restart accounting (clarion-7fc41105ea). Each
+    /// of these is the plugin's RUN-LEVEL counter as of this file, reported
+    /// unchanged on every result — the host aggregates with `max`, never a
+    /// sum. `pyright_restart_count` counts restarts NOT attributable to a
+    /// file's own request (found dead on arrival, spawn failure, crash loop);
+    /// `pyright_file_attributed_restart_count` counts immediate restarts
+    /// issued right after a file's own in-flight request killed pyright.
+    #[serde(default)]
+    pub pyright_restart_count: u64,
+    /// See [`Self::pyright_restart_count`].
+    #[serde(default)]
+    pub pyright_file_attributed_restart_count: u64,
+    /// File-attributed immediate restarts whose respawn itself failed.
+    #[serde(default)]
+    pub pyright_file_attributed_respawn_failure_count: u64,
+    /// File-attributed restarts deferred to the next file because the
+    /// crashing file's host-watchdog ceiling had no headroom left.
+    #[serde(default)]
+    pub pyright_ceiling_deferred_restart_count: u64,
+    /// Cumulative wall-clock spent in pyright respawn + initialize this run.
+    #[serde(default)]
+    pub pyright_init_latency_total_ms: u64,
     /// Per-file resolution coverage (clarion-3e517d4aff). A plugin whose
     /// call / reference resolution can fail *transiently* (a language server
     /// that timed out, crashed, or was poisoned for the rest of the run)
@@ -513,6 +535,11 @@ impl AnalyzeFileStats {
             && self.pyright_query_latency_ms.is_empty()
             && self.pyright_index_parse_latency_ms.is_empty()
             && self.extractor_parse_latency_ms == 0
+            && self.pyright_restart_count == 0
+            && self.pyright_file_attributed_restart_count == 0
+            && self.pyright_file_attributed_respawn_failure_count == 0
+            && self.pyright_ceiling_deferred_restart_count == 0
+            && self.pyright_init_latency_total_ms == 0
     }
 }
 
@@ -870,6 +897,11 @@ mod tests {
                 pyright_query_latency_ms: vec![10, 20, 30],
                 pyright_index_parse_latency_ms: vec![8, 13],
                 extractor_parse_latency_ms: 5,
+                pyright_restart_count: 1,
+                pyright_file_attributed_restart_count: 2,
+                pyright_file_attributed_respawn_failure_count: 3,
+                pyright_ceiling_deferred_restart_count: 4,
+                pyright_init_latency_total_ms: 1234,
                 resolution_coverage: None,
             },
             findings: vec![AnalyzeFileFinding {

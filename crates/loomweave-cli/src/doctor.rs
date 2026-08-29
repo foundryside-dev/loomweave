@@ -3558,6 +3558,7 @@ filigree tracks tasks for this project.\n\
                 conn,
                 source_file_id,
                 &degraded,
+                false,
                 &format!("r{run}"),
                 "t",
             )
@@ -3573,6 +3574,7 @@ filigree tracks tasks for this project.\n\
                 conn,
                 source_file_id,
                 &degraded,
+                false,
                 &format!("r{run}"),
                 "t",
             )

@@ -1,3 +1,35 @@
+"""Pyright-backed call / reference resolution for one plugin process.
+
+Coverage reason vocabulary (``FacetCoverage.reason``; ADR-057). ``collateral``
+is decided by WHICH catch-site caught the failure, never by message text:
+
+- ``syntax_error`` / ``reference_site_cap`` -- content-determined
+  (``transient=False``); a re-run hits them again.
+- ``pyright_timeout`` -- this file's own per-query or file budget expired
+  while pyright stayed alive. Self-inflicted (``collateral=False``). A single
+  timeout does not restart: the process is slow, not dead. A streak of
+  ``MAX_CONSECUTIVE_TIMEOUT_FILES`` consecutive files whose calls pass timed
+  out is read as a wedged-but-alive process and restarted once, charged to
+  the run-level ``MAX_PYRIGHT_RESTARTS_PER_RUN`` budget; the streak's files
+  keep their self-inflicted claim.
+- ``pyright_transport_failure`` -- pyright died WHILE THIS FILE'S REQUEST was
+  in flight. Self-inflicted. Restarted immediately, before the result is
+  returned, so the next file arrives at a live process; the restart is
+  file-attributed and does not spend ``MAX_PYRIGHT_RESTARTS_PER_RUN``.
+- ``pyright_local_read_error`` -- an ``OSError`` reading an unrelated target
+  file mid-pass while pyright is confirmed alive. This file's evidence gap,
+  but not a pyright-health event: no restart.
+- ``pyright_restarting`` -- pyright was already dead when this file arrived
+  (it died after answering the previous file). Collateral; the restart spends
+  the run-level ``MAX_PYRIGHT_RESTARTS_PER_RUN`` budget.
+- ``pyright_spawn_failed`` -- a transient spawn deferral (resource pressure)
+  left this file without a process. Collateral.
+- ``pyright_unavailable`` / ``pyright_poisoned`` /
+  ``pyright_restart_cap_exceeded`` -- the run is disabled; every later file is
+  collateral. ``PyrightRunState.disabled_reason`` is the single source of
+  truth for which of these applies.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -42,6 +74,8 @@ from loomweave_plugin_python.reference_resolver import (
 
 FINDING_PYRIGHT_RESTART = "LMWV-PY-PYRIGHT-RESTART"
 FINDING_PYRIGHT_POISON_FRAME = "LMWV-PY-PYRIGHT-POISON-FRAME"
+FINDING_PYRIGHT_WEDGED_RESTART = "LMWV-PY-PYRIGHT-WEDGED-RESTART"
+FINDING_PYRIGHT_TOTAL_RESTART_CAP_EXCEEDED = "LMWV-PY-PYRIGHT-TOTAL-RESTART-CAP"
 FINDING_PYRIGHT_INIT_TIMEOUT = "LMWV-PY-PYRIGHT-INIT-TIMEOUT"
 FINDING_PYRIGHT_UNAVAILABLE = "LMWV-PY-PYRIGHT-UNAVAILABLE"
 FINDING_PYRIGHT_INSTALL_FAILURE = "LMWV-PY-PYRIGHT-INSTALL-FAILURE"
@@ -68,15 +102,72 @@ class PyrightRunState:
     zero on every successful spawn, so intermittent pressure never poisons the
     run, while a sustained run of deferrals still terminates pyright once it
     exceeds ``MAX_CONSECUTIVE_SPAWN_DEFERRALS``.
+
+    Restart attribution (clarion-7fc41105ea, ADR-057):
+
+    - ``restart_count`` counts only restarts NOT attributable to a file --
+      pyright found dead on arrival, i.e. it died after answering the previous
+      file. Guarded by ``MAX_PYRIGHT_RESTARTS_PER_RUN``; exceeding it poisons
+      the run.
+    - ``file_attributed_restart_count`` counts immediate restarts issued right
+      after pyright died during THIS file's own request. These do not spend
+      the run-level cap: the troublemaker owns its hole and the next file must
+      arrive at a live process. Jointly with ``restart_count`` they are bounded
+      by ``MAX_TOTAL_PYRIGHT_RESTARTS_PER_RUN`` and by the cumulative init
+      latency budget ``MAX_PYRIGHT_RESTART_LATENCY_BUDGET_MS``.
+    - ``file_attributed_respawn_failure_count`` counts immediate restarts whose
+      respawn itself failed; the spawn path's own triage decides what happens.
+    - ``ceiling_deferred_restart_count`` / ``restart_already_charged_to_file``
+      / ``restart_charged_to_path``: when the crashing file has too little
+      REAL wall-clock headroom left under the host's per-file watchdog ceiling
+      for a respawn (or a headroom-bounded respawn handshake ran out of it),
+      the respawn is deferred to the next file's ``_ensure_process``. The
+      one-shot flag makes that next file respawn silently instead of being
+      mis-charged as collateral for a death it did not cause; the charged
+      path lets the SAME file's later facet (references after calls) in the
+      same window recognise the dead process as its own doing and stay
+      self-inflicted rather than respawn with no headroom.
+    - ``pyright_init_latency_total_ms`` is the cumulative wall-clock spent in
+      spawn + initialize handshakes for the run.
+    - ``consecutive_timeout_files`` / ``wedged_restart_count``: the
+      wedged-but-alive breaker. A pyright that hangs on every query still
+      answers ``poll()`` as alive, so no death is ever observed and no restart
+      would ever be attempted while every remaining file times out. The
+      counter is incremented once per ``resolve_calls`` whose coverage lands
+      on ``pyright_timeout`` (the calls pass is a file's first facet; the
+      references pass does not participate), reset whenever a calls pass
+      completes or a process is successfully spawned. Reaching
+      ``MAX_CONSECUTIVE_TIMEOUT_FILES`` restarts pyright once, charged to
+      ``restart_count`` so a persistent wedge is bounded by the run-level cap
+      like any other crash loop.
+    - ``disabled_reason`` is the ONLY authority on why the run is disabled.
+      Every site that sets ``disabled = True`` sets it in the same statement
+      and never overwrites an already-set value.
     """
 
     restart_count: int = 0
     disabled: bool = False
     consecutive_spawn_deferrals: int = 0
+    disabled_reason: str | None = None
+    file_attributed_restart_count: int = 0
+    file_attributed_respawn_failure_count: int = 0
+    ceiling_deferred_restart_count: int = 0
+    restart_already_charged_to_file: bool = False
+    restart_charged_to_path: str | None = None
+    pyright_init_latency_total_ms: int = 0
+    consecutive_timeout_files: int = 0
+    wedged_restart_count: int = 0
 
 
 MAX_UNRESOLVED_CALLEE_EXPR_BYTES = 512
 MAX_PYRIGHT_RESTARTS_PER_RUN = 3
+# Safety budget on ALL restarts (run-level + file-attributed) so a corpus whose
+# files each independently crash pyright cannot spend hours re-initialising it.
+# Count OR cumulative init latency trips it: 25 restarts at the 30s init
+# timeout would otherwise be ~12.5 minutes of pure restart overhead; the 4
+# minute latency budget caps that at ~2.7x today's ~90s worst case (ADR-057).
+MAX_TOTAL_PYRIGHT_RESTARTS_PER_RUN = 25
+MAX_PYRIGHT_RESTART_LATENCY_BUDGET_MS = 240_000
 # A spawn that fails with one of these errnos is a *transient* resource-pressure
 # condition (the host is momentarily out of process slots / memory), not a broken
 # install. EAGAIN in particular is what a busy workstation returns from fork(2)
@@ -88,6 +179,11 @@ _TRANSIENT_SPAWN_ERRNOS = frozenset({errno.EAGAIN, errno.ENOMEM, errno.EMFILE, e
 # fires under sustained pressure, never on an intermittent blip. A failed fork
 # costs microseconds, so retrying once per file across a large run is cheap.
 MAX_CONSECUTIVE_SPAWN_DEFERRALS = 50
+# Consecutive files whose calls pass ended in ``pyright_timeout`` before the
+# live-but-unresponsive process is presumed wedged and restarted once
+# (ADR-057). One slow file is just a slow file; three in a row with no
+# completion between them is a process that answers nothing.
+MAX_CONSECUTIVE_TIMEOUT_FILES = 3
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
 PYRIGHT_CALL_TIMEOUT_SECS = 5.0
@@ -104,6 +200,54 @@ PYRIGHT_FILE_TIMEOUT_PER_FUNCTION_SECS = 0.25
 # Stay well under it so the plugin always hands back the partial evidence it
 # resolved before the deadline instead of losing it with the killed call.
 PYRIGHT_FILE_TIMEOUT_CAP_SECS = 90.0
+# Default of the host's per-file watchdog (``DEFAULT_PLUGIN_FILE_TIMEOUT`` in
+# crates/loomweave-cli/src/analyze.rs). The host honours
+# ``LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS`` and the plugin subprocess inherits its
+# environment, so ``resolve_host_file_watchdog_secs()`` reads the SAME override: a
+# session that assumed 120s against a 30s host deadline would respawn pyright
+# in-process past the real deadline and get the whole plugin call killed.
+# An immediate restart extends the crashing file's deadline by the respawn's
+# latency, but never past the ceiling ``first touch + watchdog -
+# FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS``: the margin covers response
+# marshaling plus the AST-extraction latency that runs before ``resolve_calls``
+# is entered (server.py), which this session cannot see. A watchdog too short
+# for the full margin keeps at least half of itself as the window.
+#
+# Whether a respawn is attempted is decided on the REAL headroom
+# ``ceiling - now`` at the moment pyright dies -- not on the file's deadline,
+# which is anchored at file start and says nothing about how late in the
+# window the crash happened. Below ``MIN_RESPAWN_HEADROOM_SECS`` the respawn
+# is deferred to the next file; otherwise the initialize handshake is bounded
+# to the headroom, so a hung respawn times out inside the window and is
+# deferred instead of the host's watchdog killing the whole plugin call.
+HOST_FILE_WATCHDOG_SECS = 120.0
+HOST_FILE_WATCHDOG_ENV = "LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS"
+FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS = 15.0
+# A respawn with less real headroom than this is pointless: pyright's
+# initialize handshake rarely completes faster on a machine that just lost it.
+MIN_RESPAWN_HEADROOM_SECS = 5.0
+
+
+def resolve_host_file_watchdog_secs(environ: Mapping[str, str] | None = None) -> float:
+    """The host's per-file watchdog, as the plugin process can observe it.
+
+    Mirrors ``plugin_file_timeout()`` in crates/loomweave-cli/src/analyze.rs:
+    ``LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS`` when it parses as a positive integer,
+    else the host's default. The host ignores an unparsable value the same way.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(HOST_FILE_WATCHDOG_ENV)
+    if raw is None:
+        return HOST_FILE_WATCHDOG_SECS
+    try:
+        millis = int(raw)
+    except ValueError:
+        return HOST_FILE_WATCHDOG_SECS
+    if millis <= 0:
+        return HOST_FILE_WATCHDOG_SECS
+    return millis / 1000.0
+
+
 STDERR_TAIL_LIMIT = 65536
 PYRIGHT_EXCLUDE_PATTERNS = [
     "**/.weft/**",
@@ -134,7 +278,7 @@ _TYPE_PARAMETER_NODE_NAMES = frozenset({"ParamSpec", "TypeVar", "TypeVarTuple"})
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
 
 class LspTimeoutError(TimeoutError):
@@ -156,9 +300,13 @@ class _CallPassAbort:
     exception type would misfile a timeout as a transport failure.
     """
 
-    reason: Literal["pyright_timeout", "pyright_transport_failure"]
+    reason: Literal["pyright_timeout", "pyright_transport_failure", "pyright_local_read_error"]
     method: str | None
     message: str
+
+
+_InFlightFailureReason = Literal["pyright_transport_failure", "pyright_local_read_error"]
+_RestartOutcome = Literal["restarted", "deferred_to_next_file", "respawn_failed"]
 
 
 @dataclass(frozen=True)
@@ -242,10 +390,21 @@ class PyrightSession:
         file_timeout_per_function_secs: float = PYRIGHT_FILE_TIMEOUT_PER_FUNCTION_SECS,
         file_timeout_cap_secs: float = PYRIGHT_FILE_TIMEOUT_CAP_SECS,
         max_restarts_per_run: int = MAX_PYRIGHT_RESTARTS_PER_RUN,
+        max_total_restarts_per_run: int = MAX_TOTAL_PYRIGHT_RESTARTS_PER_RUN,
+        restart_latency_budget_ms: int = MAX_PYRIGHT_RESTART_LATENCY_BUDGET_MS,
         max_reference_sites_per_file: int = MAX_REFERENCE_SITES_PER_FILE,
+        max_consecutive_timeout_files: int = MAX_CONSECUTIVE_TIMEOUT_FILES,
         run_state: PyrightRunState | None = None,
+        host_file_watchdog_secs: float | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
+        # Resolved once per session from the host's env override (see
+        # ``resolve_host_file_watchdog_secs``); an explicit value is for tests.
+        self.host_file_watchdog_secs = (
+            host_file_watchdog_secs
+            if host_file_watchdog_secs is not None
+            else resolve_host_file_watchdog_secs()
+        )
         self.executable = executable
         self.env = env
         self.install_check = install_check
@@ -255,7 +414,10 @@ class PyrightSession:
         self.file_timeout_per_function_secs = file_timeout_per_function_secs
         self.file_timeout_cap_secs = file_timeout_cap_secs
         self.max_restarts_per_run = max_restarts_per_run
+        self.max_total_restarts_per_run = max_total_restarts_per_run
+        self.restart_latency_budget_ms = restart_latency_budget_ms
         self.max_reference_sites_per_file = max_reference_sites_per_file
+        self.max_consecutive_timeout_files = max_consecutive_timeout_files
         # Run-wide health budget: shared across session recycles when the caller
         # passes an explicit ``run_state``; isolated (per-instance) otherwise,
         # which preserves the existing contract for code that constructs
@@ -269,6 +431,14 @@ class PyrightSession:
         self._function_indexes: dict[Path, _FunctionIndex] = {}
         self._index_parse_latency_ms: list[int] = []
         self._file_deadlines: dict[Path, float] = {}
+        # When each file was first touched by this session (its calls pass, or
+        # its references pass when called alone): the anchor for the
+        # host-watchdog ceiling any restart-driven deadline extension respects.
+        self._file_started_at: dict[Path, float] = {}
+        # Set by ``_handle_initialize_timeout`` when a respawn's handshake was
+        # bounded to a crashing file's remaining headroom and ran out of it:
+        # that is a deferral, not a broken install.
+        self._bounded_init_timed_out = False
         # Set by ``_resolve_references_with_pyright`` when a per-site or
         # file-budget timeout skipped sites (clarion-3e517d4aff): the pass
         # still returns normally, but its coverage is degraded.
@@ -278,6 +448,14 @@ class PyrightSession:
         # rather than the ``_CallPassAbort`` token the calls pass returns: the
         # references loop already reports through flags.
         self._reference_pass_transport_failed = False
+        self._reference_pass_failure_message = ""
+        # And for an ``OSError`` on an unrelated target file while pyright is
+        # confirmed alive: this file's gap, but no restart (ADR-057).
+        self._reference_pass_local_read_error = False
+
+    @property
+    def run_state(self) -> PyrightRunState:
+        return self._run_state
 
     def __enter__(self) -> Self:
         return self
@@ -319,6 +497,10 @@ class PyrightSession:
         function_ids: Sequence[str],
     ) -> CallResolutionResult:
         path = Path(file_path).resolve()
+        # The calls pass is a file's first facet: start its shared window
+        # fresh so a stale deadline from an earlier visit is never reused.
+        self._file_deadlines.pop(path, None)
+        self._file_started_at[path] = self._now()
         index = self._function_index_for_path(path)
         if index.parse_status == "syntax_error":
             return CallResolutionResult(
@@ -337,7 +519,7 @@ class PyrightSession:
                 findings=self._pop_findings(),
             )
 
-        if not self._ensure_process():
+        if self._own_deferred_restart_blocks(path) or not self._ensure_process():
             # No pyright: nothing was examined. Say so (clarion-3e517d4aff) --
             # returning only the site COUNT reads to the host as a completed
             # analysis of a call-free file.
@@ -345,11 +527,7 @@ class PyrightSession:
                 unresolved_call_sites_total=ast_call_sites_total,
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
-                coverage=FacetCoverage.degraded(
-                    self._unavailable_reason(),
-                    transient=True,
-                    collateral=self._run_state.disabled,
-                ),
+                coverage=self._unavailable_coverage(),
             )
 
         deadline = self._deadline_for_file(path, len(index.functions))
@@ -377,11 +555,13 @@ class PyrightSession:
             unresolved_sites = []
             coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
-            self._record_restart_or_poison(str(exc))
+            # The document never opened: pyright was dead on arrival, which
+            # is the previous file's death, not this one's (ADR-057).
+            self._record_arrival_death(str(exc))
             edges = []
             unresolved = ast_call_sites_total
             unresolved_sites = []
-            coverage = FacetCoverage.degraded("pyright_transport_failure", transient=True)
+            coverage = FacetCoverage.degraded("pyright_restarting", transient=True, collateral=True)
         else:
             if abort is not None:
                 if abort.reason == "pyright_timeout":
@@ -390,10 +570,13 @@ class PyrightSession:
                         f"pyright query timed out: {abort.method}",
                         method=abort.method,
                     )
-                else:
-                    self._record_restart_or_poison(abort.message)
+                elif abort.reason == "pyright_transport_failure":
+                    # ``_resolve_with_pyright`` has already sent didClose on
+                    # the dead pipe, so respawning here cannot misorder it.
+                    self._record_file_attributed_restart(path, abort.message)
                 coverage = FacetCoverage.degraded(abort.reason, transient=True)
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
+        self._note_calls_facet_outcome(path, coverage)
 
         return CallResolutionResult(
             edges=edges,
@@ -405,13 +588,45 @@ class PyrightSession:
             coverage=coverage,
         )
 
-    def _unavailable_reason(self) -> str:
-        """Why ``_ensure_process`` returned False, as a coverage reason token."""
-        if self._run_state.disabled:
-            if self._run_state.restart_count > self.max_restarts_per_run:
-                return "pyright_poisoned"
-            return "pyright_unavailable"
-        return "pyright_spawn_failed"
+    def _unavailable_coverage(self) -> FacetCoverage:
+        """The coverage for a pass that never got a process.
+
+        Reads ``disabled_reason`` directly -- never re-derived from a counter
+        comparison, which went stale the moment a second cap existed. Whatever
+        kept the process away (disabled run, deferred spawn) predates this
+        file and is collateral -- with one exception: an armed
+        ``restart_already_charged_to_file`` here means
+        ``_own_deferred_restart_blocks`` refused to respawn because THIS
+        file's own earlier facet killed pyright and consumed the window, which
+        stays self-inflicted (ADR-057).
+        """
+        state = self._run_state
+        if state.disabled:
+            return FacetCoverage.degraded(
+                state.disabled_reason or "pyright_unavailable",
+                transient=True,
+                collateral=True,
+            )
+        if state.restart_already_charged_to_file:
+            return FacetCoverage.degraded("pyright_transport_failure", transient=True)
+        return FacetCoverage.degraded("pyright_spawn_failed", transient=True, collateral=True)
+
+    def _own_deferred_restart_blocks(self, path: Path) -> bool:
+        """True when ``path``'s own crash deferred a restart it still cannot afford.
+
+        The deferral happened in an earlier facet of this same file (calls,
+        then references) inside one shared watchdog window. Respawning now
+        would spend the headroom that deferral already found missing -- and
+        a spawn bounded only by ``init_timeout_secs`` could outrun the host's
+        real deadline and get the whole plugin call killed. Leave the flag
+        armed for the NEXT file, which starts a fresh window.
+        """
+        state = self._run_state
+        if state.disabled or not state.restart_already_charged_to_file:
+            return False
+        if state.restart_charged_to_path != str(path):
+            return False
+        return self._respawn_headroom_secs(path) < MIN_RESPAWN_HEADROOM_SECS
 
     def resolve_references(
         self,
@@ -419,6 +634,20 @@ class PyrightSession:
         sites: Sequence[ReferenceSite],
     ) -> ReferenceResolutionResult:
         path = Path(file_path).resolve()
+        self._file_started_at.setdefault(path, self._now())
+        try:
+            return self._resolve_references_for_file(path, sites)
+        finally:
+            # References is the last facet touched for a file: the shared
+            # deadline and its anchor end here on every exit path.
+            self._file_deadlines.pop(path, None)
+            self._file_started_at.pop(path, None)
+
+    def _resolve_references_for_file(
+        self,
+        path: Path,
+        sites: Sequence[ReferenceSite],
+    ) -> ReferenceResolutionResult:
         index = self._function_index_for_path(path)
         reference_sites_total = len(sites)
         if index.parse_status == "syntax_error":
@@ -449,17 +678,13 @@ class PyrightSession:
                 findings=self._pop_findings(),
                 coverage=FacetCoverage.degraded("reference_site_cap", transient=False),
             )
-        if not self._ensure_process():
+        if self._own_deferred_restart_blocks(path) or not self._ensure_process():
             return ReferenceResolutionResult(
                 reference_sites_total=reference_sites_total,
                 unresolved_reference_sites_total=reference_sites_total,
                 pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
                 findings=self._pop_findings(),
-                coverage=FacetCoverage.degraded(
-                    self._unavailable_reason(),
-                    transient=True,
-                    collateral=self._run_state.disabled,
-                ),
+                coverage=self._unavailable_coverage(),
             )
 
         deadline = self._deadline_for_file(path, len(index.functions))
@@ -467,6 +692,7 @@ class PyrightSession:
         coverage = FacetCoverage()
         self._reference_pass_timed_out = False
         self._reference_pass_transport_failed = False
+        self._reference_pass_local_read_error = False
         try:
             edges, resolved, skipped_external, unresolved = self._resolve_references_with_pyright(
                 path,
@@ -476,6 +702,13 @@ class PyrightSession:
             )
             if self._reference_pass_transport_failed:
                 coverage = FacetCoverage.degraded("pyright_transport_failure", transient=True)
+                # Deliberately here, not in the per-site except: that except
+                # sits inside the try whose ``finally`` sends didClose, and a
+                # respawn from there would send didClose to a fresh process
+                # for a URI it never opened.
+                self._record_file_attributed_restart(path, self._reference_pass_failure_message)
+            elif self._reference_pass_local_read_error:
+                coverage = FacetCoverage.degraded("pyright_local_read_error", transient=True)
             elif self._reference_pass_timed_out:
                 coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
         # Both arms below are reachable only from the ``didOpen`` notify that
@@ -495,14 +728,12 @@ class PyrightSession:
             unresolved = reference_sites_total
             coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
-            self._record_restart_or_poison(str(exc))
+            self._record_arrival_death(str(exc))
             edges = []
             resolved = 0
             skipped_external = 0
             unresolved = reference_sites_total
-            coverage = FacetCoverage.degraded("pyright_transport_failure", transient=True)
-        finally:
-            self._file_deadlines.pop(path, None)
+            coverage = FacetCoverage.degraded("pyright_restarting", transient=True, collateral=True)
         latency_ms = max(1, math.ceil((time.perf_counter() - latency_started) * 1000))
 
         return ReferenceResolutionResult(
@@ -555,7 +786,7 @@ class PyrightSession:
                     remaining_start = position
                     break
                 except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
-                    abort = _CallPassAbort("pyright_transport_failure", None, str(exc))
+                    abort = _CallPassAbort(self._in_flight_failure_reason(exc), None, str(exc))
                     remaining_start = position
                     break
                 edges.extend(function_edges)
@@ -732,9 +963,9 @@ class PyrightSession:
                     except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
                         # The pipe is gone: every remaining site is unresolved,
                         # but the sites resolved so far stay resolved
-                        # (clarion-7f527d3d32).
-                        self._reference_pass_transport_failed = True
-                        self._record_restart_or_poison(str(exc))
+                        # (clarion-7f527d3d32). The restart itself happens in
+                        # the caller, after this frame's didClose.
+                        self._note_reference_pass_failure(exc)
                         unresolved_total += len(sites) - site_index
                         break
                     lookup_cache[cache_key] = (candidate_ids, saw_external)
@@ -759,6 +990,13 @@ class PyrightSession:
         finally:
             with contextlib.suppress(LspTransportClosedError, BrokenPipeError, OSError):
                 self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    def _note_reference_pass_failure(self, exc: BaseException) -> None:
+        if self._in_flight_failure_reason(exc) == "pyright_transport_failure":
+            self._reference_pass_transport_failed = True
+            self._reference_pass_failure_message = str(exc)
+        else:
+            self._reference_pass_local_read_error = True
 
     def _lookup_reference_site(
         self,
@@ -805,18 +1043,46 @@ class PyrightSession:
             precise_only=site.kind in ("base", "decorator"),
         )
 
+    def _now(self) -> float:
+        """The clock every deadline lives on (monotonic; overridable in tests)."""
+        return time.monotonic()
+
     def _deadline_for_file(self, path: Path, n_functions: int) -> float:
-        return self._file_deadlines.setdefault(
-            path,
-            time.monotonic() + self._file_timeout_for(n_functions),
-        )
+        existing = self._file_deadlines.get(path)
+        if existing is not None:
+            return existing
+        deadline = self._now() + self._file_timeout_for(n_functions)
+        anchor = self._file_started_at.get(path)
+        if anchor is not None:
+            # A spawn paid before this point (first file, or a restart) has
+            # already eaten into the host watchdog's window for this file.
+            deadline = min(deadline, self._watchdog_ceiling_for(anchor))
+        self._file_deadlines[path] = deadline
+        return deadline
+
+    def _watchdog_ceiling_for(self, anchor: float) -> float:
+        watchdog = self.host_file_watchdog_secs
+        window = max(watchdog - FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS, watchdog / 2.0)
+        return anchor + window
+
+    def _respawn_headroom_secs(self, path: Path) -> float:
+        """Real wall-clock left under ``path``'s watchdog ceiling, right now.
+
+        Deliberately NOT ``deadline >= ceiling``: both are anchored at file
+        start, so that comparison reduces to ``budget >= window`` and never
+        notices a crash 89s into a 90s budget with 16s of window left.
+        """
+        anchor = self._file_started_at.get(path)
+        if anchor is None:
+            return math.inf
+        return self._watchdog_ceiling_for(anchor) - self._now()
 
     def _file_timeout_for(self, n_functions: int) -> float:
         budget = self.file_timeout_base_secs + self.file_timeout_per_function_secs * n_functions
         return min(budget, self.file_timeout_cap_secs)
 
     def _budgeted_timeout(self, deadline: float) -> float:
-        remaining = deadline - time.monotonic()
+        remaining = deadline - self._now()
         if remaining <= 0:
             method = "analyze_file budget"
             raise LspTimeoutError(method)
@@ -828,7 +1094,7 @@ class PyrightSession:
             raise LspTimeoutError(method)
 
     def _file_budget_expired(self, deadline: float) -> bool:
-        return deadline - time.monotonic() <= 0
+        return deadline - self._now() <= 0
 
     def _target_ids_from_locations(
         self,
@@ -885,37 +1151,294 @@ class PyrightSession:
         if self._run_state.disabled:
             return False
         if self._process is None:
+            # A fresh session (server.py recycles one every
+            # ``MAX_FILES_PER_PYRIGHT_SESSION`` files) may be the "next file"
+            # a ceiling-deferred restart was handed to. This spawn IS that
+            # deferred restart, so consume the one-shot flag here too: left
+            # armed, it would later swallow a genuine arrival-death on an
+            # unrelated file -- no finding, and a restart the run-level cap
+            # never sees (ADR-057).
+            self._consume_deferred_restart()
             return self._start_process()
         if self._process.poll() is None:
             return True
-        self._process = None
+        self._terminate_process()
+        if self._run_state.restart_already_charged_to_file:
+            # The previous file's own request killed pyright and its watchdog
+            # ceiling had no headroom for the respawn: it was charged there,
+            # so this file pays the spawn silently -- no finding, no
+            # collateral mark (ADR-057). (The crashing file's OWN later facet
+            # never reaches here: ``_own_deferred_restart_blocks`` stops it.)
+            self._consume_deferred_restart()
+            return self._start_process()
         self._record_restart_or_poison("pyright subprocess exited")
         if self._run_state.disabled:
             return False
         return self._start_process()
 
+    def _consume_deferred_restart(self) -> None:
+        self._run_state.restart_already_charged_to_file = False
+        self._run_state.restart_charged_to_path = None
+
+    def _defer_restart_to_next_file(self, path: Path) -> None:
+        """Leave pyright down; the next file's ``_ensure_process`` respawns, un-charged."""
+        state = self._run_state
+        state.restart_already_charged_to_file = True
+        state.restart_charged_to_path = str(path)
+        state.ceiling_deferred_restart_count += 1
+
+    def _process_confirmed_dead(self) -> bool:
+        return self._process is None or self._process.poll() is not None
+
+    def _in_flight_failure_reason(self, exc: BaseException) -> _InFlightFailureReason:
+        """Classify an exception caught mid-pass, while THIS file's request ran.
+
+        ``_target_id_from_call`` / ``_target_id_from_location`` ``read_text``
+        unrelated target files inside the same try body a pyright death is
+        caught in, so a bare ``OSError`` is only a transport failure when the
+        process is confirmed dead (or the transport itself said so).
+        """
+        if isinstance(exc, (LspTransportClosedError, BrokenPipeError)):
+            return "pyright_transport_failure"
+        if self._process_confirmed_dead():
+            return "pyright_transport_failure"
+        return "pyright_local_read_error"
+
+    def _record_arrival_death(self, reason: str) -> None:
+        """Pyright was dead before this file's document even opened.
+
+        Structurally arrival-only: the ``didOpen`` notify is the first thing
+        either pass sends. Drop the dead handle so the next ``_ensure_process``
+        spawns fresh instead of counting the same death a second time.
+        """
+        self._record_restart_or_poison(reason)
+        self._terminate_process()
+
     def _record_restart_or_poison(self, reason: str) -> None:
-        self._run_state.restart_count += 1
-        if self._run_state.restart_count > self.max_restarts_per_run:
-            self._run_state.disabled = True
-            self._record_finding(
-                FINDING_PYRIGHT_POISON_FRAME,
-                "pyright restart cap exceeded; skipping call resolution",
-                restart_count=self._run_state.restart_count,
-                reason=reason,
-            )
+        """Account for a death NOT attributable to the current file.
+
+        Spends the run-level ``MAX_PYRIGHT_RESTARTS_PER_RUN`` budget. The
+        finding is anchored (by the host) to the arriving file, and its message
+        says so, because that file is where the death was discovered -- not
+        where it happened.
+        """
+        if not self._charge_run_level_restart(reason, attribution="arrival"):
             return
         self._record_finding(
             FINDING_PYRIGHT_RESTART,
-            "pyright subprocess died and was restarted",
+            "pyright subprocess found dead on arrival (it died after the previous "
+            "file's request completed); restarting",
             restart_count=self._run_state.restart_count,
+            file_attributed_restart_count=self._run_state.file_attributed_restart_count,
+            attribution="arrival",
             reason=reason,
         )
 
-    def _start_process(self) -> bool:
+    def _charge_run_level_restart(self, reason: str, *, attribution: str) -> bool:
+        """Spend one unit of ``MAX_PYRIGHT_RESTARTS_PER_RUN``.
+
+        Returns False -- with the run disabled as ``pyright_poisoned`` and the
+        POISON-FRAME finding recorded -- when the cap is exceeded.
+        """
+        state = self._run_state
+        state.restart_count += 1
+        if state.restart_count <= self.max_restarts_per_run:
+            return True
+        state.disabled = True
+        state.disabled_reason = "pyright_poisoned"
+        self._record_finding(
+            FINDING_PYRIGHT_POISON_FRAME,
+            "pyright restart cap exceeded; skipping call resolution",
+            restart_count=state.restart_count,
+            file_attributed_restart_count=state.file_attributed_restart_count,
+            attribution=attribution,
+            reason=reason,
+        )
+        return False
+
+    def _total_restart_budget_exceeded(self) -> bool:
+        state = self._run_state
+        total = state.restart_count + state.file_attributed_restart_count
+        return (
+            total > self.max_total_restarts_per_run
+            or state.pyright_init_latency_total_ms > self.restart_latency_budget_ms
+        )
+
+    def _trip_total_restart_cap(self, reason: str) -> None:
+        state = self._run_state
+        state.disabled = True
+        state.disabled_reason = "pyright_restart_cap_exceeded"
+        self._terminate_process()
+        self._record_finding(
+            FINDING_PYRIGHT_TOTAL_RESTART_CAP_EXCEEDED,
+            "pyright total restart safety budget exceeded; skipping call resolution",
+            restart_count=state.restart_count,
+            file_attributed_restart_count=state.file_attributed_restart_count,
+            pyright_init_latency_total_ms=state.pyright_init_latency_total_ms,
+            max_total_restarts_per_run=self.max_total_restarts_per_run,
+            restart_latency_budget_ms=self.restart_latency_budget_ms,
+            reason=reason,
+        )
+
+    def _note_calls_facet_outcome(self, path: Path, coverage: FacetCoverage) -> None:
+        """Feed the wedged-but-alive breaker with this file's calls outcome.
+
+        Counts a FILE once, by the reason its calls pass landed on; the
+        references pass never participates. Any other degraded outcome
+        (transport failure, local read error) leaves the streak alone: those
+        paths either restarted pyright themselves -- which resets the streak
+        via ``_start_process`` -- or say nothing about its responsiveness.
+        """
+        state = self._run_state
+        if coverage.reason == "pyright_timeout":
+            state.consecutive_timeout_files += 1
+            if state.consecutive_timeout_files >= self.max_consecutive_timeout_files:
+                self._record_wedged_restart(path)
+        elif coverage.status == "complete":
+            state.consecutive_timeout_files = 0
+
+    def _record_wedged_restart(self, path: Path) -> None:
+        """``path`` closed a timeout streak: presume pyright wedged and restart NOW.
+
+        The process still answers ``poll()``, so nothing else would ever
+        restart it and every remaining file would time out. Charged to the
+        run-level cap (a wedge loop is a crash loop by another name), bounded
+        by the total-restart safety budget, and performed through the same
+        headroom-aware respawn path an in-flight death uses, so it defers to
+        the next file rather than overrun the host's watchdog. The streak's
+        files keep their self-inflicted ``pyright_timeout`` claim.
+        """
+        state = self._run_state
+        streak = state.consecutive_timeout_files
+        state.consecutive_timeout_files = 0
+        state.wedged_restart_count += 1
+        reason = f"pyright timed out on {streak} consecutive files while alive"
+        if not self._charge_run_level_restart(reason, attribution="wedged"):
+            self._terminate_process()
+            outcome: _RestartOutcome | Literal["cap_exceeded"] = "cap_exceeded"
+        elif self._total_restart_budget_exceeded():
+            self._trip_total_restart_cap(reason)
+            outcome = "cap_exceeded"
+        else:
+            outcome = self._restart_process_for_file(path)
+        self._record_finding(
+            FINDING_PYRIGHT_WEDGED_RESTART,
+            f"pyright timed out on {streak} consecutive files while still alive; "
+            f"treating it as wedged and restarting; {outcome}",
+            consecutive_timeout_files=streak,
+            max_consecutive_timeout_files=self.max_consecutive_timeout_files,
+            restart_count=state.restart_count,
+            wedged_restart_count=state.wedged_restart_count,
+            attribution="wedged",
+            outcome=outcome,
+            reason=reason,
+        )
+
+    def _record_file_attributed_restart(self, path: Path, reason: str) -> None:
+        """Pyright died while ``path``'s own request was in flight: restart NOW.
+
+        The crashing file's coverage was built by the caller before this runs,
+        so nothing here changes its (self-inflicted) attribution; this only
+        decides whether the NEXT file finds a live process and who pays.
+        """
+        state = self._run_state
+        state.file_attributed_restart_count += 1
+        if self._total_restart_budget_exceeded():
+            self._record_in_flight_restart_finding(reason, outcome="cap_exceeded")
+            self._trip_total_restart_cap(reason)
+            return
+        outcome = self._restart_process_for_file(path)
+        if outcome == "respawn_failed":
+            # The respawn itself failed. Never force ``disabled`` here: the
+            # spawn path already triaged it -- a transient deferral (next file
+            # retries) or a permanent disable with its OWN ``disabled_reason``.
+            state.file_attributed_respawn_failure_count += 1
+        self._record_in_flight_restart_finding(reason, outcome=outcome)
+
+    def _record_in_flight_restart_finding(self, reason: str, *, outcome: str) -> None:
+        self._record_finding(
+            FINDING_PYRIGHT_RESTART,
+            f"pyright subprocess died during this file's request; {outcome}",
+            restart_count=self._run_state.restart_count,
+            file_attributed_restart_count=self._run_state.file_attributed_restart_count,
+            attribution="in_flight",
+            outcome=outcome,
+            reason=reason,
+        )
+
+    def _restart_process_for_file(self, path: Path) -> _RestartOutcome:
+        """Respawn after ``path``'s own request killed pyright, within its headroom.
+
+        The decision is made on the REAL headroom left under the file's
+        host-watchdog ceiling at this moment. Too little (below
+        ``MIN_RESPAWN_HEADROOM_SECS``): defer to the next file -- respawning
+        would buy no time and risk the watchdog killing the whole call.
+        Otherwise the initialize handshake is bounded to the headroom, so a
+        hung respawn is cut off inside the window and deferred rather than
+        overrunning the host's real deadline.
+
+        Extends the file's shared calls/references deadline by the respawn's
+        latency -- clamped to the ceiling -- so the other facet of the same
+        file neither self-inflicts a timeout out of restart latency nor pushes
+        the host's per-file watchdog into killing the plugin call.
+        """
+        self._terminate_process()
+        headroom = self._respawn_headroom_secs(path)
+        if headroom < MIN_RESPAWN_HEADROOM_SECS:
+            self._defer_restart_to_next_file(path)
+            return "deferred_to_next_file"
+        started = self._now()
+        self._bounded_init_timed_out = False
+        ok = self._start_process(init_timeout_secs=min(self.init_timeout_secs, headroom))
+        elapsed = self._now() - started
+        anchor = self._file_started_at.get(path)
+        deadline = self._file_deadlines.get(path)
+        if anchor is not None and deadline is not None:
+            self._file_deadlines[path] = min(deadline + elapsed, self._watchdog_ceiling_for(anchor))
+        if ok:
+            return "restarted"
+        if self._bounded_init_timed_out:
+            self._defer_restart_to_next_file(path)
+            return "deferred_to_next_file"
+        return "respawn_failed"
+
+    def _terminate_process(self) -> None:
+        """Drop the current process handle, killing it if it is still alive.
+
+        Also retires its stderr drain so a RESTART finding's ``reason`` never
+        mixes two processes' stderr.
+        """
+        process = self._process
+        self._process = None
+        if process is not None and process.poll() is None:
+            process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=2)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=2)
+            self._stderr_thread = None
+        self._stderr_tail.clear()
+
+    def _start_process(self, init_timeout_secs: float | None = None) -> bool:
+        """Spawn + initialize; ``init_timeout_secs`` bounds the handshake below the default."""
+        started = self._now()
+        try:
+            ok = self._spawn_and_initialize(init_timeout_secs)
+        finally:
+            elapsed_ms = math.ceil((self._now() - started) * 1000)
+            self._run_state.pyright_init_latency_total_ms += elapsed_ms
+        if ok:
+            # A fresh process owes nothing to the old one's timeouts.
+            self._run_state.consecutive_timeout_files = 0
+        return ok
+
+    def _spawn_and_initialize(self, init_timeout_secs: float | None = None) -> bool:
+        if init_timeout_secs is None:
+            init_timeout_secs = self.init_timeout_secs
         executable = self._resolve_executable()
         if executable is None:
             self._run_state.disabled = True
+            self._run_state.disabled_reason = "pyright_unavailable"
             self._record_finding(
                 FINDING_PYRIGHT_UNAVAILABLE,
                 "pyright-langserver is not available",
@@ -924,6 +1447,7 @@ class PyrightSession:
             return False
         if self.install_check is not None and not self.install_check(executable):
             self._run_state.disabled = True
+            self._run_state.disabled_reason = "pyright_unavailable"
             self._record_finding(
                 FINDING_PYRIGHT_INSTALL_FAILURE,
                 "pyright-langserver executability check failed",
@@ -970,27 +1494,18 @@ class PyrightSession:
         self._process = process
         self._start_stderr_drain(process)
         try:
-            self._initialize()
+            self._initialize(init_timeout_secs)
         except LspTimeoutError:
-            self._run_state.disabled = True
-            self._record_finding(
-                FINDING_PYRIGHT_INIT_TIMEOUT,
-                "pyright initialize handshake timed out",
-                timeout_secs=self.init_timeout_secs,
-            )
-            process.kill()
-            process.wait(timeout=2)
-            return False
+            return self._handle_initialize_timeout(init_timeout_secs)
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
             self._run_state.disabled = True
+            self._run_state.disabled_reason = "pyright_unavailable"
             self._record_finding(
                 FINDING_PYRIGHT_UNAVAILABLE,
                 "pyright initialize handshake failed",
                 error=str(exc),
             )
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=2)
+            self._terminate_process()
             return False
         # A clean spawn + handshake clears any accumulated transient-deferral
         # pressure: the per-UID resource squeeze that caused earlier EAGAINs has
@@ -1014,6 +1529,7 @@ class PyrightSession:
             self._run_state.consecutive_spawn_deferrals += 1
             if self._run_state.consecutive_spawn_deferrals > MAX_CONSECUTIVE_SPAWN_DEFERRALS:
                 self._run_state.disabled = True
+                self._run_state.disabled_reason = "pyright_unavailable"
                 self._record_finding(
                     FINDING_PYRIGHT_RESOURCE_EXHAUSTED,
                     "pyright-langserver persistently unavailable under resource "
@@ -1035,6 +1551,7 @@ class PyrightSession:
                 )
             return False
         self._run_state.disabled = True
+        self._run_state.disabled_reason = "pyright_unavailable"
         self._record_finding(
             FINDING_PYRIGHT_INSTALL_FAILURE,
             "pyright-langserver failed to start",
@@ -1043,7 +1560,26 @@ class PyrightSession:
         )
         return False
 
-    def _initialize(self) -> None:
+    def _handle_initialize_timeout(self, init_timeout_secs: float) -> bool:
+        """Triage a handshake timeout: a headroom-bounded one is a deferral, not a disable."""
+        self._terminate_process()
+        if init_timeout_secs < self.init_timeout_secs:
+            # The respawn was cut off by a crashing file's remaining watchdog
+            # headroom, not by pyright's own budget: the caller defers it to
+            # the next file. Disabling the run here would turn one late crash
+            # into a poisoned run.
+            self._bounded_init_timed_out = True
+            return False
+        self._run_state.disabled = True
+        self._run_state.disabled_reason = "pyright_unavailable"
+        self._record_finding(
+            FINDING_PYRIGHT_INIT_TIMEOUT,
+            "pyright initialize handshake timed out",
+            timeout_secs=init_timeout_secs,
+        )
+        return False
+
+    def _initialize(self, timeout_secs: float | None = None) -> None:
         result = self._request(
             "initialize",
             {
@@ -1055,7 +1591,7 @@ class PyrightSession:
                 "capabilities": {"workspace": {"configuration": True}},
                 "clientInfo": {"name": "loomweave-plugin-python", "version": __version__},
             },
-            self.init_timeout_secs,
+            self.init_timeout_secs if timeout_secs is None else timeout_secs,
         )
         _ = result
         self._notify("initialized", {})

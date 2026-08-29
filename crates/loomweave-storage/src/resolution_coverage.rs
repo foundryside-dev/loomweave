@@ -19,6 +19,34 @@
 //!
 //! Rows are keyed by the core `file` entity id and replaced in the same per-file
 //! transaction as the file's anchored edges; the vanished-file prune drops them.
+//!
+//! # The sticky self-inflicted mark (clarion-7fc41105ea)
+//!
+//! `collateral` names WHO broke the resolver: `false` means this file's own
+//! request timed out or killed the process (self-inflicted); `true` means an
+//! earlier file did and this one arrived to a dead or disabled resolver. The
+//! host dispatches self-inflicted files last so they can only poison what
+//! follows them — but a self-inflicted file swept into the poisoned tail
+//! before its own turn reports `collateral: true`, and taking that at face
+//! value would exonerate it, dispatch it early next run, and rotate the
+//! self-inflicted set run to run. So the upsert keeps the mark sticky: when
+//! the prior row was self-inflicted (`degraded && transient && !collateral`)
+//! and the new claim is transient-degraded collateral on the same facet, the
+//! persisted `collateral` stays `0` and the facet's `reason` keeps the prior
+//! self-inflicted token (a `pyright_transport_failure` row is not relabelled
+//! `pyright_poisoned` while still attributed to the file). The mark un-sticks when the new claim is
+//! `complete`, is content-determined (`transient == false`), or the file's
+//! bytes changed (`content_changed`). The host raises `content_changed` from
+//! its whole-file hash consultation on EVERY dispatch path — including the
+//! contract-change full re-dispatch, and `--no-incremental`, which has no
+//! prior hashes and therefore reports every file as changed — so the
+//! operator's documented remedy for a wrongly-stuck mark actually un-sticks
+//! it (the row itself survives `--no-incremental`; only the vanished-file
+//! prune removes it). The rules are recorded in ADR-057. `redispatch_attempts` is
+//! untouched by the override, so a file stuck in the poisoned tail freezes at
+//! its last-persisted self-inflicted state after [`MAX_REDISPATCH_ATTEMPTS`]
+//! consecutive runs, until a content change, `--no-incremental`, or
+//! `doctor --fix` re-arms it.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -100,11 +128,97 @@ pub struct RedispatchCandidate {
     pub self_inflicted: bool,
 }
 
+/// One facet of the row the upsert is about to replace.
+#[derive(Debug, Clone)]
+struct PriorFacet {
+    degraded: bool,
+    transient: bool,
+    collateral: bool,
+    reason: Option<String>,
+}
+
+impl PriorFacet {
+    fn needs_redispatch(&self) -> bool {
+        self.degraded && self.transient
+    }
+
+    /// The inverse of [`SourceFileResolutionCoverage::is_collateral_only`]'s
+    /// per-facet predicate: this file's own request broke the resolver.
+    fn self_inflicted(&self) -> bool {
+        self.degraded && self.transient && !self.collateral
+    }
+}
+
+/// The row the upsert is about to replace, read by name so a widened
+/// `SELECT` cannot silently shift a positional index.
+#[derive(Debug, Clone)]
+struct PriorRow {
+    calls: PriorFacet,
+    references: PriorFacet,
+    redispatch_attempts: i64,
+}
+
+fn read_prior_row(conn: &Connection, source_file_id: &str) -> Result<Option<PriorRow>> {
+    let facet = |row: &rusqlite::Row<'_>, base: usize| -> rusqlite::Result<PriorFacet> {
+        Ok(PriorFacet {
+            degraded: row.get::<_, i64>(base)? == 1,
+            transient: row.get::<_, i64>(base + 1)? == 1,
+            collateral: row.get::<_, i64>(base + 2)? == 1,
+            reason: row.get(base + 3)?,
+        })
+    };
+    conn.query_row(
+        "SELECT calls_status = 'degraded', calls_transient, calls_collateral, calls_reason, \
+                references_status = 'degraded', references_transient, references_collateral, \
+                references_reason, redispatch_attempts \
+         FROM source_file_resolution_coverage WHERE source_file_id = ?1",
+        params![source_file_id],
+        |row| {
+            Ok(PriorRow {
+                calls: facet(row, 0)?,
+                references: facet(row, 4)?,
+                redispatch_attempts: row.get(8)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The `(collateral, reason)` pair to persist for one facet (module docs: the
+/// sticky self-inflicted mark). A prior self-inflicted mark survives a
+/// transient collateral claim on unchanged bytes -- and it survives WHOLE:
+/// the prior self-inflicted reason token (`pyright_transport_failure`,
+/// `pyright_timeout`, ...) is carried forward with the `collateral = 0`,
+/// because persisting the new collateral-flavoured token (`pyright_poisoned`,
+/// `pyright_restarting`) beside a self-inflicted attribution would make the
+/// row contradict itself for the first reader of `*_reason`. Everything else
+/// passes through unchanged.
+fn sticky_facet(
+    prior: Option<&PriorFacet>,
+    new: &FacetCoverageRecord,
+    content_changed: bool,
+) -> (bool, Option<String>) {
+    if content_changed || !new.degraded || !new.transient || !new.collateral {
+        return (new.collateral, new.reason.clone());
+    }
+    match prior {
+        Some(prior) if prior.self_inflicted() => {
+            (false, prior.reason.clone().or_else(|| new.reason.clone()))
+        }
+        _ => (new.collateral, new.reason.clone()),
+    }
+}
+
 /// Replace the coverage row for `source_file_id`.
 ///
 /// `redispatch_attempts` counts consecutive runs in which the file stayed
 /// transient-degraded: it increments when both the prior row and the new claim
 /// need re-dispatch, and resets to zero otherwise.
+///
+/// `content_changed` says whether the file's bytes differ from the hash the
+/// prior run stored. It only matters when the prior row carried a
+/// self-inflicted mark: see the module docs for the sticky rule it un-sticks.
 ///
 /// # Errors
 ///
@@ -113,38 +227,31 @@ pub fn upsert_source_file_resolution_coverage(
     conn: &Connection,
     source_file_id: &str,
     coverage: &SourceFileResolutionCoverage,
+    content_changed: bool,
     run_id: &str,
     updated_at: &str,
 ) -> Result<()> {
-    let prior: Option<(i64, i64, i64, i64, i64)> = conn
-        .query_row(
-            "SELECT calls_status = 'degraded', calls_transient, \
-                    references_status = 'degraded', references_transient, \
-                    redispatch_attempts \
-             FROM source_file_resolution_coverage WHERE source_file_id = ?1",
-            params![source_file_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .optional()?;
-    let prior_needed_redispatch = prior.is_some_and(
-        |(calls_degraded, calls_transient, refs_degraded, refs_transient, _)| {
-            (calls_degraded == 1 && calls_transient == 1)
-                || (refs_degraded == 1 && refs_transient == 1)
-        },
-    );
+    let prior = read_prior_row(conn, source_file_id)?;
+    let prior_needed_redispatch = prior
+        .as_ref()
+        .is_some_and(|row| row.calls.needs_redispatch() || row.references.needs_redispatch());
     let attempts = if coverage.needs_redispatch() && prior_needed_redispatch {
-        prior.map_or(1, |(_, _, _, _, attempts)| attempts.saturating_add(1))
+        prior
+            .as_ref()
+            .map_or(1, |row| row.redispatch_attempts.saturating_add(1))
     } else {
         0
     };
+    let (calls_collateral, calls_reason) = sticky_facet(
+        prior.as_ref().map(|row| &row.calls),
+        &coverage.calls,
+        content_changed,
+    );
+    let (references_collateral, references_reason) = sticky_facet(
+        prior.as_ref().map(|row| &row.references),
+        &coverage.references,
+        content_changed,
+    );
     conn.execute(
         "INSERT INTO source_file_resolution_coverage ( \
             source_file_id, calls_status, calls_reason, calls_transient, calls_collateral, \
@@ -166,13 +273,13 @@ pub fn upsert_source_file_resolution_coverage(
         params![
             source_file_id,
             coverage.calls.status(),
-            coverage.calls.reason,
+            calls_reason,
             i64::from(coverage.calls.transient),
-            i64::from(coverage.calls.collateral),
+            i64::from(calls_collateral),
             coverage.references.status(),
-            coverage.references.reason,
+            references_reason,
             i64::from(coverage.references.transient),
-            i64::from(coverage.references.collateral),
+            i64::from(references_collateral),
             attempts,
             run_id,
             updated_at,
@@ -403,12 +510,12 @@ mod tests {
             calls: degraded(true),
             references: FacetCoverageRecord::default(),
         };
-        upsert_source_file_resolution_coverage(&conn, "core:file:a.py", &first, "r1", "t1")
+        upsert_source_file_resolution_coverage(&conn, "core:file:a.py", &first, false, "r1", "t1")
             .unwrap();
         assert_eq!(degraded_call_coverage_file_count(&conn).unwrap(), 1);
 
         let healed = SourceFileResolutionCoverage::default();
-        upsert_source_file_resolution_coverage(&conn, "core:file:a.py", &healed, "r2", "t2")
+        upsert_source_file_resolution_coverage(&conn, "core:file:a.py", &healed, false, "r2", "t2")
             .unwrap();
         assert_eq!(degraded_call_coverage_file_count(&conn).unwrap(), 0);
         let rows: i64 = conn
@@ -419,6 +526,358 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1, "upsert must not duplicate the row");
+    }
+
+    /// `(calls_status, calls_transient, calls_collateral, references_collateral)`.
+    fn calls_row(conn: &Connection, id: &str) -> (String, i64, i64, i64) {
+        conn.query_row(
+            "SELECT calls_status, calls_transient, calls_collateral, references_collateral \
+             FROM source_file_resolution_coverage WHERE source_file_id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    fn self_inflicted_calls() -> SourceFileResolutionCoverage {
+        SourceFileResolutionCoverage {
+            calls: degraded(true),
+            references: FacetCoverageRecord::default(),
+        }
+    }
+
+    fn poisoned_both() -> SourceFileResolutionCoverage {
+        SourceFileResolutionCoverage {
+            calls: collateral(),
+            references: collateral(),
+        }
+    }
+
+    // clarion-7fc41105ea: the sticky self-inflicted mark.
+
+    #[test]
+    fn upsert_sticky_self_inflicted_stays_self_inflicted_when_poisoned_next_run() {
+        let conn = migrated_conn();
+        let id = "core:file:trouble.py";
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
+        // Run 2: swept into the poisoned tail before its own turn. The prior
+        // self-inflicted mark on `calls` survives; `references` was never
+        // self-inflicted so its collateral claim is taken as given.
+        upsert_source_file_resolution_coverage(&conn, id, &poisoned_both(), false, "r2", "t")
+            .unwrap();
+        assert_eq!(
+            calls_row(&conn, id),
+            ("degraded".to_owned(), 1, 0, 1),
+            "a known troublemaker is not exonerated by being poisoned this run"
+        );
+        assert_eq!(
+            reasons(&conn, id).0,
+            Some("pyright_timeout".to_owned()),
+            "the reason token travels with the sticky attribution"
+        );
+    }
+
+    /// `(calls_reason, references_reason)`.
+    fn reasons(conn: &Connection, id: &str) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT calls_reason, references_reason \
+             FROM source_file_resolution_coverage WHERE source_file_id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn upsert_sticky_mark_keeps_the_prior_self_inflicted_reason_token() {
+        // The override must not leave `calls_collateral = 0` beside a
+        // `pyright_poisoned` token: attribution and reason would contradict.
+        let conn = migrated_conn();
+        let id = "core:file:trouble.py";
+        let crashed = SourceFileResolutionCoverage {
+            calls: FacetCoverageRecord {
+                degraded: true,
+                reason: Some("pyright_transport_failure".to_owned()),
+                transient: true,
+                collateral: false,
+            },
+            references: FacetCoverageRecord::default(),
+        };
+        upsert_source_file_resolution_coverage(&conn, id, &crashed, false, "r1", "t").unwrap();
+        upsert_source_file_resolution_coverage(&conn, id, &poisoned_both(), false, "r2", "t")
+            .unwrap();
+        assert_eq!(calls_row(&conn, id), ("degraded".to_owned(), 1, 0, 1));
+        assert_eq!(
+            reasons(&conn, id),
+            (
+                Some("pyright_transport_failure".to_owned()),
+                Some("pyright_poisoned".to_owned())
+            ),
+            "the stuck facet keeps its self-inflicted token; the other facet's claim stands"
+        );
+        // Un-sticking takes the new token with it.
+        upsert_source_file_resolution_coverage(&conn, id, &poisoned_both(), true, "r3", "t")
+            .unwrap();
+        assert_eq!(calls_row(&conn, id), ("degraded".to_owned(), 1, 1, 1));
+        assert_eq!(reasons(&conn, id).0, Some("pyright_poisoned".to_owned()));
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &SourceFileResolutionCoverage::default(),
+            false,
+            "r4",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(reasons(&conn, id), (None, None));
+    }
+
+    #[test]
+    fn upsert_self_inflicted_clears_on_complete_claim() {
+        let conn = migrated_conn();
+        let id = "core:file:trouble.py";
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &SourceFileResolutionCoverage::default(),
+            false,
+            "r2",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(calls_row(&conn, id), ("complete".to_owned(), 0, 0, 0));
+    }
+
+    #[test]
+    fn upsert_collateral_becomes_self_inflicted_when_new_claim_is_self_inflicted() {
+        let conn = migrated_conn();
+        let id = "core:file:victim.py";
+        upsert_source_file_resolution_coverage(&conn, id, &poisoned_both(), false, "r1", "t")
+            .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r2",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            calls_row(&conn, id),
+            ("degraded".to_owned(), 1, 0, 0),
+            "a self-inflicted claim always passes through"
+        );
+    }
+
+    #[test]
+    fn upsert_sticky_mark_unsticks_on_content_change() {
+        let conn = migrated_conn();
+        let id = "core:file:trouble.py";
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
+        upsert_source_file_resolution_coverage(&conn, id, &poisoned_both(), true, "r2", "t")
+            .unwrap();
+        assert_eq!(
+            calls_row(&conn, id),
+            ("degraded".to_owned(), 1, 1, 1),
+            "changed bytes are a fresh file: the collateral claim stands"
+        );
+    }
+
+    #[test]
+    fn upsert_sticky_mark_unsticks_on_content_determined_claim() {
+        let conn = migrated_conn();
+        let id = "core:file:trouble.py";
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
+        let syntax = SourceFileResolutionCoverage {
+            calls: FacetCoverageRecord {
+                degraded: true,
+                reason: Some("syntax_error".to_owned()),
+                transient: false,
+                collateral: false,
+            },
+            references: FacetCoverageRecord::default(),
+        };
+        upsert_source_file_resolution_coverage(&conn, id, &syntax, false, "r2", "t").unwrap();
+        assert_eq!(calls_row(&conn, id), ("degraded".to_owned(), 0, 0, 0));
+        assert!(
+            files_needing_resolution_redispatch(&conn)
+                .unwrap()
+                .is_empty(),
+            "content-determined is definitionally not sticky-transient"
+        );
+    }
+
+    #[test]
+    fn upsert_prior_content_determined_prior_does_not_stick_new_collateral() {
+        let conn = migrated_conn();
+        let id = "core:file:syntax.py";
+        let syntax = SourceFileResolutionCoverage {
+            calls: degraded(false),
+            references: FacetCoverageRecord::default(),
+        };
+        upsert_source_file_resolution_coverage(&conn, id, &syntax, false, "r1", "t").unwrap();
+        upsert_source_file_resolution_coverage(&conn, id, &poisoned_both(), false, "r2", "t")
+            .unwrap();
+        assert_eq!(
+            calls_row(&conn, id),
+            ("degraded".to_owned(), 1, 1, 1),
+            "only a transient self-inflicted prior sticks"
+        );
+    }
+
+    #[test]
+    fn upsert_redispatch_attempts_unaffected_by_collateral_override() {
+        let conn = migrated_conn();
+        let id = "core:file:trouble.py";
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(attempts(&conn, id), 0);
+        upsert_source_file_resolution_coverage(&conn, id, &poisoned_both(), false, "r2", "t")
+            .unwrap();
+        assert_eq!(
+            attempts(&conn, id),
+            1,
+            "sticky override does not touch the counter"
+        );
+        assert_eq!(calls_row(&conn, id).2, 0);
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r3",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(attempts(&conn, id), 2);
+    }
+
+    #[test]
+    fn files_needing_resolution_redispatch_reads_corrected_collateral_after_sticky_override() {
+        let conn = migrated_conn();
+        insert_entity(
+            &conn,
+            "core:file:trouble.py",
+            "core",
+            "file",
+            "/p/trouble.py",
+            None,
+            None,
+        );
+        let id = "core:file:trouble.py";
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
+        upsert_source_file_resolution_coverage(&conn, id, &poisoned_both(), false, "r2", "t")
+            .unwrap();
+        assert_eq!(
+            paths(&files_needing_resolution_redispatch(&conn).unwrap()),
+            vec![("/p/trouble.py", true)],
+            "still dispatched LAST next run"
+        );
+    }
+
+    #[test]
+    fn upsert_sticky_mark_freezes_after_max_redispatch_attempts_then_files_needing_redispatch_drops_it()
+     {
+        let conn = migrated_conn();
+        insert_entity(
+            &conn,
+            "core:file:trouble.py",
+            "core",
+            "file",
+            "/p/trouble.py",
+            None,
+            None,
+        );
+        let id = "core:file:trouble.py";
+        upsert_source_file_resolution_coverage(
+            &conn,
+            id,
+            &self_inflicted_calls(),
+            false,
+            "r0",
+            "t",
+        )
+        .unwrap();
+        for run in 1..=MAX_REDISPATCH_ATTEMPTS {
+            upsert_source_file_resolution_coverage(
+                &conn,
+                id,
+                &poisoned_both(),
+                false,
+                &format!("r{run}"),
+                "t",
+            )
+            .unwrap();
+            assert_eq!(calls_row(&conn, id).2, 0, "run {run}: still self-inflicted");
+            assert_eq!(attempts(&conn, id), run);
+        }
+        assert!(
+            files_needing_resolution_redispatch(&conn)
+                .unwrap()
+                .is_empty(),
+            "frozen at its last-persisted self-inflicted state once the budget is spent"
+        );
+        assert_eq!(
+            degraded_resolution_coverage_summary(&conn)
+                .unwrap()
+                .exhausted,
+            1
+        );
+        // `doctor --fix` re-arms it, still flagged self-inflicted.
+        assert_eq!(reset_exhausted_redispatch_budget(&conn).unwrap(), 1);
+        assert_eq!(
+            paths(&files_needing_resolution_redispatch(&conn).unwrap()),
+            vec![("/p/trouble.py", true)]
+        );
     }
 
     #[test]
@@ -459,14 +918,29 @@ mod tests {
             calls: FacetCoverageRecord::default(),
             references: degraded(false),
         };
-        upsert_source_file_resolution_coverage(&conn, "core:file:a.py", &transient, "r", "t")
-            .unwrap();
-        upsert_source_file_resolution_coverage(&conn, "core:file:b.py", &permanent, "r", "t")
-            .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:a.py",
+            &transient,
+            false,
+            "r",
+            "t",
+        )
+        .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:b.py",
+            &permanent,
+            false,
+            "r",
+            "t",
+        )
+        .unwrap();
         upsert_source_file_resolution_coverage(
             &conn,
             "core:file:c.py",
             &SourceFileResolutionCoverage::default(),
+            false,
             "r",
             "t",
         )
@@ -516,10 +990,24 @@ mod tests {
         };
         assert!(!trouble.is_collateral_only());
         assert!(victim.is_collateral_only());
-        upsert_source_file_resolution_coverage(&conn, "core:file:trouble.py", &trouble, "r", "t")
-            .unwrap();
-        upsert_source_file_resolution_coverage(&conn, "core:file:victim.py", &victim, "r", "t")
-            .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:trouble.py",
+            &trouble,
+            false,
+            "r",
+            "t",
+        )
+        .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:victim.py",
+            &victim,
+            false,
+            "r",
+            "t",
+        )
+        .unwrap();
         let files = files_needing_resolution_redispatch(&conn).unwrap();
         assert_eq!(
             paths(&files),
@@ -553,8 +1041,15 @@ mod tests {
             .unwrap()
         };
         // Run 1 degrades: attempts=0 (first sighting), still re-dispatched.
-        upsert_source_file_resolution_coverage(&conn, "core:file:a.py", &transient, "r1", "t")
-            .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:a.py",
+            &transient,
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
         assert_eq!(attempts(&conn), 0);
         assert_eq!(files_needing_resolution_redispatch(&conn).unwrap().len(), 1);
         // Runs 2..=N keep degrading: the counter climbs until the budget is spent.
@@ -563,6 +1058,7 @@ mod tests {
                 &conn,
                 "core:file:a.py",
                 &transient,
+                false,
                 &format!("r{run}"),
                 "t",
             )
@@ -587,13 +1083,21 @@ mod tests {
             &conn,
             "core:file:a.py",
             &SourceFileResolutionCoverage::default(),
+            false,
             "ok",
             "t",
         )
         .unwrap();
         assert_eq!(attempts(&conn), 0);
-        upsert_source_file_resolution_coverage(&conn, "core:file:a.py", &transient, "again", "t")
-            .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:a.py",
+            &transient,
+            false,
+            "again",
+            "t",
+        )
+        .unwrap();
         assert_eq!(attempts(&conn), 0);
         assert_eq!(files_needing_resolution_redispatch(&conn).unwrap().len(), 1);
     }
@@ -694,6 +1198,7 @@ mod tests {
             &conn,
             "core:file:hole.py",
             &SourceFileResolutionCoverage::default(),
+            false,
             "r",
             "t",
         )
@@ -721,8 +1226,15 @@ mod tests {
             references: FacetCoverageRecord::default(),
         };
         for run in 0..=MAX_REDISPATCH_ATTEMPTS {
-            upsert_source_file_resolution_coverage(conn, id, &transient, &format!("r{run}"), "t")
-                .unwrap();
+            upsert_source_file_resolution_coverage(
+                conn,
+                id,
+                &transient,
+                false,
+                &format!("r{run}"),
+                "t",
+            )
+            .unwrap();
         }
     }
 
@@ -752,17 +1264,38 @@ mod tests {
             calls: degraded(true),
             references: FacetCoverageRecord::default(),
         };
-        upsert_source_file_resolution_coverage(&conn, "core:file:b.py", &transient, "r1", "t")
-            .unwrap();
-        upsert_source_file_resolution_coverage(&conn, "core:file:b.py", &transient, "r2", "t")
-            .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:b.py",
+            &transient,
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:b.py",
+            &transient,
+            false,
+            "r2",
+            "t",
+        )
+        .unwrap();
         // c.py: permanently degraded (content-determined), never counted.
         let permanent = SourceFileResolutionCoverage {
             calls: FacetCoverageRecord::default(),
             references: degraded(false),
         };
-        upsert_source_file_resolution_coverage(&conn, "core:file:c.py", &permanent, "r1", "t")
-            .unwrap();
+        upsert_source_file_resolution_coverage(
+            &conn,
+            "core:file:c.py",
+            &permanent,
+            false,
+            "r1",
+            "t",
+        )
+        .unwrap();
         assert_eq!(attempts(&conn, "core:file:a.py"), MAX_REDISPATCH_ATTEMPTS);
         assert_eq!(attempts(&conn, "core:file:b.py"), 1);
         assert_eq!(attempts(&conn, "core:file:c.py"), 0);
@@ -847,6 +1380,7 @@ mod tests {
             &conn,
             "core:file:a.py",
             &SourceFileResolutionCoverage::default(),
+            false,
             "r1",
             "t",
         )

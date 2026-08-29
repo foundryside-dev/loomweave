@@ -394,6 +394,7 @@ fn run_actor(
             WriterCmd::UpsertSourceFileResolutionCoverage {
                 source_file_id,
                 coverage,
+                content_changed,
                 updated_at,
                 ack,
             } => {
@@ -402,6 +403,7 @@ fn run_actor(
                     &mut state,
                     &source_file_id,
                     &coverage,
+                    content_changed,
                     &updated_at,
                     commits_observed,
                 );
@@ -1171,6 +1173,7 @@ fn upsert_resolution_coverage_in_run(
     state: &mut ActorState,
     source_file_id: &str,
     coverage: &crate::resolution_coverage::SourceFileResolutionCoverage,
+    content_changed: bool,
     updated_at: &str,
     commits_observed: &AtomicUsize,
 ) -> Result<()> {
@@ -1192,6 +1195,7 @@ fn upsert_resolution_coverage_in_run(
         conn,
         source_file_id,
         coverage,
+        content_changed,
         &run_id,
         updated_at,
     )?;

@@ -500,6 +500,11 @@ def test_analyze_file_reports_call_resolver_stats(
         "unresolved_reference_sites_total": 4,
         "pyright_query_latency_ms": [11, 29, 31],
         "pyright_index_parse_latency_ms": [5, 7],
+        "pyright_restart_count": 0,
+        "pyright_file_attributed_restart_count": 0,
+        "pyright_file_attributed_respawn_failure_count": 0,
+        "pyright_ceiling_deferred_restart_count": 0,
+        "pyright_init_latency_total_ms": 0,
         "resolution_coverage": {
             "calls": {"status": "complete", "transient": False, "collateral": False},
             "references": {"status": "complete", "transient": False, "collateral": False},
@@ -877,3 +882,49 @@ def test_disabled_pyright_unavailable_does_not_redrive_per_session(
     # is needed.  The shared run_state.disabled=True short-circuits _ensure_process
     # before _start_process (and thus _resolve_executable) is re-entered.
     assert resolve_executable_call_count == 1
+
+
+def test_analyze_file_stats_carry_cumulative_pyright_restart_counters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clarion-7fc41105ea: run-state restart accounting rides every file's stats.
+
+    The values are CUMULATIVE for the run (reported unchanged on every file),
+    so the host must aggregate them with ``max``, never by summing.
+    """
+
+    class QuietPyrightSession:
+        def __init__(self, project_root: Path, **_kwargs: Any) -> None:
+            self.project_root = project_root
+
+        def resolve_calls(self, file_path: str, function_ids: list[str]) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult()
+
+        def resolve_references(
+            self, file_path: str, sites: Sequence[ReferenceSite]
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(server_module, "PyrightSession", QuietPyrightSession, raising=False)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def hello():\n    pass\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+    state.pyright_run_state.restart_count = 2
+    state.pyright_run_state.file_attributed_restart_count = 5
+    state.pyright_run_state.file_attributed_respawn_failure_count = 1
+    state.pyright_run_state.ceiling_deferred_restart_count = 3
+    state.pyright_run_state.pyright_init_latency_total_ms = 4321
+
+    stats = server_module.handle_analyze_file({"file_path": str(demo)}, state)["stats"]
+
+    assert stats["pyright_restart_count"] == 2
+    assert stats["pyright_file_attributed_restart_count"] == 5
+    assert stats["pyright_file_attributed_respawn_failure_count"] == 1
+    assert stats["pyright_ceiling_deferred_restart_count"] == 3
+    assert stats["pyright_init_latency_total_ms"] == 4321
