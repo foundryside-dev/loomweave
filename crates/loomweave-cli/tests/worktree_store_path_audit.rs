@@ -206,7 +206,7 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     // task scope (only the additive worktree-store report + the `--fix`
     // guard in install.rs were in scope for GREEN) — see the Task 7 report.
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "crate::install::write_gitignore(&loomweave_core::store::store_dir(project_root))", count: 1, classification: Classification::IntentionalRootDerived },
-    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let db = loomweave_core::store::db_path(project_root);", count: 3, classification: Classification::IntentionalRootDerived },
+    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let db = loomweave_core::store::db_path(project_root);", count: 4, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let db = loomweave_core::store::db_path(root);", count: 3, classification: Classification::TestExempt },
     // `check_resolution_coverage_json`'s lock-held unit test holds the STO-01
     // analyze lock in-process (clarion-7f527d3d32).
@@ -215,10 +215,14 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     // lock cannot be opened (persistent problem, not contention).
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "std::fs::create_dir(loomweave_core::store::store_dir(root).join(\"loomweave.lock\")).unwrap();", count: 1, classification: Classification::TestExempt },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let db_path = loomweave_core::store::db_path(project_root);", count: 3, classification: Classification::IntentionalRootDerived },
-    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let loomweave_dir = loomweave_core::store::store_dir(project_root);", count: 2, classification: Classification::IntentionalRootDerived },
+    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let loomweave_dir = loomweave_core::store::store_dir(project_root);", count: 3, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(project_root);", count: 2, classification: Classification::IntentionalRootDerived },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(root);", count: 1, classification: Classification::TestExempt },
     AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "std::fs::read_to_string(loomweave_core::store::store_dir(root).join(\".gitignore\"))", count: 1, classification: Classification::TestExempt },
+    // `index.runs`'s lock-held unit test holds the STO-01 analyze lock
+    // in-process via the non-blocking probe (clarion-5cf9643de9), same
+    // recipe as the resolution-coverage lock-held test above.
+    AllowedHit { file: "crates/loomweave-cli/src/doctor.rs", text: "let store = loomweave_core::store::store_dir(dir.path());", count: 1, classification: Classification::TestExempt },
     // ---- crates/loomweave-cli/src/guidance.rs ----
     AllowedHit { file: "crates/loomweave-cli/src/guidance.rs", text: "fn resolve_effective_db_path(project_root: &Path) -> std::path::PathBuf {", count: 1, classification: Classification::Route },
     AllowedHit { file: "crates/loomweave-cli/src/guidance.rs", text: "let db_path = resolve_effective_db_path(project_root);", count: 1, classification: Classification::Route },

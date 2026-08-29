@@ -368,6 +368,20 @@ while True:
         raise SystemExit(0)
     ident = msg["id"]
     if method == "initialize":
+        # clarion-5cf9643de9: opt-in env observation. When the host exports an
+        # interpreter to a language-server plugin, this is how the test sees it.
+        # Inert (and cheap) when the variable is unset, which is every other
+        # test sharing this script.
+        dump_to = os.environ.get("LOOMWEAVE_PHASE3_DUMP_ENV_TO")
+        if dump_to:
+            # ONE key, never the whole environment: the test only asks whether
+            # the host pinned an interpreter, and writing the runner's full env
+            # to disk in a repo with a pre-ingest secret scanner is a hazard for
+            # no gain. Empty file when the host exported nothing.
+            observed = os.environ.get("LOOMWEAVE_PYTHON_INTERPRETER")
+            pathlib.Path(dump_to).write_text(
+                "" if observed is None else f"LOOMWEAVE_PYTHON_INTERPRETER={observed}\n"
+            )
         write_frame({
             "jsonrpc": "2.0",
             "id": ident,
@@ -5846,6 +5860,180 @@ fn analyze_ontology_bump_forces_full_reanalysis() {
         Some(0),
         "a plugin version bump must also force a full re-analyse (the marker keys on the \
          (version, ontology_version) pair)"
+    );
+}
+
+/// clarion-5cf9643de9: the phase3 fixture manifest with a language-server
+/// runtime declared, so `analyze` runs project-interpreter discovery for it.
+#[cfg(unix)]
+fn phase3_pyright_manifest() -> String {
+    let manifest = PHASE3_PLUGIN_MANIFEST.replace(
+        "\n[ontology]\n",
+        "\n[capabilities.runtime.pyright]\npin = \"1.1.409\"\n\n[ontology]\n",
+    );
+    assert_ne!(
+        manifest, PHASE3_PLUGIN_MANIFEST,
+        "the pyright capability must actually be inserted"
+    );
+    manifest
+}
+
+/// Write an executable `#!/bin/sh` stub that stands in for a Python
+/// interpreter. Discovery only stats the file and checks its mode bits, so the
+/// stub is never executed — which is what keeps this test hermetic.
+#[cfg(unix)]
+fn write_interpreter_stub(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn plugin_resolver_environment(project_root: &std::path::Path, plugin_id: &str) -> Option<String> {
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
+    conn.query_row(
+        "SELECT resolver_environment FROM plugin_index_meta WHERE plugin_id = ?1",
+        [plugin_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .unwrap()
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_interpreter_change_forces_full_reanalysis() {
+    // clarion-5cf9643de9: a language-server plugin's call/reference evidence
+    // depends on WHICH interpreter its resolver ran against. Under an `analyze`
+    // launched from an agent hook the project venv is not on `PATH`, so pyright
+    // resolved against the system interpreter, every `tests/` -> `src/` target
+    // came back empty, and the incremental skip pinned the hole for good: the
+    // files were byte-identical, so a later run with the venv present skipped
+    // them and never healed the evidence.
+    //
+    // The fix records the host-discovered interpreter as
+    // `plugin_index_meta.resolver_environment` and treats a move in it exactly
+    // like a plugin/ontology bump. This test drives the interpreter from a
+    // project-owned `.venv` to a bare `PATH` guess between two byte-identical
+    // runs and asserts the re-dispatch fires (and fires only once).
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let path_stub_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    std::fs::write(
+        plugin_dir.path().join("plugin.toml"),
+        phase3_pyright_manifest(),
+    )
+    .unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_only_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let plugin_and_stub_path = std::env::join_paths([
+        plugin_dir.path().to_path_buf(),
+        path_stub_dir.path().to_path_buf(),
+    ])
+    .unwrap();
+
+    std::fs::write(project_dir.path().join("res_a.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("res_b.p3"), b"module\n").unwrap();
+    // `analyze` canonicalises the project root before discovery, so the
+    // recorded fingerprint is rooted at the canonical path.
+    let canonical_root = project_dir.path().canonicalize().unwrap();
+    let dotvenv = canonical_root.join(".venv/bin/python");
+    write_interpreter_stub(&dotvenv);
+    let path_stub = path_stub_dir.path().join("python3");
+    write_interpreter_stub(&path_stub);
+    // Observed OUTSIDE the project tree so it never becomes an analysis input.
+    let env_dump = plugin_dir.path().join("plugin-env.txt");
+
+    // The ambient shell must not decide the answer: an activated venv or an
+    // operator override would silently outrank the fixtures below.
+    let analyze = |path: &std::ffi::OsString, dump: Option<&std::path::Path>| {
+        let mut cmd = loomweave_bin();
+        cmd.args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", path)
+            .env_remove("VIRTUAL_ENV")
+            .env_remove("CONDA_PREFIX")
+            .env_remove("LOOMWEAVE_PYTHON_INTERPRETER")
+            .env_remove("LOOMWEAVE_PHASE3_DUMP_ENV_TO");
+        if let Some(dump) = dump {
+            // Remove first: the assertions below read this file as evidence of
+            // what THIS run's plugin child saw. A leftover from an earlier run
+            // would let a run that never started a plugin pass a negative
+            // assertion vacuously.
+            let _ = std::fs::remove_file(dump);
+            cmd.env("LOOMWEAVE_PHASE3_DUMP_ENV_TO", dump);
+        }
+        cmd.assert().success();
+    };
+
+    // Run 1 (fresh): the project's own `.venv` wins discovery, is recorded as
+    // the marker, and is exported to the plugin child.
+    analyze(&plugin_only_path, Some(&env_dump));
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "first run has no prior index, so it skips nothing"
+    );
+    assert_eq!(
+        plugin_resolver_environment(project_dir.path(), "phase3fixture"),
+        Some(dotvenv.display().to_string()),
+        "the recorded fingerprint must be the absolute, unresolved .venv interpreter"
+    );
+    let dumped = std::fs::read_to_string(&env_dump).unwrap();
+    assert!(
+        dumped
+            .lines()
+            .any(|line| line == format!("LOOMWEAVE_PYTHON_INTERPRETER={}", dotvenv.display())),
+        "the plugin child must receive the host's pinned interpreter; got:\n{dumped}"
+    );
+
+    // Run 2 (unchanged): the marker matches, so the byte-hash skip re-engages.
+    // Without this the next assertion would be vacuously true.
+    analyze(&plugin_only_path, None);
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2),
+        "an unchanged incremental re-run with an unchanged interpreter skips both files"
+    );
+
+    // Run 3: the venv disappears and only a bare `PATH` python3 remains. Source
+    // is byte-identical, so ONLY the resolver environment moved.
+    std::fs::remove_dir_all(canonical_root.join(".venv")).unwrap();
+    analyze(&plugin_and_stub_path, Some(&env_dump));
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "a changed resolver interpreter must force a full re-dispatch despite \
+         byte-identical source — otherwise the stale call evidence is pinned forever"
+    );
+    assert_eq!(
+        plugin_resolver_environment(project_dir.path(), "phase3fixture"),
+        Some(format!("unpinned:{}", path_stub.display())),
+        "a bare PATH guess is recorded as unpinned, so acquiring a venv at the same \
+         path still moves the marker"
+    );
+    let dumped = std::fs::read_to_string(&env_dump).expect(
+        "the plugin child must have run and rewritten the dump — an unreadable file \
+         means the negative assertion below would be vacuous",
+    );
+    assert_eq!(
+        dumped, "",
+        "an unpinned guess must NOT be exported to the plugin as an authoritative pin"
+    );
+
+    // Run 4 (unchanged again): the force-full is one-shot per interpreter
+    // change, not a permanent disabling of incremental analysis.
+    analyze(&plugin_and_stub_path, None);
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2),
+        "once the new interpreter is recorded, an unchanged re-run skips again"
     );
 }
 

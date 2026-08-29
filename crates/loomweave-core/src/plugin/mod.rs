@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod host;
 mod host_findings;
 mod host_validate;
+pub mod interpreter;
 pub mod jail;
 pub mod limits;
 pub mod manifest;
@@ -31,6 +32,10 @@ pub use host::{
     PluginHost, RawEdge, RawEntity,
 };
 pub use host_findings::{DUPLICATE_LOCATOR_RULE_ID, FINDING_MALFORMED_FINDING};
+pub use interpreter::{
+    InterpreterSource, PYTHON_INTERPRETER_ENV, ProjectInterpreter, discover_project_interpreter,
+    resolver_environment_for,
+};
 pub use jail::{JailError, jail, jail_to_string};
 pub use limits::{
     BreakerState, CapExceeded, ContentLengthCeiling, DEFAULT_MAX_NOFILE, DEFAULT_MAX_NPROC,

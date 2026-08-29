@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import errno
+import json
 import os
 import shutil
 import stat
@@ -18,6 +19,7 @@ import pytest
 
 from loomweave_plugin_python import pyright_session as pyright_session_module
 from loomweave_plugin_python.call_resolver import CallResolutionResult, FacetCoverage
+from loomweave_plugin_python.interpreter import ProjectInterpreter
 from loomweave_plugin_python.pyright_session import (
     FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS,
     FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
@@ -2724,6 +2726,16 @@ class _FakeProcess:
         return self.returncode if self.returncode is not None else 0
 
 
+# Restart/wedge/deferral tests assert on restart ATTRIBUTION, not interpreter
+# pinning. Without a fixed default, ``RestartProbeSession``'s inherited
+# discovery would resolve against whatever interpreter the host happens to
+# expose (``VIRTUAL_ENV`` set or not), swinging otherwise-complete coverage
+# claims to ``interpreter_unpinned`` on some machines/CI runs and not others
+# (clarion-5cf9643de9). Pinned so those tests stay environment-independent;
+# a test exercising pinning itself passes its own ``interpreter=`` and wins.
+_PINNED_TEST_INTERPRETER = ProjectInterpreter(path=sys.executable, source="override")
+
+
 class RestartProbeSession(PyrightSession):
     """A fake pyright that models death and respawn without a subprocess.
 
@@ -2753,6 +2765,7 @@ class RestartProbeSession(PyrightSession):
         run_state: PyrightRunState | None = None,
         **kwargs: Any,
     ) -> None:
+        kwargs.setdefault("interpreter", _PINNED_TEST_INTERPRETER)
         super().__init__(project_root, executable=sys.executable, run_state=run_state, **kwargs)
         self.crash_stems = crash_stems or set()
         # Stems whose first query hangs past its timeout while the fake
@@ -3073,7 +3086,11 @@ def test_pyright_session_immediate_restart_next_file_uses_fresh_real_process(
     run_state = PyrightRunState()
 
     with PyrightSession(
-        tmp_path, executable=str(script), init_timeout_secs=5.0, run_state=run_state
+        tmp_path,
+        executable=str(script),
+        init_timeout_secs=5.0,
+        run_state=run_state,
+        interpreter=_PINNED_TEST_INTERPRETER,
     ) as session:
         crashed = session.resolve_calls(trouble, [_caller_id("trouble")])
         assert session._process is not None  # noqa: SLF001
@@ -4413,3 +4430,257 @@ def test_any_spawn_consumes_the_one_shot_uncharged_restart_flag(tmp_path: Path) 
     assert session.spawns == 2
     assert run_state.restart_count == 1
     assert FINDING_PYRIGHT_RESTART in _finding_codes(session._pop_findings())  # noqa: SLF001
+
+
+def test_workspace_configuration_carries_python_path_when_pinned(tmp_path: Path) -> None:
+    marker = tmp_path / "config-marker.txt"
+    fake_python = tmp_path / ".venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    script = _write_executable(
+        tmp_path,
+        textwrap.dedent(
+            """
+            #!/usr/bin/env python3
+            import json, os, sys
+            from pathlib import Path
+
+            def read_frame():
+                headers = {}
+                while True:
+                    line = sys.stdin.buffer.readline()
+                    if not line:
+                        return None
+                    if line == b"\\r\\n":
+                        break
+                    name, value = line.decode("ascii").strip().split(":", 1)
+                    headers[name.lower()] = value.strip()
+                return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+            def write_frame(message):
+                body = json.dumps(message).encode("utf-8")
+                sys.stdout.buffer.write(
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\\r\\n\\r\\n"
+                )
+                sys.stdout.buffer.write(body)
+                sys.stdout.buffer.flush()
+
+            initialize = read_frame()
+            write_frame({"jsonrpc": "2.0", "id": 0, "method": "workspace/configuration",
+                         "params": {"items": [{"section": "python"}]}})
+            config = read_frame()
+            python = config.get("result", [{}])[0]
+            Path(os.environ["CONFIG_MARKER"]).write_text(json.dumps(python))
+            write_frame({"jsonrpc": "2.0", "id": initialize["id"], "result": {}})
+            while True:
+                frame = read_frame()
+                if frame is None:
+                    break
+                method = frame.get("method")
+                if method == "textDocument/prepareCallHierarchy":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": []})
+                elif method == "shutdown":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": {}})
+                elif method == "exit":
+                    break
+            """,
+        ).lstrip(),
+    )
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n")
+
+    with PyrightSession(
+        tmp_path,
+        executable=str(script),
+        env={"CONFIG_MARKER": str(marker), "LOOMWEAVE_PYTHON_INTERPRETER": ""},
+        init_timeout_secs=1.0,
+    ) as session:
+        assert session.interpreter.source == "dotvenv"
+        result = session.resolve_calls(module, ["python:function:demo.caller"])
+
+    python_section = json.loads(marker.read_text())
+    assert python_section["pythonPath"] == str(fake_python.resolve())
+    assert python_section["analysis"]["diagnosticMode"] == "openFilesOnly"
+    assert result.coverage.status == "complete", "a pinned interpreter never degrades coverage"
+
+
+def test_unpinned_interpreter_degrades_an_otherwise_complete_facet(tmp_path: Path) -> None:
+    source = "def caller():\n    print('x')\n"
+    module = _write_module(tmp_path, source)
+    # A real site so the references pass reaches its wrapped final return
+    # rather than the ``not sites`` early exit, which stays ``complete``
+    # (zero requested sites means an unpinned interpreter cannot have cost
+    # this facet any evidence -- see the sibling assertion below).
+    site = _reference_site(source, from_id="python:module:demo", needle="print", occurrence=0)
+    unpinned = ProjectInterpreter(path="/usr/bin/python3", source="path")
+
+    session = RestartProbeSession(tmp_path, interpreter=unpinned)
+    try:
+        calls = session.resolve_calls(module, ["python:function:demo.caller"])
+        references = session.resolve_references(module, [site])
+        empty_references = session.resolve_references(module, [])
+        # Last: ``resolve_calls`` resets the file's shared deadline window, so
+        # an earlier placement would perturb the two results gathered above.
+        empty_calls = session.resolve_calls(module, [])
+    finally:
+        session.close()
+
+    for coverage in (calls.coverage, references.coverage):
+        assert coverage.status == "degraded"
+        assert coverage.reason == "interpreter_unpinned"
+        assert coverage.transient is False
+        assert coverage.collateral is False
+    # A facet with nothing requested has no interpreter-caused hole to claim:
+    # no pyright query was issued, so ``complete`` is exact rather than
+    # optimistic. Both early returns must behave the same way.
+    assert empty_references.coverage.status == "complete"
+    assert empty_calls.coverage.status == "complete"
+
+
+def test_unpinned_interpreter_never_masks_a_real_degradation(tmp_path: Path) -> None:
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n", name="slow.py")
+    unpinned = ProjectInterpreter(path=None, source="none")
+
+    session = RestartProbeSession(tmp_path, interpreter=unpinned, timeout_stems={"slow"})
+    try:
+        calls = session.resolve_calls(module, ["python:function:slow.caller"])
+    finally:
+        session.close()
+
+    assert calls.coverage.reason == "pyright_timeout", calls.coverage
+
+
+def _write_minimal_langserver(tmp_path: Path) -> Path:
+    """A fake ``pyright-langserver`` that handshakes and answers every query emptily.
+
+    Enough to make ``_spawn_and_initialize`` succeed for real (a subprocess, a
+    real transport) without depending on pyright being installed.
+    """
+    return _write_executable(
+        tmp_path,
+        textwrap.dedent(
+            """
+            #!/usr/bin/env python3
+            import json, sys
+
+            def read_frame():
+                headers = {}
+                while True:
+                    line = sys.stdin.buffer.readline()
+                    if not line:
+                        return None
+                    if line == b"\\r\\n":
+                        break
+                    name, value = line.decode("ascii").strip().split(":", 1)
+                    headers[name.lower()] = value.strip()
+                return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+            def write_frame(message):
+                body = json.dumps(message).encode("utf-8")
+                sys.stdout.buffer.write(
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\\r\\n\\r\\n"
+                )
+                sys.stdout.buffer.write(body)
+                sys.stdout.buffer.flush()
+
+            initialize = read_frame()
+            write_frame({"jsonrpc": "2.0", "id": initialize["id"], "result": {}})
+            while True:
+                frame = read_frame()
+                if frame is None:
+                    break
+                method = frame.get("method")
+                if method == "textDocument/prepareCallHierarchy":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": []})
+                elif method == "shutdown":
+                    write_frame({"jsonrpc": "2.0", "id": frame["id"], "result": {}})
+                elif method == "exit":
+                    break
+            """,
+        ).lstrip(),
+    )
+
+
+def test_path_rung_interpreter_is_unpinned_and_degrades_the_calls_facet(tmp_path: Path) -> None:
+    """A venv-less project falls to the ``path`` rung, which is a guess, not a pin.
+
+    The three pinned rungs above it are explicitly emptied (``""`` counts as
+    unset on both sides of the cross-language contract), and ``tmp_path`` has
+    no ``.venv`` -- so discovery reaches the stub on ``PATH``. That is exactly
+    the launcher-dependent situation ADR-058 refuses to call ``complete``: the
+    facet must come back ``degraded``/``interpreter_unpinned``.
+    """
+    stub_dir = tmp_path / "stub-bin"
+    stub_dir.mkdir()
+    stub_python = stub_dir / "python"
+    stub_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub_python.chmod(stub_python.stat().st_mode | stat.S_IXUSR)
+    script = _write_minimal_langserver(tmp_path)
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n")
+    assert not (tmp_path / ".venv").exists(), "rung 2 must not be reachable"
+
+    with PyrightSession(
+        tmp_path,
+        executable=str(script),
+        # The stub dir is PREPENDED rather than replacing PATH so the fake
+        # server's `#!/usr/bin/env python3` still resolves, exactly as every
+        # other fake-script test in this file assumes.
+        env={
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ['PATH']}",
+            "VIRTUAL_ENV": "",
+            "CONDA_PREFIX": "",
+            "LOOMWEAVE_PYTHON_INTERPRETER": "",
+        },
+        init_timeout_secs=5.0,
+    ) as session:
+        assert session.interpreter.source == "path"
+        assert session.interpreter.pinned is False
+        assert session.interpreter.path == str(stub_python)
+        result = session.resolve_calls(module, ["python:function:demo.caller"])
+
+    assert result.coverage.status == "degraded"
+    assert result.coverage.reason == "interpreter_unpinned"
+    assert result.coverage.transient is False
+
+
+def test_interpreter_is_announced_once_per_session_not_once_per_spawn(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``_interpreter_announced`` is a SESSION guard, not a per-process one.
+
+    A run recycles pyright every ``MAX_FILES_PER_PYRIGHT_SESSION`` files and
+    restarts it on every crash; announcing per spawn would turn one
+    orientation line into a stream of duplicates in the operator's stderr for
+    an interpreter that never changed.
+    """
+    fake_python = tmp_path / ".venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    script = _write_minimal_langserver(tmp_path)
+    module = _write_module(tmp_path, "def caller():\n    print('x')\n")
+
+    with PyrightSession(
+        tmp_path,
+        executable=str(script),
+        env={"LOOMWEAVE_PYTHON_INTERPRETER": ""},
+        init_timeout_secs=5.0,
+    ) as session:
+        assert session.interpreter.source == "dotvenv"
+        session.resolve_calls(module, ["python:function:demo.caller"])
+        first = capsys.readouterr().err
+        # A killed process forces a second, real `_spawn_and_initialize`.
+        session.kill_for_test()
+        restarted = session.resolve_calls(module, ["python:function:demo.caller"])
+        second = capsys.readouterr().err
+
+    announcements = [line for line in first.splitlines() if "pyright interpreter" in line]
+    assert len(announcements) == 1, first
+    assert str(fake_python) in announcements[0]
+    assert "source=dotvenv" in announcements[0]
+    assert "pinned=True" in announcements[0]
+    # Non-vacuity FIRST: without a genuine second spawn the assertion below is
+    # free, and a failure there would point at the wrong thing.
+    assert FINDING_PYRIGHT_RESTART in _finding_codes(restarted.findings)
+    assert "pyright interpreter" not in second, second

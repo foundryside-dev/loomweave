@@ -120,6 +120,7 @@ DEFAULT_MAX_RSS_MIB             (limits.rs, four-axis declaration)
 DEFAULT_MAX_NOFILE              (limits.rs)
 DEFAULT_MAX_NPROC               (limits.rs)
 LANGUAGE_SERVER_MAX_AS_MIB      (limits.rs, 8 GiB, language-server AS ceiling — clarion-353c5b9aa5, four-axis declaration)
+PYTHON_INTERPRETER_ENV          (interpreter.rs:33, four-axis declared — override surface, not a tunable; wire-paired-with the Python plugin's INTERPRETER_OVERRIDE_ENV literal, ADR-058)
 ```
 
 Previously this list carried `PYRIGHT_MAX_NPROC = 4096` (host.rs, a raised `RLIMIT_NPROC` ceiling for the language-server runtime). That constant was **retired**: `RLIMIT_NPROC` is a per-real-UID-global counter, so any fixed ceiling is tripped by the operator's unrelated processes and intermittently fails `pyright-langserver`'s `fork(2)` with `EAGAIN` on a busy workstation. `host::effective_max_nproc` now returns `None` (no `RLIMIT_NPROC` cap) for plugins declaring the `pyright` runtime capability, and `Some(DEFAULT_MAX_NPROC)` otherwise. See ADR-021 (Alternative 4, "process-count control") for the rationale and the cgroup v2 `pids.max` follow-up. The remaining constants MUST be retrofitted to the four-axis declaration before the 1.1 release.
@@ -139,6 +140,7 @@ PYRIGHT_FILE_TIMEOUT_CAP_SECS    (90.0,   pyright_session.py)
 MAX_REFERENCE_SITES_PER_FILE     (2000,   pyright_session.py:45)
 MAX_UNRESOLVED_CALLEE_EXPR_BYTES (512,    pyright_session.py:43, wire-paired-with Rust same-name)
 STDERR_TAIL_LIMIT                (65536,  pyright_session.py:49, wire-paired-with STDERR_TAIL_BYTES)
+INTERPRETER_OVERRIDE_ENV         (LOOMWEAVE_PYTHON_INTERPRETER, interpreter.py:44, override surface — not a tunable; wire-paired-with Rust's PYTHON_INTERPRETER_ENV literal, ADR-058)
 ```
 
 Plus the writer-actor cadence constants in `crates/loomweave-storage/src/writer.rs`:

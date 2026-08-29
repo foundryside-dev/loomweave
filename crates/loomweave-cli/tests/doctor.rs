@@ -14,6 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use loomweave_storage::EXTERNAL_READ_MAX_USER_VERSION;
 use rusqlite::Connection;
 #[cfg(unix)]
 use tempfile::TempDir;
@@ -1344,11 +1345,19 @@ fn doctor_reports_external_sqlite_current_legacy_and_older_states() {
     let current_check = check(&json, "federation.sqlite_compatibility");
     assert_eq!(current_check["status"], "ok", "{current_check}");
     assert_eq!(current_check["details"]["compatibility"], "compatible");
-    assert_eq!(current_check["details"]["user_version"], 14);
+    // Derived, not hardcoded: a schema migration advances the reviewed external
+    // ceiling, and this assertion must track it rather than re-pinning a literal
+    // that goes stale on every bump.
+    assert_eq!(
+        current_check["details"]["user_version"],
+        EXTERNAL_READ_MAX_USER_VERSION
+    );
     let (_, text) = doctor(current.path(), false);
     assert!(
         text.contains("federation.sqlite_compatibility")
-            && text.contains("compatible at user_version=14"),
+            && text.contains(&format!(
+                "compatible at user_version={EXTERNAL_READ_MAX_USER_VERSION}"
+            )),
         "text output must carry the same current compatibility verdict:\n{text}"
     );
 
@@ -1538,7 +1547,10 @@ fn doctor_rejects_foreign_and_too_new_external_sqlite_before_catalogue_queries()
     write_healthy_db(too_new.path());
     Connection::open(too_new.path().join(".weft/loomweave/loomweave.db"))
         .unwrap()
-        .execute_batch("PRAGMA user_version = 15;")
+        .execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            EXTERNAL_READ_MAX_USER_VERSION + 1
+        ))
         .unwrap();
     let (code, json) = doctor_json(too_new.path(), false);
     let incompatible = check(&json, "federation.sqlite_compatibility");

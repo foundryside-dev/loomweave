@@ -58,6 +58,7 @@ use super::host_validate::{
     validate_plugin_finding,
 };
 use crate::entity_id::{EntityId, EntityIdError, entity_id};
+use crate::plugin::interpreter::{PYTHON_INTERPRETER_ENV, discover_project_interpreter};
 use crate::plugin::jail::{JailError, jail_to_string};
 use crate::plugin::limits::{
     BreakerState, CapExceeded, ContentLengthCeiling, EntityCountCap, PathEscapeBreaker,
@@ -131,6 +132,42 @@ fn effective_as_mib(manifest: &Manifest) -> u64 {
             DEFAULT_MAX_RSS_MIB,
         )
     }
+}
+
+/// The interpreter path to export to a plugin child as
+/// [`PYTHON_INTERPRETER_ENV`], or `None` to export nothing
+/// (clarion-5cf9643de9).
+///
+/// Language-server plugins resolve against the interpreter the HOST chose, so
+/// the index never depends on the launcher's `PATH`. Three guards:
+/// - only plugins declaring `[capabilities.runtime.pyright]` are pointed at an
+///   interpreter — nothing else consumes the variable;
+/// - an operator's own NON-EMPTY [`PYTHON_INTERPRETER_ENV`] is left untouched
+///   (it already wins the plugin's own discovery, and overwriting it would
+///   silently ignore an explicit pin). An EMPTY value is "unset" here exactly
+///   as it is on both discoveries' override rung, so the host still exports;
+///   treating `""` as a set override would leave the plugin with an empty
+///   variable it also ignores, and no interpreter at all;
+/// - only a PINNED (project-owned) choice is exported. A bare `PATH` guess is
+///   no better than the plugin's own fallback, and exporting it would present
+///   a guess to the plugin as an authoritative pin.
+///
+/// `env` abstracts `std::env::var_os` so the unit tests below do not read the
+/// developer's own environment. `project_root` must be canonicalised (the
+/// caller passes `canonical_root`) — discovery is not root-invariant, and
+/// `analyze` records its marker from the same canonical root.
+fn exported_interpreter(
+    manifest: &Manifest,
+    project_root: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if manifest.capabilities.runtime.pyright.is_none()
+        || env(PYTHON_INTERPRETER_ENV).is_some_and(|value| !value.is_empty())
+    {
+        return None;
+    }
+    let chosen = discover_project_interpreter(project_root, env);
+    if chosen.pinned() { chosen.path } else { None }
 }
 
 // ── Wire entity types (Option A) ──────────────────────────────────────────────
@@ -544,6 +581,15 @@ impl
         }
 
         let mut command = std::process::Command::new(executable);
+        // clarion-5cf9643de9: point a language-server plugin at the project's
+        // own interpreter before it starts, so its resolver evidence does not
+        // depend on whatever `python` happened to be first on the launcher's
+        // `PATH`. See `exported_interpreter` for the three guards.
+        if let Some(interpreter) =
+            exported_interpreter(&manifest, &canonical_root, &|key| std::env::var_os(key))
+        {
+            command.env(PYTHON_INTERPRETER_ENV, interpreter);
+        }
         command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1539,6 +1585,75 @@ ontology_version = "0.1.0"
         {
             assert!(LANGUAGE_SERVER_MAX_AS_MIB > DEFAULT_MAX_RSS_MIB);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_language_server_plugins_are_pointed_at_the_project_interpreter() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("tempdir");
+        let venv = dir.path().join(".venv/bin/python");
+        std::fs::create_dir_all(venv.parent().unwrap()).unwrap();
+        std::fs::write(&venv, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&venv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty = |_: &str| -> Option<OsString> { None };
+
+        // A pyright plugin is handed the project's own `.venv` interpreter.
+        assert_eq!(
+            exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &empty),
+            Some(venv.clone()),
+            "a language-server plugin must be pinned to the project interpreter"
+        );
+        // A plugin that does not declare the pyright runtime never triggers
+        // discovery: the variable means nothing to it, and exporting it would
+        // widen the child's environment for no reason.
+        assert_eq!(
+            exported_interpreter(&compliant_manifest(), dir.path(), &empty),
+            None,
+            "a non-language-server plugin must not be handed an interpreter"
+        );
+        // An operator's own override is left untouched — the plugin's own
+        // discovery already trusts it first, so re-exporting the host's choice
+        // would silently defeat an explicit pin.
+        let overridden = |key: &str| -> Option<OsString> {
+            (key == PYTHON_INTERPRETER_ENV).then(|| OsString::from("/opt/custom/python"))
+        };
+        assert_eq!(
+            exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &overridden),
+            None,
+            "an operator override must survive untouched"
+        );
+        // ...but an EMPTY value is not an override. Both discoveries treat
+        // `""` as unset on the override rung (`if override:` in Python,
+        // `.filter(|v| !v.is_empty())` in Rust), so a bare `is_some()` guard
+        // here would suppress the export for a variable the plugin then also
+        // ignores — leaving the child with no interpreter at all, which is the
+        // launcher-dependent hole this export exists to close.
+        let empty_override =
+            |key: &str| -> Option<OsString> { (key == PYTHON_INTERPRETER_ENV).then(OsString::new) };
+        assert_eq!(
+            exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &empty_override),
+            Some(venv.clone()),
+            "an empty override is unset: the host still exports its own pinned choice"
+        );
+        // An UNPINNED (bare `PATH`) choice is not exported: presenting a guess
+        // to the plugin as an authoritative pin buys nothing over its own
+        // fallback.
+        let unpinned_root = TempDir::new().expect("tempdir");
+        let path_only = |key: &str| -> Option<OsString> {
+            (key == "PATH").then(|| OsString::from(venv.parent().unwrap()))
+        };
+        assert_eq!(
+            exported_interpreter(
+                &pyright_small_rss_manifest(),
+                unpinned_root.path(),
+                &path_only
+            ),
+            None,
+            "a bare PATH guess must not be exported as a pin"
+        );
     }
 
     // ── Full end-to-end helper ────────────────────────────────────────────────

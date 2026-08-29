@@ -43,13 +43,13 @@ Read these header fields before any catalogue query:
 | Field | v1 accepted values |
 |---|---|
 | `PRAGMA application_id` | `0x4c4d5756` (`LMWV`) or legacy `0` |
-| `PRAGMA user_version` | `5..=14` |
+| `PRAGMA user_version` | `5..=15` |
 
 The typed compatibility states are:
 
-- `compatible`: `user_version=14`, the newest reviewed v1 schema;
-- `older_supported`: `user_version=5..13`, with the same safe projection;
-- `incompatible`: foreign application ID, version 0, version 1–4, version 13
+- `compatible`: `user_version=15`, the newest reviewed v1 schema;
+- `older_supported`: `user_version=5..14`, with the same safe projection;
+- `incompatible`: foreign application ID, version 0, version 1–4, version 16
   or later, malformed header values, or a missing required table/column.
 
 Legacy `application_id=0` plus the required structure proves format

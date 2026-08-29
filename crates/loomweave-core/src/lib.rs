@@ -54,4 +54,7 @@ pub use plugin::{
     UnresolvedCallSite,
     discover,
     parse_manifest,
+    // interpreter (clarion-5cf9643de9) — `analyze` keys its incremental skip
+    // on the resolver environment a language-server plugin resolved against.
+    resolver_environment_for,
 };

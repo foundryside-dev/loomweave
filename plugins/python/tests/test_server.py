@@ -17,6 +17,7 @@ from typing import IO, TYPE_CHECKING, Any, cast
 
 from loomweave_plugin_python import server as server_module
 from loomweave_plugin_python.call_resolver import CallResolutionResult, FacetCoverage
+from loomweave_plugin_python.interpreter import ProjectInterpreter
 from loomweave_plugin_python.pyright_session import (
     FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
     FINDING_PYRIGHT_RESTART,
@@ -90,7 +91,7 @@ def test_initialize_roundtrip() -> None:
         assert result["name"] == "loomweave-plugin-python"
         assert result["version"] == "1.5.0"
         assert result["ontology_version"] == "0.12.0"
-        assert set(result["capabilities"]) == {"wardline"}
+        assert set(result["capabilities"]) == {"wardline", "python_interpreter"}
         assert result["capabilities"]["wardline"]["status"] in {
             "absent",
             "enabled",
@@ -928,3 +929,62 @@ def test_analyze_file_stats_carry_cumulative_pyright_restart_counters(
     assert stats["pyright_file_attributed_respawn_failure_count"] == 1
     assert stats["pyright_ceiling_deferred_restart_count"] == 3
     assert stats["pyright_init_latency_total_ms"] == 4321
+
+
+def test_initialize_discovers_and_advertises_the_project_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_python = tmp_path / ".venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    monkeypatch.delenv("LOOMWEAVE_PYTHON_INTERPRETER", raising=False)
+    state = server_module.ServerState()
+
+    response = server_module.handle_initialize(
+        {"protocol_version": "1.0", "project_root": str(tmp_path)}, state
+    )
+
+    assert response["capabilities"]["python_interpreter"] == {
+        "path": str(fake_python.resolve()),
+        "source": "dotvenv",
+        "pinned": True,
+    }
+    assert state.interpreter is not None
+    assert state.interpreter.pinned
+
+
+def test_analyze_file_hands_the_discovered_interpreter_to_pyright(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakePyrightSession:
+        def __init__(self, project_root: Path, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            self.project_root = project_root
+
+        def resolve_calls(self, file_path: str, function_ids: list[str]) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult()
+
+        def resolve_references(
+            self, file_path: str, sites: Sequence[ReferenceSite]
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(server_module, "PyrightSession", FakePyrightSession, raising=False)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def hello():\n    pass\n", encoding="utf-8")
+    interpreter = ProjectInterpreter(path="/x/python", source="override")
+    state = server_module.ServerState(
+        initialized=True, project_root=tmp_path, interpreter=interpreter
+    )
+
+    server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    assert captured["interpreter"] == interpreter
