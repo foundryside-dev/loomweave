@@ -203,7 +203,8 @@ def main() -> int:
         type=float,
         # reference_requests_per_b4_function_query = reference_requests_total /
         # function_count. Like the p95 gate this tracks the per-file reference
-        # budget PYRIGHT_FILE_TIMEOUT_SECS: a larger budget processes more
+        # budget (PYRIGHT_FILE_TIMEOUT_BASE_SECS + PYRIGHT_FILE_TIMEOUT_PER_FUNCTION_SECS
+        # per function, capped at PYRIGHT_FILE_TIMEOUT_CAP_SECS): a larger budget processes more
         # reference sites per file before cutoff, so more LSP requests are issued
         # per function. The budget was raised 3s -> 10s (more-complete graphs on
         # large files), which lifts this ratio to ~8.1 — right at the old 8.0
@@ -215,10 +216,12 @@ def main() -> int:
     parser.add_argument(
         "--max-b5-p95-ms",
         type=int,
-        # Coupled to the Python plugin's per-file reference budget
-        # PYRIGHT_FILE_TIMEOUT_SECS (pyright_session.py): a single file's
-        # resolution is capped at that budget, so the p95 over a stress corpus
-        # tracks it. The budget was raised 3s -> 10s for more-complete graphs on
+        # Coupled to the Python plugin's per-file resolution budget
+        # (pyright_session.py: PYRIGHT_FILE_TIMEOUT_BASE_SECS 10s +
+        # PYRIGHT_FILE_TIMEOUT_PER_FUNCTION_SECS 0.25s/function, capped at
+        # PYRIGHT_FILE_TIMEOUT_CAP_SECS 90s -- clarion-7f527d3d32): a single
+        # file's resolution is capped at its budget, so the p95 over a stress
+        # corpus tracks the base budget for typical files. The budget was raised 3s -> 10s for more-complete graphs on
         # large, heavily-typed files, which lifts the p95 ceiling accordingly;
         # this gate moves with it (budget + margin) and still catches a
         # regression that blows past the per-file budget.
