@@ -116,9 +116,10 @@ MAX_HEADER_LINE_BYTES           (8 KiB,  transport.rs)
 MAX_UNRESOLVED_CALLEE_EXPR_BYTES (512,   host.rs)
 ContentLengthCeiling::DEFAULT   (8 MiB,  limits.rs)
 EntityCountCap::DEFAULT_MAX     (500_000, limits.rs)
-DEFAULT_MAX_RSS_MIB             (limits.rs)
+DEFAULT_MAX_RSS_MIB             (limits.rs, four-axis declaration)
 DEFAULT_MAX_NOFILE              (limits.rs)
 DEFAULT_MAX_NPROC               (limits.rs)
+LANGUAGE_SERVER_MAX_AS_MIB      (limits.rs, 8 GiB, language-server AS ceiling — clarion-353c5b9aa5, four-axis declaration)
 ```
 
 Previously this list carried `PYRIGHT_MAX_NPROC = 4096` (host.rs, a raised `RLIMIT_NPROC` ceiling for the language-server runtime). That constant was **retired**: `RLIMIT_NPROC` is a per-real-UID-global counter, so any fixed ceiling is tripped by the operator's unrelated processes and intermittently fails `pyright-langserver`'s `fork(2)` with `EAGAIN` on a busy workstation. `host::effective_max_nproc` now returns `None` (no `RLIMIT_NPROC` cap) for plugins declaring the `pyright` runtime capability, and `Some(DEFAULT_MAX_NPROC)` otherwise. See ADR-021 (Alternative 4, "process-count control") for the rationale and the cgroup v2 `pids.max` follow-up. The remaining constants MUST be retrofitted to the four-axis declaration before the 1.1 release.

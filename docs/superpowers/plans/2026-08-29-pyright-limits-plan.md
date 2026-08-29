@@ -293,7 +293,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 2's env knob; existing helpers `fixture_binary_path()`, `loomweave_bin()`, `setup_oom_plugin_dir()`; `FINDING_OOM_KILLED`.
-- Produces: helper `setup_language_server_plugin_dir(&PathBuf) -> TempDir` (manifest identical to the OOM one but `plugin_id = "langsrv"`, `extensions = ["ls"]`, `expected_max_rss_mb = 2048`, plus `[capabilities.runtime.pyright] pin = "1.1.409"`).
+- Produces: helper `setup_language_server_plugin_dir(&PathBuf) -> TempDir` (manifest identical to the OOM one but `plugin_id = "fixture"`, `extensions = ["ls"]`, `expected_max_rss_mb = 2048`, plus `[capabilities.runtime.pyright] pin = "1.1.409"`).
 
 - [ ] **Step 1: Write the two failing tests**
 
@@ -306,7 +306,7 @@ fn setup_language_server_plugin_dir(fixture_bin: &PathBuf) -> TempDir {
     let manifest = r#"
 [plugin]
 name = "loomweave-plugin-langsrv"
-plugin_id = "langsrv"
+plugin_id = "fixture"
 version = "0.1.0"
 protocol_version = "1.0"
 executable = "loomweave-plugin-langsrv"
