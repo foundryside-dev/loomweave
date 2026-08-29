@@ -320,6 +320,114 @@ fn wp2_rlimit_as_oom_kill_is_reported_as_host_finding() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn setup_language_server_plugin_dir(fixture_bin: &PathBuf) -> TempDir {
+    let plugin_dir = TempDir::new().expect("create langsrv plugin tempdir");
+    let dest = plugin_dir.path().join("loomweave-plugin-langsrv");
+    std::os::unix::fs::symlink(fixture_bin, &dest).expect("symlink loomweave-plugin-langsrv");
+    let manifest = r#"
+[plugin]
+name = "loomweave-plugin-langsrv"
+plugin_id = "fixture"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "loomweave-plugin-langsrv"
+language = "fixture"
+extensions = ["ls"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 2048
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[capabilities.runtime.pyright]
+pin = "1.1.409"
+
+[ontology]
+entity_kinds = ["widget"]
+edge_kinds = []
+rule_id_prefix = "LMWV-LANGSRV-"
+ontology_version = "0.1.0"
+"#;
+    fs::write(plugin_dir.path().join("plugin.toml"), manifest).expect("write langsrv plugin.toml");
+    plugin_dir
+}
+
+/// clarion-353c5b9aa5: a language-server plugin's Node child reserves virtual
+/// address space far beyond its RSS. The host must not kill it at 2 GiB.
+#[test]
+#[cfg(target_os = "linux")]
+fn wp2_language_server_plugin_survives_a_3gib_virtual_reservation() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_language_server_plugin_dir(&fixture_bin);
+    let project_dir = TempDir::new().expect("create project tempdir");
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    fs::write(project_dir.path().join("demo.ls"), b"sample\n").expect("write demo.ls");
+    let new_path =
+        env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).expect("join_paths");
+
+    let out = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env("LOOMWEAVE_FIXTURE_RESERVE_VIRTUAL_MIB", "3072")
+        .assert()
+        .success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        !stderr.contains(FINDING_OOM_KILLED),
+        "language-server plugin was OOM-killed by RLIMIT_AS.\nstderr: {stderr}"
+    );
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    let widgets: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE kind = 'widget'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        widgets, 1,
+        "the reserved-but-untouched mapping must not stop extraction"
+    );
+}
+
+/// The exemption is keyed on the pyright capability alone: the same 3 GiB
+/// reservation from an ordinary plugin still trips ADR-021 §2d's 2 GiB ceiling.
+#[test]
+#[cfg(target_os = "linux")]
+fn wp2_ordinary_plugin_is_still_oom_killed_by_a_3gib_virtual_reservation() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_oom_plugin_dir(&fixture_bin);
+    let project_dir = TempDir::new().expect("create project tempdir");
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    fs::write(project_dir.path().join("demo.oom"), b"sample\n").expect("write demo.oom");
+    let new_path =
+        env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).expect("join_paths");
+
+    let out = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env("LOOMWEAVE_FIXTURE_RESERVE_VIRTUAL_MIB", "3072")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains(FINDING_OOM_KILLED),
+        "expected OOM finding.\nstderr: {stderr}"
+    );
+}
+
 /// Regression for wp2 review-2 (clarion-978c8d6f15): crash-loop breaker is
 /// wired into the production analyze path AND a single plugin crash no
 /// longer tanks the whole run.
