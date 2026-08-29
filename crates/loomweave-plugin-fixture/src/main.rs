@@ -135,6 +135,20 @@ fn main() {
                     std::process::exit(1);
                 }
 
+                // Reserve (but never touch) a large virtual mapping, then carry
+                // on: models a Node/V8 language server whose *virtual* footprint
+                // dwarfs its RSS. Under a tight RLIMIT_AS the mapping fails and
+                // we die the way the real pyright did (clarion-353c5b9aa5).
+                if let Some(mib) = std::env::var("LOOMWEAVE_FIXTURE_RESERVE_VIRTUAL_MIB")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    #[cfg(unix)]
+                    reserve_virtual_mib(mib);
+                    #[cfg(not(unix))]
+                    let _ = mib;
+                }
+
                 // Extract the file_path from params.
                 let file_path = raw
                     .get("params")
@@ -317,6 +331,35 @@ fn exceed_rlimit_as() -> ! {
                 terminate_after_rlimit_failure();
             }
         }
+    }
+}
+
+/// Reserve `mib` MiB of untouched anonymous address space and keep it mapped
+/// for the life of the process. Dies via [`terminate_after_rlimit_failure`]
+/// when the kernel refuses (i.e. the host's `RLIMIT_AS` is below `mib`).
+#[cfg(unix)]
+fn reserve_virtual_mib(mib: usize) {
+    use std::num::NonZeroUsize;
+
+    let Some(length) = NonZeroUsize::new(mib.saturating_mul(1024 * 1024)) else {
+        return;
+    };
+    // SAFETY: An anonymous PROT_NONE mapping is never dereferenced; it exists
+    // only to charge the child's address-space accounting. The mapping is
+    // intentionally leaked so it stays charged for the rest of the process.
+    let mapped = {
+        #[allow(unsafe_code)]
+        unsafe {
+            nix::sys::mman::mmap_anonymous(
+                None,
+                length,
+                nix::sys::mman::ProtFlags::PROT_NONE,
+                nix::sys::mman::MapFlags::MAP_PRIVATE | nix::sys::mman::MapFlags::MAP_NORESERVE,
+            )
+        }
+    };
+    if mapped.is_err() {
+        terminate_after_rlimit_failure();
     }
 }
 
