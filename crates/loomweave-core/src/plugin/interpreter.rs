@@ -133,8 +133,22 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
+/// `PATH` lookup, hand-rolled rather than delegating to the `which` crate.
+///
+/// The cross-language contract needs behaviour byte-identical to Python's
+/// `shutil.which(name, path=...)`: exactly the directories in the caller-supplied
+/// `PATH`, in order, no process-env fallback, no cwd rung, and the same
+/// executability predicate (`access(2)` via [`usable`]). The `which` crate
+/// applies its own resolution policy — including falling back to the ambient
+/// environment — so using it would reintroduce the launcher dependence this
+/// module exists to remove.
 fn which(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
-    // An absent PATH means "no PATH" — never fall back to the process env.
+    // An absent PATH means "no PATH" — never fall back to the process env. The
+    // caller filters out an EMPTY value before this point: `split_paths("")`
+    // yields one EMPTY entry, so `"".join("python")` would be the bare relative
+    // path `python`, stat'd against the analyze process's CWD. That is both a
+    // divergence from `shutil.which(path="")` (which returns None) and a
+    // cwd-dependent binary pickup.
     let path_var = path_var?;
     std::env::split_paths(path_var).find_map(|dir| usable(&dir.join(name)))
 }
@@ -186,7 +200,9 @@ pub fn discover_project_interpreter(
             };
         }
     }
-    let path_var = env("PATH");
+    // Empty counts as unset, exactly as on the override / VIRTUAL_ENV /
+    // CONDA_PREFIX rungs above (see `which`).
+    let path_var = env("PATH").filter(|value| !value.is_empty());
     for name in ["python", "python3"] {
         if let Some(path) = which(name, path_var.as_ref()) {
             return ProjectInterpreter {
@@ -286,6 +302,113 @@ mod tests {
             discover_project_interpreter(&canonical_root, &env(&HashMap::new())).fingerprint(),
             "an UNcanonicalised root yields a different fingerprint — which is why both \
              `analyze` and `spawn_unhandshaken` must canonicalise before discovering"
+        );
+    }
+
+    /// Sets the process CWD for the duration of a test and restores it on drop
+    /// (including on panic, so a failing assertion cannot leak a bad CWD into
+    /// another test in the same binary).
+    ///
+    /// CWD is process-global. This is safe here because it is the ONLY
+    /// CWD-mutating test in the crate and no other `loomweave-core` test reads
+    /// the CWD (`rg 'current_dir'` finds only `Command::current_dir` in
+    /// `hardened_git`, which sets the CHILD's directory explicitly). The
+    /// `MUTEX` serialises it against any future sibling regardless.
+    struct CwdGuard {
+        original: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CwdGuard {
+        fn set(to: &Path) -> Self {
+            static MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(to).unwrap();
+            Self {
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_env_values_count_as_unset() {
+        // CONTRACT: an empty env value is unset, on every rung. The Python side
+        // gets this for free (`if override:`, `if prefix and ...`, and
+        // `shutil.which(name, path="")` -> None, verified against CPython
+        // 3.12). Rust does NOT: `std::env::split_paths("")` yields one EMPTY
+        // entry, so `"".join("python")` is the bare relative path `python`,
+        // stat'd against whatever CWD the analyze process happened to have.
+        // That is both a divergence from `shutil.which` and a CWD-dependent
+        // binary pickup — the exact launcher dependence this module exists to
+        // remove.
+        //
+        // The test therefore RUNS FROM a directory containing an executable
+        // `python`. Without that, every assertion below passes even with the
+        // filter deleted (nothing named `python` sits in the default test CWD),
+        // which is precisely the vacuous test this comment exists to prevent.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        let decoy = make_python(&cwd.join("python"));
+        let _guard = CwdGuard::set(&cwd);
+
+        // The hazard, pinned directly: unfiltered, an empty PATH resolves to
+        // the CWD's `python`.
+        assert_eq!(
+            which("python", Some(&OsString::from(""))),
+            Some(decoy),
+            "an empty PATH degrades to a CWD-relative stat — this is what the \
+             caller's `.filter(|v| !v.is_empty())` exists to prevent"
+        );
+
+        // ...and with the filter, discovery ignores it entirely.
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let all_empty = HashMap::from([
+            (PYTHON_INTERPRETER_ENV, String::new()),
+            ("VIRTUAL_ENV", String::new()),
+            ("CONDA_PREFIX", String::new()),
+            ("PATH", String::new()),
+        ]);
+        assert_eq!(
+            discover_project_interpreter(&root, &env(&all_empty)),
+            ProjectInterpreter {
+                path: None,
+                source: InterpreterSource::None
+            },
+            "empty values on every rung must discover nothing — NOT the CWD's python"
+        );
+
+        // An empty override falls through to `.venv` without taking the
+        // warning path (that branch is for an operator who set a BAD path, not
+        // for an unset variable), and an empty PATH cannot outrank it.
+        let dotvenv = make_python(&root.join(".venv/bin/python"));
+        assert_eq!(
+            discover_project_interpreter(&root, &env(&all_empty)),
+            ProjectInterpreter {
+                path: Some(dotvenv),
+                source: InterpreterSource::DotVenv
+            },
+            "an empty override falls through to .venv"
+        );
+
+        // Control: a NON-empty PATH naming a directory with no interpreter
+        // reaches the same `None`, the legitimate way.
+        let empty_dir = dir.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let real_but_empty = HashMap::from([("PATH", empty_dir.display().to_string())]);
+        assert_eq!(
+            discover_project_interpreter(&dir.path().join("no-venv"), &env(&real_but_empty)).source,
+            InterpreterSource::None
         );
     }
 
