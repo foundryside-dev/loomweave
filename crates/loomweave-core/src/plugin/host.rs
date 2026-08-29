@@ -118,6 +118,10 @@ fn effective_max_nproc(manifest: &Manifest) -> Option<u64> {
 /// touches; the manifest's `expected_max_rss_mb` describes resident memory and
 /// must not cap virtual space for them. Every other plugin keeps ADR-021 §2d's
 /// `min(manifest, DEFAULT_MAX_RSS_MIB)`.
+// Used only from the Linux/macOS pre_exec limit path (its inputs are gated
+// the same way above); gate to match so other release builds don't see it
+// as dead code under `-D warnings`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn effective_as_mib(manifest: &Manifest) -> u64 {
     if manifest.capabilities.runtime.pyright.is_some() {
         LANGUAGE_SERVER_MAX_AS_MIB
@@ -559,23 +563,31 @@ impl
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::process::CommandExt;
-            let rss_mib = effective_as_mib(&manifest);
+            let as_mib = effective_as_mib(&manifest);
 
             #[cfg(target_os = "linux")]
             let max_nofile = DEFAULT_MAX_NOFILE;
             #[cfg(target_os = "linux")]
             let max_nproc = effective_max_nproc(&manifest);
 
-            // SAFETY: Each `setrlimit` call inside the closure is listed as
-            // async-signal-safe in POSIX.1-2017 §2.4.3. The `pre_exec` closure
-            // runs in the forked child after `fork()` but before `exec()`, so
-            // only the child's limits are affected. No Rust allocation, no Drop
-            // and no non-async-signal-safe call occurs inside the closure;
-            // `u64` captures are trivially Copy.
+            // SAFETY: `apply_prlimit_as` now also calls `getrlimit` (to clamp
+            // the requested ceiling to the inherited hard limit — see its doc
+            // comment) before the `setrlimit` calls in this closure.
+            // `getrlimit`/`setrlimit` are not named in POSIX.1-2017 §2.4.3's
+            // async-signal-safe function list — that list is a curated
+            // subset, not an exhaustive enumeration of every safe syscall
+            // wrapper — but both are direct, allocation-free syscall
+            // wrappers with no locking and no reentrant global state, the
+            // same basis on which the pre-existing `setrlimit` calls here
+            // already relied. The `pre_exec` closure runs in the forked
+            // child after `fork()` but before `exec()`, so only the child's
+            // limits are affected. No Rust allocation, no Drop and no other
+            // non-async-signal-safe call occurs inside the closure; `u64`
+            // captures are trivially Copy.
             #[allow(unsafe_code)]
             unsafe {
                 command.pre_exec(move || {
-                    apply_prlimit_as(rss_mib)?;
+                    apply_prlimit_as(as_mib)?;
                     #[cfg(target_os = "linux")]
                     apply_prlimit_nofile_nproc(max_nofile, max_nproc)?;
                     Ok(())
@@ -1486,6 +1498,7 @@ ontology_version = "0.1.0"
         assert_eq!(effective_max_nproc(&pyright_manifest()), None);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn language_server_plugins_get_the_wide_address_space_ceiling() {
         use crate::plugin::limits::{DEFAULT_MAX_RSS_MIB, LANGUAGE_SERVER_MAX_AS_MIB};

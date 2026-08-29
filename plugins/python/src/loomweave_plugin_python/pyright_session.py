@@ -186,7 +186,42 @@ MAX_CONSECUTIVE_SPAWN_DEFERRALS = 50
 MAX_CONSECUTIVE_TIMEOUT_FILES = 3
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
-PYRIGHT_CALL_TIMEOUT_SECS = 5.0
+# Per-LSP-request grant. The FIRST callHierarchy/definition query after
+# ``didOpen`` on a large file makes pyright analyse the whole file before it
+# answers; on 5k-line modules that warm-up alone exceeded 5 s, so one timeout
+# aborted the calls pass with almost no evidence (clarion-5d83413c36) even
+# though the file completed in ~11 s total once the first answer landed.
+# ADR-035 —
+# Basis: elspeth 2026-08-29, guided.py / pipeline_planner.py /
+#   guided_chat_atomic.py: 5 s → 28/3/20 calls edges (degraded); 120 s →
+#   633/461/153 edges (complete) in 11.2 / 12.6 / 10.3 s wall.
+# Override surface: none (internal); ``PyrightSession(call_timeout_secs=...)``
+#   for tests.
+# Retune trigger: a ``pyright_timeout`` whose single request exceeded the
+#   grant on a file that later completes with a larger grant.
+# Coupling: applies to analyze-path requests only. The effective grant there
+#   is ``min(this, remaining file budget)`` (``_budgeted_timeout``), so
+#   ``PYRIGHT_FILE_TIMEOUT_*`` and the host's ``DEFAULT_PLUGIN_FILE_TIMEOUT``
+#   (120 s) still bound a wedged server. The ADR-057 wedge breaker still
+#   counts files, not requests -- the mechanism is unchanged -- but
+#   time-to-detect a wedged server scales with this grant: worst case is
+#   now ~180 s (3 files x 2 passes x 30 s) instead of ~30 s before this
+#   change. The teardown ``shutdown`` request in ``close()`` uses
+#   ``PYRIGHT_SHUTDOWN_TIMEOUT_SECS`` instead, not this constant.
+PYRIGHT_CALL_TIMEOUT_SECS = 30.0
+# Per-LSP-request grant for the ``shutdown`` request issued by ``close()``
+# only -- deliberately NOT ``PYRIGHT_CALL_TIMEOUT_SECS``. ADR-035 —
+# Basis: this is the pre-clarion-5d83413c36 grant. A healthy server answers
+#   ``shutdown`` in milliseconds; an unresponsive one is killed by close()'s
+#   fallback anyway, so there is nothing to gain by waiting as long as an
+#   analyze-path warm-up query.
+# Override surface: none (module constant; no constructor knob).
+# Retune trigger: shutdown-path stalls visible in session-recycle latency.
+# Coupling: the ``MAX_FILES_PER_PYRIGHT_SESSION`` recycle (server.py) and
+#   plugin shutdown (server.py) both go through ``close()``; deliberately
+#   independent of ``PYRIGHT_CALL_TIMEOUT_SECS`` so raising the analyze-path
+#   grant cannot silently slow every recycle and shutdown.
+PYRIGHT_SHUTDOWN_TIMEOUT_SECS = 5.0
 # Per-file wall-clock budget, shared by the calls and references passes for
 # one file: ``base + per_function * n_functions``, capped
 # (clarion-7f527d3d32). A flat budget starved large, heavily-typed files
@@ -478,7 +513,7 @@ class PyrightSession:
         process = self._process
         if process is not None and process.poll() is None:
             try:
-                self._request("shutdown", {}, self.call_timeout_secs)
+                self._request("shutdown", {}, PYRIGHT_SHUTDOWN_TIMEOUT_SECS)
                 self._notify("exit", {})
             except (LspTimeoutError, LspTransportClosedError, BrokenPipeError, OSError):
                 process.kill()

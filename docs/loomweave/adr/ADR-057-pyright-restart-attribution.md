@@ -179,6 +179,8 @@ rows, PR #118) followed by an incremental `loomweave analyze`; a
 `--no-incremental` pass is the heavier alternative, since it reports every
 file as changed and un-sticks every mark.
 
+**Per-request grant (2026-08-29, clarion-5d83413c36).** `PYRIGHT_CALL_TIMEOUT_SECS` is 30 s, not 5 s: the first query on a large file pays for pyright's whole-file analysis and routinely exceeded 5 s, which read as a self-inflicted `pyright_timeout` although the file completes in ~11 s once warm. The effective grant is still `min(30 s, remaining file budget)`, so a truly wedged server is still detected — the three-file wedge breaker above still counts files, not requests, and the mechanism is unchanged — but time-to-detect scales with the grant: worst case is now ~180 s (3 files x 2 passes x 30 s) instead of the pre-change ~30 s.
+
 ## Alternatives considered
 
 - **Restart on timeout too** (the ticket's literal grouping). Rejected: a

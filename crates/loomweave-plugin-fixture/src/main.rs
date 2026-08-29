@@ -139,12 +139,22 @@ fn main() {
                 // on: models a Node/V8 language server whose *virtual* footprint
                 // dwarfs its RSS. Under a tight RLIMIT_AS the mapping fails and
                 // we die the way the real pyright did (clarion-353c5b9aa5).
+                //
+                // Reserved once per process, not once per `analyze_file` call:
+                // a real language server reserves its V8 address space at
+                // startup, not per file. Re-reserving on every call would
+                // multiply the charged address space across a multi-file run
+                // (e.g. a 3 GiB knob would spuriously exceed an 8 GiB ceiling
+                // on the third file), which does not model anything real.
                 if let Some(mib) = std::env::var("LOOMWEAVE_FIXTURE_RESERVE_VIRTUAL_MIB")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                 {
                     #[cfg(unix)]
-                    reserve_virtual_mib(mib);
+                    {
+                        static RESERVE_ONCE: std::sync::Once = std::sync::Once::new();
+                        RESERVE_ONCE.call_once(|| reserve_virtual_mib(mib));
+                    }
                     #[cfg(not(unix))]
                     let _ = mib;
                 }
