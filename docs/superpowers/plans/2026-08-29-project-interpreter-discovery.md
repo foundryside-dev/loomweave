@@ -19,7 +19,7 @@
 
 - CI floor (ADR-023) must be green before any task is called done: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo build --workspace --bins`, `cargo nextest run --workspace --all-features`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`, `cargo deny check`, `plugins/python/.venv/bin/ruff check plugins/python`, `plugins/python/.venv/bin/ruff format --check plugins/python`, `plugins/python/.venv/bin/mypy --strict plugins/python`, `plugins/python/.venv/bin/pytest plugins/python`. Run `cargo build --workspace --bins` BEFORE nextest (CLI integration tests exec the built binaries).
 - `unsafe_code = "deny"` workspace-wide; clippy `pedantic`. No new `unsafe`.
-- **Discovery order is a cross-language contract.** Both implementations MUST resolve in exactly this order and stop at the first hit; a hit means "the path exists, is a regular file, and has an execute bit"; every returned path is canonicalised (`realpath` / `fs::canonicalize`):
+- **Discovery order is a cross-language contract.** Both implementations MUST resolve in exactly this order and stop at the first hit; a hit means "the path exists, is a regular file, and has an execute bit"; every returned path is **absolute and normalised but NOT symlink-resolved** (`os.path.abspath` in Python; `std::path::absolute` + a lexical `..`/`.` collapse in Rust — `std::path::absolute` keeps `..` on Unix) — a venv's `bin/python` is a symlink to the base interpreter and resolving it would point pyright at the system site-packages, the very bug this fixes (review finding, Task 1 round 1):
 
   | # | source token | candidate |
   |---|---|---|
@@ -31,7 +31,7 @@
   | 6 | `none` | nothing found; path is absent |
 
   Sources 1–4 are **pinned** (project-owned); 5–6 are **unpinned**. An override that is set but does not pass the hit test is ignored with one stderr warning line and discovery continues at 2.
-- **Fingerprint format** (Rust only, stored in the marker): pinned → the canonical path string; `path` → `unpinned:<canonical path>`; `none` → `unpinned:none`. Plugins whose manifest lacks `[capabilities.runtime.pyright]` get no fingerprint (`None`).
+- **Fingerprint format** (Rust only, stored in the marker): pinned → the absolute (unresolved) path string; `path` → `unpinned:<absolute path>`; `none` → `unpinned:none`. Plugins whose manifest lacks `[capabilities.runtime.pyright]` get no fingerprint (`None`).
 - Coverage reason vocabulary gains exactly one token: `interpreter_unpinned` (`transient=false`, `collateral=false`). It is applied ONLY when a facet would otherwise be `complete`; a degraded facet keeps its real reason.
 - Every new operational constant or env override carries an ADR-035 four-axis declaration (basis / override surface / retune trigger / coupling) in a comment at its definition.
 - Version lockstep: do NOT bump plugin/workspace versions. New migration must be registered in `schema.rs` `MIGRATIONS` and `CURRENT_SCHEMA_VERSION` bumped to 15; run `python3 scripts/check-migration-retirement.py` afterwards.
@@ -576,7 +576,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        path.canonicalize().unwrap()
+        std::path::absolute(path).unwrap()
     }
 
     fn env(map: &HashMap<&str, String>) -> impl Fn(&str) -> Option<OsString> + '_ {
@@ -638,6 +638,22 @@ mod tests {
         let none = discover_project_interpreter(dir.path(), &env(&map));
         assert_eq!(none, ProjectInterpreter { path: None, source: InterpreterSource::None });
         assert_eq!(none.fingerprint(), "unpinned:none");
+    }
+
+    #[test]
+    fn override_path_is_lexically_normalised_but_symlinks_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = make_python(&dir.path().join("real/bin/python"));
+        fs::create_dir_all(dir.path().join("real/sub")).unwrap();
+        let dotted = dir.path().join("real/sub/../bin/python");
+        let map = HashMap::from([(PYTHON_INTERPRETER_ENV, dotted.display().to_string())]);
+        assert_eq!(discover_project_interpreter(dir.path(), &env(&map)).path, Some(real.clone()));
+        let link = dir.path().join(".venv/bin/python");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let found = discover_project_interpreter(dir.path(), &env(&HashMap::new()));
+        assert_eq!(found.path, Some(link), "the symlink path, not its target");
+        assert_eq!(found.source, InterpreterSource::DotVenv);
     }
 
     #[test]
@@ -736,10 +752,35 @@ fn usable(candidate: &Path) -> Option<PathBuf> {
     if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
         return None;
     }
-    candidate.canonicalize().ok()
+    // NOT canonicalize(): a venv's bin/python symlinks to the base
+    // interpreter; pyright must be handed the venv path (Global Constraints).
+    // `std::path::absolute` keeps `..` on Unix, so collapse it lexically here
+    // to match Python's `os.path.abspath` (normpath) byte-for-byte.
+    Some(normalize_lexically(&std::path::absolute(candidate).ok()?))
+}
+
+/// Lexical normalisation identical to Python's `os.path.normpath` on an
+/// absolute path: drop `.`, pop a component for `..` (never past root),
+/// never touch the filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.parent().is_some() {
+                    out.pop();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn which(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
+    // An absent PATH means "no PATH" — never fall back to the process env.
     let path_var = path_var?;
     std::env::split_paths(path_var).find_map(|dir| usable(&dir.join(name)))
 }
@@ -862,7 +903,7 @@ Fold it into `plugin_index_contract_changed` (`|| resolver_environment_changed`)
 - [ ] **Step 6: Integration test in `crates/loomweave-cli/tests/analyze.rs`**
 
 Model on the test near line 5745 (`ontology_version` bump ⇒ `skipped_files == 0`). Use the fixture plugin with a manifest that declares `[capabilities.runtime.pyright] pin = "1.1.409"` (copy the manifest from `wp2_e2e.rs::setup_language_server_plugin_dir`, `plugin_id = "fixture"`). Sequence:
-1. Project dir with two `.ls` files and an executable `.venv/bin/python` shell stub. Run 1 (fresh). Assert `plugin_index_meta.resolver_environment` for `fixture` equals the canonical stub path (query the DB directly with rusqlite as other tests in the file do).
+1. Project dir with two `.ls` files and an executable `.venv/bin/python` shell stub. Run 1 (fresh). Assert `plugin_index_meta.resolver_environment` for `fixture` equals the absolute (unresolved) stub path (query the DB directly with rusqlite as other tests in the file do).
 2. Run 2 (unchanged): `skipped_files == 2`.
 3. Remove `.venv`; run 3 with `PATH` set to a tempdir containing an executable `python3` stub (`Command::env("PATH", ...)`): `skipped_files == 0`, marker now `unpinned:<stub>`.
 4. Run 4 (unchanged again): `skipped_files == 2`.
@@ -1099,7 +1140,7 @@ git commit -m "docs: ADR-058 project interpreter discovery + resolver-environmen
 
 - [ ] Full CI floor (Rust + Python gates) green locally; push branch; open PR against `release/1.5.0`; `gh pr merge --admin --merge` once checks are green.
 - [ ] Deploy: `cargo build --release -p loomweave-cli`; atomic temp+mv into `~/.local/share/uv/tools/loomweave/bin/loomweave`; plugin into BOTH venvs (`uv pip install --python ~/.local/share/uv/tools/loomweave/bin/python --no-deps --reinstall ./plugins/python` and `uv tool install --reinstall --force ./plugins/python`).
-- [ ] Acceptance on elspeth, hook-style env: `cd /home/john/elspeth && env -i HOME="$HOME" PATH=/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin setsid nohup loomweave analyze . > /tmp/claude-…/elspeth-acc.log 2>&1 < /dev/null &`. Expect: the run logs `plugin index contract changed … resolver_environment_changed=true`, `skipped_files == 0`, `plugin_index_meta.resolver_environment` = `/home/john/elspeth/.venv/bin/python` realpath.
+- [ ] Acceptance on elspeth, hook-style env: `cd /home/john/elspeth && env -i HOME="$HOME" PATH=/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin setsid nohup loomweave analyze . > /tmp/claude-…/elspeth-acc.log 2>&1 < /dev/null &`. Expect: the run logs `plugin index contract changed … resolver_environment_changed=true`, `skipped_files == 0`, `plugin_index_meta.resolver_environment` = `/home/john/elspeth/.venv/bin/python` (the symlink path, not its target).
 - [ ] Measure: `SELECT count(*) FROM (test files importing elspeth with zero calls edges into elspeth.*)` — expected ≈ 0 (down from 400); `build_step_chat_context_block` has test callers; `tests/unit/elspeth_lints` resolves; degraded rows unchanged (3) with no `interpreter_unpinned` on elspeth.
 - [ ] `loomweave doctor --fix` on elspeth: `index.runs` repairs the two stuck rows (dce107d2, 9badd1f3).
 - [ ] Filigree: `clarion-5cf9643de9` triage → confirmed (severity) → fixing → verifying (fix_verification = the numbers above) → closed. File the aside "five runs died to the 120 s host watchdog (90 s cap + references pass)" as a new TBC bug if not already tracked.
