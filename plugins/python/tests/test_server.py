@@ -16,13 +16,16 @@ import textwrap
 from typing import IO, TYPE_CHECKING, Any, cast
 
 from loomweave_plugin_python import server as server_module
-from loomweave_plugin_python.call_resolver import CallResolutionResult
+from loomweave_plugin_python.call_resolver import CallResolutionResult, FacetCoverage
+from loomweave_plugin_python.interpreter import ProjectInterpreter
 from loomweave_plugin_python.pyright_session import (
+    FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
     FINDING_PYRIGHT_RESTART,
     PyrightRunState,
     PyrightSession,
 )
 from loomweave_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
+from tests.test_pyright_session import ScriptedCallSession
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -88,7 +91,7 @@ def test_initialize_roundtrip() -> None:
         assert result["name"] == "loomweave-plugin-python"
         assert result["version"] == "1.5.0"
         assert result["ontology_version"] == "0.12.0"
-        assert set(result["capabilities"]) == {"wardline"}
+        assert set(result["capabilities"]) == {"wardline", "python_interpreter"}
         assert result["capabilities"]["wardline"]["status"] in {
             "absent",
             "enabled",
@@ -498,6 +501,15 @@ def test_analyze_file_reports_call_resolver_stats(
         "unresolved_reference_sites_total": 4,
         "pyright_query_latency_ms": [11, 29, 31],
         "pyright_index_parse_latency_ms": [5, 7],
+        "pyright_restart_count": 0,
+        "pyright_file_attributed_restart_count": 0,
+        "pyright_file_attributed_respawn_failure_count": 0,
+        "pyright_ceiling_deferred_restart_count": 0,
+        "pyright_init_latency_total_ms": 0,
+        "resolution_coverage": {
+            "calls": {"status": "complete", "transient": False, "collateral": False},
+            "references": {"status": "complete", "transient": False, "collateral": False},
+        },
     }
     assert response["findings"] == [
         {
@@ -508,6 +520,128 @@ def test_analyze_file_reports_call_resolver_stats(
         }
     ]
     assert any(edge["kind"] == "references" for edge in response["edges"])
+
+
+def test_analyze_file_reports_degraded_resolution_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clarion-3e517d4aff: a resolver that produced nothing must SAY so.
+
+    The host cannot tell empty evidence from a call-free file; the per-file
+    coverage claim is what lets it re-dispatch the unchanged file next run.
+    """
+
+    class PoisonedPyrightSession:
+        def __init__(self, project_root: Path, **_kwargs: Any) -> None:
+            self.project_root = project_root
+
+        def resolve_calls(
+            self,
+            file_path: str,
+            function_ids: list[str],
+        ) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult(
+                unresolved_call_sites_total=1,
+                coverage=FacetCoverage.degraded("pyright_poisoned", transient=True),
+            )
+
+        def resolve_references(
+            self,
+            file_path: str,
+            sites: Sequence[ReferenceSite],
+        ) -> ReferenceResolutionResult:
+            _ = file_path
+            return ReferenceResolutionResult(
+                reference_sites_total=len(sites),
+                references_skipped_cap_total=len(sites),
+                unresolved_reference_sites_total=len(sites),
+                coverage=FacetCoverage.degraded("reference_site_cap", transient=False),
+            )
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(server_module, "PyrightSession", PoisonedPyrightSession, raising=False)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def world():\n    return 42\n\nCONST_REF = world\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+
+    response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    assert response["stats"]["resolution_coverage"] == {
+        "calls": {
+            "status": "degraded",
+            "reason": "pyright_poisoned",
+            "transient": True,
+            "collateral": False,
+        },
+        "references": {
+            "status": "degraded",
+            "reason": "reference_site_cap",
+            "transient": False,
+            "collateral": False,
+        },
+    }
+
+
+def test_analyze_file_hands_back_partial_call_edges_alongside_degraded_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clarion-7f527d3d32: a mid-file pyright timeout keeps the edges already resolved.
+
+    Drives the real ``PyrightSession`` calls pass (only the LSP transport is
+    scripted) through ``handle_analyze_file`` so the wire result the host
+    persists is what is asserted: the first function's ``calls`` edge is in
+    ``edges`` next to a degraded/transient ``calls`` claim, and the second
+    function's site is the one counted unresolved. Before the fix the
+    ``except LspTimeoutError`` arm in ``resolve_calls`` zeroed ``edges``.
+    """
+    demo = tmp_path / "demo.py"
+    demo.write_text(
+        "def callee():\n    pass\n\ndef first():\n    callee()\n\ndef second():\n    callee()\n",
+        encoding="utf-8",
+    )
+    # The server resolves every function in the file, `callee` (no call sites)
+    # included, so the script table covers all three.
+    callee = "python:function:demo.callee"
+    functions = [callee, "python:function:demo.first", "python:function:demo.second"]
+
+    def scripted_session(project_root: Path, **kwargs: Any) -> ScriptedCallSession:
+        return ScriptedCallSession(
+            project_root,
+            module=demo,
+            callee_by_caller=dict.fromkeys(functions, callee),
+            fail_on="python:function:demo.second",
+            **kwargs,
+        )
+
+    monkeypatch.setattr(server_module, "PyrightSession", scripted_session, raising=False)
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+
+    response = server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    call_edges = [edge for edge in response["edges"] if edge["kind"] == "calls"]
+    assert [(edge["from_id"], edge["to_id"]) for edge in call_edges] == [
+        ("python:function:demo.first", "python:function:demo.callee"),
+    ]
+    stats = response["stats"]
+    assert stats["resolution_coverage"]["calls"] == {
+        "status": "degraded",
+        "reason": "pyright_timeout",
+        "transient": True,
+        "collateral": False,
+    }
+    # Arithmetic closure on the wire: one site resolved, one unresolved.
+    assert stats["unresolved_call_sites_total"] == 1
+    assert [site["caller_entity_id"] for site in stats["unresolved_call_sites"]] == [
+        "python:function:demo.second",
+    ]
+    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in {
+        finding["subcode"] for finding in response["findings"]
+    }
 
 
 def test_analyze_file_restarts_pyright_after_file_budget(
@@ -749,3 +883,108 @@ def test_disabled_pyright_unavailable_does_not_redrive_per_session(
     # is needed.  The shared run_state.disabled=True short-circuits _ensure_process
     # before _start_process (and thus _resolve_executable) is re-entered.
     assert resolve_executable_call_count == 1
+
+
+def test_analyze_file_stats_carry_cumulative_pyright_restart_counters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clarion-7fc41105ea: run-state restart accounting rides every file's stats.
+
+    The values are CUMULATIVE for the run (reported unchanged on every file),
+    so the host must aggregate them with ``max``, never by summing.
+    """
+
+    class QuietPyrightSession:
+        def __init__(self, project_root: Path, **_kwargs: Any) -> None:
+            self.project_root = project_root
+
+        def resolve_calls(self, file_path: str, function_ids: list[str]) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult()
+
+        def resolve_references(
+            self, file_path: str, sites: Sequence[ReferenceSite]
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(server_module, "PyrightSession", QuietPyrightSession, raising=False)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def hello():\n    pass\n", encoding="utf-8")
+    state = server_module.ServerState(initialized=True, project_root=tmp_path)
+    state.pyright_run_state.restart_count = 2
+    state.pyright_run_state.file_attributed_restart_count = 5
+    state.pyright_run_state.file_attributed_respawn_failure_count = 1
+    state.pyright_run_state.ceiling_deferred_restart_count = 3
+    state.pyright_run_state.pyright_init_latency_total_ms = 4321
+
+    stats = server_module.handle_analyze_file({"file_path": str(demo)}, state)["stats"]
+
+    assert stats["pyright_restart_count"] == 2
+    assert stats["pyright_file_attributed_restart_count"] == 5
+    assert stats["pyright_file_attributed_respawn_failure_count"] == 1
+    assert stats["pyright_ceiling_deferred_restart_count"] == 3
+    assert stats["pyright_init_latency_total_ms"] == 4321
+
+
+def test_initialize_discovers_and_advertises_the_project_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_python = tmp_path / ".venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    monkeypatch.delenv("LOOMWEAVE_PYTHON_INTERPRETER", raising=False)
+    state = server_module.ServerState()
+
+    response = server_module.handle_initialize(
+        {"protocol_version": "1.0", "project_root": str(tmp_path)}, state
+    )
+
+    assert response["capabilities"]["python_interpreter"] == {
+        "path": str(fake_python.resolve()),
+        "source": "dotvenv",
+        "pinned": True,
+    }
+    assert state.interpreter is not None
+    assert state.interpreter.pinned
+
+
+def test_analyze_file_hands_the_discovered_interpreter_to_pyright(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakePyrightSession:
+        def __init__(self, project_root: Path, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            self.project_root = project_root
+
+        def resolve_calls(self, file_path: str, function_ids: list[str]) -> CallResolutionResult:
+            _ = (file_path, function_ids)
+            return CallResolutionResult()
+
+        def resolve_references(
+            self, file_path: str, sites: Sequence[ReferenceSite]
+        ) -> ReferenceResolutionResult:
+            _ = (file_path, sites)
+            return ReferenceResolutionResult()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(server_module, "PyrightSession", FakePyrightSession, raising=False)
+    demo = tmp_path / "demo.py"
+    demo.write_text("def hello():\n    pass\n", encoding="utf-8")
+    interpreter = ProjectInterpreter(path="/x/python", source="override")
+    state = server_module.ServerState(
+        initialized=True, project_root=tmp_path, interpreter=interpreter
+    )
+
+    server_module.handle_analyze_file({"file_path": str(demo)}, state)
+
+    assert captured["interpreter"] == interpreter

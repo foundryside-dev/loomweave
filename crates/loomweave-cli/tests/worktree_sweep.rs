@@ -32,6 +32,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command as StdCommand;
 
+use loomweave_cli::worktree::confine::{error_signals_missing_openat2, unpinned_candidate_names};
 use loomweave_cli::worktree::store::{StoreOutcome, ensure_isolated_store};
 use loomweave_cli::worktree::sweep::{SweepOutcome, sweep_best_effort, sweep_worktree_stores};
 use loomweave_core::worktree::{WorktreeContext, WorktreeKind};
@@ -380,6 +381,41 @@ fn override_store_dir_makes_sweep_report_only() {
     );
 }
 
+#[test]
+fn override_sweep_recognizes_this_repositorys_registered_store() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+    let override_dir = tmp.path().join("shared-override-store");
+    fs::write(
+        repo.join("weft.toml"),
+        format!("[loomweave]\nstore_dir = \"{}\"\n", override_dir.display()),
+    )
+    .unwrap();
+    let linked = tmp.path().join("linked");
+    add_worktree(&repo, &linked, "feature");
+
+    let linked_ctx = WorktreeContext::resolve(&linked).expect("resolves as Linked");
+    fs::create_dir_all(&linked_ctx.repository_store).unwrap();
+    ensure_isolated_store(&linked_ctx).expect("create qualified isolated store");
+    let stable_id = linked_ctx.stable_id.clone().unwrap();
+
+    let main_ctx = WorktreeContext::resolve(&repo).expect("resolves as Main");
+    let outcome = sweep_worktree_stores(&main_ctx);
+
+    assert_eq!(
+        outcome,
+        SweepOutcome::ReportOnly {
+            would_delete: vec![],
+        },
+        "a live override-backed store must use the same project-qualified ID in both context resolution and registration enumeration"
+    );
+    assert!(
+        override_dir.join("worktrees").join(stable_id).is_dir(),
+        "report-only sweep must preserve the live store"
+    );
+}
+
 /// clarion-a93b43923e: a store path that reaches through a symlink is the
 /// symlink analogue of the shared `store_dir` override — two repositories
 /// whose `.weft/loomweave` link to one shared directory would let repo A's
@@ -507,6 +543,57 @@ fn held_gc_lock_skips_the_sweep() {
     );
 
     drop(lock_file);
+}
+
+/// Old-kernel graceful degradation (regression guard): the sweep's pinned
+/// root is itself an `openat2` open, and a pre-5.6 Linux kernel fails it
+/// with `ENOSYS`. A real `ENOSYS` cannot be provoked from a modern kernel,
+/// so this pins the two halves of the fallback seam the sweep is built on:
+/// only the `ENOSYS`-equivalent error is classified as degradable (every
+/// other pin failure keeps the `StoreDirUnreadable` abort), and the
+/// unpinned report-only enumeration the degraded sweep switches to really
+/// does enumerate — with the same `wt-[0-9a-f]{64}` grammar filter — so
+/// report-only runs on old kernels keep full visibility instead of
+/// aborting. The wiring from that classification into
+/// `sweep_worktree_stores` is pinned by the in-file test
+/// `enosys_pin_failure_selects_the_unpinned_report_only_root`.
+#[cfg(unix)]
+#[test]
+fn missing_openat2_degrades_to_report_only_enumeration() {
+    use std::io;
+
+    // Classification: exactly the ENOSYS-equivalent degrades.
+    let enosys = io::Error::from_raw_os_error(rustix::io::Errno::NOSYS.raw_os_error());
+    assert!(
+        error_signals_missing_openat2(&enosys),
+        "ENOSYS from the pinned open must be recognized as the missing-openat2 kernel"
+    );
+    for non_degradable in [
+        io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        io::Error::from(io::ErrorKind::NotFound),
+    ] {
+        assert!(
+            !error_signals_missing_openat2(&non_degradable),
+            "{non_degradable:?} must keep the StoreDirUnreadable abort, not degrade"
+        );
+    }
+
+    // Fallback enumeration: the report-only view the degraded sweep uses.
+    let tmp = TempDir::new().unwrap();
+    let worktrees_dir = tmp.path().join("worktrees");
+    fs::create_dir(&worktrees_dir).unwrap();
+    let name = fake_candidate('d');
+    fs::create_dir(worktrees_dir.join(&name)).unwrap();
+    fs::write(worktrees_dir.join("gc.lock"), b"").unwrap();
+    fs::create_dir(worktrees_dir.join("not-a-store")).unwrap();
+
+    let names = unpinned_candidate_names(&worktrees_dir)
+        .expect("report-only enumeration must work without a pinned root");
+    assert_eq!(
+        names,
+        vec![name],
+        "the unpinned view must apply the store-name grammar filter"
+    );
 }
 
 /// `sweep_best_effort` — the exact entry point `serve.rs`/`analyze.rs`

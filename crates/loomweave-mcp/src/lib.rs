@@ -231,6 +231,24 @@ pub struct ToolMetadata {
     pub may_call_llm: bool,
 }
 
+/// The source-root-missing gate decision, shared by the MCP worktree gate
+/// (`consult_worktree_gate`, `worktree_gate_block_reason`) and the CLI's HTTP
+/// twin (`require_worktree_ready`).
+///
+/// Uses [`Path::try_exists`] rather than [`Path::exists`] so a transient stat
+/// failure (EACCES from a permission hiccup, ELOOP, an automount that has not
+/// come back yet) is NOT reported as a permanently-removed root: the gate's
+/// `source-root-missing` answer is non-retryable and tells a conforming
+/// client to stop polling and start a new serve, so it must only fire on a
+/// confirmed `Ok(false)` (NotFound-style resolution). On `Err` the request
+/// proceeds — the check is per-request, so a genuinely-broken root fails
+/// downstream with a retryable error and the gate self-heals once the stat
+/// hiccup clears.
+#[must_use]
+pub fn source_root_confirmed_missing(root: &Path) -> bool {
+    matches!(root.try_exists(), Ok(false))
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
 fn is_false(flag: &bool) -> bool {
     !*flag
@@ -1402,12 +1420,12 @@ impl ServerState {
     pub fn with_worktree_gate(
         mut self,
         store_paths: loomweave_core::worktree::StorePaths,
-        source_root: &Path,
+        fallback_argv: Vec<String>,
         bootstrap_spawn_failed: bool,
     ) -> Self {
         self.worktree_gate = Some(WorktreeGate {
             store_paths,
-            fallback_argv: worktree_bootstrap::fallback_argv(source_root),
+            fallback_argv,
             bootstrap_spawn_failed,
         });
         self
@@ -1822,19 +1840,21 @@ impl ServerState {
     /// behavior change) — no cached flag, no background timer, no per-tool
     /// forking across `graph.rs`/`orientation.rs`/`catalogue/*`.
     ///
-    /// `source-root-missing` is checked first and applies to *every* tool,
+    /// `source-root-missing` is checked first (via
+    /// [`source_root_confirmed_missing`], so a transient stat error never
+    /// masquerades as a removed root) and applies to *every* tool,
     /// including `project_status_get`/`analyze_status_get`: once the worktree
-    /// itself is gone there is no "remain available while building" case
+    /// itself is confirmed gone there is no "remain available while building" case
     /// left to serve — the design's accepted race for `git worktree remove`
     /// under a live `serve`. Building/build-failed then exempts exactly
-    /// `project_status_get` and `analyze_status_get` so an agent can still
-    /// observe progress and the failure diagnostics while every other tool
+    /// `project_status_get`, `analyze_status_get`, and `analyze_cancel` so an
+    /// agent can still observe or stop progress while every other tool
     /// (which would otherwise read a schema-initialized-but-empty, or
     /// partially-written, store) is blocked.
     async fn consult_worktree_gate(&self, id: &Value, canonical_name: &str) -> Option<Value> {
         let gate = self.worktree_gate.as_ref()?;
 
-        if !self.project_root.exists() {
+        if source_root_confirmed_missing(&self.project_root) {
             let envelope = tool_error_envelope_with_diagnostics(
                 McpErrorCode::SourceRootMissing,
                 &format!(
@@ -1850,13 +1870,30 @@ impl ServerState {
             return Some(tool_json_rpc_response(id, &envelope));
         }
 
-        if matches!(canonical_name, "project_status_get" | "analyze_status_get") {
+        if matches!(
+            canonical_name,
+            "project_status_get" | "analyze_status_get" | "analyze_cancel"
+        ) {
             return None;
         }
 
+        // The liveness-repair variant: a `running` row whose builder is
+        // provably dead (nothing holds the per-worktree analyze lock) is
+        // converted to `failed` on the spot, so this gate reports the
+        // non-retryable build-failed envelope below — with the explicit
+        // recovery command — instead of retryable `index-building` forever
+        // (see `read_worktree_readiness_with_liveness_repair`).
+        let repair_db_path = gate.store_paths.db.clone();
         let read = self
             .readers
-            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .with_reader(move |conn| {
+                Ok(
+                    worktree_bootstrap::read_worktree_readiness_with_liveness_repair(
+                        conn,
+                        &repair_db_path,
+                    ),
+                )
+            })
             .await;
         // A storage-layer read failure here is not this gate's to report —
         // fall through to normal dispatch, which will hit the same failure
@@ -1864,25 +1901,43 @@ impl ServerState {
         let Ok(read) = read else {
             return None;
         };
+        let bootstrap_spawn_failed = gate.bootstrap_spawn_failed && read.run_id.is_none();
 
         match read.readiness {
             worktree_bootstrap::WorktreeReadiness::Ready => None,
-            worktree_bootstrap::WorktreeReadiness::Building => Some(tool_json_rpc_response(
-                id,
-                &tool_error_envelope_with_diagnostics(
-                    McpErrorCode::IndexBuilding,
-                    "this linked worktree's isolated index is still building (no completed \
-                     analyze run yet); graph and catalogue tools are unavailable until it \
-                     finishes. project_status_get and analyze_status_get remain available to \
-                     check progress in this same session — no reconnect needed.",
-                    true,
-                    json!({}),
-                    vec![json!({
-                        "run_id": read.run_id,
-                        "fallback_command": gate.fallback_argv,
-                    })],
-                ),
-            )),
+            worktree_bootstrap::WorktreeReadiness::Building => {
+                let (code, message, retryable) = if bootstrap_spawn_failed {
+                    (
+                        McpErrorCode::IndexBuildFailed,
+                        "the linked-worktree bootstrap process could not be spawned; run the \
+                         fallback command manually.",
+                        false,
+                    )
+                } else {
+                    (
+                        McpErrorCode::IndexBuilding,
+                        "this linked worktree's isolated index is still building (no completed \
+                         analyze run yet); graph and catalogue tools are unavailable until it \
+                         finishes. project_status_get, analyze_status_get, and analyze_cancel \
+                         remain available in this same session — no reconnect needed.",
+                        true,
+                    )
+                };
+                Some(tool_json_rpc_response(
+                    id,
+                    &tool_error_envelope_with_diagnostics(
+                        code,
+                        message,
+                        retryable,
+                        json!({}),
+                        vec![json!({
+                            "run_id": read.run_id,
+                            "bootstrap_state": bootstrap_spawn_failed.then_some("bootstrap-spawn-failed"),
+                            "fallback_command": gate.fallback_argv,
+                        })],
+                    ),
+                ))
+            }
             worktree_bootstrap::WorktreeReadiness::BuildFailed => Some(tool_json_rpc_response(
                 id,
                 &tool_error_envelope_with_diagnostics(
@@ -2227,22 +2282,44 @@ impl ServerState {
     /// `McpErrorCode`) or `None` when the resource should read the store
     /// normally.
     async fn worktree_gate_block_reason(&self) -> Option<&'static str> {
-        self.worktree_gate.as_ref()?;
-        if !self.project_root.exists() {
+        let gate = self.worktree_gate.as_ref()?;
+        if source_root_confirmed_missing(&self.project_root) {
             return Some("source-root-missing");
         }
+        // Same liveness-repair consult as `consult_worktree_gate`: a dead
+        // builder's abandoned `running` row must not report `index-building`
+        // through this door either.
+        let repair_db_path = gate.store_paths.db.clone();
         let read = self
             .readers
-            .with_reader(|conn| Ok(worktree_bootstrap::read_worktree_readiness(conn)))
+            .with_reader(move |conn| {
+                Ok(
+                    worktree_bootstrap::read_worktree_readiness_with_liveness_repair(
+                        conn,
+                        &repair_db_path,
+                    ),
+                )
+            })
             .await;
         let Ok(read) = read else {
             // A storage-layer failure is not this gate's to report — fall
             // through and let the normal read path hit (and report) it.
             return None;
         };
+        let bootstrap_spawn_failed = self
+            .worktree_gate
+            .as_ref()
+            .is_some_and(|gate| gate.bootstrap_spawn_failed)
+            && read.run_id.is_none();
         match read.readiness {
             worktree_bootstrap::WorktreeReadiness::Ready => None,
-            worktree_bootstrap::WorktreeReadiness::Building => Some("index-building"),
+            worktree_bootstrap::WorktreeReadiness::Building => {
+                if bootstrap_spawn_failed {
+                    Some("index-build-failed")
+                } else {
+                    Some("index-building")
+                }
+            }
             worktree_bootstrap::WorktreeReadiness::BuildFailed => Some("index-build-failed"),
         }
     }
@@ -3921,13 +3998,25 @@ fn call_graph_scope_excludes(confidence: EdgeConfidence) -> Vec<&'static str> {
 pub(crate) fn navigation_scope_excludes(
     confidence: EdgeConfidence,
     live_unresolved_sites: bool,
+    degraded_call_coverage: bool,
 ) -> Vec<&'static str> {
     let mut excludes = call_graph_scope_excludes(confidence);
     if live_unresolved_sites && confidence != EdgeConfidence::Inferred {
         excludes.push("unresolved-static-calls");
     }
+    if degraded_call_coverage {
+        excludes.push(DEGRADED_CALL_RESOLUTION_SCOPE_EXCLUDE);
+    }
     excludes
 }
+
+/// `scope_excludes` marker for an index in which at least one analysed file's
+/// plugin reported degraded call resolution (clarion-3e517d4aff). Those files
+/// contributed NO `calls` edges and NO unresolved call sites, so every caller
+/// traversal is blind to them at every confidence tier — including `inferred`,
+/// whose dispatch pass has no recorded sites to attempt. Cleared by the next
+/// `analyze`, which re-dispatches transient-degraded files automatically.
+pub(crate) const DEGRADED_CALL_RESOLUTION_SCOPE_EXCLUDE: &str = "degraded-call-resolution";
 
 /// Per-query scope excludes for `entity_callers_list` / `entity_neighborhood_get`
 /// (clarion-76c31b730a). Unlike [`navigation_scope_excludes`] (which flags the
@@ -3942,14 +4031,23 @@ pub(crate) fn navigation_scope_excludes(
 fn caller_navigation_scope_excludes(
     confidence: EdgeConfidence,
     skipped_a_candidate: bool,
+    degraded_call_coverage: bool,
 ) -> Vec<&'static str> {
-    if !skipped_a_candidate || confidence == EdgeConfidence::Inferred {
-        return Vec::new();
+    let mut excludes = if !skipped_a_candidate || confidence == EdgeConfidence::Inferred {
+        Vec::new()
+    } else {
+        // A skipped candidate is, by construction, an attribute-receiver or
+        // dynamic call site the static resolver could not bind — name both
+        // blind-spot categories that the traversal therefore did not search.
+        vec!["attribute-receiver-calls", "unresolved-static-calls"]
+    };
+    // A file whose resolver failed recorded neither edges nor unresolved sites
+    // (clarion-3e517d4aff): its callers were never candidates at ANY tier, so
+    // the traversal cannot claim completeness while such files exist.
+    if degraded_call_coverage {
+        excludes.push(DEGRADED_CALL_RESOLUTION_SCOPE_EXCLUDE);
     }
-    // A skipped candidate is, by construction, an attribute-receiver or dynamic
-    // call site the static resolver could not bind — name both blind-spot
-    // categories that the traversal therefore did not search.
-    vec!["attribute-receiver-calls", "unresolved-static-calls"]
+    excludes
 }
 
 /// The `unresolved_name_matches` count + `next_action` recovery pointer for a
@@ -5594,8 +5692,28 @@ fn build_call_sites(
         "sites": site_values,
         "unresolved_sites": unresolved_values,
         "truncated": truncated,
-        "scope_excludes": call_graph_scope_excludes(confidence)
+        // `entity_call_site_list` SEARCHES the unresolved-site table, but a
+        // file whose resolver failed recorded no sites to search
+        // (clarion-3e517d4aff) — that hole is a blind spot even here.
+        "scope_excludes": call_site_scope_excludes(
+            confidence,
+            loomweave_storage::degraded_call_coverage_file_count(conn)? > 0,
+        )
     })))
+}
+
+/// Scope excludes for `entity_call_site_list`: the base call-graph vocabulary
+/// plus the degraded-resolution marker when the index holds files whose plugin
+/// reported degraded call coverage.
+fn call_site_scope_excludes(
+    confidence: EdgeConfidence,
+    degraded_call_coverage: bool,
+) -> Vec<&'static str> {
+    let mut excludes = call_graph_scope_excludes(confidence);
+    if degraded_call_coverage {
+        excludes.push(DEGRADED_CALL_RESOLUTION_SCOPE_EXCLUDE);
+    }
+    excludes
 }
 
 #[derive(Clone)]

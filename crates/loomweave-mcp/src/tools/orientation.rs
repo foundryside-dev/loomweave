@@ -213,7 +213,10 @@ impl ServerState {
                 let (relations_out, relations_out_omitted) = cap_neighbor_list(rels_out, cap);
 
                 let live_unresolved = live_unresolved_call_sites_exist(conn)?;
-                let scope_excludes = navigation_scope_excludes(confidence, live_unresolved);
+                let degraded_call_coverage =
+                    loomweave_storage::degraded_call_coverage_file_count(conn)? > 0;
+                let scope_excludes =
+                    navigation_scope_excludes(confidence, live_unresolved, degraded_call_coverage);
                 // Honesty fields for the `callers` bucket (clarion-df87b4f381).
                 let (unresolved_name_matches, next_action) =
                     unresolved_match_fields(conn, &entity)?;

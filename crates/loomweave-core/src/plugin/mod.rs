@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod host;
 mod host_findings;
 mod host_validate;
+pub mod interpreter;
 pub mod jail;
 pub mod limits;
 pub mod manifest;
@@ -30,13 +31,17 @@ pub use host::{
     AcceptedEdge, AcceptedEntity, AnalyzeFileOutcome, BriefingBlockReason, HostError, HostFinding,
     PluginHost, RawEdge, RawEntity,
 };
-pub use host_findings::DUPLICATE_LOCATOR_RULE_ID;
+pub use host_findings::{DUPLICATE_LOCATOR_RULE_ID, FINDING_MALFORMED_FINDING};
+pub use interpreter::{
+    InterpreterSource, PYTHON_INTERPRETER_ENV, ProjectInterpreter, discover_project_interpreter,
+    resolver_environment_for,
+};
 pub use jail::{JailError, jail, jail_to_string};
 pub use limits::{
     BreakerState, CapExceeded, ContentLengthCeiling, DEFAULT_MAX_NOFILE, DEFAULT_MAX_NPROC,
     DEFAULT_MAX_RSS_MIB, EntityCountCap, FINDING_DISABLED_PATH_ESCAPE, FINDING_ENTITY_CAP,
-    FINDING_FRAME_OVERSIZE, FINDING_OOM_KILLED, FINDING_PATH_ESCAPE, PathEscapeBreaker,
-    apply_prlimit_as, apply_prlimit_nofile_nproc, effective_rss_mib,
+    FINDING_FRAME_OVERSIZE, FINDING_OOM_KILLED, FINDING_PATH_ESCAPE, LANGUAGE_SERVER_MAX_AS_MIB,
+    PathEscapeBreaker, apply_prlimit_as, apply_prlimit_nofile_nproc, effective_rss_mib,
 };
 pub use manifest::{Manifest, ManifestError, OntologyEntityRole, parse_manifest};
 // `make_notification` and `make_request` are intentionally omitted —
@@ -45,9 +50,10 @@ pub use manifest::{Manifest, ManifestError, OntologyEntityRole, parse_manifest};
 // guarantee. External consumers should build envelopes directly and
 // handle the serde error.
 pub use protocol::{
-    AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, EdgeConfidence,
-    ExitNotification, InitializeParams, InitializeResult, InitializedNotification, JsonRpcVersion,
-    NotificationEnvelope, ProtocolError, RequestEnvelope, ResponseEnvelope, ResponsePayload,
-    ShutdownParams, ShutdownResult, UnresolvedCallSite,
+    AnalyzeFileFinding, AnalyzeFileParams, AnalyzeFileResult, AnalyzeFileStats, CoverageStatus,
+    EdgeConfidence, ExitNotification, FacetCoverage, InitializeParams, InitializeResult,
+    InitializedNotification, JsonRpcVersion, NotificationEnvelope, ProtocolError, RequestEnvelope,
+    ResolutionCoverage, ResponseEnvelope, ResponsePayload, ShutdownParams, ShutdownResult,
+    UnresolvedCallSite,
 };
 pub use transport::{Frame, TransportError, read_frame, write_frame};

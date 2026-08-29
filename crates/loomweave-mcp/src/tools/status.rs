@@ -220,6 +220,10 @@ impl ServerState {
         let root_display = self.project_root.display().to_string();
 
         let project_root = self.project_root.clone();
+        // Only a gated (linked-worktree) session probes builder liveness —
+        // for main/standalone the analyze lock lives elsewhere and readiness
+        // is not consulted for gating anyway.
+        let repair_db_path = self.worktree_gate.as_ref().map(|_| db_path.clone());
         let storage = self
             .readers
             .with_reader(move |conn| {
@@ -234,6 +238,25 @@ impl ServerState {
                     "SELECT COUNT(*) FROM entities WHERE briefing_blocked IS NOT NULL",
                 );
                 let plugins = plugin_entity_counts(conn);
+                // Worktree-indexes bootstrap gate. Deliberately a *separate*
+                // consult from `latest_run` below, not derived from it:
+                // `latest_run` is a plain read for display ("what happened
+                // last"), while the readiness consult is the gate's
+                // classification — including, for a gated session, the
+                // dead-builder liveness repair (a `running` row whose owner
+                // provably no longer holds the analyze lock is converted to
+                // `failed` so this status reports a failed build with a
+                // recovery path instead of `index-building` forever).
+                // Consulted BEFORE `latest_run` so a repair this very call
+                // performs is already reflected in the displayed run row.
+                let readiness = match &repair_db_path {
+                    Some(db) => {
+                        crate::worktree_bootstrap::read_worktree_readiness_with_liveness_repair(
+                            conn, db,
+                        )
+                    }
+                    None => crate::worktree_bootstrap::read_worktree_readiness(conn),
+                };
                 let latest_run = latest_run_row(conn);
                 // SQLite's data_version increments when another connection commits
                 // to the DB, so a consult agent can detect that the index changed
@@ -242,17 +265,6 @@ impl ServerState {
                 // Whether this index has any alive SEI bindings (REQ-C-04 /
                 // ADR-038). Degrades to `false` on a pre-SEI database.
                 let sei_populated = has_any_alive_binding(conn).unwrap_or(false);
-                // Worktree-indexes bootstrap gate. Deliberately a *separate*
-                // query from `latest_run` above, not derived from it:
-                // `latest_run` reports the single most-recent row (for
-                // display — "what happened last"), while readiness answers a
-                // different question ("is there a completed row at all,
-                // regardless of what a later row did") per
-                // `read_worktree_readiness`'s doc — a rebuild-in-progress or
-                // a rebuild-that-failed after an earlier completed run must
-                // still read as `Ready`, which `latest_run`'s status alone
-                // cannot tell you.
-                let readiness = crate::worktree_bootstrap::read_worktree_readiness(conn).readiness;
                 Ok((
                     snapshot,
                     edge_count,
@@ -290,7 +302,7 @@ impl ServerState {
         // exactly as before Task 5.
         let building = self.worktree_gate.is_some()
             && !matches!(
-                readiness,
+                readiness.readiness,
                 crate::worktree_bootstrap::WorktreeReadiness::Ready
             );
         // Explicit progress-observation state (clarion-917df0e1ad): the
@@ -299,17 +311,20 @@ impl ServerState {
         // never start because the bootstrap spawn itself failed. Response
         // field only (no tool schema/description growth — the tools/list
         // byte budget is untouched); absent entirely for ungated sessions.
-        let index_state = self.worktree_gate.as_ref().map(|gate| match readiness {
-            crate::worktree_bootstrap::WorktreeReadiness::Ready => "ready",
-            crate::worktree_bootstrap::WorktreeReadiness::BuildFailed => "index-build-failed",
-            crate::worktree_bootstrap::WorktreeReadiness::Building => {
-                if gate.bootstrap_spawn_failed {
-                    "bootstrap-spawn-failed"
-                } else {
-                    "index-building"
+        let index_state = self
+            .worktree_gate
+            .as_ref()
+            .map(|gate| match readiness.readiness {
+                crate::worktree_bootstrap::WorktreeReadiness::Ready => "ready",
+                crate::worktree_bootstrap::WorktreeReadiness::BuildFailed => "index-build-failed",
+                crate::worktree_bootstrap::WorktreeReadiness::Building => {
+                    if gate.bootstrap_spawn_failed && readiness.run_id.is_none() {
+                        "bootstrap-spawn-failed"
+                    } else {
+                        "index-building"
+                    }
                 }
-            }
-        });
+            });
 
         // The on-disk size, paired with data_version, exposes a swapped or
         // truncated DB the server may still be serving from a stale handle.

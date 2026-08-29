@@ -15,10 +15,11 @@
 //! guard's `Drop` releases the OS-level lock.
 
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use loomweave_core::worktree::WorktreeContext;
 
 const LOCK_FILE_NAME: &str = "loomweave.lock";
 
@@ -37,6 +38,54 @@ pub(crate) struct AnalyzeLockGuard {
     _file: File,
 }
 
+#[derive(Debug)]
+pub(crate) enum TryAnalyzeLock {
+    Acquired(AnalyzeLockGuard),
+    Held { lock_path: PathBuf },
+}
+
+fn lock_path_for_context(ctx: &WorktreeContext) -> Result<PathBuf> {
+    if let Some(stable_id) = ctx.stable_id.as_deref() {
+        // The path contract (`<repository-store>/worktrees/<stable-id>.lock`)
+        // is defined once, in loomweave-core, and shared with the MCP
+        // server's builder-liveness probe — never re-derived here.
+        let lock_path = loomweave_core::worktree::linked_worktree_analyze_lock_path(
+            &ctx.repository_store,
+            stable_id,
+        );
+        let namespace = lock_path
+            .parent()
+            .expect("linked_worktree_analyze_lock_path always nests under worktrees/");
+        std::fs::create_dir_all(namespace).with_context(|| {
+            format!(
+                "create worktree analyze-lock namespace {}",
+                namespace.display()
+            )
+        })?;
+        Ok(lock_path)
+    } else {
+        Ok(ctx.effective_store.join(LOCK_FILE_NAME))
+    }
+}
+
+pub(crate) fn try_acquire_analyze_lock_for_context(
+    ctx: &WorktreeContext,
+) -> Result<TryAnalyzeLock> {
+    let lock_path = lock_path_for_context(ctx)?;
+    try_acquire_lock_path(&lock_path)
+}
+
+pub(crate) fn acquire_analyze_lock_for_context(ctx: &WorktreeContext) -> Result<AnalyzeLockGuard> {
+    match try_acquire_analyze_lock_for_context(ctx)? {
+        TryAnalyzeLock::Acquired(guard) => Ok(guard),
+        TryAnalyzeLock::Held { lock_path } => bail!(
+            "another `loomweave analyze` is already in progress against this project \
+             (lock held on {}). Wait for it to finish.",
+            lock_path.display()
+        ),
+    }
+}
+
 /// Acquire an exclusive cross-process lock on `<loomweave_dir>/loomweave.lock`.
 ///
 /// `loomweave_dir` is the `.weft/loomweave/` directory inside the project root. The
@@ -51,17 +100,36 @@ pub(crate) struct AnalyzeLockGuard {
 ///   an error containing the lock-file path so the operator can identify
 ///   the conflict.
 pub(crate) fn acquire_analyze_lock(loomweave_dir: &Path) -> Result<AnalyzeLockGuard> {
-    let lock_path = loomweave_dir.join(LOCK_FILE_NAME);
+    match try_acquire_analyze_lock(loomweave_dir)? {
+        TryAnalyzeLock::Acquired(guard) => Ok(guard),
+        TryAnalyzeLock::Held { lock_path } => bail!(
+            "another `loomweave analyze` is already in progress against this project \
+             (lock held on {}). Wait for it to finish.",
+            lock_path.display()
+        ),
+    }
+}
+
+/// Non-blocking twin of [`acquire_analyze_lock`] that keeps "another
+/// process holds the lock" (`Ok(Held)`, transient) distinct from "the lock
+/// could not be taken at all" (`Err`: the sentinel cannot be opened, or the
+/// filesystem refuses advisory locks — persistent, needs an operator). Callers
+/// that report severity must not collapse the two.
+pub(crate) fn try_acquire_analyze_lock(loomweave_dir: &Path) -> Result<TryAnalyzeLock> {
+    try_acquire_lock_path(&loomweave_dir.join(LOCK_FILE_NAME))
+}
+
+fn try_acquire_lock_path(lock_path: &Path) -> Result<TryAnalyzeLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)
+        .open(lock_path)
         .with_context(|| format!("open analyze lock file {}", lock_path.display()))?;
 
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(AnalyzeLockGuard { _file: file }),
+        Ok(()) => Ok(TryAnalyzeLock::Acquired(AnalyzeLockGuard { _file: file })),
         Err(err) => {
             // fs2 returns ErrorKind::WouldBlock when another process holds
             // the lock; anything else is a real IO failure (e.g. NFS
@@ -69,12 +137,9 @@ pub(crate) fn acquire_analyze_lock(loomweave_dir: &Path) -> Result<AnalyzeLockGu
             // identify the conflict.
             let kind = err.kind();
             if kind == std::io::ErrorKind::WouldBlock {
-                bail!(
-                    "another `loomweave analyze` is already in progress against this project \
-                     (lock held on {}). Wait for it to finish, or remove the lock file if \
-                     no other process is running.",
-                    lock_path.display()
-                );
+                return Ok(TryAnalyzeLock::Held {
+                    lock_path: lock_path.to_path_buf(),
+                });
             }
             Err(err).with_context(|| {
                 format!(
@@ -130,6 +195,29 @@ mod tests {
         let second = acquire_analyze_lock(loomweave_dir)
             .expect("second acquire must succeed after first drops");
         drop(second);
+    }
+
+    /// The non-blocking probe must keep contention (`Held`) apart from a
+    /// lock file that cannot be opened (`Err`): doctor grades them differently.
+    #[test]
+    fn try_acquire_distinguishes_held_from_unopenable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = acquire_analyze_lock(tmp.path()).expect("first acquire");
+        match try_acquire_analyze_lock(tmp.path()).expect("contention is Ok(Held)") {
+            TryAnalyzeLock::Held { lock_path } => {
+                assert_eq!(lock_path, tmp.path().join(LOCK_FILE_NAME));
+            }
+            TryAnalyzeLock::Acquired(_) => panic!("second acquire must not succeed"),
+        }
+        drop(first);
+
+        let blocked = tempfile::tempdir().unwrap();
+        // A directory squatting on the sentinel path: open() fails, no lock
+        // is ever attempted, and that must surface as Err, not Held.
+        std::fs::create_dir(blocked.path().join(LOCK_FILE_NAME)).unwrap();
+        let err = try_acquire_analyze_lock(blocked.path()).expect_err("unopenable sentinel");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("open analyze lock file"), "{msg}");
     }
 
     /// Missing `.weft/loomweave/` directory must surface as an IO error, not a

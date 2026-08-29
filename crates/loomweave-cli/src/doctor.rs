@@ -37,7 +37,7 @@ use loomweave_core::{ClassifierCoverage, PluginCoverageStatus};
 use loomweave_federation::config::{McpConfig, ProviderSelection, select_provider_with_env};
 use loomweave_storage::{
     ExternalSqliteCompatibility, ExternalSqliteCompatibilityStatus, LatestClassifierCoverage,
-    external_sqlite_compatibility, latest_classifier_coverage,
+    ResolutionCoverageSummary, external_sqlite_compatibility, latest_classifier_coverage,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -88,6 +88,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     let mut tally = Tally::default();
     tally += check_skill(&project_root, fix);
     tally += check_hook(&project_root, fix);
+    tally += check_git_hooks(&project_root, fix);
     tally += check_mcp(&project_root, fix);
     tally += check_instructions(&project_root, fix);
     tally += check_integration_bindings(&project_root, fix);
@@ -102,6 +103,8 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += emit_json_check_text(&check_http_authentication_json(&project_root));
     tally += emit_json_check_text(&instance_id);
     tally += check_index_integrity(&project_root, fix);
+    tally += emit_json_check_text(&check_resolution_coverage_json(&project_root, fix));
+    tally += emit_json_check_text(&check_runs_json(&project_root, fix));
     if let Some(check) = check_worktree_stores_json(&project_root) {
         tally += emit_json_check_text(&check);
     }
@@ -232,6 +235,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_plugin_availability_json(),
         check_skill_json(project_root, fix),
         check_hook_json(project_root, fix),
+        check_git_hooks_json(project_root, fix),
         check_mcp_json(project_root, fix),
         check_instructions_json(project_root, fix),
         check_http_config_json(project_root),
@@ -240,6 +244,8 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_filigree_url_json(project_root),
         check_llm_provider_json(project_root),
         check_sei_population_json(project_root),
+        check_resolution_coverage_json(project_root, fix),
+        check_runs_json(project_root, fix),
         check_wardline_taint_capability_json(project_root),
         check_mcp_hygiene_json(),
         check_integration_bindings_json(project_root, fix),
@@ -292,6 +298,21 @@ fn default_next_action(id: &str) -> String {
                 "Run `loomweave install` + `loomweave analyze <project>` to create or \
                  rebuild the index. If the DB is corrupt, remove `.weft/loomweave/loomweave.db` \
                  first."
+                    .to_owned()
+            }
+            "index.resolution_coverage" => {
+                "Run `loomweave analyze <project>`: transient-degraded files are re-dispatched \
+                 automatically. Run `loomweave doctor --fix --path <project>` to reset the \
+                 re-dispatch budget of files that exhausted it (retry once no other analyze / \
+                 doctor --fix holds the lock), then analyze again. Content- or \
+                 environment-determined ones (syntax error / site cap / `interpreter_unpinned` \
+                 — set `LOOMWEAVE_PYTHON_INTERPRETER` or create `.venv`) need the source fixed \
+                 or a `--no-incremental` pass once the resolver is healthy."
+                    .to_owned()
+            }
+            "index.runs" => {
+                "Run `loomweave doctor --fix --path <project>` to mark abandoned `running` \
+                 runs failed (only when no live analyze holds the lock)."
                     .to_owned()
             }
             "index.freshness" => {
@@ -509,33 +530,80 @@ fn severity_rank(status: &str) -> u8 {
 /// section reporting healthy counts from the correct isolated store one
 /// line below.
 ///
-/// Rather than teach every `IndexDbHealth` branch's hint text to be
-/// worktree-aware (the other candidate fix — rejected: it would smear
-/// worktree-specific wording across five branches whose text is asserted
-/// verbatim by existing tests, for a state this function can already name
-/// directly), a linked worktree short-circuits both `check_loomweave_dir`
-/// and `check_loomweave_dir_json` to a single neutral redirect to the
-/// `worktree_stores` check, which already reports this worktree's real
-/// index health under its own stable ID. Resolution failure (non-UTF-8
-/// path) falls through to the unrouted check, matching every other
-/// `WorktreeContext::resolve`-fallback call site in this codebase.
-fn is_linked_worktree(project_root: &Path) -> bool {
+/// Linked worktrees therefore classify the exact
+/// `WorktreeContext::store_paths` database directly. The aggregate
+/// `worktree_stores` report may be absent when the namespace cannot be
+/// enumerated, or healthy because a different worktree's store is healthy;
+/// neither can stand in for the current checkout's database. Resolution
+/// failure falls through to the legacy root-derived check.
+fn linked_worktree_context(
+    project_root: &Path,
+) -> Option<loomweave_core::worktree::WorktreeContext> {
     loomweave_core::worktree::WorktreeContext::resolve(project_root)
-        .is_ok_and(|ctx| ctx.kind == loomweave_core::worktree::WorktreeKind::Linked)
+        .ok()
+        .filter(|ctx| ctx.kind == loomweave_core::worktree::WorktreeKind::Linked)
+}
+
+fn store_paths_for_doctor(project_root: &Path) -> (loomweave_core::worktree::StorePaths, bool) {
+    let resolved = loomweave_core::worktree::WorktreeContext::resolve(project_root).ok();
+    let is_linked = resolved
+        .as_ref()
+        .is_some_and(|ctx| ctx.kind == loomweave_core::worktree::WorktreeKind::Linked);
+    let paths = resolved.map_or_else(
+        || loomweave_core::worktree::StorePaths::under(&project_root.join(".weft/loomweave")),
+        |ctx| ctx.store_paths,
+    );
+    (paths, is_linked)
 }
 
 /// JSON-path check for tracked-index DB health.  Expands the former
 /// existence-only check with five distinct states: absent (warning),
 /// unreadable (problem), unmigrated (problem), future-schema (problem),
-/// healthy (ok). See [`is_linked_worktree`] for the linked-worktree redirect.
+/// healthy (ok). Linked worktrees use [`linked_worktree_context`] to classify
+/// the current isolated database rather than a checkout-local decoy.
 fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
-    if is_linked_worktree(project_root) {
-        return DoctorJsonCheck::ok(
-            ".weft/loomweave.schema",
-            "linked worktree: this checkout holds no local .weft/loomweave/ store by design \
-             (worktree-index isolation) — see the `worktree_stores` check for this worktree's \
-             actual isolated index health",
-        );
+    if let Some(ctx) = linked_worktree_context(project_root) {
+        let db_path = &ctx.store_paths.db;
+        return match classify_index_db_health_at(db_path) {
+            IndexDbHealth::Healthy => DoctorJsonCheck::ok(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated database is healthy at {} (schema v{CURRENT_SCHEMA_VERSION})",
+                    db_path.display()
+                ),
+            ),
+            IndexDbHealth::Absent => DoctorJsonCheck::warning(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated loomweave.db is absent at {}; run \
+                     `loomweave worktree analyze -- <target>`",
+                    db_path.display()
+                ),
+            ),
+            IndexDbHealth::Unreadable(detail) => DoctorJsonCheck::problem(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated database at {} is unreadable: {detail}",
+                    db_path.display()
+                ),
+            ),
+            IndexDbHealth::Unmigrated => DoctorJsonCheck::problem(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated database at {} is unmigrated \
+                     (user_version=0); rebuild it with `loomweave worktree analyze -- <target>`",
+                    db_path.display()
+                ),
+            ),
+            IndexDbHealth::FutureSchema { found, current } => DoctorJsonCheck::problem(
+                ".weft/loomweave.schema",
+                format!(
+                    "current linked worktree isolated database at {} has schema v{found}, \
+                     newer than this build (current v{current})",
+                    db_path.display()
+                ),
+            ),
+        };
     }
     match classify_index_db_health(project_root) {
         IndexDbHealth::Healthy => DoctorJsonCheck::ok(
@@ -570,14 +638,44 @@ fn check_loomweave_dir_json(project_root: &Path) -> DoctorJsonCheck {
 
 /// Text-path twin of [`check_loomweave_dir_json`]: contributes to the `Tally`
 /// so problems fail the gate and warnings are surfaced. See
-/// [`is_linked_worktree`] for the linked-worktree redirect.
+/// [`linked_worktree_context`] for the linked-worktree routing.
 fn check_loomweave_dir(project_root: &Path) -> Tally {
-    if is_linked_worktree(project_root) {
-        return ok(
-            "linked worktree: this checkout holds no local .weft/loomweave/ store by design \
-             (worktree-index isolation) — see the worktree_stores check for this worktree's \
-             actual isolated index health",
-        );
+    if let Some(ctx) = linked_worktree_context(project_root) {
+        let db_path = &ctx.store_paths.db;
+        return match classify_index_db_health_at(db_path) {
+            IndexDbHealth::Healthy => ok(&format!(
+                "current linked worktree isolated database is healthy at {} (schema v{CURRENT_SCHEMA_VERSION})",
+                db_path.display()
+            )),
+            IndexDbHealth::Absent => warn(
+                &format!(
+                    "current linked worktree isolated loomweave.db is absent at {}",
+                    db_path.display()
+                ),
+                Some("loomweave worktree analyze -- <target>"),
+            ),
+            IndexDbHealth::Unreadable(detail) => problem(
+                &format!(
+                    "current linked worktree isolated database at {} is unreadable: {detail}",
+                    db_path.display()
+                ),
+                Some("check permissions; rebuild only after inspecting the isolated store"),
+            ),
+            IndexDbHealth::Unmigrated => problem(
+                &format!(
+                    "current linked worktree isolated database at {} is unmigrated (user_version=0)",
+                    db_path.display()
+                ),
+                Some("loomweave worktree analyze -- <target>"),
+            ),
+            IndexDbHealth::FutureSchema { found, current } => problem(
+                &format!(
+                    "current linked worktree isolated database at {} has schema v{found}, newer than this build (current v{current})",
+                    db_path.display()
+                ),
+                Some("upgrade loomweave to match or exceed the database schema version"),
+            ),
+        };
     }
     match classify_index_db_health(project_root) {
         IndexDbHealth::Healthy => ok(&format!(
@@ -1666,6 +1764,47 @@ fn check_hook_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     }
 }
 
+fn check_git_hooks_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    use crate::git_hooks::GitHookState;
+    match crate::git_hooks::git_sync_hook_state(project_root) {
+        GitHookState::Present => DoctorJsonCheck::ok(
+            "hook.git_sync",
+            "git-sync hooks present (post-commit/post-checkout/post-merge)",
+        ),
+        GitHookState::NoGitDir => DoctorJsonCheck::ok(
+            "hook.git_sync",
+            "no git repository; git-sync hooks not applicable",
+        ),
+        state => {
+            let what = match state {
+                GitHookState::Missing => "git-sync git hooks missing",
+                GitHookState::Stale => "git-sync git hooks stale (outdated or partial block)",
+                GitHookState::Present | GitHookState::NoGitDir => unreachable!(),
+            };
+            // Same severity posture as the text surface: warn, do not gate.
+            if !fix {
+                return DoctorJsonCheck::warning("hook.git_sync", what);
+            }
+            match crate::git_hooks::install_git_sync_hooks(project_root) {
+                Ok(Some(_))
+                    if crate::git_hooks::git_sync_hook_state(project_root)
+                        == GitHookState::Present =>
+                {
+                    DoctorJsonCheck::fixed("hook.git_sync", format!("{what}; fixed"))
+                }
+                Ok(_) => DoctorJsonCheck::problem(
+                    "hook.git_sync",
+                    format!("{what}; repair did not converge"),
+                ),
+                Err(err) => DoctorJsonCheck::problem(
+                    "hook.git_sync",
+                    format!("{what}; repair failed: {err}"),
+                ),
+            }
+        }
+    }
+}
+
 fn check_mcp_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     match mcp_registration::mcp_entry_state(project_root) {
         McpState::Present => DoctorJsonCheck::ok(
@@ -1725,7 +1864,19 @@ fn check_mcp_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
 }
 
 fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
-    let Some(config) = read_loomweave_yaml(project_root) else {
+    // `serve` resolves both the inherited config and the published port through
+    // the worktree context. Mirror that routing here: a linked checkout reads
+    // its primary project's config and publishes under its isolated store.
+    let worktree_ctx = loomweave_core::worktree::WorktreeContext::resolve(project_root).ok();
+    let config_path = worktree_ctx.as_ref().map_or_else(
+        || project_root.join("loomweave.yaml"),
+        loomweave_core::worktree::WorktreeContext::config_path,
+    );
+    let port_path = worktree_ctx.as_ref().map_or_else(
+        || project_root.join(".weft/loomweave/ephemeral.port"),
+        |ctx| ctx.store_paths.port.clone(),
+    );
+    let Some(config) = read_loomweave_yaml_at(&config_path) else {
         return DoctorJsonCheck::warning("http.config", "loomweave.yaml is absent or unparseable");
     };
     let enabled = config
@@ -1743,7 +1894,7 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     // ADR-044: prefer the live published port over the (now usually absent)
     // static bind. A running serve publishes .weft/loomweave/ephemeral.port.
     let resolution =
-        loomweave_federation::loomweave_url::resolve_loomweave_url(None, project_root, |name| {
+        loomweave_federation::loomweave_url::resolve_loomweave_url_at(None, &port_path, |name| {
             std::env::var(name).ok()
         });
     if let Some(url) = resolution.resolved_url {
@@ -1753,9 +1904,10 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
             return DoctorJsonCheck::warning(
                 "http.config",
                 format!(
-                    "stale HTTP read-API port metadata in .weft/loomweave/ephemeral.port: \
+                    "stale HTTP read-API port metadata in {}: \
                      {url}{HTTP_LIVENESS_PATH} is not reachable; start `loomweave serve` or \
-                     ignore this persisted port when .mcp.json launches the stdio runtime"
+                     ignore this persisted port when .mcp.json launches the stdio runtime",
+                    port_path.display()
                 ),
             );
         }
@@ -1773,7 +1925,10 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     if bind.trim().is_empty() {
         DoctorJsonCheck::ok(
             "http.config",
-            "HTTP enabled; read-API port auto-selected and published to .weft/loomweave/ephemeral.port while serving",
+            format!(
+                "HTTP enabled; read-API port auto-selected and published to {} while serving",
+                port_path.display()
+            ),
         )
     } else {
         DoctorJsonCheck::ok(
@@ -1784,7 +1939,10 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
 }
 
 fn load_mcp_config_for_doctor(project_root: &Path) -> std::result::Result<McpConfig, String> {
-    let path = project_root.join("loomweave.yaml");
+    let path = loomweave_core::worktree::WorktreeContext::resolve(project_root).map_or_else(
+        |_| project_root.join("loomweave.yaml"),
+        |ctx| ctx.config_path(),
+    );
     if path.exists() {
         McpConfig::from_path(&path).map_err(|err| err.to_string())
     } else {
@@ -1822,14 +1980,12 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
             }));
     }
 
-    let identity_secret_present = http.identity_token_env.as_deref().is_some_and(|name| {
-        std::env::var(name)
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    let bearer_secret_present = std::env::var(&http.token_env)
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let identity_secret_present = http
+        .identity_token_env
+        .as_deref()
+        .is_some_and(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+    let bearer_secret_present =
+        std::env::var(&http.token_env).is_ok_and(|value| !value.trim().is_empty());
     let configured_mode = if http.identity_token_env.is_some() {
         "hmac"
     } else if bearer_secret_present {
@@ -1883,36 +2039,27 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
     }
 }
 
-/// Like [`check_loomweave_dir_json`], this check re-derives its path from the
-/// literal `--path` — `store_dir(project_root)/instance_id` — which for a
-/// linked worktree is a location `loomweave worktree analyze` never
-/// populates. Left unrouted, an absent file there sent an operator to the
-/// next action "Run `loomweave install --path <project>`" — which, followed
-/// literally inside a linked worktree, would CREATE the forbidden local
-/// `<worktree>/.weft/loomweave/` decoy store, after which every other
-/// root-derived check in this module would start reading and reporting on
-/// that decoy instead of the worktree's real, isolated store. See
-/// [`is_linked_worktree`] for the shared redirect this mirrors.
+/// Validate the exact instance-ID leaf that `serve` will load. Linked
+/// worktrees route through `WorktreeContext::store_paths` so doctor never
+/// validates (or repairs) a decoy store under the linked checkout itself.
 fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     const ID: &str = "http.instance_id";
-    if is_linked_worktree(project_root) {
-        return DoctorJsonCheck::ok(
-            ID,
-            "linked worktree: the project instance ID lives in this worktree's isolated store \
-             (`StorePaths::instance_id`, under `.weft/loomweave/worktrees/<stable-id>/`), not \
-             this checkout's `.weft/loomweave/` — see the `worktree_stores` check for this \
-             worktree's actual isolated index health",
-        );
-    }
-    let path = loomweave_core::store::store_dir(project_root).join("instance_id");
+    let (store_paths, is_linked) = store_paths_for_doctor(project_root);
+    let path = store_paths.instance_id.clone();
+    let db_path = store_paths.db.clone();
+    let scope = if is_linked {
+        "current linked worktree isolated"
+    } else {
+        "project"
+    };
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if fix && loomweave_core::store::db_path(project_root).exists() {
+            if fix && db_path.exists() {
                 return match crate::instance::load_or_create(&path) {
                     Ok(instance_id) => DoctorJsonCheck::fixed(
                         ID,
-                        format!("project instance ID materialised: {instance_id}"),
+                        format!("{scope} instance ID materialised: {instance_id}"),
                     )
                     .with_details(serde_json::json!({
                         "present": true,
@@ -1921,7 +2068,7 @@ fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonChec
                     })),
                     Err(err) => DoctorJsonCheck::problem(
                         ID,
-                        format!("project instance ID repair failed: {err}"),
+                        format!("{scope} instance ID repair failed: {err}"),
                     )
                     .with_details(serde_json::json!({
                         "present": false,
@@ -1930,57 +2077,90 @@ fn check_http_instance_id_json(project_root: &Path, fix: bool) -> DoctorJsonChec
                     })),
                 };
             }
-            return DoctorJsonCheck::warning(
-                ID,
-                "project instance ID is not materialised yet",
-            )
+            let message = if is_linked {
+                format!(
+                    "{scope} instance_id is not materialised at {}",
+                    path.display()
+                )
+            } else {
+                "project instance ID is not materialised yet".to_owned()
+            };
+            return DoctorJsonCheck::warning(ID, message)
             .with_details(serde_json::json!({
                 "present": false,
                 "valid": null,
                 "instance_id": null,
             }))
-            .with_next_action(if loomweave_core::store::db_path(project_root).exists() {
+            .with_next_action(if db_path.exists() {
                 "Run `loomweave doctor --fix`; serving and federation consumers require a project instance ID."
+            } else if is_linked {
+                "Build the current isolated store with `loomweave worktree analyze -- <target>` before materialising its instance ID."
             } else {
                 "Run `loomweave install --path <project>` before materialising a project instance ID."
             });
         }
         Err(err) => {
-            return DoctorJsonCheck::problem(
-                ID,
-                format!("project instance ID is unreadable: {err}"),
-            )
-            .with_details(serde_json::json!({
-                "present": true,
-                "valid": false,
-                "instance_id": null,
-            }))
-            .with_next_action(
-                "Restore read access to `.weft/loomweave/instance_id` and inspect it before replacing any data.",
-            );
+            let message = if is_linked {
+                format!(
+                    "{scope} instance ID at {} is unreadable: {err}",
+                    path.display()
+                )
+            } else {
+                format!("project instance ID is unreadable: {err}")
+            };
+            let next_action = if is_linked {
+                format!(
+                    "Restore read access to `{}` and inspect it before replacing any data.",
+                    path.display()
+                )
+            } else {
+                "Restore read access to `.weft/loomweave/instance_id` and inspect it before replacing any data."
+                    .to_owned()
+            };
+            return DoctorJsonCheck::problem(ID, message)
+                .with_details(serde_json::json!({
+                    "present": true,
+                    "valid": false,
+                    "instance_id": null,
+                }))
+                .with_next_action(next_action);
         }
     };
     match uuid::Uuid::parse_str(raw.trim()) {
         Ok(instance_id) => {
-            DoctorJsonCheck::ok(ID, format!("project instance ID is valid: {instance_id}"))
+            DoctorJsonCheck::ok(ID, format!("{scope} instance ID is valid: {instance_id}"))
                 .with_details(serde_json::json!({
                     "present": true,
                     "valid": true,
                     "instance_id": instance_id.to_string(),
                 }))
         }
-        Err(err) => DoctorJsonCheck::problem(
-            ID,
-            format!("project instance ID is malformed; expected a UUID: {err}"),
-        )
-        .with_details(serde_json::json!({
-            "present": true,
-            "valid": false,
-            "instance_id": null,
-        }))
-        .with_next_action(
-            "Remove the malformed `.weft/loomweave/instance_id`; `loomweave serve` will create a valid replacement.",
-        ),
+        Err(err) => {
+            let message = if is_linked {
+                format!(
+                    "{scope} instance ID at {} is malformed; expected a UUID: {err}",
+                    path.display()
+                )
+            } else {
+                format!("project instance ID is malformed; expected a UUID: {err}")
+            };
+            let next_action = if is_linked {
+                format!(
+                    "Remove the malformed `{}`; `loomweave serve` will create a valid replacement.",
+                    path.display()
+                )
+            } else {
+                "Remove the malformed `.weft/loomweave/instance_id`; `loomweave serve` will create a valid replacement."
+                    .to_owned()
+            };
+            DoctorJsonCheck::problem(ID, message)
+                .with_details(serde_json::json!({
+                    "present": true,
+                    "valid": false,
+                    "instance_id": null,
+                }))
+                .with_next_action(next_action)
+        }
     }
 }
 
@@ -2137,6 +2317,423 @@ fn check_sei_population_json(project_root: &Path) -> DoctorJsonCheck {
             format!("SEI population could not be checked: {err}"),
         ),
     }
+}
+
+/// Reset the re-dispatch budget for every file that exhausted it
+/// (`doctor --fix`, clarion-7f527d3d32). Returns the number of rows reset
+/// and the coverage summary re-read on the *same* connection right after
+/// the update, so the report cannot pair the reset count with counts from
+/// before it. The re-read is fallible independently of the reset: once the
+/// `UPDATE` has committed, a failure to re-read must not turn a successful
+/// repair into a "repair failed" verdict — the caller reports it as such.
+fn repair_resolution_redispatch_budget(
+    db_path: &Path,
+) -> Result<(u64, Result<ResolutionCoverageSummary, String>)> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open index {} for repair", db_path.display()))?;
+    loomweave_storage::pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let count = loomweave_storage::reset_exhausted_redispatch_budget(&conn)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let after =
+        loomweave_storage::degraded_resolution_coverage_summary(&conn).map_err(|e| e.to_string());
+    Ok((count, after))
+}
+
+/// What the `--fix` half of [`check_resolution_coverage_json`] did.
+enum RedispatchBudgetReset {
+    /// Dry run, or `--fix` with no exhausted file to reset.
+    NotAttempted,
+    /// Another `analyze` / `doctor --fix` held the lock (`WouldBlock`);
+    /// nothing ran. Carries the lock path. This is the ONLY lock outcome that
+    /// is transient — a lock file that cannot be opened or a filesystem that
+    /// refuses advisory locks never reaches this variant (it is a `problem`).
+    LockContended(std::path::PathBuf),
+    /// The reset committed `count` rows. `after` is the post-reset summary,
+    /// or why it could not be re-read (the reset still happened).
+    ///
+    /// A reset only re-arms the counter: the files are still degraded on
+    /// disk until the next `analyze` re-dispatches them, so the check stays
+    /// a `warning` (with `fixed: true` and an explicit next action) rather
+    /// than `fixed`, which would drop it from the report's `next_actions`.
+    Reset {
+        count: u64,
+        after: Result<ResolutionCoverageSummary, String>,
+    },
+}
+
+/// Files whose last analysis reported degraded call / reference resolution
+/// (clarion-3e517d4aff). Each is a call-graph hole; transient ones are
+/// re-dispatched by the next `analyze` automatically; content- or
+/// environment-determined ones (syntax error, per-file site cap,
+/// `interpreter_unpinned`) persist until the source or the resolver
+/// environment changes.
+///
+/// Under `--fix`, files that exhausted the re-dispatch budget
+/// ([`loomweave_storage::MAX_REDISPATCH_ATTEMPTS`] consecutive transient
+/// failures) get their budget reset so the next incremental `analyze`
+/// re-dispatches them (clarion-7f527d3d32). Rows still under budget are left
+/// alone — they already re-dispatch, and wiping their counter would let a
+/// chronically flaky file dodge the anti-thrash budget.
+///
+/// Severity: lock contention with a concurrent `analyze` / `doctor --fix` is
+/// transient and retriable, so it is a `warning`. A lock that cannot be
+/// taken for any other reason (sentinel unopenable, filesystem without
+/// advisory locks) and an actual repair failure (the update itself errors)
+/// are `problem`s — persistent, needing an operator, never "just retry".
+fn check_resolution_coverage_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    const ID: &str = "index.resolution_coverage";
+    let db = loomweave_core::store::db_path(project_root);
+    if !db.exists() {
+        return DoctorJsonCheck::warning(ID, "loomweave.db is absent");
+    }
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return DoctorJsonCheck::warning(ID, "loomweave.db is absent or unreadable");
+    };
+    if let Err(err) = validate_external_sqlite_read_gate(&conn) {
+        return DoctorJsonCheck::problem(
+            ID,
+            format!("resolution coverage unavailable: {}", err.message()),
+        )
+        .with_details(serde_json::json!({
+            "external_sqlite": err.details(),
+        }));
+    }
+    let before = match loomweave_storage::degraded_resolution_coverage_summary(&conn) {
+        Ok(summary) => summary,
+        Err(err) => {
+            return DoctorJsonCheck::warning(
+                ID,
+                format!("resolution coverage could not be checked: {err}"),
+            );
+        }
+    };
+
+    let reset = if fix && before.exhausted > 0 {
+        // Release the read-only handle before opening the write connection.
+        drop(conn);
+        // Same STO-01 advisory lock `analyze` takes, scoped to this repair
+        // only (see `index_integrity_outcome` for why not all of `--fix`).
+        let loomweave_dir = loomweave_core::store::store_dir(project_root);
+        match crate::analyze_lock::try_acquire_analyze_lock(&loomweave_dir) {
+            Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(_guard)) => {
+                match repair_resolution_redispatch_budget(&db) {
+                    Ok((count, after)) => RedispatchBudgetReset::Reset { count, after },
+                    // The lock WAS held and the write itself failed: a real
+                    // repair failure, correctly a problem.
+                    Err(err) => {
+                        return DoctorJsonCheck::problem(
+                            ID,
+                            format!("resolution re-dispatch budget repair failed: {err}"),
+                        );
+                    }
+                }
+            }
+            Ok(crate::analyze_lock::TryAnalyzeLock::Held { lock_path }) => {
+                RedispatchBudgetReset::LockContended(lock_path)
+            }
+            // Not contention: the sentinel could not be opened (permissions,
+            // read-only or missing store dir) or the filesystem refused the
+            // advisory lock (NFS without lockd — unsupported for the store,
+            // see CLAUDE.md). Retrying will not help; say so.
+            Err(err) => {
+                return DoctorJsonCheck::problem(
+                    ID,
+                    format!(
+                        "{} file(s) exhausted the re-dispatch budget but the analyze lock \
+                         could not be taken: {err:#} (not lock contention — check the \
+                         permissions and filesystem of {}; advisory locks are required, \
+                         NFS is unsupported)",
+                        before.exhausted,
+                        loomweave_dir.display()
+                    ),
+                )
+                .with_details(serde_json::json!({
+                    "exhausted_files": before.exhausted,
+                    "analyze_lock_error": format!("{err:#}"),
+                }))
+                .with_next_action(format!(
+                    "Make {} writable on a filesystem that supports advisory locks (not \
+                     NFS), then re-run `loomweave doctor --fix --path <project>`.",
+                    loomweave_dir.display()
+                ));
+            }
+        }
+    } else {
+        RedispatchBudgetReset::NotAttempted
+    };
+
+    render_resolution_coverage_check(fix, &before, reset)
+}
+
+/// Pure half of [`check_resolution_coverage_json`]: turn the pre-reset
+/// summary plus what `--fix` did into the report.
+///
+/// A reset is reported as `warning` + `fixed: true`, never as status
+/// `fixed`: `json_report` builds `next_actions` from `problem` / `warning`
+/// checks only, and the reset files stay degraded on disk until the next
+/// `analyze` re-dispatches them — an agent that reads only `next_actions`
+/// must still be told to run it. Status `fixed` is reserved for a repair
+/// that leaves the checked condition healthy in the same step (compare
+/// `repair_index_integrity`, `mark_classifier_repair`).
+///
+/// Every count in the report comes from ONE read: `before` when no reset
+/// ran, the post-reset re-read when one did. A reset whose re-read failed
+/// must not fall back to `before` — that would print the exhausted count the
+/// reset just zeroed next to `reset_redispatch_budget_files`, contradicting
+/// itself. It reports the reset count, says the current counts are
+/// unavailable, and carries the pre-reset counts under an explicit
+/// `before_reset` key instead.
+fn render_resolution_coverage_check(
+    fix: bool,
+    before: &ResolutionCoverageSummary,
+    reset: RedispatchBudgetReset,
+) -> DoctorJsonCheck {
+    const ID: &str = "index.resolution_coverage";
+    let (summary, reset_count, lock_contended) = match reset {
+        RedispatchBudgetReset::NotAttempted => (before, None, None),
+        RedispatchBudgetReset::LockContended(err) => (before, None, Some(err)),
+        RedispatchBudgetReset::Reset {
+            count,
+            after: Ok(ref after),
+        } => (after, Some(count), None),
+        RedispatchBudgetReset::Reset {
+            count,
+            after: Err(err),
+        } => {
+            return reset_pending_analyze(
+                count,
+                format!(
+                    "reset the re-dispatch budget for {count} exhausted file(s); they will \
+                     re-dispatch on the next incremental analyze — current coverage counts \
+                     could not be re-read after the reset ({err}); re-run doctor for them"
+                ),
+                serde_json::json!({
+                    "reset_redispatch_budget_files": count,
+                    "max_redispatch_attempts": loomweave_storage::MAX_REDISPATCH_ATTEMPTS,
+                    "post_reset_summary_error": err,
+                    "before_reset": coverage_summary_details(before),
+                }),
+            );
+        }
+    };
+
+    if summary.degraded_calls == 0 && summary.degraded_references == 0 {
+        return DoctorJsonCheck::ok(
+            ID,
+            "every analysed file reports complete call and reference resolution",
+        );
+    }
+    let calls = summary.degraded_calls;
+    let references = summary.degraded_references;
+    let transient = summary.transient;
+    let exhausted = summary.exhausted;
+    let persistent = calls
+        .max(references)
+        .saturating_sub(transient)
+        .saturating_sub(exhausted);
+
+    // `reset_redispatch_budget_files` is present iff a reset ran — absent
+    // (not null) on a dry run, a lock-contended run, or a --fix with nothing
+    // exhausted, so "was anything reset" is a key-presence check.
+    let mut details = coverage_summary_details(summary);
+    details.insert(
+        "max_redispatch_attempts".into(),
+        loomweave_storage::MAX_REDISPATCH_ATTEMPTS.into(),
+    );
+    if let Some(count) = reset_count {
+        details.insert("reset_redispatch_budget_files".into(), count.into());
+    }
+    let details = Value::Object(details);
+
+    let summary_clause = format!(
+        "{calls} file(s) with degraded call resolution, {references} with degraded reference \
+         resolution ({transient} transient, re-dispatched by the next analyze; {exhausted} \
+         exhausted the re-dispatch budget; {persistent} content- or environment-determined: \
+         syntax error / site cap / interpreter_unpinned)"
+    );
+
+    if let Some(count) = reset_count {
+        reset_pending_analyze(
+            count,
+            format!(
+                "reset the re-dispatch budget for {count} exhausted file(s); they re-dispatch \
+                 on the next incremental analyze, which has not run yet ({summary_clause})"
+            ),
+            details,
+        )
+    } else if let Some(lock_path) = lock_contended {
+        DoctorJsonCheck::warning(
+            ID,
+            format!(
+                "{exhausted} file(s) exhausted the re-dispatch budget but the reset could not \
+                 run: another analyze / doctor --fix holds the lock on {} (retry once it \
+                 finishes — transient, not a repair failure)",
+                lock_path.display()
+            ),
+        )
+        .with_details(details)
+    } else if fix {
+        DoctorJsonCheck::warning(
+            ID,
+            format!(
+                "{summary_clause}; --fix ran but no file had exhausted the re-dispatch \
+                 budget, so nothing was reset"
+            ),
+        )
+        .with_details(details)
+    } else {
+        DoctorJsonCheck::warning(ID, summary_clause).with_details(details)
+    }
+}
+
+/// The four per-file counts of a [`ResolutionCoverageSummary`] as report
+/// details.
+/// A committed budget reset that still needs `analyze` to take effect: the
+/// `--fix` action ran (`fixed: true`) but the condition persists (`warning`),
+/// so `json_report` keeps it in `next_actions` with the follow-up spelled out.
+fn reset_pending_analyze(count: u64, message: String, details: Value) -> DoctorJsonCheck {
+    let mut check = DoctorJsonCheck::warning("index.resolution_coverage", message)
+        .with_details(details)
+        .with_next_action(format!(
+            "Run `loomweave analyze <project>`: the {count} file(s) whose re-dispatch budget \
+             was just reset are still degraded until that run re-dispatches them."
+        ));
+    check.fixed = true;
+    check
+}
+
+fn coverage_summary_details(summary: &ResolutionCoverageSummary) -> serde_json::Map<String, Value> {
+    let mut details = serde_json::Map::new();
+    details.insert("degraded_calls_files".into(), summary.degraded_calls.into());
+    details.insert(
+        "degraded_references_files".into(),
+        summary.degraded_references.into(),
+    );
+    details.insert("transient_files".into(), summary.transient.into());
+    details.insert("exhausted_files".into(), summary.exhausted.into());
+    details
+}
+
+/// `runs` rows left `running` by a builder that died uncleanly (OOM-kill,
+/// `kill -9`, reboot) — clarion-5cf9643de9 aside. `analyze` itself only
+/// sweeps rows whose heartbeat is >24 h old (`mark_stale_running_runs_failed`);
+/// a fresher abandoned row poisons `project_status_get` / the hook snapshot
+/// until then. The analyze lock is the liveness proof: every `analyze` holds
+/// it from before `BeginRun` to after its last transaction, so if `doctor`
+/// can take it, no builder is alive and every `running` row is abandoned.
+///
+/// Root-derived like its sibling checks: both the DB and the analyze-lock
+/// directory come from `project_root` via `loomweave_core::store`, so a linked
+/// worktree resolves to the repository store rather than a store of its own
+/// (clarion-f8b577dc48).
+fn check_runs_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    const ID: &str = "index.runs";
+    let db = loomweave_core::store::db_path(project_root);
+    if !db.exists() {
+        return DoctorJsonCheck::warning(ID, "loomweave.db is absent");
+    }
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return DoctorJsonCheck::warning(ID, "loomweave.db is absent or unreadable");
+    };
+    if let Err(err) = validate_external_sqlite_read_gate(&conn) {
+        return DoctorJsonCheck::problem(ID, format!("runs unavailable: {}", err.message()))
+            .with_details(serde_json::json!({ "external_sqlite": err.details() }));
+    }
+    let running = match running_runs(&conn) {
+        Ok(rows) => rows,
+        Err(err) => return DoctorJsonCheck::warning(ID, format!("runs could not be read: {err}")),
+    };
+    if running.is_empty() {
+        return DoctorJsonCheck::ok(ID, "no analyze run is recorded as running");
+    }
+    drop(conn);
+    let loomweave_dir = loomweave_core::store::store_dir(project_root);
+    let details = serde_json::json!({ "running_rows": running.len(), "runs": running });
+    match crate::analyze_lock::try_acquire_analyze_lock(&loomweave_dir) {
+        Ok(crate::analyze_lock::TryAnalyzeLock::Held { .. }) => DoctorJsonCheck::ok(
+            ID,
+            format!(
+                "{} running run(s); an analyze holds the analyze lock, so they are live",
+                running.len()
+            ),
+        )
+        .with_details(details),
+        Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(_guard)) if fix => {
+            match repair_abandoned_runs(&db) {
+                Ok(count) => runs_repair_outcome(count, &running),
+                Err(err) => {
+                    DoctorJsonCheck::problem(ID, format!("abandoned run repair failed: {err}"))
+                }
+            }
+        }
+        Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(_guard)) => DoctorJsonCheck::warning(
+            ID,
+            format!(
+                "{} run(s) recorded as running but no analyze holds the lock (abandoned)",
+                running.len()
+            ),
+        )
+        .with_details(details)
+        .with_next_action(
+            "Run `loomweave doctor --fix --path <project>` to mark the abandoned runs failed.",
+        ),
+        Err(err) => DoctorJsonCheck::problem(
+            ID,
+            format!(
+                "{} running run(s) and the analyze lock could not be taken: {err:#}",
+                running.len()
+            ),
+        )
+        .with_details(details),
+    }
+}
+
+/// Pure half of [`check_runs_json`]'s `--fix` arm: turn the repair's row count
+/// into the report.
+///
+/// `count == 0` is NOT a repair. The `running` rows were read before the
+/// analyze lock was taken, so a run that finished in that window is gone by
+/// the time the UPDATE lands — nothing was abandoned and nothing was marked.
+/// Reporting that as `fixed` with "marked 0 abandoned running run(s) failed"
+/// tells an operator (and `json_report`'s tally) that doctor repaired
+/// something it did not touch, on a run that was healthy all along. It is an
+/// `ok` with the reason named, matching the sibling "no analyze run is
+/// recorded as running" early return.
+fn runs_repair_outcome(count: usize, running: &[Value]) -> DoctorJsonCheck {
+    const ID: &str = "index.runs";
+    if count == 0 {
+        return DoctorJsonCheck::ok(
+            ID,
+            "no analyze run is recorded as running (the run completed before repair)",
+        );
+    }
+    DoctorJsonCheck::fixed(
+        ID,
+        format!("marked {count} abandoned running run(s) failed (no live analyze holds the lock)"),
+    )
+    .with_details(serde_json::json!({ "repaired_rows": count, "runs": running }))
+}
+
+fn running_runs(conn: &Connection) -> rusqlite::Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, started_at, owner_pid, heartbeat_at FROM runs WHERE status = 'running' ORDER BY started_at",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "started_at": row.get::<_, String>(1)?,
+            "owner_pid": row.get::<_, Option<i64>>(2)?,
+            "heartbeat_at": row.get::<_, Option<String>>(3)?,
+        }))
+    })?;
+    rows.collect()
+}
+
+fn repair_abandoned_runs(db_path: &Path) -> Result<usize> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open index {} for repair", db_path.display()))?;
+    loomweave_storage::pragma::apply_write_pragmas(&conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    loomweave_storage::mark_abandoned_running_runs_failed(&conn).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn check_wardline_taint_capability_json(project_root: &Path) -> DoctorJsonCheck {
@@ -2299,7 +2896,11 @@ fn check_integration_bindings_json(project_root: &Path, fix: bool) -> DoctorJson
 }
 
 fn read_loomweave_yaml(project_root: &Path) -> Option<Value> {
-    let raw = fs::read_to_string(project_root.join("loomweave.yaml")).ok()?;
+    read_loomweave_yaml_at(&project_root.join("loomweave.yaml"))
+}
+
+fn read_loomweave_yaml_at(config_path: &Path) -> Option<Value> {
+    let raw = fs::read_to_string(config_path).ok()?;
     serde_norway::from_str(&raw).ok()
 }
 
@@ -2444,6 +3045,40 @@ fn check_hook(project_root: &Path, fix: bool) -> Tally {
                 Ok(_)
                     if hooks_settings::session_start_hook_state(project_root)
                         == HookState::Present =>
+                {
+                    ok(&format!("{what} — fixed"))
+                }
+                Ok(_) => problem(&format!("{what} — repair did not converge"), None),
+                Err(err) => problem(&format!("{what} — repair failed: {err}"), None),
+            }
+        }
+    }
+}
+
+fn check_git_hooks(project_root: &Path, fix: bool) -> Tally {
+    use crate::git_hooks::GitHookState;
+    match crate::git_hooks::git_sync_hook_state(project_root) {
+        GitHookState::Present => {
+            ok("git-sync hooks present (post-commit/post-checkout/post-merge)")
+        }
+        // Not a git repo: git-sync has nowhere to live and that is fine.
+        GitHookState::NoGitDir => ok("no git repository; git-sync hooks not applicable"),
+        state => {
+            let what = match state {
+                GitHookState::Missing => "git-sync git hooks missing",
+                GitHookState::Stale => "git-sync git hooks stale (outdated or partial block)",
+                GitHookState::Present | GitHookState::NoGitDir => unreachable!(),
+            };
+            // Freshness enrichment, not a correctness requirement: a project
+            // installed before `git init` (or one that never re-ran install)
+            // must not gate-fail doctor. Warn with the repair nudge instead.
+            if !fix {
+                return warn(what, Some("loomweave install --hooks"));
+            }
+            match crate::git_hooks::install_git_sync_hooks(project_root) {
+                Ok(Some(_))
+                    if crate::git_hooks::git_sync_hook_state(project_root)
+                        == GitHookState::Present =>
                 {
                     ok(&format!("{what} — fixed"))
                 }
@@ -3020,5 +3655,471 @@ filigree tracks tasks for this project.\n\
             !marker.exists(),
             "db untrack repair must not run repo-configured fsmonitor"
         );
+    }
+
+    // --- index.resolution_coverage: dry run / --fix / lock-held / no-op ---
+
+    /// A real migrated index at the canonical store path (schema-current, so
+    /// the external-SQLite read gate admits it).
+    fn migrated_db(root: &Path) -> std::path::PathBuf {
+        let db = loomweave_core::store::db_path(root);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let mut conn = Connection::open(&db).unwrap();
+        loomweave_storage::schema::apply_migrations(&mut conn).unwrap();
+        db
+    }
+
+    fn transient_degraded_calls() -> loomweave_storage::SourceFileResolutionCoverage {
+        loomweave_storage::SourceFileResolutionCoverage {
+            calls: loomweave_storage::FacetCoverageRecord {
+                degraded: true,
+                reason: Some("pyright_timeout".to_owned()),
+                transient: true,
+                collateral: false,
+            },
+            references: loomweave_storage::FacetCoverageRecord::default(),
+        }
+    }
+
+    /// Drive one file through enough consecutive degraded runs to exhaust
+    /// `MAX_REDISPATCH_ATTEMPTS`.
+    fn exhaust_one_file(conn: &Connection, source_file_id: &str) {
+        let degraded = transient_degraded_calls();
+        for run in 0..=loomweave_storage::MAX_REDISPATCH_ATTEMPTS {
+            loomweave_storage::upsert_source_file_resolution_coverage(
+                conn,
+                source_file_id,
+                &degraded,
+                false,
+                &format!("r{run}"),
+                "t",
+            )
+            .unwrap();
+        }
+    }
+
+    /// One transient-degraded row still under budget (attempts == 1).
+    fn under_budget_file(conn: &Connection, source_file_id: &str) {
+        let degraded = transient_degraded_calls();
+        for run in 1..=2 {
+            loomweave_storage::upsert_source_file_resolution_coverage(
+                conn,
+                source_file_id,
+                &degraded,
+                false,
+                &format!("r{run}"),
+                "t",
+            )
+            .unwrap();
+        }
+    }
+
+    fn redispatch_attempts(conn: &Connection, source_file_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT redispatch_attempts FROM source_file_resolution_coverage \
+             WHERE source_file_id = ?1",
+            rusqlite::params![source_file_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolution_coverage_dry_run_reports_warning_and_does_not_touch_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+        let before = redispatch_attempts(&conn, "core:file:stuck.py");
+        assert_eq!(before, loomweave_storage::MAX_REDISPATCH_ATTEMPTS);
+
+        let check = check_resolution_coverage_json(root, false);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(!check.fixed);
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["exhausted_files"], 1);
+        assert!(
+            details.get("reset_redispatch_budget_files").is_none(),
+            "dry run must not report a reset: {details}"
+        );
+        assert!(!check.message.contains("nothing was reset"));
+        assert_eq!(redispatch_attempts(&conn, "core:file:stuck.py"), before);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_resets_the_exhausted_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+
+        let check = check_resolution_coverage_json(root, true);
+        // The counter is re-armed but the file is still degraded until the
+        // next analyze runs: an action was taken (`fixed`), the condition
+        // persists (`warning`), and the follow-up is spelled out so
+        // `json_report` keeps it in `next_actions`.
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(check.fixed);
+        assert!(
+            check.message.contains("has not run yet"),
+            "must say analyze is still pending: {}",
+            check.message
+        );
+        let next = check.next_action.as_deref().expect("explicit next action");
+        assert!(
+            next.contains("loomweave analyze") && next.contains('1'),
+            "next action must name analyze and the reset count: {next}"
+        );
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["reset_redispatch_budget_files"], 1);
+        assert_eq!(
+            details["exhausted_files"], 0,
+            "summary re-read after the reset"
+        );
+        assert_eq!(details["transient_files"], 1);
+        assert_eq!(redispatch_attempts(&conn, "core:file:stuck.py"), 0);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_lock_that_cannot_be_opened_is_a_problem_not_contention() {
+        // A lock sentinel that cannot be opened (here: a directory squatting
+        // on its path, standing in for permission denied / NFS without
+        // lockd) is persistent. It must not be narrated as "another analyze
+        // holds the lock, retry" — that is a problem needing an operator.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+        std::fs::create_dir(loomweave_core::store::store_dir(root).join("loomweave.lock")).unwrap();
+
+        let check = check_resolution_coverage_json(root, true);
+        assert_eq!(check.status, "problem", "{}", check.message);
+        assert!(!check.fixed);
+        assert!(
+            check.message.contains("not lock contention")
+                && !check.message.contains("retry once it finishes"),
+            "must not be graded as transient contention: {}",
+            check.message
+        );
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["exhausted_files"], 1);
+        assert!(
+            details["analyze_lock_error"]
+                .as_str()
+                .unwrap()
+                .contains("open analyze lock file"),
+            "{details}"
+        );
+        assert!(details.get("reset_redispatch_budget_files").is_none());
+        assert!(check.next_action.is_some());
+        assert_eq!(
+            redispatch_attempts(&conn, "core:file:stuck.py"),
+            loomweave_storage::MAX_REDISPATCH_ATTEMPTS,
+            "repair must not have run"
+        );
+    }
+
+    #[test]
+    fn resolution_coverage_fix_is_a_warning_not_a_problem_when_the_analyze_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+
+        let held =
+            crate::analyze_lock::acquire_analyze_lock(&loomweave_core::store::store_dir(root))
+                .unwrap();
+        let check = check_resolution_coverage_json(root, true);
+        assert_eq!(
+            check.status, "warning",
+            "lock contention is transient, must not fail the gate: {}",
+            check.message
+        );
+        assert!(!check.fixed);
+        assert!(
+            check.message.contains("retry") && check.message.contains("lock"),
+            "{}",
+            check.message
+        );
+        let details = check.details.as_ref().unwrap();
+        assert!(details.get("reset_redispatch_budget_files").is_none());
+        assert_eq!(details["exhausted_files"], 1);
+        assert_eq!(
+            redispatch_attempts(&conn, "core:file:stuck.py"),
+            loomweave_storage::MAX_REDISPATCH_ATTEMPTS,
+            "repair must not have run"
+        );
+
+        drop(held);
+        let check = check_resolution_coverage_json(root, true);
+        assert!(check.fixed, "{}", check.message);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert_eq!(redispatch_attempts(&conn, "core:file:stuck.py"), 0);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_with_nothing_exhausted_is_a_legible_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        under_budget_file(&conn, "core:file:flaky.py");
+        assert_eq!(redispatch_attempts(&conn, "core:file:flaky.py"), 1);
+
+        let check = check_resolution_coverage_json(root, true);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(!check.fixed);
+        assert!(
+            check.message.contains("nothing was reset"),
+            "--fix with nothing exhausted must say so: {}",
+            check.message
+        );
+        let details = check.details.as_ref().unwrap();
+        assert!(details.get("reset_redispatch_budget_files").is_none());
+        assert_eq!(details["transient_files"], 1);
+        assert_eq!(details["exhausted_files"], 0);
+        assert_eq!(redispatch_attempts(&conn, "core:file:flaky.py"), 1);
+    }
+
+    #[test]
+    fn resolution_coverage_fix_whose_post_reset_reread_fails_does_not_report_stale_counts() {
+        // The reset committed but the summary could not be re-read: the
+        // report must not print the pre-reset exhausted count (now zero on
+        // disk) beside `reset_redispatch_budget_files`.
+        let before = ResolutionCoverageSummary {
+            degraded_calls: 1,
+            degraded_references: 0,
+            transient: 0,
+            exhausted: 1,
+        };
+        let check = render_resolution_coverage_check(
+            true,
+            &before,
+            RedispatchBudgetReset::Reset {
+                count: 1,
+                after: Err("database is locked".to_owned()),
+            },
+        );
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(check.fixed);
+        assert!(
+            check
+                .next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("loomweave analyze")),
+            "reset still needs analyze: {:?}",
+            check.next_action
+        );
+        assert!(
+            check.message.contains("reset the re-dispatch budget for 1")
+                && check.message.contains("could not be re-read")
+                && check.message.contains("database is locked"),
+            "{}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("exhausted the re-dispatch budget;"),
+            "must not narrate pre-reset counts as current: {}",
+            check.message
+        );
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["reset_redispatch_budget_files"], 1);
+        assert_eq!(details["post_reset_summary_error"], "database is locked");
+        assert!(
+            details.get("exhausted_files").is_none() && details.get("transient_files").is_none(),
+            "current counts are unknown and must be absent, not stale: {details}"
+        );
+        assert_eq!(details["before_reset"]["exhausted_files"], 1);
+        assert_eq!(details["before_reset"]["degraded_calls_files"], 1);
+    }
+
+    #[test]
+    fn resolution_coverage_headline_names_the_environment_determined_reason_too() {
+        // The residual bucket (`persistent`) is everything that is neither
+        // transient nor budget-exhausted, which since ADR-058 includes
+        // `interpreter_unpinned` (`transient == false`, environment- not
+        // content-determined). Calling the whole bucket "content-determined:
+        // syntax error / site cap" told an operator staring at an unpinned
+        // interpreter to go fix their source. The headline must offer the same
+        // three reasons `default_next_action("index.resolution_coverage")`
+        // does, or the two halves of the same check disagree.
+        let before = ResolutionCoverageSummary {
+            degraded_calls: 3,
+            degraded_references: 0,
+            transient: 0,
+            exhausted: 0,
+        };
+        let check =
+            render_resolution_coverage_check(false, &before, RedispatchBudgetReset::NotAttempted);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(
+            check.message.contains(
+                "3 content- or environment-determined: syntax error / site cap / \
+                          interpreter_unpinned"
+            ),
+            "{}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("content-determined: syntax error"),
+            "the old wording mislabelled interpreter_unpinned rows: {}",
+            check.message
+        );
+        assert!(
+            default_next_action("index.resolution_coverage").contains("interpreter_unpinned"),
+            "headline and next action must name the same reasons"
+        );
+    }
+
+    #[test]
+    fn resolution_coverage_fix_reread_succeeds_on_the_write_connection() {
+        // The re-read rides the same connection as the UPDATE, so the
+        // reported counts are the post-reset ones even though no second
+        // read-only handle is ever opened.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = migrated_db(root);
+        let conn = Connection::open(&db).unwrap();
+        exhaust_one_file(&conn, "core:file:stuck.py");
+
+        let (count, after) = repair_resolution_redispatch_budget(&db).unwrap();
+        assert_eq!(count, 1);
+        let after = after.unwrap();
+        assert_eq!((after.exhausted, after.transient), (0, 1));
+    }
+
+    #[test]
+    fn resolution_coverage_fix_on_an_empty_coverage_table_is_a_safe_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        migrated_db(root);
+        let check = check_resolution_coverage_json(root, true);
+        assert_eq!(check.status, "ok", "{}", check.message);
+        assert!(!check.fixed);
+        assert!(check.details.is_none());
+    }
+
+    // --- index.runs: dry run / --fix / lock-held ---
+
+    fn seed_run(conn: &Connection, id: &str, status: &str, owner_pid: Option<i64>) {
+        conn.execute(
+            "INSERT INTO runs (id, started_at, completed_at, config, stats, status, owner_pid) \
+             VALUES (?1, '2026-01-01T00:00:00.000Z', NULL, '{}', '{}', ?2, ?3)",
+            rusqlite::params![id, status, owner_pid],
+        )
+        .unwrap();
+    }
+
+    fn run_status(conn: &Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT status FROM runs WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn runs_check_is_ok_when_nothing_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrated_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seed_run(&conn, "done", "completed", None);
+        let check = check_runs_json(dir.path(), false);
+        assert_eq!(check.status, "ok", "{}", check.message);
+    }
+
+    #[test]
+    fn runs_dry_run_warns_and_lists_abandoned_rows_without_touching_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrated_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seed_run(&conn, "stuck", "running", Some(99_999_999));
+        let check = check_runs_json(dir.path(), false);
+        assert_eq!(check.status, "warning", "{}", check.message);
+        assert!(!check.fixed);
+        let details = check.details.as_ref().unwrap();
+        assert_eq!(details["running_rows"], 1);
+        assert_eq!(details["runs"][0]["id"], "stuck");
+        assert_eq!(details["runs"][0]["owner_pid"], 99_999_999);
+        assert_eq!(run_status(&conn, "stuck"), "running");
+    }
+
+    #[test]
+    fn runs_fix_marks_every_running_row_failed_while_holding_the_analyze_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrated_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seed_run(&conn, "stuck-a", "running", Some(1));
+        seed_run(&conn, "stuck-b", "running", None);
+        seed_run(&conn, "done", "completed", None);
+        let check = check_runs_json(dir.path(), true);
+        assert_eq!(check.status, "fixed", "{}", check.message);
+        assert!(check.fixed);
+        assert_eq!(check.details.as_ref().unwrap()["repaired_rows"], 2);
+        assert_eq!(run_status(&conn, "stuck-a"), "failed");
+        assert_eq!(run_status(&conn, "stuck-b"), "failed");
+        assert_eq!(run_status(&conn, "done"), "completed");
+    }
+
+    #[test]
+    fn runs_repair_that_marked_nothing_is_ok_not_fixed() {
+        // The `running` rows are read BEFORE the analyze lock is taken, so a
+        // run that completed in that window leaves zero rows for the UPDATE.
+        // The race is not deterministically reproducible through
+        // `check_runs_json` (there is no seam between the read and the lock),
+        // so the outcome half is tested directly.
+        let running = vec![serde_json::json!({ "id": "raced" })];
+        let none = runs_repair_outcome(0, &running);
+        assert_eq!(none.status, "ok", "{}", none.message);
+        assert!(!none.fixed, "nothing was repaired");
+        assert!(
+            none.message.contains("completed before repair"),
+            "{}",
+            none.message
+        );
+        assert!(
+            !none.message.contains("marked 0"),
+            "must not narrate a no-op as a repair: {}",
+            none.message
+        );
+        assert!(none.details.is_none());
+
+        let repaired = runs_repair_outcome(2, &running);
+        assert_eq!(repaired.status, "fixed", "{}", repaired.message);
+        assert!(repaired.fixed);
+        assert!(
+            repaired.message.contains("marked 2"),
+            "{}",
+            repaired.message
+        );
+        let details = repaired.details.as_ref().unwrap();
+        assert_eq!(details["repaired_rows"], 2);
+        assert_eq!(details["runs"][0]["id"], "raced");
+    }
+
+    #[test]
+    fn runs_check_is_ok_not_warning_when_a_live_analyze_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrated_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seed_run(&conn, "live", "running", Some(std::process::id().into()));
+        let store = loomweave_core::store::store_dir(dir.path());
+        let _guard = match crate::analyze_lock::try_acquire_analyze_lock(&store).unwrap() {
+            crate::analyze_lock::TryAnalyzeLock::Acquired(guard) => guard,
+            crate::analyze_lock::TryAnalyzeLock::Held { .. } => {
+                panic!("lock free in a fresh tempdir")
+            }
+        };
+        for fix in [false, true] {
+            let check = check_runs_json(dir.path(), fix);
+            assert_eq!(check.status, "ok", "fix={fix}: {}", check.message);
+            assert!(check.message.contains("analyze lock"), "{}", check.message);
+        }
+        assert_eq!(run_status(&conn, "live"), "running");
     }
 }

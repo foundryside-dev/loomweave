@@ -83,6 +83,15 @@ from loomweave_plugin_python.wardline_descriptor import (
 # bytes wardline ships, not a yaml.safe_load round-trip.
 GOLDEN_PATH = Path(__file__).parent / "fixtures" / "wardline-vocabulary-descriptor.golden.yaml"
 
+# The SEMANTIC preview of the future (wardline.vocabulary/v2, wardline-generic-3)
+# descriptor. Deliberately NOT byte-pinned: wardline does not emit generic-3 yet,
+# so these bytes are the consumer's forward contract, field-asserted only. The
+# byte-freeze (and a blob pin on both sides) lands in S1 when the real producer
+# output exists (Rollout Fence §3).
+PREVIEW_PATH = (
+    Path(__file__).parent / "fixtures" / "wardline-vocabulary-descriptor.generic-3.preview.yaml"
+)
+
 # Layer-1 byte-pin: the git-blob SHA-1 of the vendored golden. This is the SAME
 # 40 hex chars wardline pins as UPSTREAM_BLOB_SHA on the producer side
 # (wardline/tests/conformance/test_vocabulary_descriptor_wire_golden.py) — the
@@ -250,9 +259,12 @@ class Sanitizer:
 def test_consumer_version_gate_rejects_skew_copy(tmp_path: Path) -> None:
     """The version gate is REAL, not cosmetic: the SAME golden bytes with ONLY
     the ``version`` string bumped flip the consumer from ``enabled`` to
-    ``version_skew`` through the REAL ``load_wardline_descriptor``. The contrast
-    with ``test_consumer_accepts_golden_and_parses_vocabulary`` (identical bytes
-    bar the version) is the proof that the gate fires on version alone."""
+    ``version_skew`` through the REAL ``load_wardline_descriptor``. Since the
+    dual-accept change the gate keys on the (schema, version) PAIR: the same
+    golden bytes with only the version bumped are a pair mismatch — the golden
+    still declares ``schema: wardline.vocabulary/v1`` (line 1), and
+    ``wardline-generic-3`` is accepted ONLY under ``wardline.vocabulary/v2``.
+    That is the proof that version alone cannot unlock v2 parsing."""
     golden_text = GOLDEN_PATH.read_text("utf-8")
     assert EXPECTED_DESCRIPTOR_VERSION in golden_text, (
         "the golden must carry the expected version for the skew derivation to be a "
@@ -277,6 +289,67 @@ def test_consumer_version_gate_rejects_skew_copy(tmp_path: Path) -> None:
     assert tuple(sorted(state.vocabulary.entries_by_name)) == tuple(
         sorted(EXPECTED_CANONICAL_NAMES)
     )
+
+
+def test_consumer_accepts_the_v2_pair(tmp_path: Path) -> None:
+    # The dual-accept half: the (wardline.vocabulary/v2, wardline-generic-3)
+    # pair from the SEMANTIC preview fixture is enabled, not skew. This fixture
+    # is field-asserted, never byte-pinned — the byte-freeze happens in S1 when
+    # wardline's producer emits real generic-3 bytes (Rollout Fence).
+    _write_project_descriptor(tmp_path, PREVIEW_PATH.read_text(encoding="utf-8"))
+    state = load_wardline_descriptor(tmp_path)
+    assert state.status == "enabled"
+    assert state.descriptor_version == "wardline-generic-3"
+
+
+def test_consumer_attributes_v2_facet_through_extractor(tmp_path: Path) -> None:
+    """The NON-CIRCULAR proof for the v2 facets section: every other facet test
+    constructs its vocabulary in Python, so only this one shows that descriptor
+    BYTES → real ``load_wardline_descriptor`` → real ``extractor.extract``
+    actually reach an entity's tags. Acceptance of the v2 pair is accept-and-READ
+    (spec rev 9 §4.3); a facet that parses but never attributes would still be a
+    silently-ignored section."""
+    _write_project_descriptor(tmp_path, PREVIEW_PATH.read_text(encoding="utf-8"))
+
+    state = load_wardline_descriptor(tmp_path)
+    assert state.status == "enabled"
+    vocabulary = state.vocabulary
+    assert vocabulary is not None
+
+    source = """\
+from weft_markers import audit_record, trusted
+
+@weft_markers.audit_record
+def settle():
+    return 1
+
+@trusted(level="INTEGRAL")
+class Ledger:
+    pass
+"""
+
+    entities, _edges = extract(source, "service.py", wardline_vocabulary=vocabulary)
+
+    settle = next(e for e in entities if e["id"] == "python:function:service.settle")
+    ledger = next(e for e in entities if e["id"] == "python:class:service.Ledger")
+
+    # The facet reached the entity, tagged and marked as a facet.
+    assert "wardline" in settle["tags"]
+    assert "wardline:audit_record" in settle["tags"]
+    assert settle["wardline"]["descriptor_version"] == "wardline-generic-3"
+    assert settle["wardline"]["confidence_basis"] == "descriptor"
+    facet_records = settle["wardline"]["decorators"]
+    assert [d["canonical_name"] for d in facet_records] == ["audit_record"]
+    assert facet_records[0]["kind"] == "facet"
+    assert facet_records[0]["group"] == 3
+    assert facet_records[0]["attrs"] == {}
+
+    # A seeding entry from the SAME v2 descriptor still carries no `kind`, so
+    # facet attribution did not disturb the trust-marker record shape.
+    trusted_record = ledger["wardline"]["decorators"][0]
+    assert trusted_record["canonical_name"] == "trusted"
+    assert trusted_record["attrs"] == {"_wardline_level": "TaintState"}
+    assert "kind" not in trusted_record
 
 
 # ── Layer 2 — drift recheck vs the Wardline source of truth ──────────────────

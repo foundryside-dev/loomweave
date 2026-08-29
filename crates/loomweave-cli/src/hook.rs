@@ -76,6 +76,26 @@ fn trigger_background_analyze(project_root: &Path) {
     }
 }
 
+/// Git-hook entry point (`loomweave hook git-sync`): spawn the same detached
+/// background analyze the `SessionStart` hook uses, when — and only when — the
+/// index is present and stale. Silent on the happy path (the managed git-hook
+/// block discards output anyway) and never errors: a hook must not block git.
+///
+/// # Errors
+///
+/// Never returns an error today; the `anyhow::Result` keeps the signature
+/// uniform with the other hook entry points.
+#[allow(clippy::unnecessary_wraps)]
+pub fn git_sync(path: &Path) -> anyhow::Result<()> {
+    let outcome = load_snapshot(path);
+    if should_trigger_background_analyze(&outcome)
+        && let Err(err) = spawn_detached_analyze(path)
+    {
+        tracing::warn!(error = %err, "git-sync background analyze spawn failed");
+    }
+    Ok(())
+}
+
 /// Spawn `loomweave analyze <project_root>` as a fire-and-forget child:
 /// stdio to `/dev/null`, in its own process group, never waited on.
 ///
@@ -95,6 +115,15 @@ fn spawn_detached_analyze(project_root: &Path) -> std::io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Strip repository-selector env before spawning. When this runs from a git
+    // hook, git exports GIT_DIR / GIT_INDEX_FILE / GIT_WORK_TREE etc.; the
+    // analyze child runs its own git for SEI extraction, and inheriting those
+    // would repoint or poison it (mid-operation index files especially).
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&key);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -218,6 +247,17 @@ fn snapshot_outcome_lines(project_root: &Path, outcome: &SnapshotOutcome) -> Vec
         }
     };
     if !snapshot.db_present() {
+        if let Ok(ctx) = loomweave_core::worktree::WorktreeContext::resolve(project_root)
+            && ctx.kind == loomweave_core::worktree::WorktreeKind::Linked
+        {
+            lines.push(format!(
+                "Loomweave: no index at {}. Run `loomweave worktree analyze -- {}` \
+                 to build this linked worktree's isolated index.",
+                ctx.store_paths.db.display(),
+                project_root.display()
+            ));
+            return lines;
+        }
         lines.push(format!(
             "Loomweave: no index at {}/.weft/loomweave/loomweave.db. \
              Run `loomweave install --path {}` then `loomweave analyze {}`.",
@@ -535,6 +575,59 @@ mod tests {
             banner.contains("does NOT reflect the working tree")
                 && banner.contains("loomweave analyze"),
             "StaleWorktree banner must name the gap and the re-analyze remedy: {banner}"
+        );
+    }
+
+    #[test]
+    fn unbuilt_linked_worktree_banner_points_to_the_isolated_analyze_command() {
+        use std::process::Command;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".weft/loomweave")).unwrap();
+        std::fs::write(repo.join(".weft/loomweave/.gitignore"), "# marker\n").unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "init"]);
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feature", "../linked"],
+        );
+        let linked = root.path().join("linked");
+        let ctx = loomweave_core::worktree::WorktreeContext::resolve(&linked)
+            .expect("resolve linked context");
+
+        let banner = snapshot_report(&linked).join("\n");
+
+        assert!(
+            banner.contains(&ctx.store_paths.db.display().to_string()),
+            "the missing index location must name the routed isolated store: {banner}"
+        );
+        assert!(
+            banner.contains(&format!(
+                "loomweave worktree analyze -- {}",
+                linked.display()
+            )),
+            "the remediation must build the isolated store: {banner}"
+        );
+        assert!(
+            !banner.contains(&format!("loomweave install --path {}", linked.display())),
+            "installing inside the linked checkout would create a decoy store: {banner}"
         );
     }
 }

@@ -706,9 +706,10 @@ pub struct InstructionsInstallReport {
 /// **Redirect routing (C-20).** The target set comes from
 /// [`instruction_targets`]: normally both [`TARGET_FILES`], but when `CLAUDE.md`
 /// is merely a redirect to `AGENTS.md` the block belongs in `AGENTS.md` alone
-/// and a legacy `CLAUDE.md` block is migrated off. Migration runs **first**, so
-/// a redirecting project never briefly carries two blocks. `AGENTS.md` is
-/// created if absent, exactly as for a first install.
+/// and a legacy `CLAUDE.md` block is migrated off. The replacement target is
+/// written and validated **before** migration removes the legacy block; a
+/// symlink skip or write failure therefore leaves the last usable guidance in
+/// place. `AGENTS.md` is created if absent, exactly as for a first install.
 ///
 /// The removal side is deliberately more conservative than this one — see
 /// [`remove_instructions`]. A refusal is warned about and left in place; it
@@ -751,36 +752,7 @@ pub fn install_instructions(project_root: &Path) -> Result<InstructionsInstallRe
     let mut changed = false;
     let mut skipped_symlinks = Vec::new();
     let (write_to, migrate_off) = instruction_targets(project_root);
-
-    for name in migrate_off {
-        let path = project_root.join(name);
-        let outcome = remove_instructions(&path).with_context(|| {
-            format!(
-                "migrate loomweave instructions out of {} (it redirects to {AGENTS_MD})",
-                path.display()
-            )
-        })?;
-        match outcome {
-            RemoveOutcome::Removed => changed = true,
-            RemoveOutcome::Nothing => {}
-            // Degrade, don't abort — same posture as the symlink skip below. A
-            // legacy block we cannot prove is ours stays put; the redirect still
-            // delivers the current copy from AGENTS.md, so the failure mode is a
-            // stale duplicate, never missing guidance. To stderr, never stdout
-            // (operator-diagnostic hygiene).
-            RemoveOutcome::Refused(reason) => eprintln!("loomweave: warning: {reason}"),
-            RemoveOutcome::SkippedSymlink => {
-                eprintln!(
-                    "loomweave: warning: skipping {}: it is a symlink (loomweave never writes \
-                     through a symlink; replace the link with a regular file by hand, then \
-                     re-run `loomweave install` or `loomweave doctor --fix`)",
-                    path.display()
-                );
-                skipped_symlinks.push(path);
-            }
-        }
-    }
-
+    let mut replacement_secured = true;
     for name in write_to {
         let path = project_root.join(name);
         if is_symlink(&path)
@@ -796,10 +768,41 @@ pub fn install_instructions(project_root: &Path) -> Result<InstructionsInstallRe
                 path.display()
             );
             skipped_symlinks.push(path);
+            replacement_secured = false;
             continue;
         }
         changed |= install_into_file(&path)
             .with_context(|| format!("inject loomweave instructions into {}", path.display()))?;
+    }
+
+    if replacement_secured {
+        for name in migrate_off {
+            let path = project_root.join(name);
+            let outcome = remove_instructions(&path).with_context(|| {
+                format!(
+                    "migrate loomweave instructions out of {} (it redirects to {AGENTS_MD})",
+                    path.display()
+                )
+            })?;
+            match outcome {
+                RemoveOutcome::Removed => changed = true,
+                RemoveOutcome::Nothing => {}
+                // A legacy block we cannot prove is ours stays put; the
+                // redirect now delivers the secured current copy from
+                // AGENTS.md, so the failure mode is a stale duplicate, never
+                // missing guidance.
+                RemoveOutcome::Refused(reason) => eprintln!("loomweave: warning: {reason}"),
+                RemoveOutcome::SkippedSymlink => {
+                    eprintln!(
+                        "loomweave: warning: skipping {}: it is a symlink (loomweave never writes \
+                         through a symlink; replace the link with a regular file by hand, then \
+                         re-run `loomweave install` or `loomweave doctor --fix`)",
+                        path.display()
+                    );
+                    skipped_symlinks.push(path);
+                }
+            }
+        }
     }
     Ok(InstructionsInstallReport {
         changed,
@@ -1656,6 +1659,33 @@ filigree tracks tasks for this project.\n\
         );
         assert!(read(dir.path(), "AGENTS.md").contains(START_PREFIX));
         assert_eq!(instructions_state(dir.path()), InstructionsState::UpToDate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirect_keeps_legacy_guidance_when_agents_target_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        install_instructions(dir.path()).unwrap();
+        let seeded = read(dir.path(), "CLAUDE.md");
+        write(
+            dir.path(),
+            "CLAUDE.md",
+            &format!("# Project\n\n@AGENTS.md\n\n{seeded}"),
+        );
+        std::fs::remove_file(dir.path().join("AGENTS.md")).unwrap();
+        write(dir.path(), "real-agents.md", "# external guidance\n");
+        symlink("real-agents.md", dir.path().join("AGENTS.md")).unwrap();
+
+        let report = install_instructions(dir.path()).expect("install degrades on symlink");
+
+        assert_eq!(report.skipped_symlinks, vec![dir.path().join("AGENTS.md")]);
+        assert!(
+            read(dir.path(), "CLAUDE.md").contains(START_PREFIX),
+            "the only managed block must remain until its redirect target has a secured replacement"
+        );
+        assert_eq!(read(dir.path(), "real-agents.md"), "# external guidance\n");
     }
 
     #[test]

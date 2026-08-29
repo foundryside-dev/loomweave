@@ -10,10 +10,11 @@ language = "python"
 extensions = ["py"]
 
 [capabilities.runtime]
-# Plugin's declared RSS envelope (MiB). Effective prlimit is
-# min(this, core default 2 GiB). Pyright's Node-based language server
-# inherits this limit from the plugin process, so B.4* declares the core
-# ceiling rather than the Sprint-1 CPython-only working set.
+# Plugin's declared RSS envelope (MiB). For plugins declaring
+# [capabilities.runtime.pyright] this documents resident memory only: the
+# host applies its 8 GiB language-server RLIMIT_AS ceiling
+# (LANGUAGE_SERVER_MAX_AS_MIB, ADR-021 §2d amendment) because pyright's
+# Node/V8 process reserves virtual space far beyond its RSS.
 expected_max_rss_mb = 2048
 # Triggers LMWV-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING well before the 500k
 # core cap (warning emission itself is deferred to Tier B — Sprint 1
@@ -76,6 +77,12 @@ classifier_tags = [
 
 [integrations.wardline]
 expected_descriptor_version = "wardline-generic-2"
+# The dual-accept set, as `schema@version` PAIRS. A version-only list would
+# destroy the schema/version association the gate rests on (re-admitting
+# "version alone unlocks v2 parsing"). A space-separated STRING, never a TOML
+# array: manifest.rs:137 deserialises this table as BTreeMap<String, String>,
+# so an array value is a hard manifest-parse failure.
+accepted_descriptors = "wardline.vocabulary/v1@wardline-generic-2 wardline.vocabulary/v2@wardline-generic-3"
 
 [ontology.roles]
 file_scope = ["module"]

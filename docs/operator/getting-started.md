@@ -165,6 +165,14 @@ typical hardware. The result lives at `.weft/loomweave/loomweave.db` (a single S
 file) and is safe to commit to git — see
 [ADR-005](../loomweave/adr/ADR-005-loomweave-dir-tracking.md).
 
+For full `tests/` → `src/` call resolution, give the project a `.venv` before
+analyzing (or set `LOOMWEAVE_PYTHON_INTERPRETER` to its interpreter) —
+Pyright resolves calls against whatever interpreter it finds, and an
+unpinned interpreter silently misses cross-module targets. (The `requests`
+tarball above has no `.venv`, so this walkthrough's own call resolution is
+correspondingly partial.) See
+[ADR-058](../loomweave/adr/ADR-058-project-interpreter-discovery.md).
+
 ## 3. Serve
 
 Start the MCP stdio server in one shell:

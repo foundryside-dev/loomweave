@@ -2,10 +2,14 @@
 //!
 //! Merge semantics (never clobber): parse existing JSON and ensure exactly one
 //! `SessionStart` matcher-group runs `loomweave hook session-start --path
-//! <project>` (the project path POSIX-single-quote-escaped for the shell).
-//! Loomweave-owned hooks are canonicalised — the first is refreshed to the
-//! desired command and any extras (a stale duplicate, or one pinned to a
-//! different project) are removed. Every other key is preserved.
+//! "${CLAUDE_PROJECT_DIR}"` — the host substitutes the variable at hook run
+//! time, so the same tracked settings file serves every checkout and every
+//! linked worktree. A functionally-equivalent existing entry (the templated
+//! form, or a literal pin that resolves to this project root) is treated as
+//! healthy and never rewritten. Loomweave-owned hooks are canonicalised — the
+//! first is refreshed to the desired command and any extras (a stale
+//! duplicate, or one pinned to a different project) are removed. Every other
+//! key is preserved.
 //!
 //! Verified against the Claude Code settings schema: `hooks.SessionStart` is an
 //! array of matcher-groups, each `{ "matcher"?, "hooks": [ {type,command} ] }`.
@@ -22,8 +26,8 @@ pub const HOOK_COMMAND: &str = "loomweave hook session-start";
 /// Read-only health of the installed `SessionStart` hook, for `loomweave doctor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookState {
-    /// Exactly one Loomweave hook is present and runs the command this project
-    /// would install ([`desired_hook_command`]).
+    /// Exactly one Loomweave hook is present and is functionally current for
+    /// this project ([`hook_command_is_current`]).
     Present,
     /// A Loomweave hook exists but is stale — the old path-less form, one pinned
     /// to a different project, or a duplicate. Repairable in place.
@@ -35,21 +39,62 @@ pub enum HookState {
     Unparseable,
 }
 
-/// The `SessionStart` hook command this project would install: a bare
-/// `loomweave hook session-start` (PATH-resolved) pinned to the absolute project
-/// path (POSIX-single-quote-escaped). Shared by the installer and the
-/// `doctor` state check so the two never disagree on what "current" means.
+/// The `SessionStart` hook command the installer writes: `--path` bound to
+/// `${CLAUDE_PROJECT_DIR}`, which Claude Code substitutes when it runs the
+/// hook. Never a baked absolute path — that silently points linked worktrees
+/// at the main checkout and churns settings files tracked in git.
+pub const DESIRED_HOOK_COMMAND: &str =
+    r#"loomweave hook session-start --path "${CLAUDE_PROJECT_DIR}""#;
+
+/// Whether an installed hook `command` is functionally current for
+/// `project_root` — i.e. running it under this project would orient this
+/// project. Current forms:
+///
+/// - `--path` bound to `$CLAUDE_PROJECT_DIR` / `${CLAUDE_PROJECT_DIR}`, bare
+///   or double-quoted (forms the shell expands). Single-quoted is NOT current:
+///   single quotes suppress expansion, so that entry is broken.
+/// - `--path` a literal (bare or quoted) that resolves to this project root —
+///   the pre-1.5.1 installer's baked-pin form.
+///
+/// Shared by the installer and the `doctor` state check so the two never
+/// disagree on what "current" means. A current entry is left byte-for-byte
+/// untouched; anything else is repaired to [`DESIRED_HOOK_COMMAND`].
 #[must_use]
-pub fn desired_hook_command(project_root: &Path) -> String {
-    // `install::run` canonicalizes before calling, so `project_root` is already
-    // absolute; canonicalize defensively in case another caller is not.
+pub fn hook_command_is_current(command: &str, project_root: &Path) -> bool {
+    let Some(rest) = command.strip_prefix(HOOK_COMMAND) else {
+        return false;
+    };
+    let Some(arg) = rest.trim().strip_prefix("--path") else {
+        return false;
+    };
+    let arg = arg.trim();
+    if matches!(
+        arg,
+        "\"${CLAUDE_PROJECT_DIR}\""
+            | "\"$CLAUDE_PROJECT_DIR\""
+            | "${CLAUDE_PROJECT_DIR}"
+            | "$CLAUDE_PROJECT_DIR"
+    ) {
+        return true;
+    }
+    // A literal pin: unwrap one layer of shell quoting and compare the path it
+    // names against this project root (canonicalised on both sides, so a
+    // symlinked spelling of the same directory still counts as current).
+    let unquoted = arg
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| arg.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(arg);
+    if unquoted.is_empty() || unquoted.contains('$') {
+        return false;
+    }
     let canonical = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
-    format!(
-        "loomweave hook session-start --path {}",
-        shell_single_quote(&canonical.display().to_string())
-    )
+    Path::new(unquoted) == canonical
+        || Path::new(unquoted)
+            .canonicalize()
+            .is_ok_and(|p| p == canonical)
 }
 
 /// Every `command` string across all `SessionStart` groups that looks like a
@@ -85,32 +130,11 @@ pub fn session_start_hook_state(project_root: &Path) -> HookState {
     let cmds = loomweave_commands(&settings);
     if cmds.is_empty() {
         HookState::Missing
-    } else if cmds.len() == 1 && cmds[0] == desired_hook_command(project_root) {
+    } else if cmds.len() == 1 && hook_command_is_current(&cmds[0], project_root) {
         HookState::Present
     } else {
         HookState::Stale
     }
-}
-
-/// POSIX single-quote escaping for a value embedded in a shell command string.
-///
-/// Claude Code runs hook commands through a shell, so an embedded project path
-/// must be a single literal argument — never word-split or subject to `$`,
-/// backtick, or `\` expansion. Single quotes suppress all shell processing; the
-/// only character that can't appear inside them is `'` itself, which we close
-/// the quote for, emit an escaped `\'`, and reopen: `a'b` → `'a'\''b'`.
-fn shell_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// Merge Loomweave's `SessionStart` hook into a parsed settings `Value` in place,
@@ -244,6 +268,14 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
     let claude_dir = project_root.join(".claude");
     let settings_path = claude_dir.join("settings.json");
 
+    // A functionally-current hook (templated ${CLAUDE_PROJECT_DIR} binding, or
+    // a literal pin resolving to this project) must be left byte-for-byte
+    // alone: settings.json is often tracked in git and partially owned by
+    // other tools, so a no-op re-serialisation is still unsolicited churn.
+    if session_start_hook_state(project_root) == HookState::Present {
+        return Ok(false);
+    }
+
     let mut settings: Value = if settings_path.exists() {
         let raw = fs::read_to_string(&settings_path)
             .with_context(|| format!("read {}", settings_path.display()))?;
@@ -289,14 +321,11 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
         }
     }
 
-    // Embed the resolved project path so the installed hook orients THIS
-    // project no matter what working directory Claude Code runs it from. The
-    // path is POSIX-single-quote-escaped (not merely double-quoted) because
-    // Claude runs hook commands via a shell and the path may contain `$`,
-    // backticks, quotes, or backslashes — see `desired_hook_command`.
-    let command = desired_hook_command(project_root);
-
-    let changed = merge_session_start_hook(&mut settings, &command);
+    // Bind --path to ${CLAUDE_PROJECT_DIR} rather than baking the resolved
+    // project path: Claude Code substitutes the variable when it runs the
+    // hook, so the entry orients whichever checkout or linked worktree the
+    // session actually opened — see `DESIRED_HOOK_COMMAND`.
+    let changed = merge_session_start_hook(&mut settings, DESIRED_HOOK_COMMAND);
     if !changed {
         return Ok(false);
     }
@@ -337,45 +366,6 @@ mod tests {
     };
 
     const TEST_COMMAND: &str = "loomweave hook session-start --path \"/some/project\"";
-
-    #[cfg(unix)]
-    fn sh_roundtrip(quoted: &str) -> String {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("printf %s {quoted}"))
-            .output()
-            .expect("run sh");
-        String::from_utf8(out.stdout).expect("utf8")
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shell_quote_round_trips_metacharacters_through_a_real_shell() {
-        // The installed hook command is run by Claude through a shell. A path
-        // with shell metacharacters must survive as a single literal argument,
-        // never expanded or split. Double-quote wrapping (the prior form) lets
-        // $, backtick, and \ act; single-quote escaping does not. Prove the
-        // helper round-trips through `sh` exactly. (loomweave review #5)
-        for s in [
-            "/plain/path",
-            "/with space/x",
-            "/we'ird/x",
-            "/$(touch pwned)/x",
-            "/back`tick`/x",
-            "/back\\slash/x",
-            "/dquote\"here/x",
-            "/a'b\"c$d`e/x",
-            "", // the one structurally distinct (zero-iteration) input
-        ] {
-            assert_eq!(
-                sh_roundtrip(&super::shell_single_quote(s)),
-                s,
-                "shell_single_quote did not round-trip {s:?} through sh"
-            );
-        }
-        // The empty string must produce a valid empty shell word, not nothing.
-        assert_eq!(super::shell_single_quote(""), "''");
-    }
 
     #[test]
     fn adds_hook_to_empty_settings() {
@@ -653,7 +643,11 @@ mod tests {
     }
 
     #[test]
-    fn installed_hook_command_embeds_resolved_project_path() {
+    fn installed_hook_command_binds_claude_project_dir() {
+        // The emitted command must be the portable templated form — the host
+        // substitutes ${CLAUDE_PROJECT_DIR} at hook run time — never a baked
+        // absolute path, which breaks tracked settings shared across checkouts
+        // and points linked worktrees at the main checkout.
         let dir = tempfile::tempdir().unwrap();
         super::install_session_start_hook(dir.path()).unwrap();
         let raw = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
@@ -661,18 +655,145 @@ mod tests {
         let cmd = parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(cmd.contains("loomweave hook session-start"), "cmd: {cmd}");
-        assert!(
-            cmd.contains("--path"),
-            "installed hook must pin --path: {cmd}"
+        assert_eq!(
+            cmd, r#"loomweave hook session-start --path "${CLAUDE_PROJECT_DIR}""#,
+            "installed hook must bind --path to ${{CLAUDE_PROJECT_DIR}}"
         );
-        // The path must reference this project's directory, not be path-less.
         let canon = dir.path().canonicalize().unwrap();
         assert!(
-            cmd.contains(&canon.display().to_string()),
-            "cmd should contain {} : {cmd}",
+            !cmd.contains(&canon.display().to_string()),
+            "installed hook must not bake the absolute project path: {cmd}"
+        );
+    }
+
+    #[test]
+    fn templated_claude_project_dir_hook_is_present_and_untouched() {
+        // The elspeth regression: a committed hook already binding
+        // ${CLAUDE_PROJECT_DIR} is functionally current. It must classify as
+        // Present, and a re-install must leave the file byte-for-byte alone —
+        // including foreign entries whose key order serde_json would otherwise
+        // alphabetise on a rewrite.
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let original = concat!(
+            "{\n",
+            "  \"hooks\": {\n",
+            "    \"SessionStart\": [\n",
+            "      {\n",
+            "        \"hooks\": [\n",
+            "          {\n",
+            "            \"type\": \"command\",\n",
+            "            \"command\": \"legis session-context\",\n",
+            "            \"timeout\": 5\n",
+            "          },\n",
+            "          {\n",
+            "            \"type\": \"command\",\n",
+            "            \"command\": \"loomweave hook session-start --path \\\"${CLAUDE_PROJECT_DIR}\\\"\"\n",
+            "          }\n",
+            "        ]\n",
+            "      }\n",
+            "    ]\n",
+            "  }\n",
+            "}\n"
+        );
+        fs::write(claude.join("settings.json"), original).unwrap();
+
+        assert_eq!(
+            session_start_hook_state(dir.path()),
+            HookState::Present,
+            "a ${{CLAUDE_PROJECT_DIR}}-templated hook is current, not stale"
+        );
+        let changed = install_session_start_hook(dir.path()).unwrap();
+        assert!(!changed, "re-install must be a no-op on a templated hook");
+        let after = fs::read_to_string(claude.join("settings.json")).unwrap();
+        assert_eq!(after, original, "file must be byte-for-byte untouched");
+    }
+
+    #[test]
+    fn legacy_absolute_pin_to_this_project_stays_present() {
+        // The pre-fix installer baked the canonical project path. That form is
+        // functionally current for this checkout, so it must not be churned on
+        // the next install/doctor pass.
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let original = format!(
+            r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"loomweave hook session-start --path '{}'"}}]}}]}}}}"#,
             canon.display()
         );
+        fs::write(claude.join("settings.json"), &original).unwrap();
+
+        assert_eq!(
+            session_start_hook_state(dir.path()),
+            HookState::Present,
+            "an absolute pin resolving to this project is current"
+        );
+        let changed = install_session_start_hook(dir.path()).unwrap();
+        assert!(!changed, "re-install must not churn a current absolute pin");
+        let after = fs::read_to_string(claude.join("settings.json")).unwrap();
+        assert_eq!(after, original, "file must be byte-for-byte untouched");
+    }
+
+    #[test]
+    fn single_quoted_templated_form_is_stale() {
+        // Single quotes suppress shell expansion, so '--path
+        // ${CLAUDE_PROJECT_DIR}' inside single quotes never resolves — that
+        // entry is broken, not current, and must be repaired.
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"loomweave hook session-start --path '${CLAUDE_PROJECT_DIR}'"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(session_start_hook_state(dir.path()), HookState::Stale);
+    }
+
+    #[test]
+    fn hook_command_is_current_accepts_equivalent_forms_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let canon = root.canonicalize().unwrap();
+        let current = |arg: &str| format!("loomweave hook session-start --path {arg}");
+        // Templated forms the shell expands: bare or double-quoted, braced or not.
+        for arg in [
+            "\"${CLAUDE_PROJECT_DIR}\"",
+            "\"$CLAUDE_PROJECT_DIR\"",
+            "${CLAUDE_PROJECT_DIR}",
+            "$CLAUDE_PROJECT_DIR",
+        ] {
+            assert!(
+                super::hook_command_is_current(&current(arg), root),
+                "{arg} should be current"
+            );
+        }
+        // Literal pins that resolve to this project root, in any quoting.
+        for arg in [
+            format!("'{}'", canon.display()),
+            format!("\"{}\"", canon.display()),
+            format!("{}", canon.display()),
+        ] {
+            assert!(
+                super::hook_command_is_current(&current(&arg), root),
+                "{arg} should be current"
+            );
+        }
+        // Not current: single-quoted template (never expands), another project,
+        // the path-less legacy form, a foreign command entirely.
+        for cmd in [
+            current("'${CLAUDE_PROJECT_DIR}'"),
+            current("'/some/other/proj'"),
+            "loomweave hook session-start".to_owned(),
+            "legis session-context".to_owned(),
+        ] {
+            assert!(
+                !super::hook_command_is_current(&cmd, root),
+                "{cmd} should NOT be current"
+            );
+        }
     }
 
     #[test]

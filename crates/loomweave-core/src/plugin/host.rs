@@ -24,7 +24,8 @@
 //! # Memory limit
 //!
 //! On Linux/macOS, [`PluginHost::spawn`] calls [`apply_prlimit_as`] inside
-//! `CommandExt::pre_exec` to set `RLIMIT_AS` before `exec()`. On Linux the same
+//! `CommandExt::pre_exec` to set `RLIMIT_AS` before `exec()` (2 GiB by default;
+//! 8 GiB for language-server plugins — see `effective_as_mib`). On Linux the same
 //! closure also applies `RLIMIT_NOFILE` and `RLIMIT_NPROC`. The closure body
 //! only calls `setrlimit(2)`, which is async-signal-safe per POSIX.1-2017
 //! §2.4.3. The `unsafe` block is the minimum required by the `pre_exec` API.
@@ -57,6 +58,7 @@ use super::host_validate::{
     validate_plugin_finding,
 };
 use crate::entity_id::{EntityId, EntityIdError, entity_id};
+use crate::plugin::interpreter::{PYTHON_INTERPRETER_ENV, discover_project_interpreter};
 use crate::plugin::jail::{JailError, jail_to_string};
 use crate::plugin::limits::{
     BreakerState, CapExceeded, ContentLengthCeiling, EntityCountCap, PathEscapeBreaker,
@@ -67,7 +69,9 @@ use crate::plugin::limits::{
 #[cfg(target_os = "linux")]
 use crate::plugin::limits::{DEFAULT_MAX_NOFILE, apply_prlimit_nofile_nproc};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::plugin::limits::{DEFAULT_MAX_RSS_MIB, apply_prlimit_as, effective_rss_mib};
+use crate::plugin::limits::{
+    DEFAULT_MAX_RSS_MIB, LANGUAGE_SERVER_MAX_AS_MIB, apply_prlimit_as, effective_rss_mib,
+};
 // `DEFAULT_MAX_NPROC` is also reached from the unit tests below, so it needs the
 // `test` arm in addition to Linux.
 #[cfg(any(target_os = "linux", test))]
@@ -106,6 +110,64 @@ fn effective_max_nproc(manifest: &Manifest) -> Option<u64> {
     } else {
         Some(DEFAULT_MAX_NPROC)
     }
+}
+
+/// The `RLIMIT_AS` ceiling (MiB) to apply to a plugin child.
+///
+/// Plugins that declare the `pyright` runtime capability spawn a Node language
+/// server whose V8 heap *reserves* far more virtual address space than it
+/// touches; the manifest's `expected_max_rss_mb` describes resident memory and
+/// must not cap virtual space for them. Every other plugin keeps ADR-021 §2d's
+/// `min(manifest, DEFAULT_MAX_RSS_MIB)`.
+// Used only from the Linux/macOS pre_exec limit path (its inputs are gated
+// the same way above); gate to match so other release builds don't see it
+// as dead code under `-D warnings`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn effective_as_mib(manifest: &Manifest) -> u64 {
+    if manifest.capabilities.runtime.pyright.is_some() {
+        LANGUAGE_SERVER_MAX_AS_MIB
+    } else {
+        effective_rss_mib(
+            manifest.capabilities.runtime.expected_max_rss_mb,
+            DEFAULT_MAX_RSS_MIB,
+        )
+    }
+}
+
+/// The interpreter path to export to a plugin child as
+/// [`PYTHON_INTERPRETER_ENV`], or `None` to export nothing
+/// (clarion-5cf9643de9).
+///
+/// Language-server plugins resolve against the interpreter the HOST chose, so
+/// the index never depends on the launcher's `PATH`. Three guards:
+/// - only plugins declaring `[capabilities.runtime.pyright]` are pointed at an
+///   interpreter — nothing else consumes the variable;
+/// - an operator's own NON-EMPTY [`PYTHON_INTERPRETER_ENV`] is left untouched
+///   (it already wins the plugin's own discovery, and overwriting it would
+///   silently ignore an explicit pin). An EMPTY value is "unset" here exactly
+///   as it is on both discoveries' override rung, so the host still exports;
+///   treating `""` as a set override would leave the plugin with an empty
+///   variable it also ignores, and no interpreter at all;
+/// - only a PINNED (project-owned) choice is exported. A bare `PATH` guess is
+///   no better than the plugin's own fallback, and exporting it would present
+///   a guess to the plugin as an authoritative pin.
+///
+/// `env` abstracts `std::env::var_os` so the unit tests below do not read the
+/// developer's own environment. `project_root` must be canonicalised (the
+/// caller passes `canonical_root`) — discovery is not root-invariant, and
+/// `analyze` records its marker from the same canonical root.
+fn exported_interpreter(
+    manifest: &Manifest,
+    project_root: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if manifest.capabilities.runtime.pyright.is_none()
+        || env(PYTHON_INTERPRETER_ENV).is_some_and(|value| !value.is_empty())
+    {
+        return None;
+    }
+    let chosen = discover_project_interpreter(project_root, env);
+    if chosen.pinned() { chosen.path } else { None }
 }
 
 // ── Wire entity types (Option A) ──────────────────────────────────────────────
@@ -519,6 +581,15 @@ impl
         }
 
         let mut command = std::process::Command::new(executable);
+        // clarion-5cf9643de9: point a language-server plugin at the project's
+        // own interpreter before it starts, so its resolver evidence does not
+        // depend on whatever `python` happened to be first on the launcher's
+        // `PATH`. See `exported_interpreter` for the three guards.
+        if let Some(interpreter) =
+            exported_interpreter(&manifest, &canonical_root, &|key| std::env::var_os(key))
+        {
+            command.env(PYTHON_INTERPRETER_ENV, interpreter);
+        }
         command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -538,26 +609,31 @@ impl
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::process::CommandExt;
-            let rss_mib = effective_rss_mib(
-                manifest.capabilities.runtime.expected_max_rss_mb,
-                DEFAULT_MAX_RSS_MIB,
-            );
+            let as_mib = effective_as_mib(&manifest);
 
             #[cfg(target_os = "linux")]
             let max_nofile = DEFAULT_MAX_NOFILE;
             #[cfg(target_os = "linux")]
             let max_nproc = effective_max_nproc(&manifest);
 
-            // SAFETY: Each `setrlimit` call inside the closure is listed as
-            // async-signal-safe in POSIX.1-2017 §2.4.3. The `pre_exec` closure
-            // runs in the forked child after `fork()` but before `exec()`, so
-            // only the child's limits are affected. No Rust allocation, no Drop
-            // and no non-async-signal-safe call occurs inside the closure;
-            // `u64` captures are trivially Copy.
+            // SAFETY: `apply_prlimit_as` now also calls `getrlimit` (to clamp
+            // the requested ceiling to the inherited hard limit — see its doc
+            // comment) before the `setrlimit` calls in this closure.
+            // `getrlimit`/`setrlimit` are not named in POSIX.1-2017 §2.4.3's
+            // async-signal-safe function list — that list is a curated
+            // subset, not an exhaustive enumeration of every safe syscall
+            // wrapper — but both are direct, allocation-free syscall
+            // wrappers with no locking and no reentrant global state, the
+            // same basis on which the pre-existing `setrlimit` calls here
+            // already relied. The `pre_exec` closure runs in the forked
+            // child after `fork()` but before `exec()`, so only the child's
+            // limits are affected. No Rust allocation, no Drop and no other
+            // non-async-signal-safe call occurs inside the closure; `u64`
+            // captures are trivially Copy.
             #[allow(unsafe_code)]
             unsafe {
                 command.pre_exec(move || {
-                    apply_prlimit_as(rss_mib)?;
+                    apply_prlimit_as(as_mib)?;
                     #[cfg(target_os = "linux")]
                     apply_prlimit_nofile_nproc(max_nofile, max_nproc)?;
                     Ok(())
@@ -1364,6 +1440,72 @@ ontology_version = "0.4.0"
         crate::plugin::parse_manifest(toml.as_bytes()).expect("valid pyright manifest")
     }
 
+    /// Pyright capability present, but a manifest RSS expectation well BELOW
+    /// the language-server ceiling. Discriminates `effective_as_mib` keying on
+    /// the `pyright` capability from a wrong implementation that keys on the
+    /// manifest's `expected_max_rss_mb` value instead (e.g.
+    /// `if expected_max_rss_mb >= 2048 { LANGUAGE_SERVER_MAX_AS_MIB } else { .. }`,
+    /// which this manifest alone would defeat).
+    fn pyright_small_rss_manifest() -> Manifest {
+        let toml = r#"
+[plugin]
+name = "mock-plugin"
+plugin_id = "mock"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "mock-plugin"
+language = "mock"
+extensions = ["mock"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 64
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[capabilities.runtime.pyright]
+pin = "1.1.409"
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains", "calls"]
+rule_id_prefix = "LMWV-MOCK-"
+ontology_version = "0.4.0"
+"#;
+        crate::plugin::parse_manifest(toml.as_bytes()).expect("valid pyright small-rss manifest")
+    }
+
+    /// No pyright capability, but a manifest RSS expectation AT the
+    /// language-server ceiling's value. Discriminates in the other direction:
+    /// a wrong implementation keyed on `expected_max_rss_mb >= 2048` would
+    /// wrongly grant this ordinary plugin the wide ceiling.
+    fn non_pyright_large_rss_manifest() -> Manifest {
+        let toml = r#"
+[plugin]
+name = "mock-plugin"
+plugin_id = "mock"
+version = "0.1.0"
+protocol_version = "1.0"
+executable = "mock-plugin"
+language = "mock"
+extensions = ["mock"]
+
+[capabilities.runtime]
+expected_max_rss_mb = 2048
+expected_entities_per_file = 100
+wardline_aware = false
+reads_outside_project_root = false
+
+[ontology]
+entity_kinds = ["module", "function"]
+edge_kinds = ["contains", "calls"]
+rule_id_prefix = "LMWV-MOCK-"
+ontology_version = "0.4.0"
+"#;
+        crate::plugin::parse_manifest(toml.as_bytes())
+            .expect("valid non-pyright large-rss manifest")
+    }
+
     fn reads_outside_manifest() -> Manifest {
         let toml = r#"
 [plugin]
@@ -1400,6 +1542,118 @@ ontology_version = "0.1.0"
         // Pyright plugins run with no RLIMIT_NPROC cap: the per-UID-global limit
         // is the wrong tool for a language-server plugin (see effective_max_nproc).
         assert_eq!(effective_max_nproc(&pyright_manifest()), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn language_server_plugins_get_the_wide_address_space_ceiling() {
+        use crate::plugin::limits::{DEFAULT_MAX_RSS_MIB, LANGUAGE_SERVER_MAX_AS_MIB};
+        // Ordinary plugins: min(manifest, core default) exactly as before.
+        assert_eq!(
+            effective_as_mib(&compliant_manifest()),
+            effective_rss_mib(
+                compliant_manifest()
+                    .capabilities
+                    .runtime
+                    .expected_max_rss_mb,
+                DEFAULT_MAX_RSS_MIB
+            )
+        );
+        // Language-server plugins: V8 reserves virtual address space far beyond
+        // its RSS (pyright died at 766 MB RSS under the 2 GiB RLIMIT_AS on a
+        // 13.6k-line file), so the manifest's RSS expectation must NOT cap AS.
+        assert_eq!(
+            effective_as_mib(&pyright_manifest()),
+            LANGUAGE_SERVER_MAX_AS_MIB
+        );
+        // Keying is on the `pyright` capability alone, NOT on the manifest's
+        // `expected_max_rss_mb` value: a pyright plugin with a small manifest
+        // RSS still gets the wide ceiling...
+        assert_eq!(
+            effective_as_mib(&pyright_small_rss_manifest()),
+            LANGUAGE_SERVER_MAX_AS_MIB
+        );
+        // ...and a non-pyright plugin whose manifest RSS happens to equal the
+        // core default does NOT get the wide ceiling.
+        assert_eq!(
+            effective_as_mib(&non_pyright_large_rss_manifest()),
+            DEFAULT_MAX_RSS_MIB
+        );
+        // Constant-vs-constant: documents the ordering the module doc promises;
+        // clippy flags it as trivially true, which is the point.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(LANGUAGE_SERVER_MAX_AS_MIB > DEFAULT_MAX_RSS_MIB);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_language_server_plugins_are_pointed_at_the_project_interpreter() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("tempdir");
+        let venv = dir.path().join(".venv/bin/python");
+        std::fs::create_dir_all(venv.parent().unwrap()).unwrap();
+        std::fs::write(&venv, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&venv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty = |_: &str| -> Option<OsString> { None };
+
+        // A pyright plugin is handed the project's own `.venv` interpreter.
+        assert_eq!(
+            exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &empty),
+            Some(venv.clone()),
+            "a language-server plugin must be pinned to the project interpreter"
+        );
+        // A plugin that does not declare the pyright runtime never triggers
+        // discovery: the variable means nothing to it, and exporting it would
+        // widen the child's environment for no reason.
+        assert_eq!(
+            exported_interpreter(&compliant_manifest(), dir.path(), &empty),
+            None,
+            "a non-language-server plugin must not be handed an interpreter"
+        );
+        // An operator's own override is left untouched — the plugin's own
+        // discovery already trusts it first, so re-exporting the host's choice
+        // would silently defeat an explicit pin.
+        let overridden = |key: &str| -> Option<OsString> {
+            (key == PYTHON_INTERPRETER_ENV).then(|| OsString::from("/opt/custom/python"))
+        };
+        assert_eq!(
+            exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &overridden),
+            None,
+            "an operator override must survive untouched"
+        );
+        // ...but an EMPTY value is not an override. Both discoveries treat
+        // `""` as unset on the override rung (`if override:` in Python,
+        // `.filter(|v| !v.is_empty())` in Rust), so a bare `is_some()` guard
+        // here would suppress the export for a variable the plugin then also
+        // ignores — leaving the child with no interpreter at all, which is the
+        // launcher-dependent hole this export exists to close.
+        let empty_override =
+            |key: &str| -> Option<OsString> { (key == PYTHON_INTERPRETER_ENV).then(OsString::new) };
+        assert_eq!(
+            exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &empty_override),
+            Some(venv.clone()),
+            "an empty override is unset: the host still exports its own pinned choice"
+        );
+        // An UNPINNED (bare `PATH`) choice is not exported: presenting a guess
+        // to the plugin as an authoritative pin buys nothing over its own
+        // fallback.
+        let unpinned_root = TempDir::new().expect("tempdir");
+        let path_only = |key: &str| -> Option<OsString> {
+            (key == "PATH").then(|| OsString::from(venv.parent().unwrap()))
+        };
+        assert_eq!(
+            exported_interpreter(
+                &pyright_small_rss_manifest(),
+                unpinned_root.path(),
+                &path_only
+            ),
+            None,
+            "a bare PATH guess must not be exported as a pin"
+        );
     }
 
     // ── Full end-to-end helper ────────────────────────────────────────────────

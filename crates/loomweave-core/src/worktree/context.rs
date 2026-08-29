@@ -26,14 +26,17 @@
 //! failing to prove "linked" is always the safe, local fallback.
 //!
 //! The stable ID that isolates a linked worktree's store
-//! (`wt-<BLAKE3 hex>`) is derived from the Git *administrative* identity —
+//! (`wt-<BLAKE3 hex>`) is normally derived from the Git *administrative* identity —
 //! the path fragment under the common Git directory (e.g.
 //! `worktrees/federation-seam-followups`) — never from the branch, `HEAD`,
 //! dirty state, or absolute filesystem path. That is what lets the ID
 //! survive a branch switch ([`resolve`]'s own admin identity is keyed by
 //! worktree *directory* name, which `git worktree add`/`move` controls, not
 //! `git checkout`) and, once `git worktree repair` has restored the
-//! administrative links, a repository relocation.
+//! administrative links, a repository relocation. When an explicit
+//! `store_dir` override can be shared by unrelated projects, the corresponding
+//! primary project root is also domain-separated into the hash so identical
+//! Git administrative names cannot route two repositories to one directory.
 //!
 //! [`resolve`]: WorktreeContext::resolve
 
@@ -93,23 +96,36 @@ pub enum ConfigOrigin {
     DefaultTarget,
 }
 
-/// Non-UTF-8 input encountered while resolving a [`WorktreeContext`].
+/// A failure while resolving a [`WorktreeContext`].
 ///
-/// Loomweave persists worktree metadata as JSON and hashes the Git
-/// administrative identity as a UTF-8 string, so a non-UTF-8 source root,
-/// primary root, Git administrative directory, or derived admin-identity
-/// fragment is rejected here, before any store directory is created or any
-/// git output is trusted further. This is a deliberate departure from
-/// [`crate::hardened_git::list_untracked_files`]'s lossy decode: that
-/// function's output is display-only, so silently substituting the Unicode
-/// replacement character for invalid bytes is safe there. Here the decoded
-/// value becomes a filesystem path and a hash input, so silent mangling
-/// could route two different worktrees to the same (or a bogus) store.
+/// Every variant is a *fail-loud* condition: once Git's own evidence proves
+/// `source_root` is a linked worktree, the resolver must never silently
+/// degrade to [`WorktreeKind::Standalone`] — that fallback would let
+/// `loomweave analyze` build a decoy store at the worktree's own
+/// `.weft/loomweave/`, exactly the outcome worktree isolation forbids.
+/// Conditions that fail to *prove* the linked relationship in the first
+/// place (no Git repository, a bare primary) still fall back to
+/// `Standalone` without error; conditions that arise *after* the linked
+/// relationship is proven error out here instead.
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeContextError {
+    /// Non-UTF-8 input encountered during resolution.
+    ///
+    /// Loomweave persists worktree metadata as JSON and hashes the Git
+    /// administrative identity as a UTF-8 string, so a non-UTF-8 source
+    /// root, primary root, Git administrative directory, or derived
+    /// admin-identity fragment is rejected here, before any store directory
+    /// is created or any git output is trusted further. This is a deliberate
+    /// departure from [`crate::hardened_git::list_untracked_files`]'s lossy
+    /// decode: that function's output is display-only, so silently
+    /// substituting the Unicode replacement character for invalid bytes is
+    /// safe there. Here the decoded value becomes a filesystem path and a
+    /// hash input, so silent mangling could route two different worktrees to
+    /// the same (or a bogus) store.
+    ///
     /// `field` identifies which resolution input failed to decode as UTF-8:
     /// `"source_root"`, `"git-dir"`, `"git-common-dir"`, `"worktree-list"`,
-    /// or `"admin-identity"`.
+    /// `"toplevel"`, or `"admin-identity"`.
     #[error("{field} is not valid UTF-8 (lossy: {lossy:?})")]
     NonUtf8Path {
         /// Which resolution input failed to decode.
@@ -117,6 +133,47 @@ pub enum WorktreeContextError {
         /// A best-effort lossy rendering of the offending bytes, for
         /// diagnostics only — never used to build a path or a hash input.
         lossy: String,
+    },
+    /// Git proved `source_root` is a linked worktree, but the checkout's own
+    /// root could not be established, so the isolated store cannot be
+    /// routed. Refusing the standalone fallback is deliberate: it would
+    /// build a decoy store inside the worktree.
+    #[error(
+        "{source_root:?} is a linked Git worktree, but its own checkout root could not be \
+         resolved ({detail}); refusing to fall back to a worktree-local store. If this worktree \
+         was moved or its administrative links are damaged, run `git worktree repair` from the \
+         primary checkout, then retry"
+    )]
+    LinkedWorktreeUnresolvable {
+        /// The canonicalized source root that was being resolved.
+        source_root: PathBuf,
+        /// What specifically could not be established.
+        detail: &'static str,
+    },
+    /// `source_root` is a project directory nested inside a linked worktree,
+    /// but the corresponding directory does not exist in the primary
+    /// checkout — e.g. the project was added on this worktree's branch and
+    /// has not reached the primary's checked-out branch yet. Loomweave
+    /// anchors a linked worktree's store at the corresponding project
+    /// directory in the primary checkout, so there is no store location to
+    /// route to until that directory exists.
+    #[error(
+        "{source_root:?} is inside a linked Git worktree, but its corresponding project \
+         directory {primary_project:?} does not exist in the primary checkout \
+         {primary_checkout:?} (the project likely exists only on this worktree's branch). \
+         Loomweave anchors a linked worktree's store at that primary-side directory, so this \
+         project cannot be resolved from the worktree yet — check out or merge a branch \
+         containing it in the primary checkout first, or run Loomweave against a project \
+         directory that exists in both"
+    )]
+    NestedProjectMissingFromPrimary {
+        /// The canonicalized source root that was being resolved.
+        source_root: PathBuf,
+        /// The primary-side project directory that does not exist.
+        primary_project: PathBuf,
+        /// The primary checkout root the project directory was expected
+        /// under.
+        primary_checkout: PathBuf,
     },
 }
 
@@ -151,8 +208,10 @@ pub struct WorktreeContext {
     /// target here, so a checkout reached through a symlink gets the same
     /// identity as one reached directly).
     pub source_root: PathBuf,
-    /// The canonicalized main-worktree path. Equals `source_root` unless
-    /// `kind` is [`WorktreeKind::Linked`].
+    /// The canonicalized corresponding project path in the main worktree.
+    /// Equals `source_root` unless `kind` is [`WorktreeKind::Linked`]. For a
+    /// nested project resolved at `services/api`, this is the primary
+    /// checkout's `services/api`, not the Git checkout root.
     pub primary_root: PathBuf,
     /// `store_dir(primary_root)` — the primary checkout's store directory. A
     /// `[loomweave].store_dir` override in `weft.toml` DOES apply here: it
@@ -180,7 +239,8 @@ pub struct WorktreeContext {
     pub store_paths: StorePaths,
     /// Which `loomweave.yaml` precedence rung applies.
     pub config_origin: ConfigOrigin,
-    /// `wt-<BLAKE3 hex of the Git administrative identity>`, present only
+    /// `wt-<BLAKE3 hex>` of the Git administrative identity (plus the primary
+    /// project identity under a shared `store_dir` override), present only
     /// when `kind` is [`WorktreeKind::Linked`].
     pub stable_id: Option<String>,
     /// The Git administrative identity `stable_id` is a `BLAKE3` hash of —
@@ -205,8 +265,10 @@ impl WorktreeContext {
     /// `git worktree list --porcelain -z`. Any failure to positively prove a
     /// linked relationship — no Git repository, a bare primary, or an
     /// unparseable/absent worktree administrative link — falls back to
-    /// [`WorktreeKind::Standalone`] rather than guessing. The only error
-    /// this returns is [`WorktreeContextError::NonUtf8Path`].
+    /// [`WorktreeKind::Standalone`] rather than guessing. Once the linked
+    /// relationship IS proven, later failures error out instead of degrading
+    /// (see [`WorktreeContextError`]): a proven-linked checkout must never
+    /// silently receive a worktree-local (decoy) store.
     pub fn resolve(source_root: &Path) -> Result<Self, WorktreeContextError> {
         let canonical_source = require_utf8("source_root", canonicalize_or_given(source_root))?;
 
@@ -274,10 +336,13 @@ impl WorktreeContext {
     fn linked_store(
         source_root: PathBuf,
         primary_root: PathBuf,
-        stable_id: String,
+        mut stable_id: String,
         admin_identity: String,
     ) -> Self {
         let (repository_store, store_dir_overridden) = store_dir_resolution(&primary_root);
+        if store_dir_overridden {
+            stable_id = stable_id_for_shared_store_project(&primary_root, &admin_identity);
+        }
         let effective_store = repository_store.join("worktrees").join(&stable_id);
         let config_origin = resolve_config_origin(&source_root, &primary_root);
         Self {
@@ -363,18 +428,65 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
         return Ok(GitProbe::Main);
     }
 
+    // From here on, git's own evidence has PROVEN this checkout is a linked
+    // worktree of a non-bare primary, so no failure below may silently
+    // degrade to `Unresolvable`/`Standalone`: that fallback would let
+    // `analyze` build a decoy store at the worktree's own
+    // `.weft/loomweave/`, exactly what isolation forbids. Anything that
+    // cannot be resolved is a hard, actionable error instead.
+    //
+    // The checkout's own root comes from `git rev-parse --show-toplevel`
+    // run at `source`, never from this checkout's `git worktree list`
+    // entry: the list reports the *registered* path, which goes stale when
+    // a linked worktree is moved without `git worktree repair` (the
+    // administrative `gitdir` file still names the old location) — while
+    // git commands run inside the moved checkout keep working, because its
+    // `.git` file points at the unmoved common dir. Keying on the stale
+    // entry would misroute exactly that moved-worktree case.
+    let Some(toplevel_raw) = run_git_stdout(source, &["rev-parse", "--show-toplevel"]) else {
+        return Err(WorktreeContextError::LinkedWorktreeUnresolvable {
+            source_root: source.to_path_buf(),
+            detail: "`git rev-parse --show-toplevel` failed at the source root",
+        });
+    };
+    let toplevel_str = decode_git_line(&toplevel_raw, "toplevel")?;
+    let own_checkout_root = canonicalize_or_given(&resolve_absolute(source, &toplevel_str));
+    let Ok(project_suffix) = source.strip_prefix(&own_checkout_root) else {
+        return Err(WorktreeContextError::LinkedWorktreeUnresolvable {
+            source_root: source.to_path_buf(),
+            detail: "the source root is not under the checkout root git reported",
+        });
+    };
+    let primary_checkout_root = canonicalize_or_given(&primary_entry.path);
+    let primary_project = primary_checkout_root.join(project_suffix);
+    // A nested project may exist only on this worktree's branch; its
+    // primary-side counterpart then does not exist, and no store can be
+    // anchored there. Detect that here, with a truthful error, instead of
+    // letting callers bail against a store path under a directory that does
+    // not exist (an unsatisfiable "run `loomweave install`" hint).
+    if !project_suffix.as_os_str().is_empty() && !primary_project.is_dir() {
+        return Err(WorktreeContextError::NestedProjectMissingFromPrimary {
+            source_root: source.to_path_buf(),
+            primary_project,
+            primary_checkout: primary_checkout_root,
+        });
+    }
     // `canonicalize_or_given` resolves symlinks; that can introduce
     // non-UTF-8 path components that were never present in git's own
     // (already-validated) reported string. Guard here too, same as
     // `source_root` — the brief names `primary_root` explicitly among the
     // inputs that must be rejected before any store path is built.
-    let primary_root = require_utf8("primary_root", canonicalize_or_given(&primary_entry.path))?;
+    let primary_root = require_utf8("primary_root", canonicalize_or_given(&primary_project))?;
 
     let Ok(admin_identity_path) = own_git_dir.strip_prefix(&common_dir) else {
         // The linked git-dir isn't nested under the common dir at all — an
-        // administrative shape this resolver doesn't understand. Fall back
-        // rather than guess.
-        return Ok(GitProbe::Unresolvable);
+        // administrative shape this resolver doesn't understand. Fail loud
+        // rather than guess: this checkout is proven linked, so the
+        // standalone fallback would build a decoy store.
+        return Err(WorktreeContextError::LinkedWorktreeUnresolvable {
+            source_root: source.to_path_buf(),
+            detail: "the linked worktree's git dir is not nested under the common git dir",
+        });
     };
     let admin_identity = admin_identity_path
         .to_str()
@@ -419,6 +531,27 @@ fn probe_git(source: &Path) -> Result<GitProbe, WorktreeContextError> {
 #[must_use]
 pub fn stable_id_for_admin_identity(admin_identity: &str) -> String {
     format!("wt-{}", blake3::hash(admin_identity.as_bytes()).to_hex())
+}
+
+/// Derive the project-qualified stable ID used when multiple repositories may
+/// share one configured `store_dir`. Cleanup enumeration must use this same
+/// construction or every live override-backed store appears unregistered.
+///
+/// # Panics
+///
+/// Panics when `primary_root` is not valid UTF-8. Production callers obtain
+/// this path from [`WorktreeContext`], whose resolver rejects non-UTF-8 roots.
+#[must_use]
+pub fn stable_id_for_shared_store_project(primary_root: &Path, admin_identity: &str) -> String {
+    let primary_root = primary_root
+        .to_str()
+        .expect("WorktreeContext rejects non-UTF-8 primary roots before store routing");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"loomweave.shared-store-project.v1\0");
+    hasher.update(primary_root.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(admin_identity.as_bytes());
+    format!("wt-{}", hasher.finalize().to_hex())
 }
 
 /// This checkout's own (canonicalized) Git directory, or `None` if `dir`
@@ -583,6 +716,7 @@ mod tests {
             WorktreeContextError::NonUtf8Path { field, .. } => {
                 assert_eq!(field, "primary_root");
             }
+            other => panic!("expected NonUtf8Path, got {other:?}"),
         }
     }
 

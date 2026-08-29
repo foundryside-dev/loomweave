@@ -76,8 +76,10 @@ from loomweave_plugin_python.call_resolver import (
     CallResolutionResult,
     CallResolver,
     CallsEdgeProperties,
+    FacetCoverage,
     Finding,
     NoOpCallResolver,
+    ResolutionCoverageWire,
     UnresolvedCallSite,
 )
 from loomweave_plugin_python.entity_id import entity_id
@@ -176,6 +178,10 @@ class WardlineDecoratorMetadata(TypedDict):
     group: int
     attrs: dict[str, str]
     line: int
+    # Present only on facets (declaration-surface-v2 §7): a decorator that is
+    # attributed but seeds no taint. Absent means a seeding entry, so every
+    # pre-facet record is byte-identical and no exact-dict assertion moves.
+    kind: NotRequired[Literal["facet"]]
 
 
 class WardlineEntityMetadata(TypedDict):
@@ -265,6 +271,31 @@ class ExtractionStats:
     extractor_parse_latency_ms: int = 0
     findings: list[Finding] = field(default_factory=list)
     duplicate_entities_dropped_total: int = 0
+    # Per-facet coverage claim (clarion-3e517d4aff). Defaults to complete;
+    # every degraded arm (resolver failure, syntax error, too-complex) says so
+    # explicitly so the host never mistakes empty evidence for a call-free file.
+    calls_coverage: FacetCoverage = field(default_factory=FacetCoverage)
+    references_coverage: FacetCoverage = field(default_factory=FacetCoverage)
+
+    def resolution_coverage_wire(self) -> ResolutionCoverageWire:
+        return {
+            "calls": self.calls_coverage.to_wire(),
+            "references": self.references_coverage.to_wire(),
+        }
+
+    @classmethod
+    def degraded_file(cls, reason: str, *, extractor_parse_latency_ms: int) -> ExtractionStats:
+        """Stats for a file the extractor could not walk (syntax error, too complex).
+
+        Neither facet was examined; the limit is content-determined, so a
+        byte-identical re-run would hit it again (``transient=False``).
+        """
+        coverage = FacetCoverage.degraded(reason, transient=False)
+        return cls(
+            extractor_parse_latency_ms=extractor_parse_latency_ms,
+            calls_coverage=coverage,
+            references_coverage=coverage,
+        )
 
     @classmethod
     def from_resolution_results(
@@ -273,6 +304,8 @@ class ExtractionStats:
         references: ReferenceResolutionResult,
     ) -> ExtractionStats:
         return cls(
+            calls_coverage=calls.coverage,
+            references_coverage=references.coverage,
             unresolved_call_sites_total=calls.unresolved_call_sites_total,
             unresolved_call_sites=calls.unresolved_call_sites,
             reference_sites_total=references.reference_sites_total,
@@ -460,7 +493,9 @@ def extract_with_stats(  # noqa: PLR0913 - resolver seams + optional Wardline vo
         return ExtractResult(
             [_build_module_entity(source, dotted_module, file_path, "syntax_error")],
             [],
-            ExtractionStats(extractor_parse_latency_ms=parse_latency_ms),
+            ExtractionStats.degraded_file(
+                "syntax_error", extractor_parse_latency_ms=parse_latency_ms
+            ),
         )
     except (RecursionError, MemoryError) as exc:
         # Deep AST construction (RecursionError) or PEG parser stack guard
@@ -578,7 +613,9 @@ def _too_complex_result(  # noqa: PLR0913 - degraded-path builder mirrors the sy
         f"loomweave-plugin-python: degrading {file_path}: nesting too complex "
         f"during {phase} ({type(exc).__name__})\n",
     )
-    stats = ExtractionStats(extractor_parse_latency_ms=parse_latency_ms)
+    stats = ExtractionStats.degraded_file(
+        "too_complex", extractor_parse_latency_ms=parse_latency_ms
+    )
     stats.findings.append(
         Finding(
             subcode=FINDING_TOO_COMPLEX,
@@ -1298,19 +1335,25 @@ def _attach_wardline_entity_metadata(
         qualified_name = _expr_qualified_name(decorator)
         if qualified_name is None:
             continue
+        # Entries resolve FIRST; facets only when that misses, so no seeding
+        # marker can ever be re-labelled a facet by a name collision (and the
+        # parser already rejects such a collision at load).
         entry = vocabulary.entry_for_decorator(qualified_name)
-        if entry is None:
+        facet = None if entry is not None else vocabulary.facet_for_decorator(qualified_name)
+        marker = entry if entry is not None else facet
+        if marker is None:
             continue
-        decorators.append(
-            {
-                "canonical_name": entry.canonical_name,
-                "qualified_name": qualified_name,
-                "group": entry.group,
-                "attrs": dict(entry.attrs),
-                "line": decorator.lineno,
-            },
-        )
-        tags.update({"wardline", f"wardline:{entry.canonical_name}"})
+        record: WardlineDecoratorMetadata = {
+            "canonical_name": marker.canonical_name,
+            "qualified_name": qualified_name,
+            "group": marker.group,
+            "attrs": dict(marker.attrs),
+            "line": decorator.lineno,
+        }
+        if facet is not None:
+            record["kind"] = "facet"
+        decorators.append(record)
+        tags.update({"wardline", f"wardline:{marker.canonical_name}"})
     if decorators:
         entity["wardline"] = {
             "descriptor_version": vocabulary.version,

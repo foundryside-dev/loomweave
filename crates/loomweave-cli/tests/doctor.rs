@@ -14,6 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use loomweave_storage::EXTERNAL_READ_MAX_USER_VERSION;
 use rusqlite::Connection;
 #[cfg(unix)]
 use tempfile::TempDir;
@@ -394,6 +395,41 @@ fn spawn_one_shot_health_server() -> (u16, std::thread::JoinHandle<()>) {
             body
         )
         .expect("write health response");
+    });
+    (port, handle)
+}
+
+fn spawn_bounded_health_server() -> (u16, std::thread::JoinHandle<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bounded health server");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0_u8; 512];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"ok":true}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    return true;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > std::time::Duration::from_secs(2) {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("accept bounded health probe: {err}"),
+            }
+        }
     });
     (port, handle)
 }
@@ -1116,6 +1152,55 @@ fn doctor_reports_published_ephemeral_port() {
     );
 }
 
+#[test]
+fn doctor_probes_the_isolated_port_for_a_linked_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+    let ctx = loomweave_core::worktree::WorktreeContext::resolve(&linked)
+        .expect("resolve linked worktree");
+    loomweave_cli::worktree::store::ensure_isolated_store(&ctx).expect("create isolated store");
+    let (port, handle) = spawn_bounded_health_server();
+    std::fs::write(&ctx.store_paths.port, format!("{port}\n")).unwrap();
+
+    let (_code, json) = doctor_json(&linked, false);
+    let probed = handle.join().expect("health server joins");
+
+    assert!(
+        probed,
+        "doctor never probed the isolated published port: {json}"
+    );
+    let http = check(&json, "http.config");
+    assert_eq!(http["status"], "ok", "{http}");
+    assert!(
+        http["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&port.to_string()),
+        "doctor must report the port published under the routed isolated store: {http}"
+    );
+}
+
+#[test]
+fn doctor_authentication_uses_the_linked_worktrees_inherited_config() {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+    fs::remove_file(linked.join("loomweave.yaml")).ok();
+    fs::write(
+        root.path().join("repo/loomweave.yaml"),
+        "version: 1\nserve:\n  http:\n    enabled: true\n    identity_token_env: DOCTOR_LINKED_HMAC\n",
+    )
+    .unwrap();
+
+    let (code, json) = doctor_json_with_env(&linked, false, &[], &["DOCTOR_LINKED_HMAC"]);
+    let auth = check(&json, "http.authentication");
+
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(auth["status"], "problem", "{auth}");
+    assert_eq!(auth["details"]["http_enabled"], true, "{auth}");
+    assert_eq!(auth["details"]["protected_routes"], "hmac", "{auth}");
+    assert_eq!(auth["details"]["secret_present"], false, "{auth}");
+}
+
 /// The liveness probe must aim at a route the read API actually serves.
 ///
 /// `/api/v1/_capabilities` is the one deliberately unauthenticated route
@@ -1260,11 +1345,19 @@ fn doctor_reports_external_sqlite_current_legacy_and_older_states() {
     let current_check = check(&json, "federation.sqlite_compatibility");
     assert_eq!(current_check["status"], "ok", "{current_check}");
     assert_eq!(current_check["details"]["compatibility"], "compatible");
-    assert_eq!(current_check["details"]["user_version"], 12);
+    // Derived, not hardcoded: a schema migration advances the reviewed external
+    // ceiling, and this assertion must track it rather than re-pinning a literal
+    // that goes stale on every bump.
+    assert_eq!(
+        current_check["details"]["user_version"],
+        EXTERNAL_READ_MAX_USER_VERSION
+    );
     let (_, text) = doctor(current.path(), false);
     assert!(
         text.contains("federation.sqlite_compatibility")
-            && text.contains("compatible at user_version=12"),
+            && text.contains(&format!(
+                "compatible at user_version={EXTERNAL_READ_MAX_USER_VERSION}"
+            )),
         "text output must carry the same current compatibility verdict:\n{text}"
     );
 
@@ -1454,7 +1547,10 @@ fn doctor_rejects_foreign_and_too_new_external_sqlite_before_catalogue_queries()
     write_healthy_db(too_new.path());
     Connection::open(too_new.path().join(".weft/loomweave/loomweave.db"))
         .unwrap()
-        .execute_batch("PRAGMA user_version = 13;")
+        .execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            EXTERNAL_READ_MAX_USER_VERSION + 1
+        ))
         .unwrap();
     let (code, json) = doctor_json(too_new.path(), false);
     let incompatible = check(&json, "federation.sqlite_compatibility");
@@ -2425,9 +2521,8 @@ fn doctor_redirects_schema_check_for_a_linked_worktree_instead_of_recommending_l
     let (_, json) = doctor_json(&linked, false);
     let schema_check = check(&json, ".weft/loomweave.schema");
     assert_eq!(
-        schema_check["status"], "ok",
-        "a linked worktree's own checkout holding no local .weft/loomweave/ store is by \
-         design, not a defect: {schema_check}"
+        schema_check["status"], "warning",
+        "the current linked worktree has no usable isolated database: {schema_check}"
     );
     let message = schema_check["message"].as_str().unwrap_or_default();
     assert!(
@@ -2436,9 +2531,8 @@ fn doctor_redirects_schema_check_for_a_linked_worktree_instead_of_recommending_l
          followed literally, would create the forbidden local store: {schema_check}"
     );
     assert!(
-        message.contains("worktree_stores"),
-        "must redirect to the worktree_stores check, which reports this worktree's actual \
-         isolated index health: {schema_check}"
+        message.contains("isolated") && message.contains("loomweave.db"),
+        "must report the current linked worktree's exact isolated database: {schema_check}"
     );
 
     // Text path twin: no "run install/analyze" hint either.
@@ -2447,6 +2541,33 @@ fn doctor_redirects_schema_check_for_a_linked_worktree_instead_of_recommending_l
         !stdout.contains("run `loomweave install`"),
         "text-path doctor must not recommend install/analyze from inside a linked worktree: \
          {stdout}"
+    );
+}
+
+#[test]
+fn doctor_checks_the_current_linked_database_even_when_another_store_is_healthy() {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+    let ctx = loomweave_core::worktree::WorktreeContext::resolve(&linked)
+        .expect("resolve linked worktree");
+    let other_id = format!("wt-{}", "f".repeat(64));
+    write_migrated_db_at(
+        &ctx.repository_store
+            .join("worktrees")
+            .join(other_id)
+            .join("loomweave.db"),
+    );
+
+    let (_, json) = doctor_json(&linked, false);
+    let schema = check(&json, ".weft/loomweave.schema");
+
+    assert_eq!(schema["status"], "warning", "{schema}");
+    assert!(
+        schema["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&ctx.store_paths.db.display().to_string()),
+        "schema check must identify the missing database for the current checkout: {schema}"
     );
 }
 
@@ -2490,9 +2611,8 @@ fn doctor_redirects_http_instance_id_check_for_a_linked_worktree_instead_of_reco
     let (_, json) = doctor_json(&linked, false);
     let instance_check = check(&json, "http.instance_id");
     assert_eq!(
-        instance_check["status"], "ok",
-        "a linked worktree's own checkout holding no local instance_id file is by design, not \
-         a defect: {instance_check}"
+        instance_check["status"], "warning",
+        "the current linked worktree has no materialised isolated instance ID: {instance_check}"
     );
     let message = instance_check["message"].as_str().unwrap_or_default();
     assert!(
@@ -2501,9 +2621,8 @@ fn doctor_redirects_http_instance_id_check_for_a_linked_worktree_instead_of_reco
          followed literally, would create the forbidden local store: {instance_check}"
     );
     assert!(
-        message.contains("worktree_stores"),
-        "must redirect to the worktree_stores check, which reports this worktree's actual \
-         isolated index health: {instance_check}"
+        message.contains("isolated") && message.contains("instance_id"),
+        "must report the current linked worktree's isolated instance-ID leaf: {instance_check}"
     );
 
     // The JSON report's top-level `next_actions` aggregate is where the
@@ -2541,8 +2660,8 @@ fn doctor_redirects_http_instance_id_check_for_a_linked_worktree_instead_of_reco
         "text-path doctor must not recommend install from inside a linked worktree: {instance_line}"
     );
     assert!(
-        instance_line.contains("worktree_stores"),
-        "text-path doctor must redirect to worktree_stores: {instance_line}"
+        instance_line.contains("isolated") && instance_line.contains("instance_id"),
+        "text-path doctor must report the current isolated instance-ID leaf: {instance_line}"
     );
 
     // --fix must not materialize anything on this check's path: the redirect
@@ -2554,11 +2673,69 @@ fn doctor_redirects_http_instance_id_check_for_a_linked_worktree_instead_of_reco
     let (_, fixed_json) = doctor_json(&linked, true);
     let fixed_instance_check = check(&fixed_json, "http.instance_id");
     assert_eq!(
-        fixed_instance_check["status"], "ok",
+        fixed_instance_check["status"], "warning",
         "--fix must not change the redirect's status: {fixed_instance_check}"
     );
     assert!(
         !linked.join(".weft/loomweave/instance_id").exists(),
         "--fix must not materialize a local instance_id file inside a linked worktree"
+    );
+}
+
+#[test]
+fn doctor_rejects_a_malformed_linked_worktree_instance_id() {
+    let root = tempfile::tempdir().unwrap();
+    let linked = setup_primary_with_linked_worktree(root.path());
+    let ctx = loomweave_core::worktree::WorktreeContext::resolve(&linked)
+        .expect("resolve linked worktree");
+    loomweave_cli::worktree::store::ensure_isolated_store(&ctx).expect("create isolated store");
+    fs::write(&ctx.store_paths.instance_id, "not-a-uuid\n").unwrap();
+
+    let (code, json) = doctor_json(&linked, false);
+    let instance = check(&json, "http.instance_id");
+
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(instance["status"], "problem", "{instance}");
+    assert_eq!(instance["details"]["present"], true, "{instance}");
+    assert_eq!(instance["details"]["valid"], false, "{instance}");
+    assert!(
+        instance["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("malformed"),
+        "{instance}"
+    );
+}
+
+/// `doctor --fix` installs the managed git-sync hooks into a repo that gained
+/// git after install, and a repeat doctor run sees them as present — the
+/// warning → fixed → ok lifecycle for `hook.git_sync`.
+#[test]
+fn doctor_fix_installs_missing_git_sync_hooks() {
+    let project = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], project.path());
+    write_healthy_db(project.path());
+    // Repo gains git AFTER install: the read-only doctor must warn (not gate),
+    // and --fix must converge the hooks to present.
+    run_git(project.path(), &["init", "-q"]);
+
+    let (code, json) = doctor_json(project.path(), false);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["status"], "warning", "{hooks}");
+    assert_eq!(code, 0, "a missing enrichment must not gate-fail: {json}");
+
+    let (_, json) = doctor_json(project.path(), true);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["fixed"], true, "{hooks}");
+
+    let (code, json) = doctor_json(project.path(), false);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["status"], "ok", "{hooks}");
+    assert_eq!(code, 0, "{json}");
+    let hook_file = project.path().join(".git/hooks/post-commit");
+    let content = std::fs::read_to_string(hook_file).unwrap();
+    assert!(
+        content.contains("loomweave hook git-sync --path ."),
+        "installed hook must run git-sync: {content}"
     );
 }

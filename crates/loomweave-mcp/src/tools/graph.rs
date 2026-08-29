@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use loomweave_core::{EdgeConfidence, McpErrorCode};
 use serde_json::{Value, json};
 
+use loomweave_storage::degraded_call_coverage_file_count;
 use loomweave_storage::{
     EntityVisibility, RELATION_EDGE_KINDS, ReferenceDirection, StorageError, ancestor_chain,
     call_edges_from, call_edges_targeting, child_entity_ids, entities_containing_line,
@@ -23,16 +24,16 @@ use crate::filigree::IssueDetail;
 
 use crate::{
     CallSiteKind, CallSiteRole, InferredDispatchStats, IssuesForAccumulator, ParamError, PathScope,
-    PathTraversal, ServerState, build_call_sites, build_unresolved_candidates,
-    call_graph_scope_excludes, callee_json, caller_json, caller_navigation_scope_excludes,
-    compact_execution_paths, entity_context_json, entity_json, entity_not_found_envelope,
-    entity_properties_json, envelope_from_storage_result, flatten_storage_envelope_result,
-    import_neighbors, issues_unavailable, navigation_scope_excludes, optional_bool,
-    optional_confidence, optional_usize, parse_cursor_offset, path_truncation_reason,
-    reference_neighbors_for, relation_neighbors, required_i64, required_str, storage_retryable,
-    success_envelope, success_envelope_with_stats, success_envelope_with_truncation,
-    success_envelope_with_truncation_and_stats, tool_error_envelope, unresolved_match_fields,
-    wardline_section_for_entity, wardline_unavailable,
+    PathTraversal, ServerState, build_call_sites, build_unresolved_candidates, callee_json,
+    caller_json, caller_navigation_scope_excludes, compact_execution_paths, entity_context_json,
+    entity_json, entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
+    flatten_storage_envelope_result, import_neighbors, issues_unavailable,
+    navigation_scope_excludes, optional_bool, optional_confidence, optional_usize,
+    parse_cursor_offset, path_truncation_reason, reference_neighbors_for, relation_neighbors,
+    required_i64, required_str, storage_retryable, success_envelope, success_envelope_with_stats,
+    success_envelope_with_truncation, success_envelope_with_truncation_and_stats,
+    tool_error_envelope, unresolved_match_fields, wardline_section_for_entity,
+    wardline_unavailable,
 };
 
 /// The direction argument of [`ServerState::tool_relation_list`]: a single
@@ -244,8 +245,12 @@ impl ServerState {
                         }
                         None => (0, Value::Null, Vec::new()),
                     };
-                let scope_excludes =
-                    caller_navigation_scope_excludes(confidence, unresolved_name_matches > 0);
+                let degraded_call_coverage_files = degraded_call_coverage_file_count(conn)?;
+                let scope_excludes = caller_navigation_scope_excludes(
+                    confidence,
+                    unresolved_name_matches > 0,
+                    degraded_call_coverage_files > 0,
+                );
                 let traversal_complete = scope_excludes.is_empty();
                 Ok(success_envelope_with_stats(
                     json!({
@@ -256,6 +261,10 @@ impl ServerState {
                         "next_action": next_action,
                         "scope_excludes": scope_excludes,
                         "traversal_complete": traversal_complete,
+                        // Files whose last analysis reported degraded call
+                        // resolution (clarion-3e517d4aff); non-zero means the
+                        // index has call-graph holes `analyze` will re-dispatch.
+                        "degraded_call_coverage_files": degraded_call_coverage_files,
                         "unresolved_candidates": unresolved_candidates,
                     }),
                     stats_delta,
@@ -303,13 +312,18 @@ impl ServerState {
                 let edge_count_visited = traversal.edge_count_visited;
                 let compact = compact_execution_paths(conn, traversal.paths, path_cap)?;
                 let live_unresolved = live_unresolved_call_sites_exist(conn)?;
+                let degraded_call_coverage = degraded_call_coverage_file_count(conn)? > 0;
                 Ok(success_envelope_with_truncation(
                     json!({
                         "root": entity_id,
                         "nodes": compact.nodes,
                         "paths": compact.paths,
                         "edge_count_visited": edge_count_visited,
-                        "scope_excludes": navigation_scope_excludes(confidence, live_unresolved),
+                        "scope_excludes": navigation_scope_excludes(
+                            confidence,
+                            live_unresolved,
+                            degraded_call_coverage,
+                        ),
                     }),
                     path_truncation_reason(edge_truncated, compact.path_cap_truncated),
                 ))
@@ -402,16 +416,26 @@ impl ServerState {
         let path_cap = self.execution_path_cap;
         let compacted = self
             .readers
-            .with_reader(move |conn| compact_execution_paths(conn, paths, path_cap))
+            .with_reader(move |conn| {
+                let degraded_call_coverage = degraded_call_coverage_file_count(conn)? > 0;
+                compact_execution_paths(conn, paths, path_cap)
+                    .map(|compact| (compact, degraded_call_coverage))
+            })
             .await;
         match compacted {
-            Ok(compact) => success_envelope_with_truncation_and_stats(
+            Ok((compact, degraded_call_coverage)) => success_envelope_with_truncation_and_stats(
                 json!({
                     "root": root,
                     "nodes": compact.nodes,
                     "paths": compact.paths,
                     "edge_count_visited": edge_count_visited,
-                    "scope_excludes": call_graph_scope_excludes(EdgeConfidence::Inferred),
+                    // The inferred pass attempts recorded unresolved sites; a
+                    // degraded file recorded none (clarion-3e517d4aff).
+                    "scope_excludes": navigation_scope_excludes(
+                        EdgeConfidence::Inferred,
+                        false,
+                        degraded_call_coverage,
+                    ),
                 }),
                 path_truncation_reason(truncated, compact.path_cap_truncated),
                 stats.to_json(),
@@ -424,6 +448,7 @@ impl ServerState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn tool_neighborhood(
         &self,
         arguments: &serde_json::Map<String, Value>,
@@ -522,8 +547,12 @@ impl ServerState {
                 } else {
                     build_unresolved_candidates(conn, &entity)?
                 };
-                let scope_excludes =
-                    caller_navigation_scope_excludes(confidence, unresolved_name_matches > 0);
+                let degraded_call_coverage_files = degraded_call_coverage_file_count(conn)?;
+                let scope_excludes = caller_navigation_scope_excludes(
+                    confidence,
+                    unresolved_name_matches > 0,
+                    degraded_call_coverage_files > 0,
+                );
                 let traversal_complete = scope_excludes.is_empty();
                 // Bound EACH bucket independently and record whether it was
                 // trimmed in the sibling `truncated` map. A trimmed bucket directs
@@ -571,6 +600,7 @@ impl ServerState {
                     "next_action": next_action,
                     "scope_excludes": scope_excludes,
                     "traversal_complete": traversal_complete,
+                    "degraded_call_coverage_files": degraded_call_coverage_files,
                     "unresolved_candidates": unresolved_candidates,
                 })))
             })

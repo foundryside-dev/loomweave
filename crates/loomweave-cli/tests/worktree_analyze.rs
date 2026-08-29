@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+use fs2::FileExt as _;
+use loomweave_core::worktree::WorktreeContext;
 use rusqlite::Connection;
 
 fn loomweave_bin() -> Command {
@@ -314,6 +316,47 @@ fn worktree_analyze_builds_an_index_by_path() {
     assert!(
         !linked.join(".weft/loomweave/loomweave.db").exists(),
         "the worktree's own local .weft/loomweave/ must never get a loomweave.db"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_analyze_acquires_the_stable_lock_before_initializing_its_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let (_repo, linked) = setup_primary_with_linked_worktree(
+        tmp.path(),
+        plugin_dir.path(),
+        "lock-before-init",
+        "feature-lock-before-init",
+        "locked_module",
+    );
+    let ctx = WorktreeContext::resolve(&linked).expect("resolve linked worktree");
+    let stable_id = ctx.stable_id.as_deref().expect("linked stable id");
+    let worktrees_dir = ctx.repository_store.join("worktrees");
+    std::fs::create_dir_all(&worktrees_dir).expect("create worktrees namespace");
+    let lock_path = worktrees_dir.join(format!("{stable_id}.lock"));
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open stable analyze lock");
+    lock_file
+        .lock_exclusive()
+        .expect("hold stable analyze lock");
+
+    loomweave_bin()
+        .args(["worktree", "analyze", "--"])
+        .arg(&linked)
+        .env("PATH", path_with_plugin(plugin_dir.path()))
+        .assert()
+        .failure();
+
+    assert!(
+        !ctx.effective_store.exists(),
+        "a process that cannot acquire the analyze lock must not initialize or rebuild the store"
     );
 }
 

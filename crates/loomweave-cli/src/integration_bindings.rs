@@ -172,11 +172,29 @@ fn wardline_mcp_ok(project_root: &Path, desired: &DesiredBindings) -> Result<boo
     let Some(entry) = servers.get("wardline") else {
         return Ok(false);
     };
-    // Loomweave cedes the emit URL: the expected args carry forward whatever
-    // wardline recorded, so this check validates Loomweave's own fields
-    // (command, --loomweave-url, structure) without judging wardline's emit URL.
-    let existing = existing_wardline_filigree_url(&value);
-    Ok(entry.get("args") == Some(&desired_wardline_args(desired, existing.as_deref())))
+    // Loomweave owns exactly one field of this entry: the --loomweave-url
+    // VALUE. Everything else — the command, --root, wardline-owned launch
+    // flags like --trust-pack/--allow-custom-packs, the ceded --filigree-url —
+    // is wardline's (or the operator's) and never judged here. An entry that
+    // omits --loomweave-url entirely is also current: wardline's resolver
+    // falls through to the published .weft/loomweave/ephemeral.port rung.
+    let Some(args) = entry.get("args").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    if args.first().and_then(Value::as_str) != Some("mcp") {
+        return Ok(false);
+    }
+    Ok(loomweave_url_arg(args).is_none_or(|url| url == desired.loomweave_url))
+}
+
+/// The value following `--loomweave-url` in an args array, if the flag is
+/// present. A trailing flag with no value reads as an empty string so it
+/// classifies stale (never current) rather than being ignored.
+fn loomweave_url_arg(args: &[Value]) -> Option<&str> {
+    let flag = args
+        .iter()
+        .position(|arg| arg.as_str() == Some("--loomweave-url"))?;
+    Some(args.get(flag + 1).and_then(Value::as_str).unwrap_or(""))
 }
 
 fn install_loomweave_yaml(project_root: &Path, desired: &DesiredBindings) -> Result<bool> {
@@ -233,60 +251,65 @@ fn install_wardline_mcp(project_root: &Path, desired: &DesiredBindings) -> Resul
             path.display()
         );
     }
-    // Read wardline's existing emit URL *before* mutating, so we carry it forward
-    // verbatim (Loomweave cedes ownership; it never synthesizes or downgrades it).
-    let existing = existing_wardline_filigree_url(&root);
     let root_obj = root.as_object_mut().expect("root is object");
     let servers = root_obj
         .entry("mcpServers".to_owned())
         .or_insert_with(|| Value::Object(Map::new()));
     let servers = servers.as_object_mut().expect("mcpServers is object");
-    let desired_entry = json!({
-        "type": "stdio",
-        "command": wardline_command(),
-        "args": desired_wardline_args(desired, existing.as_deref()),
-    });
-    if servers.get("wardline") == Some(&desired_entry) {
-        return Ok(false);
+
+    // An existing sane entry (args invoke the MCP server) is carried forward
+    // verbatim — command, --root, wardline-owned launch flags like
+    // --trust-pack/--allow-custom-packs, the ceded --filigree-url (weft emit
+    // incident 2026-06-10) — with exactly one owned mutation: refresh the
+    // --loomweave-url VALUE when the flag is present with a stale value. An
+    // entry omitting the flag is left alone entirely; wardline resolves
+    // Loomweave at runtime via the published .weft/loomweave/ephemeral.port
+    // rung. Rewriting wholesale here is what silently dropped a project's
+    // trust-grammar pack grant from a git-tracked .mcp.json.
+    if let Some(args) = servers
+        .get_mut("wardline")
+        .and_then(|entry| entry.get_mut("args"))
+        .and_then(Value::as_array_mut)
+        .filter(|args| args.first().and_then(Value::as_str) == Some("mcp"))
+    {
+        let Some(flag) = args
+            .iter()
+            .position(|arg| arg.as_str() == Some("--loomweave-url"))
+        else {
+            return Ok(false);
+        };
+        if args.get(flag + 1).and_then(Value::as_str) == Some(desired.loomweave_url.as_str()) {
+            return Ok(false);
+        }
+        let url = json!(desired.loomweave_url);
+        if flag + 1 < args.len() {
+            args[flag + 1] = url;
+        } else {
+            args.push(url);
+        }
+        return write_json_if_changed(&path, &root);
     }
-    servers.insert("wardline".to_owned(), desired_entry);
+
+    // Fresh registration (no entry, or one too malformed to edit surgically):
+    // seed the full entry, --loomweave-url included (ADR-044). No
+    // --filigree-url — wardline's own installer owns and project-scopes the
+    // emit URL; a Loomweave-synthesized unscoped value fail-closes with a
+    // silent 400 that drops every finding.
+    servers.insert(
+        "wardline".to_owned(),
+        json!({
+            "type": "stdio",
+            "command": wardline_command(),
+            "args": [
+                "mcp",
+                "--root",
+                ".",
+                "--loomweave-url",
+                desired.loomweave_url,
+            ],
+        }),
+    );
     write_json_if_changed(&path, &root)
-}
-
-/// Loomweave does **not** own wardline's emit URL — wardline's own installer
-/// writes and project-scopes `--filigree-url` (it knows its own Filigree prefix;
-/// the server-mode daemon fail-closes an unscoped write with a silent 400 that
-/// drops every finding). So Loomweave carries an existing value forward verbatim
-/// and otherwise **omits** the flag; it never synthesizes one. (Ownership
-/// decision, weft emit incident 2026-06-10: Loomweave cedes the emit URL to
-/// wardline; it cannot compute the `/api/p/<prefix>/` scope itself.)
-fn desired_wardline_args(desired: &DesiredBindings, filigree_url: Option<&str>) -> Value {
-    let mut args = vec![
-        json!("mcp"),
-        json!("--root"),
-        json!("."),
-        json!("--loomweave-url"),
-        json!(desired.loomweave_url),
-    ];
-    if let Some(url) = filigree_url {
-        args.push(json!("--filigree-url"));
-        args.push(json!(url));
-    }
-    Value::Array(args)
-}
-
-/// The `--filigree-url` value wardline currently records in the project's
-/// `.mcp.json` entry, if any — carried forward verbatim (Loomweave never owns it).
-fn existing_wardline_filigree_url(root: &Value) -> Option<String> {
-    let args = root
-        .get("mcpServers")?
-        .get("wardline")?
-        .get("args")?
-        .as_array()?;
-    let flag = args
-        .iter()
-        .position(|arg| arg.as_str() == Some("--filigree-url"))?;
-    args.get(flag + 1)?.as_str().map(str::to_owned)
 }
 
 fn wardline_command() -> String {
@@ -451,6 +474,105 @@ mod tests {
         assert!(
             wardline_mcp_ok(dir.path(), &desired).unwrap(),
             "the emit-URL-less entry Loomweave just wrote is its own definition of ok"
+        );
+    }
+
+    /// Cede: wardline-owned launch flags (--trust-pack, --allow-custom-packs,
+    /// --read-only, …) survive repair verbatim, and an entry that omits
+    /// --loomweave-url entirely is current — wardline resolves Loomweave at
+    /// runtime via the published .weft/loomweave/ephemeral.port rung. The
+    /// elspeth regression: repair rewrote a tracked entry to
+    /// ["mcp","--root",".","--loomweave-url",…], silently dropping the
+    /// project's trust-grammar pack grant.
+    #[test]
+    fn repair_preserves_wardline_owned_flags_and_flagless_url_is_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let desired = desired_bindings(dir.path());
+        let original = concat!(
+            "{\n",
+            "  \"mcpServers\": {\n",
+            "    \"wardline\": {\n",
+            "      \"args\": [\n",
+            "        \"mcp\",\n",
+            "        \"--root\",\n",
+            "        \".\",\n",
+            "        \"--trust-pack\",\n",
+            "        \"scripts.wardline_pack\",\n",
+            "        \"--allow-custom-packs\"\n",
+            "      ],\n",
+            "      \"command\": \"/custom/bin/wardline\",\n",
+            "      \"type\": \"stdio\"\n",
+            "    }\n",
+            "  }\n",
+            "}\n"
+        );
+        fs::write(dir.path().join(".mcp.json"), original).unwrap();
+
+        assert!(
+            wardline_mcp_ok(dir.path(), &desired).unwrap(),
+            "a sane wardline entry without --loomweave-url is current"
+        );
+        let changed = install_wardline_mcp(dir.path(), &desired).unwrap();
+        assert!(!changed, "repair must not rewrite a current entry");
+        let after = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
+        assert_eq!(
+            after, original,
+            "tracked entry must be byte-for-byte untouched (trust flags kept)"
+        );
+    }
+
+    /// The one mutation Loomweave owns: when --loomweave-url IS present with a
+    /// stale value, refresh that value alone — every other arg (including
+    /// wardline-owned trust flags) and the command are carried forward.
+    #[test]
+    fn repair_refreshes_only_the_owned_loomweave_url_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let desired = desired_bindings(dir.path());
+        fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"wardline":{"type":"stdio","command":"/custom/bin/wardline","args":["mcp","--root",".","--trust-pack","scripts.wardline_pack","--loomweave-url","http://127.0.0.1:9111","--filigree-url","http://127.0.0.1:8749/api/p/x/weft/scan-results"]}}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !wardline_mcp_ok(dir.path(), &desired).unwrap(),
+            "a stale --loomweave-url value is not current"
+        );
+        let changed = install_wardline_mcp(dir.path(), &desired).unwrap();
+        assert!(changed, "stale owned value must be refreshed");
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        let entry = &value["mcpServers"]["wardline"];
+        assert_eq!(
+            entry["command"], "/custom/bin/wardline",
+            "command is carried forward, not re-resolved"
+        );
+        let args: Vec<&str> = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "mcp",
+                "--root",
+                ".",
+                "--trust-pack",
+                "scripts.wardline_pack",
+                "--loomweave-url",
+                desired.loomweave_url.as_str(),
+                "--filigree-url",
+                "http://127.0.0.1:8749/api/p/x/weft/scan-results",
+            ],
+            "only the --loomweave-url value changes; order and flags survive"
+        );
+        assert!(
+            wardline_mcp_ok(dir.path(), &desired).unwrap(),
+            "check agrees with write (no doctor flap)"
         );
     }
 

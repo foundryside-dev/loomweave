@@ -106,7 +106,7 @@ fn linked_state_with_spawn_outcome(
         .with_tool_policy(McpToolPolicy::allow_write_tools())
         .with_worktree_gate(
             ctx.store_paths.clone(),
-            &ctx.source_root,
+            loomweave_mcp::worktree_bootstrap::fallback_argv(&ctx.source_root, None),
             bootstrap_spawn_failed,
         )
 }
@@ -293,10 +293,21 @@ fn second_serve_does_not_spawn_a_duplicate_analyze() {
     let coord = dir.path().to_path_buf();
     let script = write_lock_race_stub(&coord);
     let target = dir.path().join("target-worktree");
+    let monitor_db = dir.path().join("unused-monitor.db");
     std::fs::create_dir_all(&target).unwrap();
 
-    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(&script, &target, None);
-    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(&script, &target, None);
+    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
+        &script,
+        &target,
+        None,
+        &monitor_db,
+    );
+    loomweave_mcp::worktree_bootstrap::spawn_detached_worktree_analyze(
+        &script,
+        &target,
+        None,
+        &monitor_db,
+    );
 
     wait_until(Duration::from_secs(5), || {
         count_matching(&coord, "done-") == 2
@@ -343,6 +354,106 @@ fn count_matching(dir: &Path, prefix: &str) -> usize {
                 .is_some_and(|name| name.starts_with(prefix))
         })
         .count()
+}
+
+/// The per-worktree analyze lock file (`<repository-store>/worktrees/
+/// <stable-id>.lock`) a live builder holds for its whole run — the liveness
+/// signal the readiness gate's dead-builder repair probes.
+fn analyze_lock_path(ctx: &WorktreeContext) -> PathBuf {
+    ctx.repository_store.join("worktrees").join(format!(
+        "{}.lock",
+        ctx.stable_id.as_deref().expect("linked fixture")
+    ))
+}
+
+/// Dead-child wedge (review finding): a bootstrap analyze child that dies
+/// uncleanly (OOM-kill, `kill -9`, reboot) AFTER writing its `BeginRun`
+/// `status='running'` row must not leave the worktree in retryable
+/// `index-building` forever. A `running` row whose owning process is provably
+/// gone — nothing holds the per-worktree analyze lock — must be converted to
+/// a failed row so the gate reports the non-retryable `index-build-failed`
+/// envelope with the explicit recovery command.
+#[tokio::test]
+async fn dead_builder_running_row_repairs_to_build_failed_not_building_forever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    // The dead child's own `running` row; no process holds the analyze lock.
+    seed_run(
+        &ctx.store_paths.db,
+        "r-dead",
+        "2026-01-01T00:00:00.000Z",
+        "running",
+    );
+    let state = linked_state(&ctx);
+
+    let resp = call_tool(&state, "entity_find", json!({"pattern": "x"})).await;
+    assert_eq!(resp["ok"], false, "{resp:?}");
+    assert_eq!(
+        resp["error"]["code"], "index-build-failed",
+        "a running row with no live lock holder is a dead builder, not a build in progress: \
+         {resp:?}"
+    );
+    assert_eq!(
+        resp["error"]["retryable"], false,
+        "no automatic recovery — the explicit fallback command is the documented path: {resp:?}"
+    );
+    assert_eq!(
+        resp["diagnostics"][0]["fallback_command"],
+        fallback_command_json(&ctx),
+        "{resp:?}"
+    );
+
+    // The repair persisted: the abandoned row is now terminally `failed`.
+    let conn = Connection::open(&ctx.store_paths.db).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM runs WHERE id = 'r-dead'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        status, "failed",
+        "the abandoned row must be repaired on disk"
+    );
+}
+
+/// The inverse guard for the repair above: a `running` row whose builder IS
+/// alive (holds the per-worktree analyze lock) must keep gating reads as
+/// retryable `index-building` — the repair must never shoot a live build.
+#[tokio::test]
+async fn live_builder_holding_the_lock_still_gates_as_building() {
+    use fs2::FileExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(analyze_lock_path(&ctx))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    seed_run(
+        &ctx.store_paths.db,
+        "r-live",
+        "2026-01-01T00:00:00.000Z",
+        "running",
+    );
+    let state = linked_state(&ctx);
+
+    let resp = call_tool(&state, "entity_find", json!({"pattern": "x"})).await;
+    assert_eq!(resp["error"]["code"], "index-building", "{resp:?}");
+    assert_eq!(resp["error"]["retryable"], true, "{resp:?}");
+
+    let conn = Connection::open(&ctx.store_paths.db).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM runs WHERE id = 'r-live'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "running", "a live builder's row must be left alone");
 }
 
 #[tokio::test]
@@ -410,6 +521,84 @@ async fn status_index_state_distinguishes_building_spawn_failed_and_ready() {
         status["result"]["index_state"], "ready",
         "a completed run must override the spawn-failed report: {status:?}"
     );
+}
+
+#[tokio::test]
+async fn manual_recovery_run_overrides_session_static_bootstrap_spawn_failure() {
+    use fs2::FileExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    let state = linked_state_with_spawn_outcome(&ctx, true);
+
+    // A real manual recovery run holds the per-worktree analyze lock for its
+    // whole run; without it the gate's dead-builder repair would (correctly)
+    // classify the row below as abandoned.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(analyze_lock_path(&ctx))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    seed_run(
+        &ctx.store_paths.db,
+        "manual-recovery",
+        "2026-02-01T00:00:00.000Z",
+        "running",
+    );
+
+    let graph = call_tool(&state, "entity_find", json!({"pattern": "x"})).await;
+    assert_eq!(graph["error"]["code"], "index-building", "{graph:?}");
+    assert_eq!(graph["error"]["retryable"], true, "{graph:?}");
+    assert_eq!(
+        graph["diagnostics"][0]["run_id"], "manual-recovery",
+        "{graph:?}"
+    );
+    assert!(
+        graph["diagnostics"][0]["bootstrap_state"].is_null(),
+        "a real recovery row supersedes the failed automatic spawn: {graph:?}"
+    );
+
+    let status = call_tool(&state, "project_status_get", json!({})).await;
+    assert_eq!(
+        status["result"]["index_state"], "index-building",
+        "{status:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn analyze_cancel_bypasses_building_gate_for_a_live_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = linked_context(tmp.path());
+    init_effective_store(&ctx);
+    seed_completed_run(&ctx.store_paths.db, "completed-before-rebuild");
+
+    let stub = tmp.path().join("blocking-analyze-stub.sh");
+    std::fs::write(&stub, "#!/bin/sh\nsleep 5\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&stub).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&stub, permissions).unwrap();
+    }
+    let state = linked_state(&ctx).with_analyze_command(stub);
+    let started = call_tool(&state, "analyze_start", json!({})).await;
+    assert_eq!(started["ok"], true, "{started:?}");
+    let run_id = started["result"]["run_id"].as_str().unwrap().to_owned();
+    seed_run(
+        &ctx.store_paths.db,
+        &run_id,
+        "2026-02-01T00:00:00.000Z",
+        "running",
+    );
+
+    let cancelled = call_tool(&state, "analyze_cancel", json!({"run_id": run_id})).await;
+    assert_eq!(cancelled["ok"], true, "{cancelled:?}");
+    assert_eq!(cancelled["result"]["status"], "cancelled", "{cancelled:?}");
 }
 
 #[tokio::test]

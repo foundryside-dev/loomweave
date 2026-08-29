@@ -43,11 +43,17 @@
 //!   `openat2` checks re-enforce confinement independently on every entry
 //!   in the delete pass too.
 //! - Off Linux — or on a Linux kernel old enough that `openat2` itself
-//!   returns [`rustix::io::Errno::NOSYS`] — [`refuse_unsupported`] is used:
-//!   nothing is deleted, unconditionally. This is the platform's hard
-//!   floor, not a best-effort fallback: a platform without race-resistant,
-//!   handle-relative, no-cross-mount traversal simply has no mechanism this
-//!   module trusts.
+//!   returns [`rustix::io::Errno::NOSYS`] (pre-5.6) — [`refuse_unsupported`]
+//!   is used: nothing is deleted, unconditionally. This is the platform's
+//!   hard floor, not a best-effort fallback: a platform without
+//!   race-resistant, handle-relative, no-cross-mount traversal simply has no
+//!   mechanism this module trusts. The hard floor applies to **deletion
+//!   only**: on such a kernel [`WorktreesRoot::open`] itself fails with
+//!   `ENOSYS` (its pin *is* an `openat2` call), and the sweep keeps its
+//!   report-only visibility by recognizing that failure via
+//!   [`error_signals_missing_openat2`] and enumerating through
+//!   [`unpinned_candidate_names`] instead — a plain `read_dir` view that
+//!   never authorizes a deletion.
 //!
 //! No `remove_dir_all` on a string path exists anywhere in this module —
 //! every deletion is a single-component `unlinkat` relative to a
@@ -58,6 +64,8 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 use std::ffi::CStr;
@@ -65,7 +73,9 @@ use std::ffi::CStr;
 #[cfg(unix)]
 use rustix::fd::OwnedFd;
 #[cfg(unix)]
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, statat};
+#[cfg(target_os = "linux")]
+use rustix::fs::{CWD, ResolveFlags, openat2};
 use tracing::warn;
 
 /// The exact name grammar a worktree-store directory must match to ever be
@@ -186,6 +196,61 @@ pub fn refuse_unsupported(candidate_name: &str, reason: &str) -> DeleteOutcome {
     DeleteOutcome::UnsupportedPlatform
 }
 
+/// Whether an [`io::Error`] from [`WorktreesRoot::open`] means the running
+/// kernel has no `openat2(2)` at all (Linux pre-5.6: `ENOSYS`) — the one
+/// open failure a sweep may degrade on, keeping report-only visibility via
+/// [`unpinned_candidate_names`] while deletion stays refused as
+/// [`DeleteOutcome::UnsupportedPlatform`]. Every other failure (missing
+/// directory, permission denied, symlink refused, ...) is a real
+/// unreadable-store condition and must abort, not degrade.
+///
+/// Kept as a plain error-kind predicate precisely so the degradation
+/// decision is unit-testable on modern kernels, where a real `ENOSYS`
+/// cannot be provoked (see `sweep.rs`'s
+/// `enosys_pin_failure_selects_the_unpinned_report_only_root`).
+pub fn error_signals_missing_openat2(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(rustix::io::Errno::NOSYS.raw_os_error())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Enumerate grammar-valid direct-child store names of `worktrees_dir` via
+/// a plain, path-based `read_dir` — **no pinned handle, no inode-stability
+/// property**. This is the report-only fallback view for a Linux kernel
+/// without `openat2` (where [`WorktreesRoot::open`] fails with `ENOSYS`,
+/// see [`error_signals_missing_openat2`]): it lets a sweep still *report*
+/// what it would have considered, but it must never feed a deletion — the
+/// deletion path hard-requires [`WorktreesRoot`]'s pinned handle, and on
+/// such a kernel every deletion refuses
+/// [`DeleteOutcome::UnsupportedPlatform`] anyway.
+///
+/// # Errors
+///
+/// Returns any `read_dir`/metadata error from enumerating `worktrees_dir`.
+pub fn unpinned_candidate_names(worktrees_dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(worktrees_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if matches_worktree_store_grammar(&name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// A pinned handle to a repository's `<store>/worktrees/` directory.
 ///
 /// [`delete_worktree_store`](Self::delete_worktree_store) is always
@@ -204,24 +269,41 @@ pub struct WorktreesRoot {
     handle: OwnedFd,
     #[cfg(not(unix))]
     handle: (),
+    #[cfg(not(unix))]
+    path: PathBuf,
 }
 
 impl WorktreesRoot {
     /// Pin a handle to `worktrees_dir` (normally
     /// `<repository-store>/worktrees/`).
     ///
-    /// The final path component is opened with `O_NOFOLLOW`: if
-    /// `worktrees_dir` itself is a symlink, this refuses rather than
-    /// opening the symlink's target. This step is portable — only
-    /// [`delete_worktree_store`](Self::delete_worktree_store)'s traversal
-    /// beneath the pinned handle is Linux-only.
+    /// On Linux the entire path is opened with `openat2(RESOLVE_NO_SYMLINKS)`,
+    /// so neither the final `worktrees` component nor an intermediate store
+    /// prefix can be substituted with a symlink before the handle is pinned.
+    /// Other Unix targets retain a final-component `O_NOFOLLOW` check and
+    /// subsequently refuse deletion as unsupported.
     ///
     /// # Errors
     ///
     /// Returns an error if `worktrees_dir` cannot be opened as a directory
-    /// (missing, not a directory, or a symlink).
+    /// (missing, not a directory, or a symlink). On a Linux kernel without
+    /// `openat2` (pre-5.6) the pin itself fails with `ENOSYS` — callers
+    /// that only need report-only visibility should recognize that one case
+    /// via [`error_signals_missing_openat2`] and fall back to
+    /// [`unpinned_candidate_names`]; deletion has no fallback.
     pub fn open(worktrees_dir: &Path) -> io::Result<Self> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            let handle = openat2(
+                CWD,
+                worktrees_dir,
+                OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            )?;
+            Ok(Self { handle })
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             let handle = rustix::fs::open(
                 worktrees_dir,
@@ -250,7 +332,49 @@ impl WorktreesRoot {
                     "worktrees path is not a directory",
                 ));
             }
-            Ok(Self { handle: () })
+            Ok(Self {
+                handle: (),
+                path: worktrees_dir.to_path_buf(),
+            })
+        }
+    }
+
+    /// Enumerate grammar-valid direct-child store directories through this
+    /// pinned root. On Unix both classification and naming are handle-relative,
+    /// so a rename or pathname replacement cannot split candidate decisions
+    /// from the inode later used by [`Self::delete_worktree_store`].
+    pub(crate) fn candidate_names(&self) -> io::Result<Vec<String>> {
+        #[cfg(unix)]
+        {
+            let mut names = Vec::new();
+            let dir = Dir::read_from(&self.handle).map_err(io::Error::from)?;
+            for entry in dir {
+                let entry = entry.map_err(io::Error::from)?;
+                let raw_name = entry.file_name();
+                if raw_name.to_bytes() == b"." || raw_name.to_bytes() == b".." {
+                    continue;
+                }
+                let stat = statat(&self.handle, raw_name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(io::Error::from)?;
+                if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+                    continue;
+                }
+                let Ok(name) = raw_name.to_str() else {
+                    continue;
+                };
+                if matches_worktree_store_grammar(name) {
+                    names.push(name.to_owned());
+                }
+            }
+            names.sort();
+            Ok(names)
+        }
+        #[cfg(not(unix))]
+        {
+            // No fd primitive here; same path-based view as the report-only
+            // fallback. Deletion refuses `UnsupportedPlatform` regardless.
+            let _ = &self.handle;
+            unpinned_candidate_names(&self.path)
         }
     }
 
@@ -538,5 +662,35 @@ mod linux {
 
     fn is_dot_or_dotdot(name: &CStr) -> bool {
         name.to_bytes() == b"." || name.to_bytes() == b".."
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn candidate_enumeration_stays_on_pinned_root_after_path_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktrees = tmp.path().join("worktrees");
+        std::fs::create_dir(&worktrees).unwrap();
+        let old_name = format!("wt-{}", "a".repeat(64));
+        std::fs::create_dir(worktrees.join(&old_name)).unwrap();
+
+        let root = WorktreesRoot::open(&worktrees).unwrap();
+        let moved = tmp.path().join("worktrees-moved");
+        std::fs::rename(&worktrees, &moved).unwrap();
+        std::fs::create_dir(&worktrees).unwrap();
+        let replacement_name = format!("wt-{}", "b".repeat(64));
+        std::fs::create_dir(worktrees.join(&replacement_name)).unwrap();
+
+        let candidates = root.candidate_names().unwrap();
+
+        assert_eq!(candidates, vec![old_name]);
+        assert!(
+            !candidates.contains(&replacement_name),
+            "candidate decisions must come from the same pinned inode deletion will use"
+        );
     }
 }

@@ -4,20 +4,55 @@ This module deliberately reads descriptor files without importing Wardline.
 Wardline remains authoritative for the vocabulary; Loomweave records only the
 source-observed decorator facts it can derive from that descriptor.
 
-Two contract details below (``PROJECT_DESCRIPTOR_PATHS`` and the descriptor
-``version`` semantics) are Loomweave-side assumptions pending Wardline's
-"Pre-Rust core hardening" Task B, which has not yet published the canonical
-project-local descriptor location or the ``schema: wardline.vocabulary/v1``
-format-version field. The parser ignores unknown top-level keys, so a future
-``schema`` field is tolerated without change; acting on it (format-version
-compatibility decisions) is deferred until Task B pins the contract. Confirm
-both assumptions against the Wardline descriptor ADR when it lands
-(tracked: filigree clarion-6ab5668d82).
+``PROJECT_DESCRIPTOR_PATHS`` remains a Loomweave-side assumption pending
+Wardline's "Pre-Rust core hardening" Task B, which has not yet published the
+canonical project-local descriptor location. Confirm it against the Wardline
+descriptor ADR when it lands (tracked: filigree clarion-6ab5668d82).
+
+This parser READS exactly four top-level keys, and acceptance is keyed on the
+``(schema, version)`` PAIR (``ACCEPTED_DESCRIPTORS``):
+
+* ``schema`` — the descriptor format version. Absent means the pre-schema v1
+  era (``wardline.vocabulary/v1``) by definition.
+* ``version`` — the vocabulary version (``wardline-generic-2`` today).
+* ``entries`` — the seeding trust markers.
+* ``facets`` — under ``wardline.vocabulary/v2`` only: decorators that are
+  attributed but seed no taint (declaration-surface-v2 §7).
+
+Accepting a schema is the OBLIGATION to read every section that schema defines,
+not permission to ignore the ones this reader has not learned yet: accepting a
+pair while dropping one of its sections would report full ``confidence_basis:
+"descriptor"`` confidence over a half-understood descriptor — an
+accept-and-ignore fail-open. So when Wardline adds a section to a schema this
+reader accepts, the reader is extended in the SAME consumer-first change (spec
+P6).
+
+That obligation is currently enforced for exactly ONE section: a ``facets:`` key
+under the v1 schema, whose shape is known exactly, fails closed. Any OTHER unknown
+top-level key is silently ignored — including under an accepted pair, where the
+descriptor still reports full ``confidence_basis: "descriptor"``. Measured, not
+assumed: a v2/generic-3 descriptor carrying an extra ``contracts:`` section parses
+to ``enabled``/``descriptor`` with the section dropped and no signal. The designated
+tripwire is the preview fixture's top-level key-set test (declaration-surface-v2
+§13.1), which watches an artifact in THIS repository and so cannot fire on a section
+arriving in a producer descriptor at runtime.
+
+The sibling gap — the ``facets:`` guard keying on "is v1?" rather than "is this the
+schema whose facet grammar I know?", which let an unaccepted schema's section be
+parsed under v2's rules — is CLOSED; see ``_parse_facets``.
+
+The remaining gap is tracked as a residual rather than closed here. Rejecting
+unknown top-level keys would fail-close this reader on every future additive
+Wardline section, which is the inverse of the consumer-first property the dual-
+accept design exists to deliver, and that blast radius has not been measured. It
+is a producer/consumer contract question — what the runtime tripwire should be —
+and belongs in the declaration-surface spec, not in a reader's guard. See filigree
+for the owning issue.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -28,6 +63,22 @@ import yaml
 # location and descriptor-version semantics are not yet pinned by Wardline.
 # Tracked: filigree clarion-6ab5668d82.
 EXPECTED_DESCRIPTOR_VERSION = "wardline-generic-2"
+# Pre-schema descriptors (no `schema:` key) are the v1 era by definition.
+_DEFAULT_SCHEMA = "wardline.vocabulary/v1"
+# The ONLY schema whose ``facets:`` grammar this reader knows. Kept separate from
+# ACCEPTED_DESCRIPTORS on purpose: acceptance is keyed on the (schema, version)
+# PAIR, while knowing how to read a section is a property of the SCHEMA alone.
+_FACETS_SCHEMA = "wardline.vocabulary/v2"
+# Consumer-first dual-accept (wardline declaration-surface-v2 §13.1 item 1): the
+# (schema, version) PAIR gates acceptance — generic-3 is accepted only under
+# the v2 schema, BEFORE wardline emits it. EXPECTED_DESCRIPTOR_VERSION remains
+# the canonical current version for messages/tooling and the manifest pin.
+ACCEPTED_DESCRIPTORS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("wardline.vocabulary/v1", "wardline-generic-2"),
+        ("wardline.vocabulary/v2", "wardline-generic-3"),
+    }
+)
 
 # Weft store consolidation (ADR-046): sibling runtime state lives under the
 # shared ``.weft/<member>/`` dotdir, so the Wardline descriptor is read only from
@@ -55,12 +106,23 @@ class DescriptorEntry:
 @dataclass(frozen=True)
 class WardlineVocabulary:
     version: str
+    schema: str
     source: DescriptorSource
     confidence_basis: Literal["descriptor", "descriptor_version_skew"]
     entries_by_name: dict[str, DescriptorEntry]
+    facets_by_name: dict[str, DescriptorEntry]
 
     def entry_for_decorator(self, qualified_name: str) -> DescriptorEntry | None:
         return self.entries_by_name.get(qualified_name.rsplit(".", 1)[-1])
+
+    def facet_for_decorator(self, qualified_name: str) -> DescriptorEntry | None:
+        """A facet from the v2 ``facets:`` section.
+
+        Facets are decorators too, but they seed no taint
+        (declaration-surface-v2 §7), so they resolve through their own lookup
+        and can never be mistaken for a trust claim.
+        """
+        return self.facets_by_name.get(qualified_name.rsplit(".", 1)[-1])
 
 
 @dataclass(frozen=True)
@@ -143,17 +205,15 @@ def _state_from_text(text: str, source: DescriptorSource) -> WardlineDescriptorS
         vocabulary = _parse_descriptor(descriptor, source)
     except (OSError, yaml.YAMLError, _DescriptorError):
         return WardlineDescriptorState(status="absent", reason="invalid_descriptor")
-    if vocabulary.version != EXPECTED_DESCRIPTOR_VERSION:
+    if (vocabulary.schema, vocabulary.version) not in ACCEPTED_DESCRIPTORS:
         return WardlineDescriptorState(
             status="version_skew",
             descriptor_version=vocabulary.version,
             source=source,
-            vocabulary=WardlineVocabulary(
-                version=vocabulary.version,
-                source=source,
-                confidence_basis="descriptor_version_skew",
-                entries_by_name=vocabulary.entries_by_name,
-            ),
+            # `replace` rather than a field-by-field rebuild: a hand-copied
+            # rebuild silently drops every newly-parsed field (it would have
+            # discarded `facets_by_name` the moment it was added).
+            vocabulary=replace(vocabulary, confidence_basis="descriptor_version_skew"),
         )
     return WardlineDescriptorState(
         status="enabled",
@@ -173,6 +233,13 @@ def _parse_descriptor(descriptor: Any, source: DescriptorSource) -> WardlineVoca
         msg = "descriptor must carry string version and list entries"
         raise _DescriptorError(msg)
 
+    schema = descriptor.get("schema")
+    if schema is None:
+        schema = _DEFAULT_SCHEMA
+    if not isinstance(schema, str):
+        msg = "descriptor schema must be a string when present"
+        raise _DescriptorError(msg)
+
     entries_by_name: dict[str, DescriptorEntry] = {}
     for raw_entry in entries:
         entry = _parse_entry(raw_entry)
@@ -182,9 +249,11 @@ def _parse_descriptor(descriptor: Any, source: DescriptorSource) -> WardlineVoca
         entries_by_name[entry.canonical_name] = entry
     return WardlineVocabulary(
         version=version,
+        schema=schema,
         source=source,
         confidence_basis="descriptor",
         entries_by_name=entries_by_name,
+        facets_by_name=_parse_facets(descriptor, schema, entries_by_name),
     )
 
 
@@ -210,3 +279,87 @@ def _parse_entry(raw_entry: Any) -> DescriptorEntry:
         group=group,
         attrs=cast("dict[str, str]", dict(attrs)),
     )
+
+
+def _parse_facets(
+    descriptor: dict[Any, Any],
+    schema: str,
+    entries_by_name: dict[str, DescriptorEntry],
+) -> dict[str, DescriptorEntry]:
+    """Parse the ``wardline.vocabulary/v2`` ``facets:`` section.
+
+    Facets are decorators that seed no taint (declaration-surface-v2 §7), which
+    is why Wardline gives them their own section — and why Loomweave gives them
+    their own map rather than folding them into ``entries_by_name``. An absent
+    section yields an empty map, so every v1 descriptor parses unchanged.
+
+    A ``facets:`` key under the v1 schema is a contract violation, not an
+    unknown key: v1's shape is known exactly, and honouring a section the
+    declared schema does not have is the fail-open this reader exists to avoid.
+
+    Under any OTHER schema — one this reader has never accepted — the section is
+    neither honoured nor rejected: it is simply not interpreted. The guard used to
+    key on "is v1?", which meant every unaccepted schema fell through into v2's
+    facet grammar, so a ``wardline.vocabulary/v3`` descriptor had its facets parsed
+    and attributed under rules written for a different version. That is
+    interpret-what-you-do-not-understand, the mirror of accept-and-ignore, and it
+    failed in both directions at once: a v3 facet whose shape legitimately differed
+    (non-empty ``attrs``, or a mapping instead of a list) was rejected hard enough
+    to drop the WHOLE descriptor to ``absent``, losing entries the reader could
+    have kept. Returning an empty map restores the pre-facets posture for unknown
+    schemas — ``version_skew`` with entries preserved and no facets claimed —
+    which is the honest answer: this reader does not know what a v3 ``facets:``
+    section means, and says so by declining to read it rather than by guessing.
+    """
+    if "facets" not in descriptor:
+        return {}
+    # A TUPLE, not a set: membership against a set requires a hashable operand,
+    # and this reader parses untrusted YAML. `schema` is str-checked upstream so a
+    # set would be safe today, but the containment test should not be one refactor
+    # away from raising TypeError on a descriptor that ought to degrade.
+    if schema not in (_FACETS_SCHEMA, _DEFAULT_SCHEMA):
+        return {}
+    if schema == _DEFAULT_SCHEMA:
+        msg = "descriptor carries a facets section under the v1 schema"
+        raise _DescriptorError(msg)
+    facets = descriptor["facets"]
+    if not isinstance(facets, list):
+        msg = "descriptor facets must be a list"
+        raise _DescriptorError(msg)
+
+    facets_by_name: dict[str, DescriptorEntry] = {}
+    for raw_facet in facets:
+        facet = _parse_facet(raw_facet)
+        if facet.canonical_name in facets_by_name:
+            msg = f"duplicate Wardline descriptor facet: {facet.canonical_name}"
+            raise _DescriptorError(msg)
+        if facet.canonical_name in entries_by_name:
+            msg = f"Wardline descriptor facet collides with an entry: {facet.canonical_name}"
+            raise _DescriptorError(msg)
+        facets_by_name[facet.canonical_name] = facet
+    return facets_by_name
+
+
+def _parse_facet(raw_facet: Any) -> DescriptorEntry:
+    """Parse one ``facets:`` element.
+
+    A facet carries ``canonical_name`` and ``group`` but stamps no
+    ``_wardline_*`` level attributes — Wardline registers facets in their own
+    vocabulary group precisely so ``apply_marker`` rejects level attributes and
+    a facet can never become a trust claim (§7). ``attrs`` is therefore absent
+    or an explicit empty mapping; a facet carrying attrs fails closed rather
+    than being honoured as a trust marker.
+    """
+    if not isinstance(raw_facet, dict):
+        msg = "descriptor facet must be a mapping"
+        raise _DescriptorError(msg)
+    canonical_name = raw_facet.get("canonical_name")
+    group = raw_facet.get("group")
+    if not isinstance(canonical_name, str) or not isinstance(group, int):
+        msg = "descriptor facet must carry canonical_name and group"
+        raise _DescriptorError(msg)
+    attrs = raw_facet.get("attrs", {})
+    if not isinstance(attrs, dict) or attrs:
+        msg = "descriptor facet must not carry attrs (a facet seeds no taint)"
+        raise _DescriptorError(msg)
+    return DescriptorEntry(canonical_name=canonical_name, group=group, attrs={})

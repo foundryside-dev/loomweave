@@ -75,12 +75,27 @@ const MIGRATIONS: &[Migration] = &[
         name: "0012_plugin_syntax_finding_contract",
         sql: include_str!("../migrations/0012_plugin_syntax_finding_contract.sql"),
     },
+    Migration {
+        version: 13,
+        name: "0013_source_file_resolution_coverage",
+        sql: include_str!("../migrations/0013_source_file_resolution_coverage.sql"),
+    },
+    Migration {
+        version: 14,
+        name: "0014_resolution_coverage_redispatch_budget",
+        sql: include_str!("../migrations/0014_resolution_coverage_redispatch_budget.sql"),
+    },
+    Migration {
+        version: 15,
+        name: "0015_plugin_resolver_environment",
+        sql: include_str!("../migrations/0015_plugin_resolver_environment.sql"),
+    },
 ];
 
 /// Highest migration version known to this build. Mirrored into the
 /// `SQLite` `user_version` header (STO-02) so a future-built database is
 /// refused at open instead of silently corrupting state.
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
 
 const _CURRENT_SCHEMA_VERSION_MATCHES_LAST_MIGRATION: () = {
     // Compile-time check: `CURRENT_SCHEMA_VERSION` must equal the highest

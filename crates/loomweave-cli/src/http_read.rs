@@ -174,6 +174,10 @@ pub struct WorktreeHttpGate {
     /// MCP gate's `fallback_command` diagnostic
     /// (`loomweave_mcp::worktree_bootstrap::fallback_argv`).
     pub fallback_argv: Vec<String>,
+    /// `serve` could not launch the automatic analyzer. While no real run row
+    /// exists, HTTP must report a terminal operator-action state rather than
+    /// an indefinitely retryable build.
+    pub bootstrap_spawn_failed: bool,
 }
 
 #[derive(Clone)]
@@ -598,6 +602,21 @@ pub(crate) async fn require_worktree_ready(
     let Some(gate) = state.worktree_gate.clone() else {
         return next.run(request).await;
     };
+    // Confirmed-missing only (`Path::try_exists` semantics): a transient
+    // stat error must not be answered as a permanent, non-retryable 410 —
+    // see `loomweave_mcp::source_root_confirmed_missing`.
+    if loomweave_mcp::source_root_confirmed_missing(&state.project_root) {
+        let body = serde_json::json!({
+            "error": format!(
+                "the worktree source root {} no longer exists; this serve session cannot answer for a removed tree",
+                state.project_root.display()
+            ),
+            "code": ErrorCode::SourceRootMissing,
+            "retryable": false,
+            "source_root": state.project_root.display().to_string(),
+        });
+        return (StatusCode::GONE, Json(body)).into_response();
+    }
     let read = state
         .readers
         .with_reader(|conn| {
@@ -609,8 +628,15 @@ pub(crate) async fn require_worktree_ready(
     let Ok(read) = read else {
         return next.run(request).await;
     };
+    let bootstrap_spawn_failed = gate.bootstrap_spawn_failed && read.run_id.is_none();
     let (code, retryable, message) = match read.readiness {
         WorktreeReadiness::Ready => return next.run(request).await,
+        WorktreeReadiness::Building if bootstrap_spawn_failed => (
+            ErrorCode::BootstrapSpawnFailed,
+            false,
+            "the linked-worktree bootstrap process could not be spawned; run the fallback \
+             command manually",
+        ),
         WorktreeReadiness::Building => (
             ErrorCode::IndexBuilding,
             true,
@@ -632,6 +658,11 @@ pub(crate) async fn require_worktree_ready(
         "code": code,
         "retryable": retryable,
         "run_id": read.run_id,
+        "bootstrap_state": if bootstrap_spawn_failed {
+            Some("bootstrap-spawn-failed")
+        } else {
+            None
+        },
         "fallback_command": gate.fallback_argv,
     });
     let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
@@ -1190,6 +1221,7 @@ mod tests {
     fn spawn_gated_server(
         db_path: &std::path::Path,
         project_root: &std::path::Path,
+        bootstrap_spawn_failed: bool,
     ) -> (HttpReadServer, std::net::SocketAddr) {
         use loomweave_federation::config::HttpReadConfig;
         use std::net::TcpListener;
@@ -1215,6 +1247,7 @@ mod tests {
             port_path,
             &config,
             Some(WorktreeHttpGate {
+                bootstrap_spawn_failed,
                 fallback_argv: vec![
                     "loomweave".to_owned(),
                     "worktree".to_owned(),
@@ -1242,7 +1275,7 @@ mod tests {
         let db_path = tempdir.path().join("loomweave.db");
         schema_init_db(&db_path);
 
-        let (server, bind) = spawn_gated_server(&db_path, tempdir.path());
+        let (server, bind) = spawn_gated_server(&db_path, tempdir.path(), false);
 
         let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
         assert_eq!(status, 503, "building store must gate data routes: {body}");
@@ -1261,6 +1294,82 @@ mod tests {
         server.shutdown().expect("shutdown HTTP read API");
     }
 
+    #[test]
+    fn gated_http_rejects_graph_reads_after_the_worktree_source_is_removed() {
+        let _guard = http_runtime_test_guard();
+        let tempdir = tempfile::tempdir().expect("temp fixture root");
+        let project_root = tempdir.path().join("linked-worktree");
+        std::fs::create_dir(&project_root).expect("create linked worktree root");
+        let db_path = tempdir.path().join("isolated-store.db");
+        schema_init_db(&db_path);
+        seed_run(&db_path, "run-1", "completed");
+        let (server, bind) = spawn_gated_server(&db_path, &project_root, false);
+
+        std::fs::remove_dir_all(&project_root).expect("simulate git worktree remove");
+        let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
+
+        assert_eq!(
+            status, 410,
+            "a removed source tree is not a readable project: {body}"
+        );
+        assert_eq!(body["code"], "SOURCE_ROOT_MISSING", "{body}");
+        assert_eq!(body["retryable"], false, "{body}");
+        assert_eq!(
+            body["source_root"],
+            project_root.display().to_string(),
+            "the diagnostic must identify the disappeared worktree"
+        );
+
+        server.shutdown().expect("shutdown HTTP read API");
+    }
+
+    #[test]
+    fn gated_http_reports_a_known_bootstrap_spawn_failure_as_non_retryable() {
+        let _guard = http_runtime_test_guard();
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("loomweave.db");
+        schema_init_db(&db_path);
+        let (server, bind) = spawn_gated_server(&db_path, tempdir.path(), true);
+
+        let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
+
+        assert_eq!(
+            status, 503,
+            "a failed launcher keeps graph routes unavailable: {body}"
+        );
+        assert_eq!(body["code"], "BOOTSTRAP_SPAWN_FAILED", "{body}");
+        assert_eq!(body["retryable"], false, "{body}");
+        assert_eq!(body["bootstrap_state"], "bootstrap-spawn-failed", "{body}");
+
+        server.shutdown().expect("shutdown HTTP read API");
+    }
+
+    #[test]
+    fn gated_http_reports_progress_after_manual_recovery_starts() {
+        let _guard = http_runtime_test_guard();
+        let tempdir = tempfile::tempdir().expect("temp project root");
+        let db_path = tempdir.path().join("loomweave.db");
+        schema_init_db(&db_path);
+        seed_run(&db_path, "manual-recovery", "running");
+        let (server, bind) = spawn_gated_server(&db_path, tempdir.path(), true);
+
+        let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
+
+        assert_eq!(
+            status, 503,
+            "the live rebuild still gates data reads: {body}"
+        );
+        assert_eq!(body["code"], "INDEX_BUILDING", "{body}");
+        assert_eq!(body["retryable"], true, "{body}");
+        assert_eq!(body["run_id"], "manual-recovery", "{body}");
+        assert!(
+            body["bootstrap_state"].is_null(),
+            "a real recovery run supersedes the failed automatic spawn: {body}"
+        );
+
+        server.shutdown().expect("shutdown HTTP read API");
+    }
+
     /// clarion-ecf882f230: a failed-only build history answers 503
     /// `INDEX_BUILD_FAILED` (not retryable) with the fallback command.
     #[test]
@@ -1271,7 +1380,7 @@ mod tests {
         schema_init_db(&db_path);
         seed_run(&db_path, "run-failed", "failed");
 
-        let (server, bind) = spawn_gated_server(&db_path, tempdir.path());
+        let (server, bind) = spawn_gated_server(&db_path, tempdir.path(), false);
 
         let (status, body) = http_get_json(&bind, "/api/v1/files?path=demo.py&language=python");
         assert_eq!(status, 503, "failed-only history must gate data routes");

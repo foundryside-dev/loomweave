@@ -61,8 +61,11 @@ const METADATA_FILE_NAME: &str = "metadata.json";
 /// stores under) and, cross-crate, with `loomweave-cli`'s bin target
 /// (`install.rs`'s `--force` guard and `doctor.rs`'s additive worktree-store
 /// report both need the same directory name; worktree-index Task 7), so this
-/// is `pub` rather than `pub(crate)`.
-pub const WORKTREES_DIR_NAME: &str = "worktrees";
+/// is `pub` rather than `pub(crate)`. The name itself is defined in
+/// loomweave-core (`worktree::paths`), where it also anchors the analyze
+/// lock-path contract `analyze_lock.rs` and `loomweave-mcp` share; this
+/// re-export keeps the CLI's existing import paths working.
+pub use loomweave_core::worktree::WORKTREES_DIR_NAME;
 
 const ISO8601_MILLIS_UTC: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
@@ -222,6 +225,13 @@ pub enum StoreError {
 ///
 /// [kind]: loomweave_core::worktree::WorktreeKind::Linked
 pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, StoreError> {
+    ensure_isolated_store_with(ctx, WorktreesRoot::open)
+}
+
+fn ensure_isolated_store_with(
+    ctx: &WorktreeContext,
+    open_root: impl FnOnce(&Path) -> io::Result<WorktreesRoot>,
+) -> Result<StoreOutcome, StoreError> {
     let Some(stable_id) = ctx.stable_id.as_deref() else {
         return Ok(StoreOutcome::NotIsolated);
     };
@@ -235,12 +245,6 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
         path: worktrees_dir.clone(),
         source,
     })?;
-    let root =
-        WorktreesRoot::open(&worktrees_dir).map_err(|source| StoreError::OpenWorktreesRoot {
-            path: worktrees_dir.clone(),
-            source,
-        })?;
-
     let candidate = worktrees_dir.join(stable_id);
     // `WorktreeContext::resolve` already rejects a non-UTF-8 `source_root`
     // before this context could exist.
@@ -255,11 +259,7 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
             create_fresh(&candidate, stable_id, admin_identity, &source_root)?;
             return Ok(StoreOutcome::Created);
         }
-        MetadataState::Valid(meta)
-            if meta.schema == METADATA_SCHEMA
-                && meta.stable_id == stable_id
-                && meta.source_root == source_root =>
-        {
+        MetadataState::Valid(meta) if metadata_matches(&meta, stable_id, &source_root) => {
             return Ok(StoreOutcome::Reused);
         }
         // Name exactly which of the three validity checks failed
@@ -296,6 +296,14 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
         reason = %reason,
         "worktree-isolated store failed validation; deleting and rebuilding"
     );
+    // Pin the confined root only for the sole operation that needs it:
+    // deleting a stale store. First-time creation and ordinary reuse remain
+    // available on kernels where `openat2` is unavailable, while stale
+    // deletion still fails closed through `WorktreesRoot`.
+    let root = open_root(&worktrees_dir).map_err(|source| StoreError::OpenWorktreesRoot {
+        path: worktrees_dir.clone(),
+        source,
+    })?;
     match root.delete_worktree_store(stable_id, &reason) {
         DeleteOutcome::Deleted => {}
         DeleteOutcome::Refused(refusal) => {
@@ -313,6 +321,55 @@ pub fn ensure_isolated_store(ctx: &WorktreeContext) -> Result<StoreOutcome, Stor
 
     create_fresh(&candidate, stable_id, admin_identity, &source_root)?;
     Ok(StoreOutcome::Rebuilt { reason })
+}
+
+/// The three-way validity check [`ensure_isolated_store`] gates reuse on —
+/// extracted so [`isolated_store_metadata_is_current`] answers the *same*
+/// question a lock-holding analyze's `ensure_isolated_store` call is about to
+/// answer, and the two can never drift apart.
+fn metadata_matches(meta: &Metadata, stable_id: &str, source_root: &str) -> bool {
+    meta.schema == METADATA_SCHEMA && meta.stable_id == stable_id && meta.source_root == source_root
+}
+
+/// Whether the isolated store's on-disk `metadata.json` currently matches
+/// `ctx` — i.e. whether [`ensure_isolated_store`] run against this context
+/// would take the `Reused` path rather than delete-and-rebuild the store.
+///
+/// This is the *generation probe* `serve`'s Held-analyze-lock wait uses
+/// (`serve.rs::bootstrap_linked_worktree`): while another process holds the
+/// analyze lock and may be mid-`ensure_isolated_store`, a bare "does the db
+/// have a schema" check can pass against the OLD, about-to-be-deleted
+/// generation. Metadata that matches proves the opposite: a rebuilding
+/// holder deletes the whole store directory (metadata included) *before*
+/// `create_fresh` writes the new `metadata.json`, so a matching file means
+/// the current on-disk generation is either being reused as-is or is the
+/// freshly rebuilt one — never the doomed one. (A holder running a
+/// *different binary version* with a different `METADATA_SCHEMA` can still
+/// disagree with this probe; callers must treat `false` as "wait", not
+/// "corrupt".)
+///
+/// Returns `true` for a non-isolated context (no `stable_id`): there is no
+/// per-worktree generation to be stale. Returns `false` when the store (or
+/// its metadata) does not exist yet — the holder has not finished creating
+/// it.
+#[must_use]
+pub fn isolated_store_metadata_is_current(ctx: &WorktreeContext) -> bool {
+    let Some(stable_id) = ctx.stable_id.as_deref() else {
+        return true;
+    };
+    let Some(source_root) = ctx.source_root.to_str() else {
+        // `WorktreeContext::resolve` rejects non-UTF-8 source roots, so this
+        // is unreachable in practice; fail toward "not current" (wait).
+        return false;
+    };
+    let candidate = ctx
+        .repository_store
+        .join(WORKTREES_DIR_NAME)
+        .join(stable_id);
+    match read_metadata(&candidate) {
+        MetadataState::Valid(meta) => metadata_matches(&meta, stable_id, source_root),
+        MetadataState::Absent | MetadataState::Unreadable(_) => false,
+    }
 }
 
 /// The result of reading `<candidate>/metadata.json`.
@@ -404,7 +461,9 @@ fn initialise_db(db_path: &Path) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{METADATA_FILE_NAME, StoreOutcome, ensure_isolated_store};
+    use super::{
+        METADATA_FILE_NAME, StoreOutcome, ensure_isolated_store, isolated_store_metadata_is_current,
+    };
     use loomweave_core::worktree::WorktreeContext;
     use std::path::Path;
     use std::process::Command;
@@ -449,6 +508,56 @@ mod tests {
         WorktreeContext::resolve(&linked).expect("resolves as Linked")
     }
 
+    /// The generation probe `serve`'s Held-lock wait relies on: it must
+    /// answer exactly the reuse-vs-rebuild question `ensure_isolated_store`
+    /// itself would, so a store a lock-holding analyze is about to
+    /// delete-and-rebuild can never read as "current".
+    #[test]
+    fn metadata_is_current_tracks_ensure_reuse_vs_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+
+        // Before the store exists there is no current generation.
+        assert!(
+            !isolated_store_metadata_is_current(&ctx),
+            "an absent store must not read as current"
+        );
+
+        ensure_isolated_store(&ctx).expect("ensure store");
+        assert!(
+            isolated_store_metadata_is_current(&ctx),
+            "a freshly created store must read as current"
+        );
+
+        // Corrupt the metadata — exactly the state that makes the next
+        // `ensure_isolated_store` delete-and-rebuild the whole directory.
+        std::fs::write(ctx.effective_store.join(METADATA_FILE_NAME), "not json").unwrap();
+        assert!(
+            !isolated_store_metadata_is_current(&ctx),
+            "a store whose metadata fails validation is a doomed generation, never current"
+        );
+
+        let outcome = ensure_isolated_store(&ctx).expect("rebuild store");
+        assert!(matches!(outcome, StoreOutcome::Rebuilt { .. }));
+        assert!(
+            isolated_store_metadata_is_current(&ctx),
+            "the rebuilt generation must read as current again"
+        );
+    }
+
+    #[test]
+    fn metadata_is_current_is_vacuously_true_without_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        let ctx = WorktreeContext::resolve(&repo).expect("resolves as Main");
+        assert!(ctx.stable_id.is_none(), "fixture sanity: not isolated");
+        assert!(
+            isolated_store_metadata_is_current(&ctx),
+            "no stable_id means no per-worktree generation to be stale"
+        );
+    }
+
     #[test]
     fn creating_a_store_writes_plain_metadata() {
         let tmp = tempfile::tempdir().unwrap();
@@ -486,6 +595,45 @@ mod tests {
             user_version > 0,
             "eagerly-created loomweave.db must have schema applied (user_version > 0)"
         );
+    }
+
+    #[test]
+    fn first_time_creation_does_not_require_the_confined_deletion_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        let opener_called = std::cell::Cell::new(false);
+
+        let outcome = super::ensure_isolated_store_with(&ctx, |_| {
+            opener_called.set(true);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "openat2 unavailable",
+            ))
+        })
+        .expect("an absent store only needs creation");
+
+        assert_eq!(outcome, StoreOutcome::Created);
+        assert!(!opener_called.get(), "no stale store exists to delete");
+    }
+
+    #[test]
+    fn valid_reuse_does_not_require_the_confined_deletion_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = linked_context(tmp.path());
+        ensure_isolated_store(&ctx).expect("create initial store");
+        let opener_called = std::cell::Cell::new(false);
+
+        let outcome = super::ensure_isolated_store_with(&ctx, |_| {
+            opener_called.set(true);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "openat2 unavailable",
+            ))
+        })
+        .expect("valid metadata only needs reuse");
+
+        assert_eq!(outcome, StoreOutcome::Reused);
+        assert!(!opener_called.get(), "no stale store exists to delete");
     }
 
     #[test]
@@ -534,6 +682,48 @@ mod tests {
             ctx.source_root.to_str().unwrap().to_owned(),
             "rebuilt metadata must describe the ACTUAL resolved worktree, not the stale one"
         );
+    }
+
+    #[test]
+    fn shared_override_does_not_delete_another_repositorys_live_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_store = tmp.path().join("shared-store");
+        let mut contexts = Vec::new();
+
+        for parent in ["a", "b"] {
+            let repo = tmp.path().join(parent).join("repo");
+            init_repo(&repo, "main");
+            std::fs::write(
+                repo.join("weft.toml"),
+                format!(
+                    "[loomweave]\nstore_dir = {:?}\n",
+                    shared_store.to_str().unwrap()
+                ),
+            )
+            .unwrap();
+            git(&repo, &["add", "weft.toml"]);
+            git(&repo, &["commit", "-qm", "configure shared store"]);
+            git(
+                &repo,
+                &["worktree", "add", "-q", "-b", "feature", "../linked"],
+            );
+            contexts.push(
+                WorktreeContext::resolve(&tmp.path().join(parent).join("linked"))
+                    .expect("resolve linked worktree"),
+            );
+        }
+        std::fs::create_dir_all(&shared_store).unwrap();
+
+        ensure_isolated_store(&contexts[0]).expect("create first repository store");
+        let marker = contexts[0].effective_store.join("first-repository.marker");
+        std::fs::write(&marker, "live\n").unwrap();
+        ensure_isolated_store(&contexts[1]).expect("create second repository store");
+
+        assert!(
+            marker.is_file(),
+            "initializing the second repository must not rebuild-delete the first repository's live index"
+        );
+        assert_ne!(contexts[0].effective_store, contexts[1].effective_store);
     }
 
     #[test]
