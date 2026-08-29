@@ -186,7 +186,24 @@ MAX_CONSECUTIVE_SPAWN_DEFERRALS = 50
 MAX_CONSECUTIVE_TIMEOUT_FILES = 3
 MAX_REFERENCE_SITES_PER_FILE = 2000
 PYRIGHT_INIT_TIMEOUT_SECS = 30.0
-PYRIGHT_CALL_TIMEOUT_SECS = 5.0
+# Per-LSP-request grant. The FIRST callHierarchy/definition query after
+# ``didOpen`` on a large file makes pyright analyse the whole file before it
+# answers; on 5k-line modules that warm-up alone exceeded 5 s, so one timeout
+# aborted the calls pass with almost no evidence (clarion-5d83413c36) even
+# though the file completed in ~11 s total once the first answer landed.
+# ADR-035 —
+# Basis: elspeth 2026-08-29, guided.py / pipeline_planner.py /
+#   guided_chat_atomic.py: 5 s → 28/3/20 calls edges (degraded); 120 s →
+#   633/461/153 edges (complete) in 11.2 / 12.6 / 10.3 s wall.
+# Override surface: none (internal); ``PyrightSession(call_timeout_secs=...)``
+#   for tests.
+# Retune trigger: a ``pyright_timeout`` whose single request exceeded the
+#   grant on a file that later completes with a larger grant.
+# Coupling: the effective grant is ``min(this, remaining file budget)``
+#   (``_budgeted_timeout``), so ``PYRIGHT_FILE_TIMEOUT_*`` and the host's
+#   ``DEFAULT_PLUGIN_FILE_TIMEOUT`` (120 s) still bound a wedged server; the
+#   ADR-057 wedge breaker counts files, not requests, and is unaffected.
+PYRIGHT_CALL_TIMEOUT_SECS = 30.0
 # Per-file wall-clock budget, shared by the calls and references passes for
 # one file: ``base + per_function * n_functions``, capped
 # (clarion-7f527d3d32). A flat budget starved large, heavily-typed files

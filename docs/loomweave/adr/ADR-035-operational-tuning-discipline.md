@@ -131,7 +131,7 @@ MAX_CONTENT_LENGTH               (8 MiB,  server.py:48,   wire-paired-with Conte
 MAX_FILES_PER_PYRIGHT_SESSION    (25,     server.py:49,   operational; see §3 below)
 MAX_PYRIGHT_RESTARTS_PER_RUN     (3,      pyright_session.py:44,  policy-paired with the 25-file recycle)
 PYRIGHT_INIT_TIMEOUT_SECS        (30.0,   pyright_session.py:46)
-PYRIGHT_CALL_TIMEOUT_SECS        (5.0,    pyright_session.py:47)
+PYRIGHT_CALL_TIMEOUT_SECS        (30.0,   pyright_session.py, four-axis declared — clarion-5d83413c36)
 PYRIGHT_FILE_TIMEOUT_SECS        (3.0,    pyright_session.py:48)
 MAX_REFERENCE_SITES_PER_FILE     (2000,   pyright_session.py:45)
 MAX_UNRESOLVED_CALLEE_EXPR_BYTES (512,    pyright_session.py:43, wire-paired-with Rust same-name)

@@ -33,6 +33,7 @@ from loomweave_plugin_python.pyright_session import (
     MAX_CONSECUTIVE_SPAWN_DEFERRALS,
     MAX_CONSECUTIVE_TIMEOUT_FILES,
     MAX_PYRIGHT_RESTARTS_PER_RUN,
+    PYRIGHT_CALL_TIMEOUT_SECS,
     PYRIGHT_FILE_TIMEOUT_CAP_SECS,
     LspTimeoutError,
     LspTransportClosedError,
@@ -2215,6 +2216,31 @@ def test_pyright_session_file_deadline_scales_with_function_count(tmp_path: Path
     # The deadline is memoised per file: the references pass re-asks with the
     # same path and must share the calls pass's budget, not restart it.
     assert session._deadline_for_file(path, n_functions=1000) == deadline  # noqa: SLF001
+
+
+def test_default_call_timeout_admits_a_large_file_warm_up_query() -> None:
+    """clarion-5d83413c36: pyright's FIRST callHierarchy query on a big file
+    triggers full analysis of that file and took >5 s on elspeth's 5k-line
+    modules, aborting the whole calls pass. 30 s covers the measured warm-up
+    (the files then finish in ~11 s total) while the file budget still bounds
+    a wedged server.
+    """
+    assert PYRIGHT_CALL_TIMEOUT_SECS == 30.0
+    assert PYRIGHT_CALL_TIMEOUT_SECS < PYRIGHT_FILE_TIMEOUT_CAP_SECS
+
+
+def test_budgeted_timeout_grants_the_call_timeout_when_the_file_budget_is_larger(
+    tmp_path: Path,
+) -> None:
+    session = PyrightSession(tmp_path, executable=sys.executable)
+    path = tmp_path / "big.py"
+    # 290 functions → base 10 + 0.25*290 = 82.5 s file budget (< 90 s cap).
+    deadline = session._deadline_for_file(path, n_functions=290)  # noqa: SLF001
+    grant = session._budgeted_timeout(deadline)  # noqa: SLF001
+    assert 30.0 - 0.5 <= grant <= 30.0
+    # ...and never more than what is left of the file budget.
+    session._file_deadlines[path] = session._now() + 4.0  # noqa: SLF001
+    assert session._budgeted_timeout(session._file_deadlines[path]) <= 4.0  # noqa: SLF001
 
 
 def test_pyright_session_file_deadline_is_capped_for_very_large_files(tmp_path: Path) -> None:
