@@ -12,6 +12,10 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.5.0] — 2026-08-29
+
 ### Added
 
 - **Isolated worktree indexes.** A linked Git worktree now gets its own
@@ -1545,7 +1549,7 @@ normative.
   Filigree's intake (WP9-B) is deferred per the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md).
   `issues_for(id)` (the WP9-A binding for reading from Filigree) ships in 1.0.
   *(WP9-B core shipped post-1.0 — see the Filigree-finding-emission entry under
-  [Unreleased]; only the REQ-FINDING-05/-06 lifecycle tail remains deferred.)*
+  [1.5.0]; only the REQ-FINDING-05/-06 lifecycle tail remains deferred.)*
 - **HTTP file language inference** uses persisted plugin manifest language when
   available, with a narrow core-extension fallback for files that predate
   manifest capture.
@@ -1590,7 +1594,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...v1.5.0
 [1.2.1]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/foundryside-dev/loomweave/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/foundryside-dev/loomweave/compare/v1.0.1...v1.1.0
