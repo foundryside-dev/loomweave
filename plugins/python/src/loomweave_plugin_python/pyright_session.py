@@ -14,7 +14,12 @@ is decided by WHICH catch-site caught the failure, never by message text:
   host re-dispatches when the interpreter fingerprint changes.
 - ``pyright_timeout`` -- this file's own per-query or file budget expired
   while pyright stayed alive. Self-inflicted (``collateral=False``). A single
-  timeout does not restart: the process is slow, not dead. A streak of
+  timeout does not restart: the process is slow, not dead. In the calls pass
+  a per-query timeout with file budget remaining skips ONLY that function
+  (its sites disclosed as unresolved, the abandoned computation cancelled via
+  ``$/cancelRequest``) and continues -- one pathological function no longer
+  forfeits the rest of the file (clarion-bf3986e301); the pass aborts, and
+  the facet degrades, only when the FILE budget itself is spent. A streak of
   ``MAX_CONSECUTIVE_TIMEOUT_FILES`` consecutive files whose calls pass timed
   out is read as a wedged-but-alive process and restarted once, charged to
   the run-level ``MAX_PYRIGHT_RESTARTS_PER_RUN`` budget; the streak's files
@@ -245,6 +250,15 @@ PYRIGHT_SHUTDOWN_TIMEOUT_SECS = 5.0
 # handing a small one a budget it will never use.
 PYRIGHT_FILE_TIMEOUT_BASE_SECS = 10.0
 PYRIGHT_FILE_TIMEOUT_PER_FUNCTION_SECS = 0.25
+# Second scaling axis (clarion-bf3986e301): pyright's evaluation work tracks
+# the amount of CODE it must type-check, not the def count. elspeth's
+# tool_batch.py (2,354 lines, 17 defs -- one a 1,199-line nested closure) got
+# base + 17 * 0.25 ~= 14 s under the per-function-only budget: starved the
+# same way the flat budget starved ML files (clarion-7f527d3d32). The budget
+# takes ``max(per_function * n_functions, per_line * n_lines)`` -- for the
+# common shape (many small defs) the per-function term still governs, and the
+# cap (90 s) still bounds the monster files.
+PYRIGHT_FILE_TIMEOUT_PER_LINE_SECS = 0.03
 # The host watchdog (``DEFAULT_PLUGIN_FILE_TIMEOUT`` in
 # crates/loomweave-cli/src/analyze.rs) kills an ``analyze_file`` call at 120s.
 # Stay well under it so the plugin always hands back the partial evidence it
@@ -276,6 +290,21 @@ FILE_DEADLINE_TERMINAL_SAFETY_MARGIN_SECS = 15.0
 # A respawn with less real headroom than this is pointless: pyright's
 # initialize handshake rarely completes faster on a machine that just lost it.
 MIN_RESPAWN_HEADROOM_SECS = 5.0
+# The raising sites spell this label; the calls-pass skip logic keys on it to
+# tell "the FILE's budget is spent" (abort the pass) from "one query's grant
+# expired" (skip the function and continue, clarion-bf3986e301).
+FILE_BUDGET_EXPIRED_METHOD = "analyze_file budget"
+# Write bound for the fire-and-forget ``$/cancelRequest`` notify after an
+# abandoned query: a healthy pyright drains it in microseconds; a full pipe
+# means cancellation is hopeless anyway and the suppressed write timeout
+# leaves the file budget to backstop.
+CANCEL_WRITE_DEADLINE_SECS = 2.0
+# Last stderr bytes attached to a FINDING_PYRIGHT_RESTART's metadata
+# (clarion-bf3986e301 direction 3): enough to carry a crash reason (OOM kill,
+# node stack trace tail) without bloating the findings channel. The in-memory
+# tail keeps ``STDERR_TAIL_LIMIT`` for future probes; findings carry the tail
+# end of it.
+STDERR_TAIL_FINDING_LIMIT_BYTES = 512
 
 
 def resolve_host_file_watchdog_secs(environ: Mapping[str, str] | None = None) -> float:
@@ -460,6 +489,7 @@ class PyrightSession:
         call_timeout_secs: float = PYRIGHT_CALL_TIMEOUT_SECS,
         file_timeout_base_secs: float = PYRIGHT_FILE_TIMEOUT_BASE_SECS,
         file_timeout_per_function_secs: float = PYRIGHT_FILE_TIMEOUT_PER_FUNCTION_SECS,
+        file_timeout_per_line_secs: float = PYRIGHT_FILE_TIMEOUT_PER_LINE_SECS,
         file_timeout_cap_secs: float = PYRIGHT_FILE_TIMEOUT_CAP_SECS,
         max_restarts_per_run: int = MAX_PYRIGHT_RESTARTS_PER_RUN,
         max_total_restarts_per_run: int = MAX_TOTAL_PYRIGHT_RESTARTS_PER_RUN,
@@ -496,6 +526,7 @@ class PyrightSession:
         self.call_timeout_secs = call_timeout_secs
         self.file_timeout_base_secs = file_timeout_base_secs
         self.file_timeout_per_function_secs = file_timeout_per_function_secs
+        self.file_timeout_per_line_secs = file_timeout_per_line_secs
         self.file_timeout_cap_secs = file_timeout_cap_secs
         self.max_restarts_per_run = max_restarts_per_run
         self.max_total_restarts_per_run = max_total_restarts_per_run
@@ -511,6 +542,12 @@ class PyrightSession:
         self._stderr_thread: threading.Thread | None = None
         self._stderr_tail = bytearray()
         self._next_id = 1
+        # The id of the request currently awaiting its response, for
+        # ``$/cancelRequest`` after an abandoned per-query timeout
+        # (clarion-bf3986e301). Set by ``_request`` before the write, cleared
+        # on a completed round-trip; a timeout leaves it set for the skip
+        # path to consume.
+        self._request_id_in_flight: int | None = None
         self._findings: list[Finding] = []
         self._function_indexes: dict[Path, _FunctionIndex] = {}
         self._index_parse_latency_ms: list[int] = []
@@ -637,11 +674,15 @@ class PyrightSession:
                 coverage=self._unavailable_coverage(),
             )
 
-        deadline = self._deadline_for_file(path, len(index.functions))
+        deadline = self._deadline_for_file(
+            path,
+            len(index.functions),
+            index.source.count("\n") + 1,
+        )
         latency_started = time.perf_counter()
         coverage = FacetCoverage()
         try:
-            edges, unresolved, skipped_builtin, unresolved_sites, abort = (
+            edges, unresolved, skipped_builtin, unresolved_sites, skipped_timeouts, abort = (
                 self._resolve_with_pyright(
                     path,
                     index,
@@ -674,6 +715,15 @@ class PyrightSession:
             unresolved_sites = []
             coverage = FacetCoverage.degraded("pyright_restarting", transient=True, collateral=True)
         else:
+            if abort is None and skipped_timeouts and skipped_timeouts == len(requested):
+                # EVERY function timed out: nothing was genuinely answered, so
+                # a ``complete`` claim would be a lie -- and it would reset the
+                # consecutive-timeout streak the ADR-057 wedge breaker needs to
+                # spot a wedged-but-alive server that survives per-function
+                # skip-and-continue. Partial timeouts (some functions resolved)
+                # stay complete with the skipped functions disclosed as
+                # unresolved sites + findings.
+                coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
             if abort is not None:
                 if abort.reason == "pyright_timeout":
                     self._record_finding(
@@ -819,7 +869,11 @@ class PyrightSession:
                 coverage=self._unavailable_coverage(),
             )
 
-        deadline = self._deadline_for_file(path, len(index.functions))
+        deadline = self._deadline_for_file(
+            path,
+            len(index.functions),
+            index.source.count("\n") + 1,
+        )
         latency_started = time.perf_counter()
         coverage = FacetCoverage()
         self._reference_pass_timed_out = False
@@ -886,7 +940,7 @@ class PyrightSession:
         index: _FunctionIndex,
         functions: Sequence[_FunctionInfo],
         deadline: float,
-    ) -> tuple[list[CallsRawEdge], int, int, list[UnresolvedCallSite], _CallPassAbort | None]:
+    ) -> tuple[list[CallsRawEdge], int, int, list[UnresolvedCallSite], int, _CallPassAbort | None]:
         uri = path.as_uri()
         self._notify(
             "textDocument/didOpen",
@@ -906,6 +960,7 @@ class PyrightSession:
             skipped_builtin_total = 0
             unresolved_sites: list[UnresolvedCallSite] = []
             abort: _CallPassAbort | None = None
+            skipped_function_timeouts = 0
             remaining_start = len(functions)
             # A bare call to an unshadowed builtin (``len(x)``, ``str(v)``,
             # ``isinstance(...)``) can never resolve to a project entity, so
@@ -923,9 +978,43 @@ class PyrightSession:
                         deadline,
                     )
                 except LspTimeoutError as exc:
-                    abort = _CallPassAbort("pyright_timeout", exc.method, str(exc))
-                    remaining_start = position
-                    break
+                    if (
+                        isinstance(exc, LspWriteTimeoutError)
+                        or exc.method == FILE_BUDGET_EXPIRED_METHOD
+                        or self._file_budget_expired(deadline)
+                    ):
+                        # The FILE's window is spent (or the pipe itself timed
+                        # out, where a "next function" would block the same
+                        # way): abort with the evidence gathered so far.
+                        abort = _CallPassAbort("pyright_timeout", exc.method, str(exc))
+                        remaining_start = position
+                        break
+                    # One query's grant expired with file budget remaining:
+                    # this function alone is unresolved. Cancel the abandoned
+                    # computation so pyright can serve the next function, and
+                    # continue the pass (clarion-bf3986e301) -- one
+                    # pathological function no longer forfeits the file.
+                    self._cancel_in_flight_request()
+                    self._record_finding(
+                        FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT,
+                        f"pyright query timed out: {exc.method}; skipped "
+                        f"{function.entity_id} and continued the calls pass",
+                        method=exc.method,
+                        function=function.entity_id,
+                        skipped_function=True,
+                    )
+                    counted, skipped = _unresolved_call_site_total_for_function(
+                        function,
+                        set(),
+                        builtin_names,
+                    )
+                    unresolved_total += counted
+                    skipped_builtin_total += skipped
+                    unresolved_sites.extend(
+                        _unresolved_call_sites_for_function(index, function, set(), builtin_names),
+                    )
+                    skipped_function_timeouts += 1
+                    continue
                 except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
                     abort = _CallPassAbort(self._in_flight_failure_reason(exc), None, str(exc))
                     remaining_start = position
@@ -969,7 +1058,14 @@ class PyrightSession:
                     unresolved_sites.extend(
                         _unresolved_call_sites_for_function(index, function, set(), builtin_names),
                     )
-            return edges, unresolved_total, skipped_builtin_total, unresolved_sites, abort
+            return (
+                edges,
+                unresolved_total,
+                skipped_builtin_total,
+                unresolved_sites,
+                skipped_function_timeouts,
+                abort,
+            )
         finally:
             # The pipe may be the very thing that just failed: a notify over a
             # dead transport must not raise and discard the evidence above.
@@ -1211,11 +1307,11 @@ class PyrightSession:
         """The clock every deadline lives on (monotonic; overridable in tests)."""
         return time.monotonic()
 
-    def _deadline_for_file(self, path: Path, n_functions: int) -> float:
+    def _deadline_for_file(self, path: Path, n_functions: int, n_lines: int) -> float:
         existing = self._file_deadlines.get(path)
         if existing is not None:
             return existing
-        deadline = self._now() + self._file_timeout_for(n_functions)
+        deadline = self._now() + self._file_timeout_for(n_functions, n_lines)
         anchor = self._file_started_at.get(path)
         if anchor is not None:
             # A spawn paid before this point (first file, or a restart) has
@@ -1241,15 +1337,17 @@ class PyrightSession:
             return math.inf
         return self._watchdog_ceiling_for(anchor) - self._now()
 
-    def _file_timeout_for(self, n_functions: int) -> float:
-        budget = self.file_timeout_base_secs + self.file_timeout_per_function_secs * n_functions
-        return min(budget, self.file_timeout_cap_secs)
+    def _file_timeout_for(self, n_functions: int, n_lines: int) -> float:
+        scaled = max(
+            self.file_timeout_per_function_secs * n_functions,
+            self.file_timeout_per_line_secs * n_lines,
+        )
+        return min(self.file_timeout_base_secs + scaled, self.file_timeout_cap_secs)
 
     def _budgeted_timeout(self, deadline: float) -> float:
         remaining = deadline - self._now()
         if remaining <= 0:
-            method = "analyze_file budget"
-            raise LspTimeoutError(method)
+            raise LspTimeoutError(FILE_BUDGET_EXPIRED_METHOD)
         return min(self.call_timeout_secs, remaining)
 
     def _write_deadline(self, deadline: float) -> float:
@@ -1269,8 +1367,7 @@ class PyrightSession:
 
     def _ensure_file_budget(self, deadline: float) -> None:
         if self._file_budget_expired(deadline):
-            method = "analyze_file budget"
-            raise LspTimeoutError(method)
+            raise LspTimeoutError(FILE_BUDGET_EXPIRED_METHOD)
 
     def _file_budget_expired(self, deadline: float) -> bool:
         return deadline - self._now() <= 0
@@ -1411,6 +1508,7 @@ class PyrightSession:
             file_attributed_restart_count=self._run_state.file_attributed_restart_count,
             attribution="arrival",
             reason=reason,
+            stderr_tail=self._stderr_tail_snapshot(),
         )
 
     def _charge_run_level_restart(self, reason: str, *, attribution: str) -> bool:
@@ -1522,8 +1620,14 @@ class PyrightSession:
         """
         state = self._run_state
         state.file_attributed_restart_count += 1
+        # Snapshot before any restart path terminates the process, which
+        # clears the tail (clarion-bf3986e301: attribute the NEXT crash class
+        # without a manual probe).
+        stderr_tail = self._stderr_tail_snapshot()
         if self._total_restart_budget_exceeded():
-            self._record_in_flight_restart_finding(reason, outcome="cap_exceeded")
+            self._record_in_flight_restart_finding(
+                reason, outcome="cap_exceeded", stderr_tail=stderr_tail
+            )
             self._trip_total_restart_cap(reason)
             return
         outcome = self._restart_process_for_file(path)
@@ -1532,9 +1636,11 @@ class PyrightSession:
             # spawn path already triaged it -- a transient deferral (next file
             # retries) or a permanent disable with its OWN ``disabled_reason``.
             state.file_attributed_respawn_failure_count += 1
-        self._record_in_flight_restart_finding(reason, outcome=outcome)
+        self._record_in_flight_restart_finding(reason, outcome=outcome, stderr_tail=stderr_tail)
 
-    def _record_in_flight_restart_finding(self, reason: str, *, outcome: str) -> None:
+    def _record_in_flight_restart_finding(
+        self, reason: str, *, outcome: str, stderr_tail: str
+    ) -> None:
         self._record_finding(
             FINDING_PYRIGHT_RESTART,
             f"pyright subprocess died during this file's request; {outcome}",
@@ -1543,6 +1649,7 @@ class PyrightSession:
             attribution="in_flight",
             outcome=outcome,
             reason=reason,
+            stderr_tail=stderr_tail,
         )
 
     def _restart_process_for_file(self, path: Path) -> _RestartOutcome:
@@ -1845,6 +1952,7 @@ class PyrightSession:
         # One deadline for the whole request, write included: the write is the
         # half that blocked on elspeth (clarion-e3ab8a4131).
         deadline = self._now() + timeout_secs
+        self._request_id_in_flight = request_id
         self._write_message(
             {
                 "jsonrpc": "2.0",
@@ -1870,6 +1978,7 @@ class PyrightSession:
                 continue
             if response.get("id") != request_id:
                 continue
+            self._request_id_in_flight = None
             if "error" in response:
                 raise LspTransportClosedError(str(response["error"]))
             process.poll()
@@ -2048,6 +2157,42 @@ class PyrightSession:
         self._function_indexes[resolved] = index
         self._index_parse_latency_ms.append(index.parse_latency_ms)
         return index
+
+    def _cancel_in_flight_request(self) -> None:
+        """Fire-and-forget ``$/cancelRequest`` for an abandoned query.
+
+        pyright honours LSP cancellation between evaluation steps, so telling
+        it the caller stopped waiting lets it drop the pathological
+        computation and answer the NEXT function's query instead of chewing
+        through the rest of the file's budget behind our back
+        (clarion-bf3986e301). Best-effort by design: a transport already
+        broken, or a pipe already full, means the file budget backstops --
+        every failure here is suppressed. (A partial-write timeout still
+        invalidates the frame inside ``_write_message``, so a corrupted
+        stream is put down rather than limped on.)
+        """
+        request_id = self._request_id_in_flight
+        self._request_id_in_flight = None
+        if request_id is None:
+            return
+        with contextlib.suppress(
+            LspTimeoutError, LspTransportClosedError, BrokenPipeError, OSError
+        ):
+            self._notify(
+                "$/cancelRequest",
+                {"id": request_id},
+                deadline=self._now() + CANCEL_WRITE_DEADLINE_SECS,
+            )
+
+    def _stderr_tail_snapshot(self) -> str:
+        """The last stderr bytes of the CURRENT process, finding-sized.
+
+        Callers must snapshot BEFORE ``_terminate_process``, which clears the
+        tail so two processes' stderr never mix in one finding.
+        """
+        return bytes(self._stderr_tail[-STDERR_TAIL_FINDING_LIMIT_BYTES:]).decode(
+            "utf-8", "replace"
+        )
 
     def _record_finding(self, subcode: str, message: str, **metadata: object) -> None:
         self._findings.append(
