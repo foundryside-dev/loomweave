@@ -51,6 +51,7 @@ from loomweave_plugin_python.pyright_session import (
     _build_function_index,
     _CallSite,
     _containing_function_id,
+    _descendant_pids,
     _filter_relation_candidates,
     _FunctionIndex,
     _FunctionInfo,
@@ -235,6 +236,48 @@ def test_resolved_call_site_keys_map_pyright_token_ranges_onto_ast_callee_ranges
         (3, 4, 3, 13),
         (4, 4, 5, 9),
     }
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc children walk is Linux-only")
+def test_terminate_process_kills_the_language_server_grandchild(tmp_path: Path) -> None:
+    """clarion-ebf404dfbb: the venv's pyright-langserver is a Python wrapper
+    around a node grandchild; killing the wrapper alone orphaned node (seen
+    at 103% CPU, ppid 1, for 1h40m). ``_terminate_process`` must take the
+    subtree.
+    """
+    wrapper = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 300 & wait"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 5
+    grandchildren: list[int] = []
+    while not grandchildren and time.monotonic() < deadline:
+        grandchildren = _descendant_pids(wrapper.pid)
+        time.sleep(0.02)
+    assert len(grandchildren) == 1, "the sleep must be visible as a descendant"
+    sleeper = grandchildren[0]
+
+    session = PyrightSession(tmp_path)
+    session._process = wrapper  # noqa: SLF001
+    session._terminate_process()  # noqa: SLF001
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(sleeper, 0)
+        except ProcessLookupError:
+            break
+        # Still present: it may be a zombie awaiting its (dead) parent's
+        # reap by init; a live sleeper would still show state S.
+        stat = Path(f"/proc/{sleeper}/stat").read_text(encoding="ascii")
+        if ") Z " in stat:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"grandchild {sleeper} outlived _terminate_process")
+    assert wrapper.poll() is not None
 
 
 def _finding_codes(result_findings: Sequence[Finding]) -> set[str]:

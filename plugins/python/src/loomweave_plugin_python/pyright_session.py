@@ -1697,9 +1697,20 @@ class PyrightSession:
         process = self._process
         self._process = None
         if process is not None and process.poll() is None:
+            # The venv's ``pyright-langserver`` is a Python wrapper around a
+            # ``node`` grandchild; killing the wrapper alone leaves node
+            # behind, reparented to pid 1 and -- when wedged, which is why we
+            # are killing it -- spinning forever (clarion-ebf404dfbb). Walk
+            # the descendants BEFORE the kill (they are reparented the moment
+            # the wrapper dies), then kill wrapper and descendants.
+            pid = getattr(process, "pid", None)
+            descendants = _descendant_pids(pid) if isinstance(pid, int) else []
             process.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=2)
+            for pid in descendants:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=2)
             self._stderr_thread = None
@@ -2550,6 +2561,38 @@ def _reference_accumulator_to_edge(
     if len(candidates) > 1:
         edge["properties"] = {"candidates": candidates}
     return edge
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    """Every live descendant of ``pid`` via ``/proc/<pid>/task/*/children``.
+
+    Linux only (``CONFIG_PROC_CHILDREN``, on by default); elsewhere, or once
+    the process is gone, the walk yields nothing and only the direct child
+    is killed -- the pre-existing behaviour.
+    """
+    found: list[int] = []
+    frontier = [pid]
+    while frontier:
+        parent = frontier.pop()
+        task_dir = Path("/proc") / str(parent) / "task"
+        try:
+            tasks = list(task_dir.iterdir())
+        except OSError:
+            continue
+        for task in tasks:
+            try:
+                listed = (task / "children").read_text(encoding="ascii").split()
+            except OSError:
+                continue
+            for raw in listed:
+                try:
+                    child = int(raw)
+                except ValueError:
+                    continue
+                if child not in found:
+                    found.append(child)
+                    frontier.append(child)
+    return found
 
 
 def _function_call_sites(

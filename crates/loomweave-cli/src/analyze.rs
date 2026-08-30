@@ -6379,7 +6379,7 @@ fn spawn_plugin_watchdog(
                     "plugin exceeded lifecycle deadline; killing child",
                 );
                 if let Ok(mut c) = child.lock() {
-                    let _ = c.kill();
+                    let _ = loomweave_core::kill_process_tree(&mut c);
                 }
             }
         }
@@ -6492,7 +6492,7 @@ fn spawn_live_plugin(
         // must not be misreported as an OOM event (the handshake-failure
         // reason already tells the operator story).
         let child_already_exited = matches!(child.try_wait(), Ok(Some(_)));
-        let _ = child.kill();
+        let _ = loomweave_core::kill_process_tree(&mut child);
         let mut findings = host.take_findings();
         drop(host);
         let reason = if handshake_timed_out {
@@ -6890,11 +6890,11 @@ fn run_plugin_blocking(
                 "best-effort host shutdown failed; falling back to kill()",
             );
             if let Ok(mut c) = child.lock() {
-                let _ = c.kill();
+                let _ = loomweave_core::kill_process_tree(&mut c);
             }
         }
     } else if let Ok(mut c) = child.lock() {
-        let _ = c.kill();
+        let _ = loomweave_core::kill_process_tree(&mut c);
     }
 
     // Stop and join the watchdog before reaping so it no longer holds the child
@@ -7033,7 +7033,7 @@ fn reap_and_classify_exit_with_timeout(
                 timeout_ms = timeout.as_millis(),
                 "plugin did not exit before reap timeout; killing child",
             );
-            if let Err(e) = child.kill() {
+            if let Err(e) = loomweave_core::kill_process_tree(child) {
                 tracing::warn!(
                     plugin_id = %plugin_id,
                     error = %e,
