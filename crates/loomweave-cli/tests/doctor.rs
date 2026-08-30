@@ -2732,7 +2732,7 @@ fn doctor_fix_installs_missing_git_sync_hooks() {
     let hooks = check(&json, "hook.git_sync");
     assert_eq!(hooks["status"], "ok", "{hooks}");
     assert_eq!(code, 0, "{json}");
-    let hook_file = project.path().join(".git/hooks/post-commit");
+    let hook_file = project.path().join(".git/hooks/post-merge");
     let content = std::fs::read_to_string(hook_file).unwrap();
     assert!(
         content.contains("loomweave hook git-sync --path ."),

@@ -22,6 +22,11 @@ use fs2::FileExt;
 use loomweave_core::worktree::WorktreeContext;
 
 const LOCK_FILE_NAME: &str = "loomweave.lock";
+/// Sibling of the lock file: its presence is a queued refresh request
+/// (clarion-78d75e45c9). Written by a hook that found the lock held, consumed
+/// by the next analyze to take the lock, drained by the running analyze on
+/// exit. Content-free — only existence carries meaning.
+const PENDING_MARKER_EXTENSION: &str = "pending";
 
 /// RAII guard holding the analyze lock. Drop releases the OS lock.
 ///
@@ -66,6 +71,34 @@ fn lock_path_for_context(ctx: &WorktreeContext) -> Result<PathBuf> {
     } else {
         Ok(ctx.effective_store.join(LOCK_FILE_NAME))
     }
+}
+
+fn pending_marker_path_for_context(ctx: &WorktreeContext) -> Result<PathBuf> {
+    Ok(lock_path_for_context(ctx)?.with_extension(PENDING_MARKER_EXTENSION))
+}
+
+/// Queue a refresh for the analyze currently holding this context's lock.
+/// Idempotent; a second request while one is queued is the same request.
+///
+/// # Errors
+///
+/// The marker path cannot be resolved or the file cannot be created.
+pub(crate) fn request_pending_analyze(ctx: &WorktreeContext) -> Result<PathBuf> {
+    let path = pending_marker_path_for_context(ctx)?;
+    File::create(&path).with_context(|| format!("touch {}", path.display()))?;
+    Ok(path)
+}
+
+/// Whether a refresh request is queued for this context. Fail-soft: an
+/// unresolvable marker path reads as "nothing queued".
+pub(crate) fn pending_analyze_requested(ctx: &WorktreeContext) -> bool {
+    pending_marker_path_for_context(ctx).is_ok_and(|path| path.exists())
+}
+
+/// Consume a queued refresh request, returning whether one was queued.
+/// Fail-soft: an unresolvable path or a removal error reads as "none".
+pub(crate) fn take_pending_analyze(ctx: &WorktreeContext) -> bool {
+    pending_marker_path_for_context(ctx).is_ok_and(|path| std::fs::remove_file(path).is_ok())
 }
 
 pub(crate) fn try_acquire_analyze_lock_for_context(
