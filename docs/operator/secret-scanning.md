@@ -27,6 +27,20 @@ The hash is SHA-1 over the matched literal bytes, matching `detect-secrets` v1.x
 
 A matching baseline entry suppresses the block and records `LMWV-INFRA-SECRET-BASELINE-MATCH` for audit.
 
+## Inline Allow-Marker
+
+For a false positive that is easier to justify in place than in the baseline, put an allow-marker comment on the flagged line itself:
+
+```python
+FIXTURE_KEY = "AKIAIOSFODNN7EXAMPLE"  # secret-scan: allow-this-line
+```
+
+`# pragma: allowlist secret` (the `detect-secrets` inline convention) is honoured as well. The marker applies to its own line only, suppresses every detector that fired on that line, and records `LMWV-INFRA-SECRET-INLINE-ALLOW-MATCH` (INFO) for audit — the marker's diff in code review is the justification surface, exactly as a baseline diff is.
+
+## Digest Fixtures
+
+Hex strings of exactly a common digest's length (SHA-1/224/256/384/512, BLAKE2b/BLAKE3) on a line that names a digest context (`sha*`, `blake*`, `digest`, `checksum`, `hash`, `fingerprint`, `etag` — case-insensitive) are treated as digest fixtures and skipped by the high-entropy-hex rule. Only that rule is gated: named credential patterns and keyword-assignment detection still fire on such lines. Lockfile `integrity:` fields and bare `commit <sha>` lines carry no digest keyword and still need a baseline entry or an inline marker.
+
 ## Override Flag
 
 Use `--allow-unredacted-secrets` only when you deliberately accept that detected secrets may reach the LLM provider.

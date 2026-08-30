@@ -14,6 +14,7 @@ use serde_json::json;
 use super::SecretScanOutcome;
 
 pub(super) const SECRET_DETECTED: &str = "LMWV-SEC-SECRET-DETECTED";
+pub(super) const INLINE_ALLOW_MATCH: &str = "LMWV-INFRA-SECRET-INLINE-ALLOW-MATCH";
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingFinding {
@@ -83,6 +84,7 @@ pub(super) enum FindingConfidence {
     ScoredPattern(f64),
     ScoredEntropy(f64),
     Baseline,
+    InlineAllowMarker,
     OperatorOverride,
     Schema,
     Unknown,
@@ -92,7 +94,9 @@ impl FindingConfidence {
     fn value(self) -> Option<f64> {
         match self {
             Self::ScoredPattern(value) | Self::ScoredEntropy(value) => Some(value),
-            Self::Baseline | Self::OperatorOverride | Self::Schema => Some(1.0),
+            Self::Baseline | Self::InlineAllowMarker | Self::OperatorOverride | Self::Schema => {
+                Some(1.0)
+            }
             Self::Unknown => None,
         }
     }
@@ -102,6 +106,7 @@ impl FindingConfidence {
             Self::ScoredPattern(_) => Some("pattern"),
             Self::ScoredEntropy(_) => Some("entropy"),
             Self::Baseline => Some("baseline"),
+            Self::InlineAllowMarker => Some("inline_allow_marker"),
             Self::OperatorOverride => Some("operator_override"),
             Self::Schema => Some("baseline_schema"),
             Self::Unknown => None,
@@ -183,6 +188,39 @@ pub(super) fn secret_detected_finding(file: &Path, detection: &Detection) -> Pen
         },
         message: format!(
             "{} detected in {}:{}",
+            detection.rule_id,
+            file.display(),
+            detection.line_number
+        ),
+        evidence: json!({
+            "file_path": file,
+            "line_number": detection.line_number,
+            "rule": detection.rule_id,
+            "hashed_secret_hex": detection.hashed_secret.to_string(),
+        }),
+        site: format!(
+            "{}:{}:{}",
+            file.display(),
+            detection.line_number,
+            detection.rule_id
+        ),
+    }
+}
+
+/// Audit fact for a detection an inline `# secret-scan: allow-this-line`
+/// (or detect-secrets `# pragma: allowlist secret`) marker suppressed:
+/// mirrors the baseline-match trail so `filigree` reviews enumerate inline
+/// allow decisions the same way they enumerate baseline entries. The site
+/// keeps the `file:line:detector` shape of the sibling detection row.
+pub(super) fn inline_allow_match_finding(file: &Path, detection: &Detection) -> PendingFinding {
+    PendingFinding {
+        file_path: file.to_path_buf(),
+        rule_id: INLINE_ALLOW_MATCH,
+        kind: FindingKind::Fact,
+        severity: FindingSeverity::Info,
+        confidence: FindingConfidence::InlineAllowMarker,
+        message: format!(
+            "Inline allow-marker suppressed {} in {}:{}",
             detection.rule_id,
             file.display(),
             detection.line_number

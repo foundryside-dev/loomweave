@@ -96,8 +96,10 @@ fn entropy_detection_has_expected_bounds() {
         "secret = AbCdEfGhIjKlMnOpQrStUvWxYz123456+/",
         "HighEntropyBase64",
     );
+    // Deliberately keyword-free name and a non-digest length (66 chars) so
+    // this pins the raw entropy bound, not the digest-context carve-out.
     assert_detects(
-        "digest = 0123456789abcdefABCDEF0123456789abcdefABCDEF0123456789abcdef",
+        "value = 0123456789abcdefABCDEF0123456789abcdefABCDEF0123456789abcdef",
         "HighEntropyHex",
     );
     assert_not_detects(
@@ -565,6 +567,13 @@ results:
 /// Tightening the entropy floor risks missing real secrets that happen to
 /// look hash-like; the baseline path is per-(rule,file,line,hash) and is the
 /// existing escape hatch ADR-013 §"Operator baseline" describes.
+///
+/// ADR-013 amendment 2026-08-31 carves out one narrow context ahead of the
+/// baseline: an exact-digest-length candidate on a line naming a digest
+/// keyword (`digest_context_hex_suppression_requires_keyword_and_exact_digest_length`
+/// below). The `"integrity":` and `commit ` contexts asserted here carry no
+/// such keyword, so they still fire and still rely on the baseline —
+/// unchanged, and now load-bearing as the boundary of that carve-out.
 #[test]
 fn high_entropy_hex_fires_on_lockfile_shas_but_baseline_suppresses_them() {
     // Lockfile integrity hash (npm-style sha512-truncated to hex) and a git
@@ -635,6 +644,74 @@ results:
     );
     assert_eq!(lockfile_result.fired_entries.len(), 1);
     assert_eq!(git_result.fired_entries.len(), 1);
+}
+
+#[test]
+fn inline_allow_marker_partitions_detections_on_its_line_only() {
+    let scanner = Scanner::new();
+    let buf =
+        b"key = 'AKIAIOSFODNN7EXAMPLE'  # secret-scan: allow-this-line\nother = 'AKIAIOSFODNN7EXAMPLE'\n";
+    let scan = scanner.scan_bytes_partitioned(buf);
+
+    assert_eq!(scan.inline_allowed.len(), 1);
+    assert_eq!(scan.inline_allowed[0].line_number, 1);
+    assert_eq!(scan.detections.len(), 1);
+    assert_eq!(scan.detections[0].line_number, 2);
+    // `scan_bytes` stays policy-free: both lines report raw.
+    assert_eq!(scanner.scan_bytes(buf).len(), 2);
+}
+
+#[test]
+fn detect_secrets_pragma_allowlist_marker_is_honoured() {
+    let scanner = Scanner::new();
+    let buf = b"token = 'ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ'  # pragma: allowlist secret\n";
+    let scan = scanner.scan_bytes_partitioned(buf);
+
+    assert!(
+        scan.detections.is_empty(),
+        "pragma-marked line must not report: {:?}",
+        scan.detections
+    );
+    assert!(
+        scan.inline_allowed
+            .iter()
+            .any(|detection| detection.rule_id == "GitHubPat"),
+        "suppressed detections must surface for audit: {:?}",
+        scan.inline_allowed
+    );
+}
+
+#[test]
+fn digest_context_hex_suppression_requires_keyword_and_exact_digest_length() {
+    let hex64 = "19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2";
+
+    // Digest keyword + exact digest length → suppressed at the detector.
+    assert_not_detects(&format!("expected_sha256 = \"{hex64}\""), "HighEntropyHex");
+    assert_not_detects(&format!("content_hash: \"{hex64}\""), "HighEntropyHex");
+    assert_not_detects(&format!("GOLDEN_BLAKE3 = \"{hex64}\""), "HighEntropyHex");
+    // No keyword on the line → still fires.
+    assert_detects(&format!("value = \"{hex64}\""), "HighEntropyHex");
+    // Keyword but a non-digest length → still fires.
+    assert_detects(
+        &format!("expected_sha256 = \"{hex64}ab\""),
+        "HighEntropyHex",
+    );
+    // Keyword on an adjacent line does not suppress.
+    assert_detects(
+        &format!("# sha256 fixtures\nvalue = \"{hex64}\""),
+        "HighEntropyHex",
+    );
+}
+
+#[test]
+fn digest_keyword_line_still_flags_keyword_credentials() {
+    let hex64 = "19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2";
+    // A credential assigned to a secret-keyword name stays flagged even on a
+    // digest-keyword line: only the entropy rule is gated by digest context.
+    let line = format!("secret = \"{hex64}\"  # sha256-shaped");
+
+    assert_detects(&line, "ContextualCredential");
+    assert_not_detects(&line, "HighEntropyHex");
 }
 
 fn hex20(hash: HashedSecret) -> String {
