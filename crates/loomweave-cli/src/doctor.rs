@@ -1769,7 +1769,7 @@ fn check_git_hooks_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     match crate::git_hooks::git_sync_hook_state(project_root) {
         GitHookState::Present => DoctorJsonCheck::ok(
             "hook.git_sync",
-            "git-sync hooks present (post-commit/post-checkout/post-merge)",
+            "git-sync hooks present (post-checkout/post-merge)",
         ),
         GitHookState::NoGitDir => DoctorJsonCheck::ok(
             "hook.git_sync",
@@ -3058,9 +3058,7 @@ fn check_hook(project_root: &Path, fix: bool) -> Tally {
 fn check_git_hooks(project_root: &Path, fix: bool) -> Tally {
     use crate::git_hooks::GitHookState;
     match crate::git_hooks::git_sync_hook_state(project_root) {
-        GitHookState::Present => {
-            ok("git-sync hooks present (post-commit/post-checkout/post-merge)")
-        }
+        GitHookState::Present => ok("git-sync hooks present (post-checkout/post-merge)"),
         // Not a git repo: git-sync has nowhere to live and that is fine.
         GitHookState::NoGitDir => ok("no git repository; git-sync hooks not applicable"),
         state => {

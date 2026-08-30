@@ -100,7 +100,7 @@ fn main() -> Result<()> {
                     std::process::exit(78);
                 }
             };
-            rt.block_on(analyze::run_with_options(
+            rt.block_on(analyze::run_with_options_draining_pending(
                 path,
                 analyze::AnalyzeOptions {
                     config_path: config,
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                rt.block_on(analyze::run_with_options(
+                rt.block_on(analyze::run_with_options_draining_pending(
                     resolved,
                     analyze::AnalyzeOptions {
                         no_incremental,

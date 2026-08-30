@@ -48,7 +48,12 @@ enum BackgroundAnalyzeOutcome {
     Started,
     /// The analyze advisory lock is already held: another analyze is running
     /// (or landing its final transaction) and ours would have been a no-op.
-    AlreadyRunning { lock_path: PathBuf },
+    AlreadyRunning {
+        lock_path: PathBuf,
+        /// Whether a follow-up refresh was queued for the running analyze to
+        /// drain on exit.
+        queued: bool,
+    },
     /// The spawn itself failed; the manual nudge already printed stands.
     SpawnFailed,
 }
@@ -67,7 +72,17 @@ fn probe_then_spawn_background_analyze(project_root: &Path) -> BackgroundAnalyze
     if let Ok(ctx) = loomweave_core::worktree::WorktreeContext::resolve(project_root) {
         match crate::analyze_lock::try_acquire_analyze_lock_for_context(&ctx) {
             Ok(crate::analyze_lock::TryAnalyzeLock::Held { lock_path }) => {
-                return BackgroundAnalyzeOutcome::AlreadyRunning { lock_path };
+                // Queue a follow-up instead of forking a child doomed to lose
+                // the lock: the running analyze drains the request on exit
+                // (clarion-78d75e45c9), so a burst of N events costs two runs.
+                let queued = match crate::analyze_lock::request_pending_analyze(&ctx) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "could not queue a follow-up analyze");
+                        false
+                    }
+                };
+                return BackgroundAnalyzeOutcome::AlreadyRunning { lock_path, queued };
             }
             Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(guard)) => drop(guard),
             Err(err) => {
@@ -95,12 +110,17 @@ fn background_analyze_line(outcome: &BackgroundAnalyzeOutcome) -> Option<String>
              Loomweave once it finishes to pick up the refreshed graph."
                 .to_owned(),
         ),
-        BackgroundAnalyzeOutcome::AlreadyRunning { lock_path } => Some(format!(
+        BackgroundAnalyzeOutcome::AlreadyRunning { lock_path, queued } => Some(format!(
             "Loomweave: index is stale — another `loomweave analyze` is already running \
-             (holds {}); nothing was started. No need to run it manually; re-query \
+             (holds {}); nothing was started{}. No need to run it manually; re-query \
              Loomweave once it finishes (project_status_get reports the run) to pick \
              up the refreshed graph.",
-            lock_path.display()
+            lock_path.display(),
+            if *queued {
+                ", a follow-up refresh is queued to run when it finishes"
+            } else {
+                ""
+            }
         )),
         BackgroundAnalyzeOutcome::SpawnFailed => None,
     }
@@ -518,9 +538,20 @@ mod tests {
         let _held = crate::analyze_lock::acquire_analyze_lock_for_context(&ctx).unwrap();
 
         let outcome = probe_then_spawn_background_analyze(root.path());
-        let BackgroundAnalyzeOutcome::AlreadyRunning { lock_path } = &outcome else {
+        let BackgroundAnalyzeOutcome::AlreadyRunning { lock_path, queued } = &outcome else {
             panic!("held lock must report AlreadyRunning, got {outcome:?}");
         };
+        assert!(*queued, "a held lock must queue a follow-up refresh");
+        assert!(
+            crate::analyze_lock::pending_analyze_requested(&ctx),
+            "the pending marker must exist beside the lock"
+        );
+        assert!(crate::analyze_lock::take_pending_analyze(&ctx));
+        assert!(!crate::analyze_lock::pending_analyze_requested(&ctx));
+        assert!(
+            !crate::analyze_lock::take_pending_analyze(&ctx),
+            "taking twice is a no-op"
+        );
         assert!(
             lock_path.starts_with(&loomweave_dir),
             "{}",

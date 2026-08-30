@@ -12,8 +12,42 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+### Changed
+
+- **Git-sync hooks refresh on merge and branch switch, not on every commit.**
+  The managed block now lives in `post-merge` and `post-checkout` (gated on
+  git's branch-switch flag, so `git checkout -- file` does not fire it);
+  `post-commit` is retired and `install` / `doctor --fix` remove Loomweave's
+  block from it, leaving foreign hook content byte-for-byte. A commit changes
+  no file content the index has not already seen through file drift; on a
+  shared checkout per-commit refreshes were 12–148 runs a day over an
+  unchanged tree. (clarion-78d75e45c9, ADR-060)
+
+### Added
+
+- **`analyze` no-indexed-changes fast path.** When the only drift is the
+  commit clock and `git diff <analyzed>..HEAD` touches no ingested path or
+  analyzer input (`loomweave.yaml`, the secrets baseline, `.env*` sidecars),
+  the run settles at HEAD in about a second — no walk, no plugin, no
+  clustering — recording a completed run that carries the base run's stats
+  under a `fast_path` block. Any in-place edit, staged indexed change,
+  untracked source, or observation blindness runs the full pipeline;
+  `--no-incremental` bypasses it. (clarion-78d75e45c9, ADR-060)
+- **Refresh requests coalesce.** A git-sync or SessionStart hook that finds
+  an analyze already running queues a follow-up (a marker beside the analyze
+  lock) that the running analyze drains on exit, instead of forking a child
+  that loses the lock; a burst of N events costs two runs. The hook line says
+  "a follow-up refresh is queued". (clarion-78d75e45c9)
+
 ### Fixed
 
+- **A per-file plugin timeout no longer fails the whole run.** The host now
+  skips the file that hit the watchdog (its stored rows are retained and it
+  re-dispatches next run), records the `LMWV-PY-TIMEOUT` finding with the
+  file path, respawns the plugin, and continues — bounded to three kills per
+  plugin per run, after which a kill is terminal as before. On a shared
+  checkout 9 of 39 runs in one day had failed this way, each persisting
+  nothing. (clarion-78d75e45c9, ADR-060)
 - **Python: instantiating a class is now a `calls` edge to the class.**
   pyright reports `Name(...)` as an outgoing call whose target is the class
   item itself; the plugin only looked that target up in its function index and

@@ -55,6 +55,7 @@ use duplicate_guard::{DUPLICATE_LOCATOR_RULE_ID, DuplicateLocatorGuard};
 
 mod classifier_coverage;
 mod duplicate_guard;
+mod fast_path;
 use loomweave_analysis::{
     ClusterAlgorithm, ClusterConfig, ModuleEdge, ModuleGraph, cluster_hash, cluster_modules,
 };
@@ -336,6 +337,43 @@ pub(crate) struct AnalyzeOptions {
     pub(crate) json: bool,
 }
 
+/// Upper bound on follow-up runs one `analyze` process drains after its own
+/// run: a request queued while we ran is honoured, and a request queued while
+/// THAT ran is honoured once more; beyond that the next hook or session start
+/// picks it up. Bounded so a tree that changes faster than it can be analyzed
+/// cannot pin one process forever.
+const MAX_PENDING_FOLLOW_UPS: usize = 2;
+
+/// [`run_with_options`], then drain any refresh request that was queued while
+/// it ran (clarion-78d75e45c9): the git-sync / session-start hooks touch a
+/// pending marker instead of forking a child doomed to lose the analyze lock,
+/// and the running analyze picks the request up here on exit. Follow-ups run
+/// with a fresh run id and no progress file (an MCP `analyze_start` caller
+/// tracks the run it asked for, not the drain) and otherwise the same options.
+pub(crate) async fn run_with_options_draining_pending(
+    project_root: PathBuf,
+    options: AnalyzeOptions,
+) -> Result<()> {
+    let follow_up_options = AnalyzeOptions {
+        run_id: None,
+        resume_run_id: None,
+        progress_file: None,
+        ..options.clone()
+    };
+    run_with_options(project_root.clone(), options).await?;
+    for _ in 0..MAX_PENDING_FOLLOW_UPS {
+        let Ok(ctx) = loomweave_core::worktree::WorktreeContext::resolve(&project_root) else {
+            break;
+        };
+        if !crate::analyze_lock::pending_analyze_requested(&ctx) {
+            break;
+        }
+        tracing::info!("a refresh was requested while this analyze ran; draining it now");
+        run_with_options(project_root.clone(), follow_up_options.clone()).await?;
+    }
+    Ok(())
+}
+
 /// Run the analyze command against `project_path` with resolved CLI options.
 ///
 /// # Errors
@@ -380,6 +418,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // races from deleting half-written metadata or migrating one SQLite file
     // concurrently. It remains held through the writer actor's final join.
     let _analyze_lock = crate::analyze_lock::acquire_analyze_lock_for_context(&worktree_ctx)?;
+    // This run IS the refresh a queued request was waiting for: consume the
+    // marker now, under the lock, so a request that arrives DURING this run
+    // is the one the exit-time drain honours (clarion-78d75e45c9).
+    crate::analyze_lock::take_pending_analyze(&worktree_ctx);
     // A no-op for a standalone/main context; for a linked worktree this
     // creates, reuses, or (on a stale/mismatched metadata.json) deletes via
     // the confined primitive and rebuilds the isolated store — see
@@ -505,6 +547,75 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         options.progress_file.clone(),
         run_id.clone(),
     ));
+
+    // ── No-indexed-changes fast path (clarion-78d75e45c9) ────────────────────
+    // Only the commit clock moved and the committed range touched nothing the
+    // pipeline ingests or reads: settle the run at HEAD without a walk. See
+    // `fast_path.rs` for the exact predicate and why it is conservative.
+    if !options.no_incremental
+        && !resume
+        && let Some(evidence) = fast_path::no_indexed_changes(&project_root, &db_path)
+    {
+        {
+            tracing::info!(
+                run_id = %run_id,
+                base_run_id = %evidence.base_run_id,
+                from_commit = %evidence.analyzed_commit,
+                to_commit = %evidence.head_commit,
+                paths_changed = evidence.paths_changed,
+                "no indexed changes since the analyzed commit; settling the run without a walk"
+            );
+            crate::run_lifecycle::open_run(
+                &writer,
+                resume,
+                &run_id,
+                &analyze_config_json,
+                &started_at,
+                head_commit.as_deref(),
+            )
+            .await?;
+            let completed_at = iso8601_now();
+            let stats_json = fast_path::fast_path_stats(&evidence).to_string();
+            commit_run_or_terminalize(
+                &writer,
+                &db_path,
+                &run_id,
+                RunStatus::Completed,
+                &completed_at,
+                stats_json,
+            )
+            .await?;
+            drop(writer);
+            handle
+                .await
+                .map_err(|e| anyhow::anyhow!("writer actor panic: {e}"))?
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let short = |sha: &str| sha.chars().take(12).collect::<String>();
+            println!(
+                "analyze complete: run {run_id} completed (fast path: no indexed changes in \
+                 {}..{}, {} path(s) changed; index carried forward from run {})",
+                short(&evidence.analyzed_commit),
+                short(&evidence.head_commit),
+                evidence.paths_changed,
+                evidence.base_run_id
+            );
+            if options.json {
+                let payload = serde_json::json!({
+                    "run_id": run_id,
+                    "fast_path": fast_path::fast_path_stats(&evidence)["fast_path"],
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(json) => println!("{json}"),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "analyze complete: structured --json output could not be serialized"
+                    ),
+                }
+            }
+            return Ok(());
+        }
+    }
+
     progress.phase("discovering", None, None);
 
     // ── Discover plugins ──────────────────────────────────────────────────────
@@ -1404,7 +1515,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             tokio::sync::mpsc::channel(PLUGIN_FILE_BATCH_CHANNEL_CAPACITY);
         let join_handle = tokio::task::spawn_blocking(move || {
             run_plugin_blocking(
-                manifest,
+                &manifest,
                 &project_root_clone,
                 &pid_clone,
                 &exec_clone,
@@ -6275,38 +6386,65 @@ fn spawn_plugin_watchdog(
     })
 }
 
-/// Spawn the plugin, handshake, run `analyze_file` for each file, collect results.
-///
-/// All I/O is synchronous — this is designed to run inside `spawn_blocking`.
-/// On unrecoverable error, returns `Err(reason_string)`.
-///
-/// Regardless of success or failure the child process is always reaped: on
-/// the happy path via `host.shutdown()` + `child.wait()`, on the error path
-/// via `child.kill()` + `child.wait()`. `std::process::Child::Drop` does NOT
-/// kill or reap on Unix, so discarding `child` without `wait()` would leak a
-/// zombie into the kernel process table per spawn.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn run_plugin_blocking(
+/// How many per-file watchdog kills one plugin may survive in a run before a
+/// kill is terminal again (clarion-78d75e45c9). Each survival costs a full
+/// plugin respawn plus the file timeout itself, so the bound keeps a tree of
+/// pathological files from turning one run into an unbounded restart loop;
+/// the crash-loop breaker is not consulted for these (a kill is the host's
+/// own doing, not a plugin crash).
+const MAX_FILE_TIMEOUT_RESPAWNS: usize = 3;
+
+/// The host over a spawned child's pipes, as `spawn_unhandshaken` builds it.
+type ChildHost = loomweave_core::PluginHost<
+    std::io::BufReader<std::process::ChildStdout>,
+    std::io::BufWriter<std::process::ChildStdin>,
+>;
+
+/// One spawned, handshaken plugin process with its lifecycle watchdog.
+struct LivePlugin {
+    host: ChildHost,
+    child: Arc<std::sync::Mutex<std::process::Child>>,
+    watchdog: Arc<PluginWatchdog>,
+    watchdog_handle: std::thread::JoinHandle<()>,
+}
+
+impl LivePlugin {
+    /// Retire a plugin the file watchdog already killed: stop the watchdog,
+    /// reap the child (the kill is ours, so it is not classified as an OOM
+    /// event), and hand any host findings to the caller.
+    fn teardown_after_kill(self, plugin_id: &str, findings: &mut Vec<HostFinding>) {
+        let Self {
+            mut host,
+            child,
+            watchdog,
+            watchdog_handle,
+        } = self;
+        watchdog.request_stop();
+        let _ = watchdog_handle.join();
+        let mut child = Arc::try_unwrap(child)
+            .unwrap_or_else(|_| unreachable!("watchdog joined; no other Arc holders remain"))
+            .into_inner()
+            .expect("child mutex poisoned");
+        findings.extend(host.take_findings());
+        drop(host);
+        reap_and_classify_exit(&mut child, plugin_id, findings, true);
+    }
+}
+
+/// Spawn and handshake one plugin process under the handshake deadline.
+/// On handshake failure the child is killed and reaped here (the
+/// `spawn_unhandshaken` contract) and the classified findings ride the error.
+fn spawn_live_plugin(
     manifest: loomweave_core::Manifest,
     project_root: &Path,
     plugin_id: &str,
     executable: &Path,
-    files: &[PathBuf],
-    content_changed_files: &Arc<HashSet<String>>,
     briefing_blocks: &Arc<BTreeMap<PathBuf, loomweave_core::BriefingBlockReason>>,
     scanned_source_files: &Arc<BTreeSet<PathBuf>>,
-    progress: &ProgressReporter,
     handshake_timeout: std::time::Duration,
-    file_timeout: std::time::Duration,
-    shutdown_timeout: std::time::Duration,
-    prior_file_scope_claims: BTreeSet<String>,
-    skipped_locator_owners: BTreeMap<String, String>,
-    batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
-) -> Result<BatchResult, PluginRunError> {
+) -> Result<LivePlugin, PluginRunError> {
     use loomweave_core::PluginHost;
 
-    let manifest_language = manifest.plugin.language.clone();
-    let kind_roles = PluginKindRoles::from_manifest(&manifest);
     let (mut host, child) = PluginHost::spawn_unhandshaken(manifest, project_root, executable)
         .map_err(|e| match e {
             HostError::Spawn(msg) => {
@@ -6388,6 +6526,60 @@ fn run_plugin_blocking(
         );
         return Err(PluginRunError::with_findings(reason, findings));
     }
+    Ok(LivePlugin {
+        host,
+        child,
+        watchdog,
+        watchdog_handle,
+    })
+}
+
+/// Spawn the plugin, handshake, run `analyze_file` for each file, collect results.
+///
+/// All I/O is synchronous — this is designed to run inside `spawn_blocking`.
+/// On unrecoverable error, returns `Err(reason_string)`.
+///
+/// Regardless of success or failure the child process is always reaped: on
+/// the happy path via `host.shutdown()` + `child.wait()`, on the error path
+/// via `child.kill()` + `child.wait()`. `std::process::Child::Drop` does NOT
+/// kill or reap on Unix, so discarding `child` without `wait()` would leak a
+/// zombie into the kernel process table per spawn.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn run_plugin_blocking(
+    manifest: &loomweave_core::Manifest,
+    project_root: &Path,
+    plugin_id: &str,
+    executable: &Path,
+    files: &[PathBuf],
+    content_changed_files: &Arc<HashSet<String>>,
+    briefing_blocks: &Arc<BTreeMap<PathBuf, loomweave_core::BriefingBlockReason>>,
+    scanned_source_files: &Arc<BTreeSet<PathBuf>>,
+    progress: &ProgressReporter,
+    handshake_timeout: std::time::Duration,
+    file_timeout: std::time::Duration,
+    shutdown_timeout: std::time::Duration,
+    prior_file_scope_claims: BTreeSet<String>,
+    skipped_locator_owners: BTreeMap<String, String>,
+    batch_tx: &tokio::sync::mpsc::Sender<PluginBatchMessage>,
+) -> Result<BatchResult, PluginRunError> {
+    let manifest_language = manifest.plugin.language.clone();
+    let kind_roles = PluginKindRoles::from_manifest(manifest);
+    let spawn = || {
+        spawn_live_plugin(
+            manifest.clone(),
+            project_root,
+            plugin_id,
+            executable,
+            briefing_blocks,
+            scanned_source_files,
+            handshake_timeout,
+        )
+    };
+    let mut live = spawn()?;
+    // Per-file watchdog kills survived so far this run (clarion-78d75e45c9):
+    // each one degrades THAT file and respawns the plugin; past the bound the
+    // next kill ends the run the way every kill used to.
+    let mut file_timeout_respawns = 0usize;
 
     let mut dispatch_findings: Vec<HostFinding> = Vec::new();
     let work_result: Result<(), String> = (|| {
@@ -6433,15 +6625,66 @@ fn run_plugin_blocking(
                     continue;
                 }
             };
-            watchdog.arm(file_timeout, WatchdogPhase::File);
-            let analyze_outcome = host.analyze_file(&dispatch_file);
-            watchdog.disarm();
+            live.watchdog.arm(file_timeout, WatchdogPhase::File);
+            let analyze_outcome = live.host.analyze_file(&dispatch_file);
+            live.watchdog.disarm();
             drop(heartbeat_guard);
+            let analyze_outcome = match analyze_outcome {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // A per-file watchdog kill degrades the FILE, not the run
+                    // (clarion-78d75e45c9): the file keeps its stored rows
+                    // (its content hash is not advanced, so it re-dispatches
+                    // next run), a phase-tagged timeout finding names it, and
+                    // a fresh plugin carries on from the next file. Bounded:
+                    // past `MAX_FILE_TIMEOUT_RESPAWNS` the kill is terminal,
+                    // exactly as before.
+                    let file_timed_out =
+                        live.watchdog.timed_out_phase() == Some(WatchdogPhase::File);
+                    if !file_timed_out || file_timeout_respawns >= MAX_FILE_TIMEOUT_RESPAWNS {
+                        return Err(classify_host_error(plugin_id, e));
+                    }
+                    file_timeout_respawns += 1;
+                    tracing::warn!(
+                        plugin_id = %plugin_id,
+                        file = %file.display(),
+                        respawn = file_timeout_respawns,
+                        "per-file watchdog killed the plugin; skipping the file and respawning",
+                    );
+                    let mut finding = plugin_timeout_finding(
+                        plugin_id,
+                        "file",
+                        file_timeout,
+                        format!(
+                            "plugin {plugin_id} exceeded the per-file analysis timeout ({} ms) \
+                             on {} and was killed; the file was skipped (its stored rows are \
+                             retained and it re-dispatches next run) and the plugin restarted",
+                            file_timeout.as_millis(),
+                            file.display()
+                        ),
+                    );
+                    finding
+                        .metadata
+                        .insert("file".to_owned(), file.display().to_string());
+                    finding
+                        .metadata
+                        .insert("skipped_file".to_owned(), "true".to_owned());
+                    dispatch_findings.push(finding);
+                    let replacement = spawn().map_err(|err| {
+                        dispatch_findings.extend(err.findings);
+                        format!("respawn after per-file timeout failed: {}", err.reason)
+                    })?;
+                    let dead = std::mem::replace(&mut live, replacement);
+                    dead.teardown_after_kill(plugin_id, &mut dispatch_findings);
+                    progress.file_completed();
+                    continue;
+                }
+            };
             let AnalyzeFileOutcome {
                 entities,
                 edges,
                 stats,
-            } = analyze_outcome.map_err(|e| classify_host_error(plugin_id, e))?;
+            } = analyze_outcome;
             progress.file_completed();
             let mut file_stats = BatchStats {
                 unresolved_call_sites_total: stats.unresolved_call_sites_total,
@@ -6601,6 +6844,13 @@ fn run_plugin_blocking(
             .map_err(|_| "plugin batch receiver closed".to_owned())?;
         Ok(())
     })();
+
+    let LivePlugin {
+        mut host,
+        child,
+        watchdog,
+        watchdog_handle,
+    } = live;
 
     // Read the file-loop verdict BEFORE arming the shutdown deadline: the
     // watchdog records the FIRST expired phase, so a `Shutdown` record can

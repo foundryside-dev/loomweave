@@ -548,7 +548,7 @@ fn install_hooks(project_root: &Path) -> Result<()> {
         .context("merge git-sync managed block into git hooks")?
     {
         Some(true) => println!(
-            "Added loomweave git-sync block to {} git hooks (post-commit, post-checkout, post-merge)",
+            "Added loomweave git-sync block to {} git hooks (post-checkout, post-merge)",
             project_root.display()
         ),
         Some(false) => println!("loomweave git-sync git hooks already present"),

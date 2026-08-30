@@ -370,7 +370,10 @@ fn shutdown_hang_times_out_run_still_completes() {
 /// watchdog (acceptance gate 3 — busy loops never allocate or crash, so the
 /// RLIMIT/breaker layers never fire); exactly one phase-tagged timeout
 /// finding, and the watchdog's own SIGKILL is NOT double-reported as an OOM
-/// kill.
+/// kill. Since clarion-78d75e45c9 a single kill degrades the file rather than
+/// the run: with one file in the tree the run COMPLETES with that file
+/// skipped (the terminal-failure shape lives in
+/// `file_watchdog_respawns_are_bounded`).
 #[test]
 fn spin_at_analyze_contained_by_file_watchdog() {
     let fixture_bin = fixture_binary_path();
@@ -387,17 +390,17 @@ fn spin_at_analyze_contained_by_file_watchdog() {
         .env("LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS", "500")
         .timeout(ANALYZE_BACKSTOP)
         .assert()
-        .failure();
+        .success();
 
     let conn = open_db(&project_dir);
 
     let (run_count, run_status, failure_reason) = run_record(&conn);
     assert_eq!(run_count, 1, "exactly one run row");
-    assert_eq!(run_status, "failed", "run must resolve terminal-failed");
-    assert!(
-        failure_reason.contains("per-file analysis timeout"),
-        "failure_reason must name the per-file timeout; got {failure_reason:?}"
+    assert_eq!(
+        run_status, "completed",
+        "one killed file degrades the file, not the run"
     );
+    assert_eq!(failure_reason, "");
 
     // Exactly one timeout finding, tagged with the file phase.
     assert_eq!(
@@ -594,5 +597,102 @@ fn plugin_forged_anchor_entity_id_does_not_win_or_fail_the_run() {
         "the finding must anchor to a real (file/project) entity; got {anchor}"
     );
 
+    assert_no_leaked_child(&marker_pair);
+}
+
+/// clarion-78d75e45c9: a per-file watchdog kill degrades THAT file — the run
+/// completes, the other files' entities land, one phase-tagged timeout
+/// finding names the skipped file, the plugin is respawned, and no child
+/// outlives the run.
+#[test]
+fn file_watchdog_kill_skips_the_file_respawns_and_completes_the_run() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    fs::write(project_dir.path().join("demo.mt"), b"gadget alpha\n").unwrap();
+    fs::write(project_dir.path().join("slow.mt"), b"gadget beta\n").unwrap();
+    fs::write(project_dir.path().join("other.mt"), b"gadget gamma\n").unwrap();
+    let (marker_key, marker_value, marker_pair) = unique_marker("hang-one-file");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env(&marker_key, &marker_value)
+        .env("LOOMWEAVE_FIXTURE_HANG_AT_FILE", "slow.mt")
+        .env("LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS", "500")
+        .timeout(ANALYZE_BACKSTOP)
+        .assert()
+        .success();
+
+    let conn = open_db(&project_dir);
+    let (run_count, run_status, failure_reason) = run_record(&conn);
+    assert_eq!(run_count, 1);
+    assert_eq!(
+        run_status, "completed",
+        "one slow file must not fail the run"
+    );
+    assert_eq!(failure_reason, "");
+
+    assert_eq!(finding_count(&conn, "LMWV-PY-TIMEOUT"), 1);
+    let evidence = finding_evidence(&conn, "LMWV-PY-TIMEOUT");
+    assert!(
+        evidence.contains("slow.mt"),
+        "finding names the file: {evidence}"
+    );
+    assert!(evidence.contains("skipped_file"), "{evidence}");
+    assert_eq!(finding_count(&conn, "LMWV-INFRA-PLUGIN-OOM-KILLED"), 0);
+    assert_eq!(
+        finding_count(&conn, "LMWV-INFRA-PLUGIN-DISABLED-CRASH-LOOP"),
+        0
+    );
+
+    assert_eq!(entity_row_count(&conn, "fixture:gadget:alpha"), 1);
+    assert_eq!(
+        entity_row_count(&conn, "fixture:gadget:gamma"),
+        1,
+        "files after the kill land"
+    );
+    assert_eq!(
+        entity_row_count(&conn, "fixture:gadget:beta"),
+        0,
+        "the skipped file did not"
+    );
+
+    assert_no_leaked_child(&marker_pair);
+}
+
+/// The respawn is bounded: when every file hangs, the fourth kill is terminal
+/// and the run fails the way a kill always did.
+#[test]
+fn file_watchdog_respawns_are_bounded() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    for name in ["a.mt", "b.mt", "c.mt", "d.mt", "e.mt"] {
+        fs::write(project_dir.path().join(name), b"widget x {}\n").unwrap();
+    }
+    let (marker_key, marker_value, marker_pair) = unique_marker("hang-all-files");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env(&marker_key, &marker_value)
+        .env("LOOMWEAVE_FIXTURE_SPIN_AT_ANALYZE", "1")
+        .env("LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS", "500")
+        .timeout(ANALYZE_BACKSTOP)
+        .assert()
+        .failure();
+
+    let conn = open_db(&project_dir);
+    let (_, run_status, failure_reason) = run_record(&conn);
+    assert_eq!(run_status, "failed");
+    assert!(
+        failure_reason.contains("per-file analysis timeout"),
+        "{failure_reason}"
+    );
+    // Three skips + the terminal kill.
+    assert_eq!(finding_count(&conn, "LMWV-PY-TIMEOUT"), 4);
     assert_no_leaked_child(&marker_pair);
 }

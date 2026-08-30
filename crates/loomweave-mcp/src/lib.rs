@@ -6,6 +6,7 @@ pub mod config;
 pub mod filigree;
 pub mod filigree_url;
 mod index_diff;
+pub use index_diff::{CommitOnlyDrift, commit_only_drift};
 pub mod scan_results;
 pub mod snapshot;
 mod tools;
