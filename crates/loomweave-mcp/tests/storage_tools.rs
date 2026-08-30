@@ -1236,7 +1236,10 @@ async fn summary_on_subsystem_returns_policy_envelope_without_llm_call() {
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["result"]["available"], false);
     assert_eq!(envelope["result"]["reason"], "summary-scope-deferred");
-    assert_eq!(envelope["stats_delta"], json!({}));
+    assert!(
+        envelope.get("stats_delta").is_none(),
+        "empty stats_delta is omitted (X-6)"
+    );
     assert!(provider.invocations().is_empty());
 
     drop(state);
@@ -1279,7 +1282,10 @@ async fn summary_on_secret_blocked_entity_returns_policy_envelope_without_llm_or
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["result"]["summary"], Value::Null);
     assert_eq!(envelope["result"]["briefing_blocked"], "secret_present");
-    assert_eq!(envelope["stats_delta"], json!({}));
+    assert!(
+        envelope.get("stats_delta").is_none(),
+        "empty stats_delta is omitted (X-6)"
+    );
     assert!(provider.invocations().is_empty());
 
     let entity_at = call_tool(&state, "entity_at", json!({"file": "demo.py", "line": 1})).await;
@@ -1341,7 +1347,10 @@ async fn summary_on_unscanned_source_returns_policy_envelope_without_llm_or_cach
             .expect("remediation text")
             .contains("not covered by the pre-ingest secret scan")
     );
-    assert_eq!(envelope["stats_delta"], json!({}));
+    assert!(
+        envelope.get("stats_delta").is_none(),
+        "empty stats_delta is omitted (X-6)"
+    );
     assert!(provider.invocations().is_empty());
 
     drop(state);
@@ -3757,21 +3766,21 @@ fn mark_blocked(db_path: &std::path::Path, id: &str, reason: &str) {
 }
 
 /// Assert a briefing-blocked entity projection keeps its navigable identity
-/// (clarion-719e7320f5, A3): `id`, `kind`, `name`, `short_name`,
-/// `source_file_path`, the line span and `content_hash` are PRESENT alongside
-/// the `briefing_blocked` flag; only the cross-tool `sei` binding key stays null.
-/// The secret is the file content, not the entity's structural identity.
+/// (clarion-719e7320f5, A3): `id`, `kind`, `short_name`, `source_file_path`
+/// and `source_line_start` are PRESENT alongside the `briefing_blocked` flag;
+/// only the cross-tool `sei` binding key stays null. The secret is the file
+/// content, not the entity's structural identity. (`name`, `source_line_end`
+/// and `content_hash` are no longer part of ANY list row — the X-6 slim
+/// projection, clarion-b24df21158 — so their absence here is row slimming,
+/// not redaction.)
 fn assert_blocked_identity_present(entity: &Value, reason: &str) {
     assert_eq!(entity["briefing_blocked"], reason, "block reason: {entity}");
     for field in [
         "id",
         "kind",
-        "name",
         "short_name",
         "source_file_path",
         "source_line_start",
-        "source_line_end",
-        "content_hash",
     ] {
         assert!(
             entity.get(field).is_some_and(|v| !v.is_null()),

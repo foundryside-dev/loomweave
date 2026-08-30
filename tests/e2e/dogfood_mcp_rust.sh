@@ -248,7 +248,7 @@ def tool_envelope(response: dict) -> dict:
     assert isinstance(content, list) and content, result
     envelope = json.loads(content[0]["text"])
     assert envelope["ok"] is True, envelope
-    assert envelope["error"] is None, envelope
+    assert envelope.get("error") is None, envelope  # absent on success (X-6 slim envelope)
     return envelope
 
 

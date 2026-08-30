@@ -26,14 +26,14 @@ use crate::{
     CallSiteKind, CallSiteRole, InferredDispatchStats, IssuesForAccumulator, ParamError, PathScope,
     PathTraversal, ServerState, build_call_sites, build_unresolved_candidates, callee_json,
     caller_json, caller_navigation_scope_excludes, compact_execution_paths, entity_context_json,
-    entity_json, entity_not_found_envelope, entity_properties_json, envelope_from_storage_result,
-    flatten_storage_envelope_result, import_neighbors, issues_unavailable,
-    navigation_scope_excludes, optional_bool, optional_confidence, optional_usize,
-    parse_cursor_offset, path_truncation_reason, reference_neighbors_for, relation_neighbors,
-    required_i64, required_str, storage_retryable, success_envelope, success_envelope_with_stats,
-    success_envelope_with_truncation, success_envelope_with_truncation_and_stats,
-    tool_error_envelope, unresolved_match_fields, wardline_section_for_entity,
-    wardline_unavailable,
+    entity_json, entity_json_full, entity_not_found_envelope, entity_properties_json,
+    envelope_from_storage_result, flatten_storage_envelope_result, import_neighbors,
+    issues_unavailable, navigation_scope_excludes, optional_bool, optional_confidence,
+    optional_usize, parse_cursor_offset, path_truncation_reason, reference_neighbors_for,
+    relation_neighbors, required_i64, required_str, storage_retryable, success_envelope,
+    success_envelope_with_stats, success_envelope_with_truncation,
+    success_envelope_with_truncation_and_stats, tool_error_envelope, unresolved_match_fields,
+    wardline_section_for_entity, wardline_unavailable,
 };
 
 /// The direction argument of [`ServerState::tool_relation_list`]: a single
@@ -101,7 +101,7 @@ impl ServerState {
                 };
                 let snapshot = crate::snapshot::project_snapshot(conn, &project_root);
                 Ok(json!({
-                    "entity": matched.as_ref().map(|e| entity_json(conn, e)),
+                    "entity": matched.as_ref().map(|e| entity_json_full(conn, e)),
                     "entity_context": entity_context_json(
                         conn,
                         Some(line),
@@ -575,7 +575,7 @@ impl ServerState {
                     "relations_out": truncate_bucket(&mut relations_out),
                 });
                 Ok(success_envelope(json!({
-                    "entity": entity_json(conn, &entity),
+                    "entity": entity_json_full(conn, &entity),
                     "callers": inbound_callers,
                     "callees": outbound_calls,
                     "container": container_entity,

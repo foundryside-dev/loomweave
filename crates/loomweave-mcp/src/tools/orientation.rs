@@ -16,7 +16,7 @@ use loomweave_storage::{
 use crate::{
     ORIENTATION_PACK_MAX_NEIGHBORS, ORIENTATION_PACK_PATH_DEPTH, OrientationCore, ParamError,
     PathTraversal, ServerState, SummaryRead, callee_json, caller_json, cap_neighbor_list,
-    compact_execution_paths, entity_context_json, entity_json, import_neighbors,
+    compact_execution_paths, entity_context_json, entity_json, entity_json_full, import_neighbors,
     navigation_scope_excludes, orientation_suggested_reads, path_truncation_reason,
     reference_neighbors_for, relation_neighbors, required_i64, storage_retryable, success_envelope,
     success_envelope_with_truncation, summary_cache_expired, tool_error_envelope,
@@ -286,7 +286,7 @@ impl ServerState {
                     primary_kind: Some(entity.kind.clone()),
                     lookup_was_id: query_line.is_none(),
                     packet: json!({
-                        "primary_entity": entity_json(conn, &entity),
+                        "primary_entity": entity_json_full(conn, &entity),
                         "entity_context": entity_context,
                         "source": source,
                         "neighbors": neighbors,
