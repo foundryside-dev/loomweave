@@ -5,6 +5,46 @@ use crate::{
     sha1_digest,
 };
 
+/// Inline allow-markers honoured by [`Scanner::scan_bytes_partitioned`]: a
+/// detection whose line carries one of these substrings (byte-exact,
+/// case-sensitive — conventionally a trailing comment) is partitioned out as
+/// operator-allowed instead of reported. The first form is Loomweave-native;
+/// the second matches detect-secrets' `# pragma: allowlist secret` so
+/// operator habits from that tool transfer (ADR-013 amendment 2026-08-31).
+pub const INLINE_ALLOW_MARKERS: [&str; 2] =
+    ["secret-scan: allow-this-line", "pragma: allowlist secret"];
+
+/// Hex-candidate lengths that are exactly a common digest's hex encoding:
+/// SHA-1 (40), SHA-224 (56), SHA-256/BLAKE3 (64), SHA-384 (96),
+/// SHA-512/BLAKE2b (128). MD5 (32) sits below the 40-char entropy floor and
+/// never becomes a candidate.
+const DIGEST_HEX_LENGTHS: [usize; 5] = [40, 56, 64, 96, 128];
+
+/// Case-insensitive line-context keywords that mark an exact-digest-length
+/// hex candidate as a digest fixture rather than a secret. Every keyword
+/// contains at least one non-hex letter, so none can match inside the hex
+/// candidate itself. Deliberately narrow: `hmac` is absent (an HMAC *key* is
+/// a secret), and `integrity`/`commit` contexts stay on the baseline path.
+const DIGEST_CONTEXT_KEYWORDS: [&str; 7] = [
+    "sha",
+    "blake",
+    "digest",
+    "checksum",
+    "fingerprint",
+    "etag",
+    "hash",
+];
+
+/// Result of [`Scanner::scan_bytes_partitioned`]: `detections` are
+/// actionable; `inline_allowed` were suppressed by an inline allow-marker on
+/// their own line and are returned so callers can audit the operator
+/// decision (mirroring the baseline-match audit trail).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartitionedScan {
+    pub detections: Vec<Detection>,
+    pub inline_allowed: Vec<Detection>,
+}
+
 /// Metadata for one named secret detector.
 #[derive(Debug, Clone)]
 pub struct PatternMeta {
@@ -125,6 +165,22 @@ impl Scanner {
         detections
     }
 
+    /// [`Self::scan_bytes`], then partition out detections whose line carries
+    /// one of [`INLINE_ALLOW_MARKERS`]. `scan_bytes` itself stays
+    /// policy-free (raw detection); this is the policy-aware entry point the
+    /// pre-ingest scan uses.
+    #[must_use]
+    pub fn scan_bytes_partitioned(&self, buf: &[u8]) -> PartitionedScan {
+        let (inline_allowed, detections) = self
+            .scan_bytes(buf)
+            .into_iter()
+            .partition(|detection| line_has_inline_allow_marker(buf, detection.byte_offset));
+        PartitionedScan {
+            detections,
+            inline_allowed,
+        }
+    }
+
     fn scan_entropy(
         &self,
         bytes: &[u8],
@@ -149,6 +205,7 @@ impl Scanner {
             let candidate_bytes = &bytes[candidate.start()..candidate.end()];
             if !range_overlaps(candidate.start(), candidate.end(), named_ranges)
                 && self.entropy_hex.accepts(candidate_bytes)
+                && !hex_candidate_is_digest_fixture(bytes, candidate.start(), candidate.end())
             {
                 detections.push(entropy_detection(
                     DetectSecretsRule::HexHighEntropyString,
@@ -285,6 +342,51 @@ fn is_base64_candidate_byte(byte: u8) -> bool {
         byte,
         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'='
     )
+}
+
+/// An exact-digest-length hex candidate whose line names a digest context is
+/// a digest fixture, not a secret (ADR-013 amendment 2026-08-31). This only
+/// gates the entropy rule: a digest-keyword line whose literal is a real
+/// credential assignment still fires the named/keyword detectors, whose
+/// matches were excluded from entropy candidacy before this check runs.
+fn hex_candidate_is_digest_fixture(bytes: &[u8], start: usize, end: usize) -> bool {
+    if !DIGEST_HEX_LENGTHS.contains(&end.saturating_sub(start)) {
+        return false;
+    }
+    let (line_start, line_end) = line_bounds(bytes, start);
+    let line_lower = bytes[line_start..line_end].to_ascii_lowercase();
+    DIGEST_CONTEXT_KEYWORDS
+        .iter()
+        .any(|keyword| contains_subslice(&line_lower, keyword.as_bytes()))
+}
+
+fn line_has_inline_allow_marker(bytes: &[u8], offset: usize) -> bool {
+    let (line_start, line_end) = line_bounds(bytes, offset);
+    let line = &bytes[line_start..line_end];
+    INLINE_ALLOW_MARKERS
+        .iter()
+        .any(|marker| contains_subslice(line, marker.as_bytes()))
+}
+
+/// `[start, end)` of the line containing `offset`, excluding the newline.
+fn line_bounds(bytes: &[u8], offset: usize) -> (usize, usize) {
+    let offset = offset.min(bytes.len());
+    let start = bytes[..offset]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |pos| pos + 1);
+    let end = bytes[offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |pos| offset + pos);
+    (start, end)
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn line_is_comment(bytes: &[u8], offset: usize) -> bool {

@@ -179,6 +179,49 @@ Rely on operator discipline — "don't commit `.env` files"; add documentation.
 - Entities in blocked files land without briefings; the summary cache (ADR-007) has no row for them until the secret is fixed. Next `loomweave analyze` post-fix cache-misses and computes normally.
 - Baseline file committed alongside source means teammates pulling a repo inherit each other's false-positive markings. This is correct — security-review consensus is expressed in the baseline diff.
 
+## Amendment (2026-08-31) — inline allow-marker and digest-context hex suppression
+
+Elspeth adoption evidence (salvage worklist A5, `clarion-aa1d8a73d3`): the
+baseline file was the only suppression channel, and on a fixture-heavy tree it
+does not keep up — 373 of 563 detections were `HighEntropyHex` firing on
+sha256 digest fixtures, `briefing_blocked: secret_present` hid 10,708 entities
+across 170 files, and the tree's 168 existing `# secret-scan: allow-this-line`
+marker comments were ignored. Two additions, both upstream of the baseline:
+
+1. **Inline allow-marker.** A detection whose own line contains
+   `secret-scan: allow-this-line` or `pragma: allowlist secret` (the
+   `detect-secrets` inline convention; byte-exact substring match,
+   conventionally a trailing comment) is suppressed. Scope is the marker's
+   line only. Each suppression emits `LMWV-INFRA-SECRET-INLINE-ALLOW-MATCH`
+   (INFO, fact) with the same `file:line:detector` site shape as the
+   detection it replaces, so the audit posture of the baseline
+   (`LMWV-INFRA-SECRET-BASELINE-MATCH`) carries over; the marker's own diff in
+   code review is the justification surface. The raw `Scanner::scan_bytes`
+   stays policy-free — the partitioned entry point
+   (`scan_bytes_partitioned`) is what the pre-ingest scan calls.
+
+2. **Digest-context hex suppression.** A `HighEntropyHex` candidate is
+   dropped when (a) its length is exactly a common digest's hex encoding
+   (40/56/64/96/128 — SHA-1/224/256/384/512, BLAKE2b/BLAKE3) AND (b) its line
+   contains a digest keyword (`sha`, `blake`, `digest`, `checksum`, `hash`,
+   `fingerprint`, `etag`, case-insensitive). This gates only the entropy
+   rule: named credential patterns and the keyword detector still fire on
+   such lines (their matches are excluded from entropy candidacy first), so
+   `secret = "<64-hex>"` remains flagged. `hmac` is deliberately not a
+   digest keyword (an HMAC *key* is a secret); `integrity:` lockfile fields
+   and `commit <sha>` lines carry no keyword and stay on the baseline path —
+   the PR #11 regression fixture now pins that boundary. Acknowledged false
+   negative: a real hex-encoded credential assigned under a digest-keyword
+   name with no credential keyword on the line slips the entropy rule.
+
+Block granularity is deliberately unchanged (file-level). With false
+positives suppressed at the detector, remaining blocks are dominated by real
+secrets, where blocking every entity of the file is this ADR's decided
+conservative posture. Entity-level granularity is tracked separately
+(`clarion-a70f76d1d7`, split off `clarion-aa1d8a73d3`) and would need the briefing-block
+map to carry detection line spans end-to-end (host stamping, writer
+reconciliation for incrementally-skipped files, MCP read surface).
+
 ## Related Decisions
 
 - [ADR-004](./ADR-004-finding-exchange-format.md) — `LMWV-SEC-SECRET-DETECTED`, `LMWV-SEC-UNREDACTED-SECRETS-ALLOWED`, `LMWV-INFRA-SECRET-*` findings use the Filigree-native exchange format this ADR defines.
