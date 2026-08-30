@@ -251,7 +251,7 @@ const ALLOWED_HITS: &[AllowedHit] = &[
     AllowedHit { file: "crates/loomweave-cli/src/install.rs", text: "let loomweave_dir = loomweave_core::store::store_dir(project_root);", count: 1, classification: Classification::IntentionalRootDerived },
 
     // ---- crates/loomweave-cli/src/secret_scan.rs (test module) ----
-    AllowedHit { file: "crates/loomweave-cli/src/secret_scan.rs", text: "&loomweave_core::store::store_dir(tmp.path()),", count: 1, classification: Classification::TestExempt },
+    AllowedHit { file: "crates/loomweave-cli/src/secret_scan.rs", text: "&loomweave_core::store::store_dir(tmp.path()),", count: 2, classification: Classification::TestExempt },
 
     // ---- crates/loomweave-cli/src/serve.rs ----
     // Main/standalone's own gate, byte-for-byte unchanged from before Task 5

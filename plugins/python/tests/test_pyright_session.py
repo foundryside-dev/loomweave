@@ -39,7 +39,9 @@ from loomweave_plugin_python.pyright_session import (
     MAX_CONSECUTIVE_TIMEOUT_FILES,
     MAX_PYRIGHT_RESTARTS_PER_RUN,
     PYRIGHT_CALL_TIMEOUT_SECS,
+    PYRIGHT_FILE_TIMEOUT_BASE_SECS,
     PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+    PYRIGHT_FILE_TIMEOUT_PER_LINE_SECS,
     PYRIGHT_SHUTDOWN_TIMEOUT_SECS,
     LspTimeoutError,
     LspTransportClosedError,
@@ -49,12 +51,15 @@ from loomweave_plugin_python.pyright_session import (
     _build_function_index,
     _CallSite,
     _containing_function_id,
+    _descendant_pids,
     _filter_relation_candidates,
     _FunctionIndex,
     _FunctionInfo,
     _merge_reference_site,
     _position_to_byte,
     _reference_accumulator_to_edge,
+    _reference_fast_path_names,
+    _resolved_call_site_keys,
     _unresolved_call_site_total_for_function,
     _unresolved_call_sites_for_function,
     resolve_host_file_watchdog_secs,
@@ -131,8 +136,148 @@ def test_unresolved_call_site_details_omit_expressions_over_host_cap() -> None:
         node=function_node,
     )
 
-    assert _unresolved_call_site_total_for_function(function, set()) == 1
+    assert _unresolved_call_site_total_for_function(function, set()) == (1, 0)
     assert _unresolved_call_sites_for_function(index, function, set()) == []
+
+
+def test_unresolved_call_sites_drop_unshadowed_builtins_and_disclose_the_count() -> None:
+    # clarion-8a862d8f7e: ``len(...)`` can never resolve to a project entity;
+    # persisting it as an unresolved site is pure noise (10k rows on elspeth).
+    source = "def caller(x):\n    len(x)\n    helper(x)\n    str(x)\n"
+    tree = ast.parse(source)
+    function_node = cast("ast.FunctionDef", tree.body[0])
+    index = _FunctionIndex(
+        source=source,
+        line_starts=(0, len(b"def caller(x):\n")),
+        lines=tuple(source.splitlines(keepends=True)),
+        parse_latency_ms=0,
+        module_id="python:module:demo",
+        by_id={},
+        by_name_position={},
+        entity_by_name_position={},
+        by_short_name={},
+        dunder_call_by_class={},
+        functions=(),
+        entities=(),
+        tree=tree,
+    )
+    call_sites = tuple(
+        _CallSite(
+            line=line, character=4, end_line=line, end_character=4 + len(name), callee_expr=name
+        )
+        for line, name in ((1, "len"), (2, "helper"), (3, "str"))
+    )
+    function = _FunctionInfo(
+        entity_id="python:function:demo.caller",
+        qualified_name="demo.caller",
+        name="caller",
+        line=0,
+        character=4,
+        end_line=3,
+        end_character=10,
+        call_sites=call_sites,
+        node=function_node,
+    )
+    builtin_names = frozenset(_reference_fast_path_names(tree))
+    assert {"len", "str"} <= builtin_names
+
+    assert _unresolved_call_site_total_for_function(function, set(), builtin_names) == (1, 2)
+    sites = _unresolved_call_sites_for_function(index, function, set(), builtin_names)
+    assert [site["callee_expr"] for site in sites] == ["helper"]
+    # Shadowed in-file: the builtin shortcut is off, the site is kept.
+    shadowed = frozenset(_reference_fast_path_names(ast.parse("def len(x):\n    pass\n")))
+    assert "len" not in shadowed
+    assert _unresolved_call_site_total_for_function(function, set(), shadowed) == (2, 1)
+
+
+def test_resolved_call_site_keys_map_pyright_token_ranges_onto_ast_callee_ranges() -> None:
+    """pyright anchors an attribute call's ``fromRange`` on the terminal token
+    (``helper`` in ``self.helper()``); the AST call site spans the whole callee
+    expression. Exact-key matching therefore only ever matched bare ``Name()``
+    calls, so every resolved method call was ALSO counted unresolved. A range
+    resolves the SMALLEST call site that contains it -- so in
+    ``Svc().helper()`` the ``Svc`` token claims the inner site and ``helper``
+    the outer one -- and a range inside no site resolves nothing.
+    """
+    site = _CallSite
+    sites = (
+        site(line=1, character=4, end_line=1, end_character=15, callee_expr="self.helper"),
+        site(line=2, character=4, end_line=2, end_character=16, callee_expr="Svc().helper"),
+        site(line=2, character=4, end_line=2, end_character=7, callee_expr="Svc"),
+        site(line=3, character=4, end_line=3, end_character=13, callee_expr="free_func"),
+        site(line=4, character=4, end_line=5, end_character=9, callee_expr="a.b(\n).c"),
+    )
+    function = _FunctionInfo(
+        entity_id="python:function:demo.f",
+        qualified_name="demo.f",
+        name="f",
+        line=0,
+        character=4,
+        end_line=6,
+        end_character=0,
+        call_sites=sites,
+        node=cast("ast.FunctionDef", ast.parse("def f():\n    pass\n").body[0]),
+    )
+    resolved = _resolved_call_site_keys(
+        function,
+        [
+            (1, 9, 1, 15),  # ``helper`` token inside ``self.helper``
+            (2, 4, 2, 7),  # ``Svc`` == the inner site exactly
+            (2, 10, 2, 16),  # ``helper`` token of ``Svc().helper``
+            (3, 4, 3, 13),  # bare name, exact
+            (5, 6, 5, 9),  # ``c`` token on the second line of a multi-line callee
+            (7, 0, 7, 3),  # inside no call site at all
+        ],
+    )
+    assert resolved == {
+        (1, 4, 1, 15),
+        (2, 4, 2, 16),
+        (2, 4, 2, 7),
+        (3, 4, 3, 13),
+        (4, 4, 5, 9),
+    }
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc children walk is Linux-only")
+def test_terminate_process_kills_the_language_server_grandchild(tmp_path: Path) -> None:
+    """clarion-ebf404dfbb: the venv's pyright-langserver is a Python wrapper
+    around a node grandchild; killing the wrapper alone orphaned node (seen
+    at 103% CPU, ppid 1, for 1h40m). ``_terminate_process`` must take the
+    subtree.
+    """
+    wrapper = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 300 & wait"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 5
+    grandchildren: list[int] = []
+    while not grandchildren and time.monotonic() < deadline:
+        grandchildren = _descendant_pids(wrapper.pid)
+        time.sleep(0.02)
+    assert len(grandchildren) == 1, "the sleep must be visible as a descendant"
+    sleeper = grandchildren[0]
+
+    session = PyrightSession(tmp_path)
+    session._process = wrapper  # noqa: SLF001
+    session._terminate_process()  # noqa: SLF001
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(sleeper, 0)
+        except ProcessLookupError:
+            break
+        # Still present: it may be a zombie awaiting its (dead) parent's
+        # reap by init; a live sleeper would still show state S.
+        stat = Path(f"/proc/{sleeper}/stat").read_text(encoding="ascii")
+        if ") Z " in stat:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"grandchild {sleeper} outlived _terminate_process")
+    assert wrapper.poll() is not None
 
 
 def _finding_codes(result_findings: Sequence[Finding]) -> set[str]:
@@ -257,6 +402,126 @@ def test_pyright_session_resolves_direct_call(tmp_path: Path, pyright_langserver
     assert result.edges[0]["source_byte_start"] < result.edges[0]["source_byte_end"]
     assert result.pyright_query_latency_ms[0] > 0
     assert result.pyright_index_parse_latency_ms[0] > 0
+    assert result.unresolved_call_sites_total == 0
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolves_class_instantiation_as_call_to_class(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    """clarion-e5224c3aff: ``Name(...)`` naming a class is a call to that class.
+
+    pyright reports every instantiation as an outgoing call whose target IS the
+    class item (its selection range sits on the class name), whether the class
+    defines ``__init__`` itself, inherits it, or gets it synthesised by
+    ``@dataclass``. Those targets used to be looked up only in the FUNCTION
+    index and so were silently dropped as unresolved -- an index of a real
+    project held zero ``calls`` edges into any ``python:class:*`` entity.
+    """
+    _write_module(
+        tmp_path,
+        """
+        from dataclasses import dataclass
+
+
+        class WithInit:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+
+        class Child(WithInit):
+            pass
+
+
+        @dataclass
+        class Record:
+            value: int
+        """,
+        name="models.py",
+    )
+    module = _write_module(
+        tmp_path,
+        """
+        from models import Child, Record, WithInit
+
+
+        class Local:
+            pass
+
+
+        def build():
+            WithInit(1)
+            Child(2)
+            Record(3)
+            Local()
+        """,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_calls(module, ["python:function:demo.build"])
+
+    assert [(edge["from_id"], edge["to_id"], edge["confidence"]) for edge in result.edges] == [
+        ("python:function:demo.build", "python:class:models.WithInit", "resolved"),
+        ("python:function:demo.build", "python:class:models.Child", "resolved"),
+        ("python:function:demo.build", "python:class:models.Record", "resolved"),
+        ("python:function:demo.build", "python:class:demo.Local", "resolved"),
+    ]
+    assert result.unresolved_call_sites_total == 0
+    assert result.unresolved_call_sites == []
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolved_attribute_calls_are_not_double_counted_as_unresolved(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    """A method/attribute call pyright resolved must not ALSO be an unresolved site.
+
+    Found while fixing clarion-e5224c3aff: ``self.helper()``, ``svc.free_func()``
+    and ``s.run()`` each produced a resolved edge AND an unresolved site,
+    because the site match keyed on pyright's token range. The partition
+    (resolved + unresolved + skipped builtins == AST call sites) is what the
+    host and ``entity_callers_list``'s ``traversal_complete`` rely on.
+    """
+    module = _write_module(
+        tmp_path,
+        """
+        def free_func() -> int:
+            return 1
+
+
+        class Svc:
+            def helper(self) -> int:
+                return 1
+
+            def run(self) -> int:
+                return self.helper()
+
+
+        def outer() -> int:
+            import demo
+
+            s = Svc()
+            return demo.free_func() + s.run() + Svc().helper()
+        """,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_calls(
+            module,
+            ["python:function:demo.Svc.run", "python:function:demo.outer"],
+        )
+
+    assert sorted((edge["from_id"], edge["to_id"]) for edge in result.edges) == [
+        ("python:function:demo.Svc.run", "python:function:demo.Svc.helper"),
+        ("python:function:demo.outer", "python:class:demo.Svc"),
+        ("python:function:demo.outer", "python:class:demo.Svc"),
+        ("python:function:demo.outer", "python:function:demo.Svc.helper"),
+        ("python:function:demo.outer", "python:function:demo.Svc.run"),
+        ("python:function:demo.outer", "python:function:demo.free_func"),
+    ]
+    assert result.unresolved_call_sites == []
     assert result.unresolved_call_sites_total == 0
 
 
@@ -1997,6 +2262,7 @@ class BudgetProbeSession(PyrightSession):
             call_timeout_secs=10.0,
             file_timeout_base_secs=0.01,
             file_timeout_per_function_secs=0.0,
+            file_timeout_per_line_secs=0.0,
         )
         self.request_timeouts: list[float] = []
 
@@ -2218,13 +2484,13 @@ def test_pyright_session_file_deadline_scales_with_function_count(tmp_path: Path
     path = tmp_path / "demo.py"
 
     before = time.monotonic()
-    deadline = session._deadline_for_file(path, n_functions=6)  # noqa: SLF001
+    deadline = session._deadline_for_file(path, n_functions=6, n_lines=0)  # noqa: SLF001
     after = time.monotonic()
 
     assert before + 5.0 <= deadline <= after + 5.0
     # The deadline is memoised per file: the references pass re-asks with the
     # same path and must share the calls pass's budget, not restart it.
-    assert session._deadline_for_file(path, n_functions=1000) == deadline  # noqa: SLF001
+    assert session._deadline_for_file(path, n_functions=1000, n_lines=0) == deadline  # noqa: SLF001
 
 
 def test_default_call_timeout_admits_a_large_file_warm_up_query() -> None:
@@ -2244,7 +2510,7 @@ def test_budgeted_timeout_grants_the_call_timeout_when_the_file_budget_is_larger
     session = PyrightSession(tmp_path, executable=sys.executable)
     path = tmp_path / "big.py"
     # 290 functions → base 10 + 0.25*290 = 82.5 s file budget (< 90 s cap).
-    deadline = session._deadline_for_file(path, n_functions=290)  # noqa: SLF001
+    deadline = session._deadline_for_file(path, n_functions=290, n_lines=0)  # noqa: SLF001
     grant = session._budgeted_timeout(deadline)  # noqa: SLF001
     assert 30.0 - 0.5 <= grant <= 30.0
     # ...and never more than what is left of the file budget.
@@ -2302,10 +2568,29 @@ def test_pyright_session_file_deadline_is_capped_for_very_large_files(tmp_path: 
     )
 
     before = time.monotonic()
-    deadline = session._deadline_for_file(tmp_path / "demo.py", n_functions=1000)  # noqa: SLF001
+    deadline = session._deadline_for_file(tmp_path / "demo.py", n_functions=1000, n_lines=0)  # noqa: SLF001
     after = time.monotonic()
 
     assert before + 10.0 <= deadline <= after + 10.0
+
+
+def test_pyright_session_file_budget_scales_with_lines_for_def_sparse_files(
+    tmp_path: Path,
+) -> None:
+    # clarion-bf3986e301: elspeth's tool_batch.py (2,354 lines, 17 defs) got
+    # base + 17 * 0.25 ~= 14 s under the per-function-only budget. The line
+    # term buys a def-sparse monster the time its code volume demands; the
+    # per-function term still governs the common many-small-defs shape, and
+    # the cap still bounds both.
+    session = PyrightSession(tmp_path, executable=sys.executable)
+
+    sparse = session._file_timeout_for(17, 2354)  # noqa: SLF001
+    assert sparse == pytest.approx(
+        PYRIGHT_FILE_TIMEOUT_BASE_SECS + 2354 * PYRIGHT_FILE_TIMEOUT_PER_LINE_SECS
+    )
+    dense = session._file_timeout_for(200, 400)  # noqa: SLF001
+    assert dense == pytest.approx(PYRIGHT_FILE_TIMEOUT_BASE_SECS + 200 * 0.25)
+    assert session._file_timeout_for(17, 100_000) == PYRIGHT_FILE_TIMEOUT_CAP_SECS  # noqa: SLF001
 
 
 def test_pyright_session_default_file_timeout_cap_stays_under_the_host_watchdog() -> None:
@@ -2369,6 +2654,7 @@ class ScriptedCallSession(PyrightSession):
         self.budget_expired = False
         self.visited: list[str] = []
         self.closed_documents = 0
+        self.cancel_requests = 0
 
     def _ensure_process(self) -> bool:
         return True
@@ -2385,6 +2671,8 @@ class ScriptedCallSession(PyrightSession):
             return
         if method == "textDocument/didClose":
             self.closed_documents += 1
+        if method == "$/cancelRequest":
+            self.cancel_requests += 1
 
     def _file_budget_expired(self, deadline: float) -> bool:
         return self.budget_expired or super()._file_budget_expired(deadline)
@@ -2400,6 +2688,10 @@ class ScriptedCallSession(PyrightSession):
         if not self.fake_spawn and method in ("initialize", "shutdown"):
             # A real spawn needs the real handshake over the real transport.
             return super()._request(method, params, timeout_secs)
+        # Mirror the real ``_request``'s in-flight bookkeeping so the skip
+        # path's ``$/cancelRequest`` is observable through the fake.
+        self._request_id_in_flight = self._next_id
+        self._next_id += 1
         index = self._function_index_for_path(self.module)
         if method == "textDocument/prepareCallHierarchy":
             position = cast("dict[str, int]", params["position"])
@@ -2473,9 +2765,43 @@ def _assert_partial_call_evidence(
     assert session.closed_documents == 1
 
 
-def test_pyright_session_call_resolution_timeout_before_any_function_is_visited_is_fully_unresolved(
+def _assert_skipped_function_call_evidence(
+    session: ScriptedCallSession,
+    module: Path,
+    result: CallResolutionResult | dict[str, object],
+    *,
+    resolved: str,
+    skipped: str,
+) -> None:
+    """Skip-and-continue closure (clarion-bf3986e301): one function's per-query
+    timeout costs ONLY that function; the pass completes with its sites
+    disclosed as unresolved and the abandoned computation cancelled."""
+    assert isinstance(result, CallResolutionResult)
+    total = _ast_call_sites_total(session, module, _TWO_CALLERS)
+    # Arithmetic closure is the load-bearing check: it catches a double-count
+    # (edges kept AND the same sites counted unresolved) that "the resolved
+    # function's edge is present" cannot.
+    assert len(result.edges) + result.unresolved_call_sites_total == total
+    assert [edge["from_id"] for edge in result.edges] == [resolved]
+    assert result.edges[0]["to_id"] == "python:function:demo.callee"
+    assert [site["caller_entity_id"] for site in result.unresolved_call_sites] == [skipped]
+    assert not result.coverage.is_degraded
+    assert session.cancel_requests == 1
+    assert session.closed_documents == 1
+    findings = [
+        finding
+        for finding in result.findings
+        if finding["subcode"] == FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT
+    ]
+    assert [finding["metadata"]["function"] for finding in findings] == [skipped]
+    assert all(finding["metadata"]["skipped_function"] is True for finding in findings)
+
+
+def test_pyright_session_timeout_on_the_first_function_skips_it_and_resolves_the_rest(
     tmp_path: Path,
 ) -> None:
+    # Pre-clarion-bf3986e301 this was the worst case: a timeout on the FIRST
+    # function forfeited the whole file. Now it costs only that function.
     module = _write_module(tmp_path, _TWO_CALLER_MODULE)
 
     with ScriptedCallSession(
@@ -2483,19 +2809,21 @@ def test_pyright_session_call_resolution_timeout_before_any_function_is_visited_
         module=module,
         callee_by_caller=_CALLEE_BY_CALLER,
         fail_on="python:function:demo.first",
+        interpreter=_PINNED_TEST_INTERPRETER,
     ) as session:
         result = session.resolve_calls(module, _TWO_CALLERS)
 
-    assert result.edges == []
-    assert result.unresolved_call_sites_total == _ast_call_sites_total(
-        session, module, _TWO_CALLERS
+    _assert_skipped_function_call_evidence(
+        session,
+        module,
+        result,
+        resolved="python:function:demo.second",
+        skipped="python:function:demo.first",
     )
-    assert {site["caller_entity_id"] for site in result.unresolved_call_sites} == set(_TWO_CALLERS)
-    assert result.coverage == FacetCoverage.degraded("pyright_timeout", transient=True)
-    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+    assert session.visited == _TWO_CALLERS
 
 
-def test_pyright_session_call_resolution_timeout_keeps_edges_resolved_before_the_timeout(
+def test_pyright_session_call_resolution_timeout_skips_the_function_and_keeps_the_rest(
     tmp_path: Path,
 ) -> None:
     module = _write_module(tmp_path, _TWO_CALLER_MODULE)
@@ -2505,12 +2833,44 @@ def test_pyright_session_call_resolution_timeout_keeps_edges_resolved_before_the
         module=module,
         callee_by_caller=_CALLEE_BY_CALLER,
         fail_on="python:function:demo.second",
+        interpreter=_PINNED_TEST_INTERPRETER,
     ) as session:
         result = session.resolve_calls(module, _TWO_CALLERS)
 
-    _assert_partial_call_evidence(session, module, result, reason="pyright_timeout")
+    _assert_skipped_function_call_evidence(
+        session,
+        module,
+        result,
+        resolved="python:function:demo.first",
+        skipped="python:function:demo.second",
+    )
     assert session.visited == _TWO_CALLERS
-    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+
+
+def test_pyright_session_all_functions_timing_out_stays_degraded_for_the_wedge_breaker(
+    tmp_path: Path,
+) -> None:
+    # A pass where EVERY function timed out resolved nothing: claiming
+    # ``complete`` would lie AND reset the consecutive-timeout streak the
+    # ADR-057 wedge breaker keys on. It stays ``pyright_timeout``.
+    source = "def callee():\n    pass\n\ndef only():\n    callee()\n"
+    module = _write_module(tmp_path, source)
+    run_state = PyrightRunState()
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller={"python:function:demo.only": "python:function:demo.callee"},
+        fail_on="python:function:demo.only",
+        run_state=run_state,
+        interpreter=_PINNED_TEST_INTERPRETER,
+    ) as session:
+        result = session.resolve_calls(module, ["python:function:demo.only"])
+
+    assert result.edges == []
+    assert result.coverage == FacetCoverage.degraded("pyright_timeout", transient=True)
+    assert run_state.consecutive_timeout_files == 1
+    assert session.cancel_requests == 1
 
 
 def test_pyright_session_call_resolution_timeout_mid_function_item_loop_keeps_arithmetic_closure(
@@ -2526,14 +2886,22 @@ def test_pyright_session_call_resolution_timeout_mid_function_item_loop_keeps_ar
         fail_at="callHierarchy/outgoingCalls",
         items_per_function=2,
         fail_on_item=1,
+        interpreter=_PINNED_TEST_INTERPRETER,
     ) as session:
         result = session.resolve_calls(module, _TWO_CALLERS)
 
     # ``second``'s first call-hierarchy item resolved a genuine candidate before
     # its second item timed out. A function's edges are appended only after its
     # whole item sub-loop finishes, so that partial per-item state must be
-    # discarded (counted unresolved), never kept AND counted.
-    _assert_partial_call_evidence(session, module, result, reason="pyright_timeout")
+    # discarded (counted unresolved), never kept AND counted -- the skip only
+    # changes what happens NEXT (continue, not abort).
+    _assert_skipped_function_call_evidence(
+        session,
+        module,
+        result,
+        resolved="python:function:demo.first",
+        skipped="python:function:demo.second",
+    )
 
 
 def test_pyright_session_call_resolution_file_budget_expiry_keeps_edges_resolved_before_it(
@@ -2585,7 +2953,14 @@ def test_pyright_session_call_resolution_transport_failure_keeps_edges_resolved_
     assert run_state.file_attributed_restart_count == 1
     assert run_state.restart_count == 0
     assert session.spawns == 1
-    assert FINDING_PYRIGHT_RESTART in _finding_codes(result.findings)
+    restart_findings = [
+        finding for finding in result.findings if finding["subcode"] == FINDING_PYRIGHT_RESTART
+    ]
+    assert restart_findings
+    # clarion-bf3986e301 direction 3: the restart finding carries the dead
+    # process's stderr tail so the next crash class is attributable without
+    # a manual probe. (Empty here -- the fake has no stderr -- but present.)
+    assert all("stderr_tail" in finding["metadata"] for finding in restart_findings)
 
 
 class PartialReferenceTransportFailureSession(PartialReferenceTimeoutSession):
@@ -2940,7 +3315,7 @@ def test_pyright_session_transient_spawn_failure_is_collateral(
     )
 
 
-def test_pyright_session_pure_timeout_is_self_inflicted_and_does_not_restart(
+def test_pyright_session_pure_timeout_skips_the_function_and_does_not_restart(
     tmp_path: Path,
 ) -> None:
     module = _write_module(tmp_path, _TWO_CALLER_MODULE)
@@ -2955,17 +3330,20 @@ def test_pyright_session_pure_timeout_is_self_inflicted_and_does_not_restart(
     ) as session:
         result = session.resolve_calls(module, _TWO_CALLERS)
 
-    assert result.coverage == FacetCoverage.degraded(
-        "pyright_timeout", transient=True, collateral=False
-    )
     # A timeout means pyright is alive but slow: restarting would throw away
-    # its warm cache for nothing (ADR-057 deviation from the ticket text).
-    # Only a STREAK of ``MAX_CONSECUTIVE_TIMEOUT_FILES`` timed-out files is
-    # read as a wedged process -- see the breaker tests below.
+    # its warm cache for nothing (ADR-057 deviation from the ticket text) --
+    # and since clarion-bf3986e301 a per-query timeout also does not abort:
+    # the one slow function is skipped (its computation cancelled) and the
+    # pass completes, so the file is not re-dispatched every run for it.
+    assert not result.coverage.is_degraded or result.coverage.reason == "interpreter_unpinned"
+    assert result.unresolved_call_sites_total >= 1
     assert run_state.restart_count == 0
     assert run_state.file_attributed_restart_count == 0
-    assert run_state.consecutive_timeout_files == 1
+    # A pass that completes (some functions genuinely answered) resets the
+    # wedge streak; only an all-functions-timeout file feeds it.
+    assert run_state.consecutive_timeout_files == 0
     assert session.spawns == 0
+    assert session.cancel_requests == 1
 
 
 def test_pyright_session_unrelated_read_error_in_flight_is_not_a_restart(
@@ -3122,6 +3500,7 @@ def test_pyright_session_restart_extends_shared_file_deadline_without_cross_face
         spawn_latency_secs=3.0,
         file_timeout_base_secs=10.0,
         file_timeout_per_function_secs=0.0,
+        file_timeout_per_line_secs=0.0,
         run_state=run_state,
     ) as session:
         anchor = session.clock

@@ -115,6 +115,9 @@ class FacetCoverage:
 class CallResolutionResult:
     edges: list[CallsRawEdge] = field(default_factory=list)
     unresolved_call_sites_total: int = 0
+    # Bare unshadowed-builtin calls dropped before persistence; disclosed so
+    # the omission is visible in run stats (clarion-8a862d8f7e).
+    unresolved_call_sites_skipped_builtin_total: int = 0
     unresolved_call_sites: list[UnresolvedCallSite] = field(default_factory=list)
     pyright_query_latency_ms: list[int] = field(default_factory=list)
     pyright_index_parse_latency_ms: list[int] = field(default_factory=list)

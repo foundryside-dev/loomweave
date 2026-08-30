@@ -35,7 +35,7 @@ from loomweave_plugin_python.pyright_session import PyrightRunState, PyrightSess
 from loomweave_plugin_python.stdout_guard import install_stdio
 from loomweave_plugin_python.wardline_descriptor import WardlineVocabulary, load_wardline_descriptor
 
-ONTOLOGY_VERSION = "0.12.0"
+ONTOLOGY_VERSION = "0.13.0"
 
 # Plugin-side Content-Length sanity cap. Matches the host's ADR-021 §2b
 # default (8 MiB) so the plugin never emits a frame the host would kill us
@@ -212,6 +212,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
     """Read the requested file, extract entities + edges, return AnalyzeFileResult shape."""
     empty_stats = {
         "unresolved_call_sites_total": 0,
+        "unresolved_call_sites_skipped_builtin_total": 0,
         "unresolved_call_sites": [],
         "reference_sites_total": 0,
         "references_resolved_total": 0,
@@ -258,6 +259,9 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         state.pyright_files_since_restart = 0
     stats = {
         "unresolved_call_sites_total": result.stats.unresolved_call_sites_total,
+        "unresolved_call_sites_skipped_builtin_total": (
+            result.stats.unresolved_call_sites_skipped_builtin_total
+        ),
         "unresolved_call_sites": result.stats.unresolved_call_sites,
         "reference_sites_total": result.stats.reference_sites_total,
         "references_resolved_total": result.stats.references_resolved_total,

@@ -366,9 +366,17 @@ pub struct AnalyzeFileParams {
 /// Run-observability counters emitted per `analyze_file` result.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnalyzeFileStats {
-    /// Call sites where the plugin found no in-project candidate.
+    /// Call sites where the plugin found no in-project candidate. Excludes
+    /// sites the plugin dropped as bare unshadowed-builtin calls (counted in
+    /// `unresolved_call_sites_skipped_builtin_total`), so this stays equal to
+    /// `unresolved_call_sites.len()` when the list is complete.
     #[serde(default)]
     pub unresolved_call_sites_total: u64,
+    /// Bare calls to unshadowed builtins (`len(...)`, `str(...)`) the plugin
+    /// dropped before persistence: they can never resolve in-project, so they
+    /// are disclosed here rather than stored as unresolved sites.
+    #[serde(default)]
+    pub unresolved_call_sites_skipped_builtin_total: u64,
     /// Concrete unresolved call sites available for query-time inference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved_call_sites: Vec<UnresolvedCallSite>,
@@ -526,6 +534,7 @@ impl AnalyzeFileStats {
     fn is_empty(&self) -> bool {
         self.resolution_coverage.is_none()
             && self.unresolved_call_sites_total == 0
+            && self.unresolved_call_sites_skipped_builtin_total == 0
             && self.reference_sites_total == 0
             && self.references_resolved_total == 0
             && self.references_skipped_external_total == 0
@@ -882,6 +891,7 @@ mod tests {
             })],
             stats: AnalyzeFileStats {
                 unresolved_call_sites_total: 2,
+                unresolved_call_sites_skipped_builtin_total: 9,
                 unresolved_call_sites: vec![UnresolvedCallSite {
                     caller_entity_id: "python:function:m.main".to_owned(),
                     site_ordinal: 1,

@@ -3125,11 +3125,13 @@ fn insert_blocked_entity(
 }
 
 /// Assert a briefing-blocked entity projection keeps its navigable identity
-/// (clarion-719e7320f5, A3): `id`, `kind`, `name`, `short_name`,
-/// `source_file_path`, the line span and `content_hash` are PRESENT alongside
-/// the `briefing_blocked` flag, so the entity stays navigable; only the secret
-/// *content* is withheld. The id is the qualname-bearing locator the caller
-/// pasted, so it appears verbatim.
+/// (clarion-719e7320f5, A3): `id`, `kind`, `short_name`, `source_file_path`
+/// and `source_line_start` are PRESENT alongside the `briefing_blocked` flag,
+/// so the entity stays navigable; only the secret *content* is withheld. The
+/// id is the qualname-bearing locator the caller pasted, so it appears
+/// verbatim. (`name`, `source_line_end` and `content_hash` are absent from
+/// every list row since the X-6 slim projection, clarion-b24df21158 — row
+/// slimming, not redaction.)
 ///
 /// `expected_sei` pins the cross-tool SEI posture (the ADR-034 amendment that
 /// reversed "sei stays null" — see [`blocked_sei`] in loomweave-mcp): `Some(sei)`
@@ -3141,12 +3143,9 @@ fn assert_blocked_identity_present(entity: &Value, reason: &str, expected_sei: O
     for field in [
         "id",
         "kind",
-        "name",
         "short_name",
         "source_file_path",
         "source_line_start",
-        "source_line_end",
-        "content_hash",
     ] {
         assert!(
             entity.get(field).is_some_and(|v| !v.is_null()),
@@ -3352,7 +3351,10 @@ async fn coupling_hotspots_blocked_entity_keeps_navigable_identity() {
     assert_eq!(blocked["id"], "python:function:hub", "{env}");
     assert_eq!(blocked["source_file_path"], "hub.py", "{env}");
     assert_eq!(blocked["source_line_start"], 3, "{env}");
-    assert_eq!(blocked["source_line_end"], 9, "{env}");
+    assert!(
+        blocked.get("source_line_end").is_none(),
+        "slim row (X-6): {env}"
+    );
 }
 
 #[tokio::test]

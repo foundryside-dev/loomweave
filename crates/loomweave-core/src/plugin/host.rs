@@ -512,7 +512,7 @@ impl
         // reap either. Errors from kill/wait are best-effort — by this
         // point the child's state is already anomalous.
         if let Err(e) = host.handshake() {
-            let _ = child.kill();
+            let _ = crate::plugin::process_tree::kill_process_tree(&mut child);
             let _ = child.wait();
             return Err(e);
         }

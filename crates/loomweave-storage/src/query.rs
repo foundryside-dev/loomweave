@@ -1051,6 +1051,7 @@ pub fn preferred_finding_anchor_by_file(conn: &Connection) -> Result<HashMap<Str
 /// secret-detected row), and missing it flips the anchor on the next skip.
 pub const PRE_INGEST_SECRET_SCAN_RULE_IDS: &[&str] = &[
     "LMWV-SEC-SECRET-DETECTED",
+    "LMWV-INFRA-SECRET-INLINE-ALLOW-MATCH",
     "LMWV-INFRA-SECRET-BASELINE-MATCH",
     "LMWV-INFRA-SECRET-BASELINE-NO-JUSTIFICATION",
     "LMWV-SEC-UNREDACTED-SECRETS-ALLOWED",

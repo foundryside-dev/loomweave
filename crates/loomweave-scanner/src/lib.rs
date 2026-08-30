@@ -13,7 +13,7 @@ pub use baseline::{
     load_baseline,
 };
 pub use entropy::EntropyTuning;
-pub use patterns::{PatternMeta, Scanner};
+pub use patterns::{INLINE_ALLOW_MARKERS, PartitionedScan, PatternMeta, Scanner};
 use std::{
     fmt::{self, Write as _},
     str::FromStr,

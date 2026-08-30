@@ -40,6 +40,92 @@ pub fn session_start(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the hook actually did about a stale index — the one thing the printed
+/// line must be honest about (clarion-f57c9e74a6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackgroundAnalyzeOutcome {
+    /// No analyze held the lock; a detached child was spawned.
+    Started,
+    /// The analyze advisory lock is already held: another analyze is running
+    /// (or landing its final transaction) and ours would have been a no-op.
+    AlreadyRunning {
+        lock_path: PathBuf,
+        /// Whether a follow-up refresh was queued for the running analyze to
+        /// drain on exit.
+        queued: bool,
+    },
+    /// The spawn itself failed; the manual nudge already printed stands.
+    SpawnFailed,
+}
+
+/// Probe the analyze advisory lock, then spawn only when nobody holds it.
+///
+/// Before this probe the hook printed "started a background analyze" on every
+/// successful *spawn*, even when the child then lost the lock and exited at
+/// once — reproduced on a shared checkout mid-analyze (clarion-f57c9e74a6).
+/// The probe guard is dropped BEFORE the spawn so the child can take the lock;
+/// the residual race (a second analyze starting in that gap) is harmless — the
+/// loser is the same clean no-op it always was, we merely stop claiming credit
+/// for it. A lock-path resolution failure degrades to the old spawn-and-see
+/// behaviour rather than suppressing the refresh.
+fn probe_then_spawn_background_analyze(project_root: &Path) -> BackgroundAnalyzeOutcome {
+    if let Ok(ctx) = loomweave_core::worktree::WorktreeContext::resolve(project_root) {
+        match crate::analyze_lock::try_acquire_analyze_lock_for_context(&ctx) {
+            Ok(crate::analyze_lock::TryAnalyzeLock::Held { lock_path }) => {
+                // Queue a follow-up instead of forking a child doomed to lose
+                // the lock: the running analyze drains the request on exit
+                // (clarion-78d75e45c9), so a burst of N events costs two runs.
+                let queued = match crate::analyze_lock::request_pending_analyze(&ctx) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "could not queue a follow-up analyze");
+                        false
+                    }
+                };
+                return BackgroundAnalyzeOutcome::AlreadyRunning { lock_path, queued };
+            }
+            Ok(crate::analyze_lock::TryAnalyzeLock::Acquired(guard)) => drop(guard),
+            Err(err) => {
+                tracing::warn!(error = %err, "analyze-lock probe failed; spawning anyway");
+            }
+        }
+    }
+    match spawn_detached_analyze(project_root) {
+        Ok(()) => BackgroundAnalyzeOutcome::Started,
+        Err(err) => {
+            tracing::warn!(error = %err, "background analyze spawn failed");
+            BackgroundAnalyzeOutcome::SpawnFailed
+        }
+    }
+}
+
+/// The line the session-start hook prints for a stale index, keyed on what
+/// actually happened. `None` for a failed spawn: the snapshot's manual
+/// `loomweave analyze` nudge is already on screen and stays the truth.
+fn background_analyze_line(outcome: &BackgroundAnalyzeOutcome) -> Option<String> {
+    match outcome {
+        BackgroundAnalyzeOutcome::Started => Some(
+            "Loomweave: index is stale — started a background `loomweave analyze` \
+             just now (detached, non-blocking). No need to run it manually; re-query \
+             Loomweave once it finishes to pick up the refreshed graph."
+                .to_owned(),
+        ),
+        BackgroundAnalyzeOutcome::AlreadyRunning { lock_path, queued } => Some(format!(
+            "Loomweave: index is stale — another `loomweave analyze` is already running \
+             (holds {}); nothing was started{}. No need to run it manually; re-query \
+             Loomweave once it finishes (project_status_get reports the run) to pick \
+             up the refreshed graph.",
+            lock_path.display(),
+            if *queued {
+                ", a follow-up refresh is queued to run when it finishes"
+            } else {
+                ""
+            }
+        )),
+        BackgroundAnalyzeOutcome::SpawnFailed => None,
+    }
+}
+
 /// Whether a stale index should kick off a background re-analyze.
 ///
 /// True only for a readable, *present* index whose freshness check says the
@@ -64,15 +150,9 @@ fn should_trigger_background_analyze(outcome: &SnapshotOutcome) -> bool {
 /// Fail-soft: a spawn failure degrades to the manual `loomweave analyze` nudge
 /// the snapshot already printed — it never errors out of the session-start hook.
 fn trigger_background_analyze(project_root: &Path) {
-    match spawn_detached_analyze(project_root) {
-        Ok(()) => println!(
-            "Loomweave: index is stale — started a background `loomweave analyze` \
-             just now (detached, non-blocking). No need to run it manually; re-query \
-             Loomweave once it finishes to pick up the refreshed graph."
-        ),
-        Err(err) => {
-            tracing::warn!(error = %err, "background analyze spawn failed");
-        }
+    let outcome = probe_then_spawn_background_analyze(project_root);
+    if let Some(line) = background_analyze_line(&outcome) {
+        println!("{line}");
     }
 }
 
@@ -88,10 +168,10 @@ fn trigger_background_analyze(project_root: &Path) {
 #[allow(clippy::unnecessary_wraps)]
 pub fn git_sync(path: &Path) -> anyhow::Result<()> {
     let outcome = load_snapshot(path);
-    if should_trigger_background_analyze(&outcome)
-        && let Err(err) = spawn_detached_analyze(path)
-    {
-        tracing::warn!(error = %err, "git-sync background analyze spawn failed");
+    if should_trigger_background_analyze(&outcome) {
+        // Same lock probe as session-start: a held lock means the refresh is
+        // already underway, so don't fork a child just to have it lose the lock.
+        let _ = probe_then_spawn_background_analyze(path);
     }
     Ok(())
 }
@@ -443,6 +523,56 @@ mod tests {
         assert!(
             should_trigger_background_analyze(&SnapshotOutcome::Ready(snapshot)),
             "a present, stale index must trigger the single-shot background analyze"
+        );
+    }
+
+    #[test]
+    fn held_analyze_lock_reports_already_running_not_started() {
+        // clarion-f57c9e74a6: the hook must not claim it started an analyze
+        // when the advisory lock says one is already running.
+        let root = tempfile::tempdir().unwrap();
+        let loomweave_dir = root.path().join(".weft").join("loomweave");
+        std::fs::create_dir_all(&loomweave_dir).unwrap();
+        let ctx = loomweave_core::worktree::WorktreeContext::resolve(root.path())
+            .expect("plain directory resolves as its own store");
+        let _held = crate::analyze_lock::acquire_analyze_lock_for_context(&ctx).unwrap();
+
+        let outcome = probe_then_spawn_background_analyze(root.path());
+        let BackgroundAnalyzeOutcome::AlreadyRunning { lock_path, queued } = &outcome else {
+            panic!("held lock must report AlreadyRunning, got {outcome:?}");
+        };
+        assert!(*queued, "a held lock must queue a follow-up refresh");
+        assert!(
+            crate::analyze_lock::pending_analyze_requested(&ctx),
+            "the pending marker must exist beside the lock"
+        );
+        assert!(crate::analyze_lock::take_pending_analyze(&ctx));
+        assert!(!crate::analyze_lock::pending_analyze_requested(&ctx));
+        assert!(
+            !crate::analyze_lock::take_pending_analyze(&ctx),
+            "taking twice is a no-op"
+        );
+        assert!(
+            lock_path.starts_with(&loomweave_dir),
+            "{}",
+            lock_path.display()
+        );
+        let line = background_analyze_line(&outcome).expect("already-running prints a line");
+        assert!(line.contains("already running"), "{line}");
+        assert!(line.contains("nothing was started"), "{line}");
+        assert!(!line.contains("started a background"), "{line}");
+    }
+
+    #[test]
+    fn background_analyze_lines_are_honest_per_outcome() {
+        let started = background_analyze_line(&BackgroundAnalyzeOutcome::Started).unwrap();
+        assert!(
+            started.contains("started a background `loomweave analyze`"),
+            "{started}"
+        );
+        assert!(
+            background_analyze_line(&BackgroundAnalyzeOutcome::SpawnFailed).is_none(),
+            "a failed spawn must not print a success line; the manual nudge stands"
         );
     }
 

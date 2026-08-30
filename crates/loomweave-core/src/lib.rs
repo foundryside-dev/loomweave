@@ -22,6 +22,7 @@ pub use classifier_coverage::{
 pub use entity_id::{EntityId, EntityIdError, entity_id};
 pub use errors::{HttpErrorCode, McpErrorCode};
 pub use hardened_git::{hardened_git_command, list_untracked_files};
+pub use plugin::process_tree::{descendant_pids, kill_process_tree};
 pub use plugin::{
     // host (Task 6) — facade for callers that spawn/connect plugins
     AcceptedEdge,

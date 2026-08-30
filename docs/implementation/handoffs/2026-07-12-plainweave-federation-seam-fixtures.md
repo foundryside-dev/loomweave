@@ -1,7 +1,7 @@
 # Plainweave federation seam fixture handoff
 
 **Date:** 2026-07-12
-**Producer:** Loomweave 1.5.1 worktree artifacts
+**Producer:** Loomweave 1.6.0 worktree artifacts
 **Consumer owner:** Plainweave ticket `plainweave-f8303b4b50`
 
 Loomweave now publishes the classifier, external SQLite, identity-ownership,
@@ -17,8 +17,8 @@ basename expected by both repositories.
 
 | Fixture | SHA-256 |
 |---|---|
-| `crates/loomweave-storage/tests/fixtures/classifier-coverage-v1.golden.json` | `b4860fdaec065e06154af27ba5a630ecf3c26b0ab5a3d18b793a1971cc221cf8` |
-| `docs/federation/fixtures/classification.python.json` | `3f3bb6e20f414c98f5407d7de01c26b285d795864de86e654e297bd807a06c54` |
+| `crates/loomweave-storage/tests/fixtures/classifier-coverage-v1.golden.json` | `f4e41783d58f082427a68137a62288cc5a314848dd79c79a49c531f548ad2fb2` |
+| `docs/federation/fixtures/classification.python.json` | `624f3c42dd2b303cb62349376767d511a56ca855b2b657eeec341d9365aecce9` |
 | `docs/federation/fixtures/get-api-v1-capabilities.json` | `61020b20aadaef75a3de523f0a8f83be03d1d503ffdca719c78d949d20beeced` |
 | `docs/federation/fixtures/loomweave-http-auth-v1.golden.json` | `cd4a8a1598bedafdfe247d47a616e9a82a148e7cf8feaac9299a21550b2c720b` |
 | `docs/federation/fixtures/external-sqlite-compatibility-v1.json` | `46fc47a9553dbad9151ee3e0f760a5e4b1d6b967a1a4c1e376d3073de4c15d1a` |
@@ -30,9 +30,9 @@ The generated metadata records these explicit artifacts:
 
 | Artifact | Version | Ontology |
 |---|---:|---:|
-| `target/debug/loomweave` | 1.5.1 | n/a |
-| `target/debug/loomweave-rust-plugin` | 1.5.1 | 0.9.0 |
-| `plugins/python/.venv/bin/loomweave-plugin-python` | 1.5.1 | 0.12.0 |
+| `target/debug/loomweave` | 1.6.0 | n/a |
+| `target/debug/loomweave-rust-plugin` | 1.6.0 | 0.9.0 |
+| `plugins/python/.venv/bin/loomweave-plugin-python` | 1.6.0 | 0.12.0 |
 
 Provenance is intentionally narrower than “all fixtures came from analysis.”
 The real Python analysis and production handlers produce classifier coverage,

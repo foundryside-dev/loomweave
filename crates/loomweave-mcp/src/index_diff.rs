@@ -338,6 +338,7 @@ fn plugin_stats_subset(stats: &Value) -> Value {
         "references_skipped_external_total": pick("references_skipped_external_total"),
         "references_skipped_cap_total": pick("references_skipped_cap_total"),
         "unresolved_call_sites_total": pick("unresolved_call_sites_total"),
+        "unresolved_call_sites_skipped_builtin_total": pick("unresolved_call_sites_skipped_builtin_total"),
         "unresolved_reference_sites_total": pick("unresolved_reference_sites_total"),
     })
 }
@@ -589,6 +590,63 @@ pub(crate) fn compute_freshness(
         dirty_indexed_count,
         untracked_source,
     }
+}
+
+/// Evidence that the ONLY thing separating the index from the working tree is
+/// the commit clock: HEAD moved past `analyzed_at_commit`, but no indexed file
+/// was modified in place, nothing staged touches an indexed path, and no
+/// un-indexed source of an ingested type sits untracked. Consumed by the
+/// `analyze` no-indexed-changes fast path (clarion-78d75e45c9), which then asks
+/// git whether `analyzed_commit..head_commit` touched any ingested path at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOnlyDrift {
+    pub analyzed_commit: String,
+    pub head_commit: String,
+    /// The distinct extensions of every ingested source file — the scope the
+    /// caller checks the committed diff against.
+    pub ingested_extensions: BTreeSet<String>,
+}
+
+/// The commit-only-drift verdict for `project_root`, derived from the same
+/// freshness oracle every other surface reads (`compute_freshness`) so the
+/// fast path can never disagree with `project_status_get`.
+///
+/// `None` whenever the verdict is anything but "drift, and only the commit
+/// channel fired": fresh or never-analyzed indexes (nothing to fast-path), any
+/// in-place modification, staged indexed change, or untracked source, and any
+/// blindness — an unparsable run timestamp, a stat failure, a truncated stat
+/// scan, or an unknown HEAD / analyzed commit. Blind never means "unchanged".
+#[must_use]
+pub fn commit_only_drift(
+    conn: &rusqlite::Connection,
+    project_root: &Path,
+) -> Option<CommitOnlyDrift> {
+    let state = read_index_state(conn).ok()?;
+    state.analyzed_at.as_ref()?;
+    let git = gather_git_facts(project_root);
+    let untracked = compute_untracked_source(conn, project_root);
+    let verdict = compute_freshness(project_root, &state, &git, untracked);
+    let file_channel_blind = verdict.file_drift.stat_failures > 0
+        || verdict.file_drift.stat_scan_truncated
+        || (verdict.file_drift.statted == 0
+            && verdict.file_drift.missing.is_empty()
+            && verdict.file_drift.skipped_non_files == 0
+            && !state.files.is_empty());
+    if verdict.overall != FreshnessOverall::Drift
+        || verdict.commit_mismatch != Some(true)
+        || !verdict.analyzed_time_parsed
+        || !verdict.file_drift.modified.is_empty()
+        || verdict.dirty_indexed_count > 0
+        || untracked == Some(true)
+        || file_channel_blind
+    {
+        return None;
+    }
+    Some(CommitOnlyDrift {
+        analyzed_commit: state.analyzed_commit?,
+        head_commit: git.head_commit?,
+        ingested_extensions: ingested_source_extensions(conn),
+    })
 }
 
 /// Whether the working tree holds untracked source of an already-indexed file

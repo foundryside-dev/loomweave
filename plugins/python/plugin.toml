@@ -1,7 +1,7 @@
 [plugin]
 name = "loomweave-plugin-python"
 plugin_id = "python"
-version = "1.5.1"
+version = "1.6.0"
 protocol_version = "1.0"
 # Bare basename per ADR-021 §Layer 1 + WP2 scrub commit eb0a41d — the host
 # refuses manifests whose `executable` carries any path component.
@@ -57,13 +57,17 @@ rule_id_prefix = "LMWV-PY-"
 # runner-wrapper, `sys.argv`, and argparse `cli-command` tagging; 0.12.0
 # declares the complete static classifier set so supported-empty results are
 # distinguishable from unsupported classifiers and forces unchanged files to
-# re-dispatch. Classifier declarations do not create entity-tag rows. NOTE:
+# re-dispatch. Classifier declarations do not create entity-tag rows. 0.13.0
+# widens `calls` targets to class entities: an instantiation ``Name(...)``
+# is a call to the class (clarion-e5224c3aff) -- a semantic widening of an
+# existing kind, bumped so unchanged files re-dispatch and pick up the edges.
+# NOTE:
 # ADR-007's summary-cache key is the 5-tuple (entity_id, content_hash,
 # prompt_template_id, model_tier, guidance_fingerprint) — ontology_version is
 # handshake-validation, NOT a cache-key component. New edge rows miss the
 # cache by component-1 of the 5-tuple organically (no edges live in the
 # 5-tuple yet anyway).
-ontology_version = "0.12.0"
+ontology_version = "0.13.0"
 classifier_tags = [
     "cli-command",
     "data-model",

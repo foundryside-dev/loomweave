@@ -1977,7 +1977,7 @@ fn analyze_phase3_is_stable_on_unchanged_incremental_rerun() {
                      related_entities, message, evidence, properties, supports, supported_by, \
                      status, filigree_issue_id, created_at, updated_at\
                  ) VALUES (\
-                     ?1, 'loomweave', '1.5.1', ?2, 'LMWV-FIXTURE-SUBSYSTEM', 'fact', 'WARN', \
+                     ?1, 'loomweave', '1.6.0', ?2, 'LMWV-FIXTURE-SUBSYSTEM', 'fact', 'WARN', \
                      'core:subsystem:obsolete', '[]', 'fixture', '{}', '{}', '[]', '[]', \
                      ?3, ?4, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'\
                  )",
@@ -7498,6 +7498,9 @@ fn write_hanging_plugin(plugin_dir: &std::path::Path) {
 /// by the per-file analysis-timeout watchdog and produces a persisted
 /// `LMWV-PY-TIMEOUT` finding (and not a redundant `LMWV-INFRA-PLUGIN-CRASH`). The
 /// timeout is set low via `LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS` on the spawned process.
+/// Since clarion-78d75e45c9 the kill degrades the FILE, so with a single
+/// hanging file the run completes with that file skipped (the terminal shape
+/// is pinned in `analyze_hardening::file_watchdog_respawns_are_bounded`).
 #[cfg(unix)]
 #[test]
 fn analyze_persists_timeout_finding_for_hanging_plugin() {
@@ -7520,7 +7523,7 @@ fn analyze_persists_timeout_finding_for_hanging_plugin() {
         .env("PATH", &plugin_path)
         .env("LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS", "500")
         .assert()
-        .failure();
+        .success();
 
     let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
     let (timeout_count, anchor): (i64, String) = conn

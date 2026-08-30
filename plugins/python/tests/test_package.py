@@ -20,7 +20,7 @@ def _read_toml(path: Path) -> dict[str, Any]:
 
 
 def test_package_version_matches_pyproject() -> None:
-    assert loomweave_plugin_python.__version__ == "1.5.1"
+    assert loomweave_plugin_python.__version__ == "1.6.0"
 
 
 def test_plugin_version_lockstep_across_pyproject_manifest_and_module() -> None:
@@ -45,7 +45,7 @@ def test_plugin_version_lockstep_across_pyproject_manifest_and_module() -> None:
 def test_manifest_declares_current_v1_ontology_only() -> None:
     manifest = _read_toml(_PLUGIN_ROOT / "plugin.toml")
 
-    assert manifest["plugin"]["version"] == "1.5.1"
+    assert manifest["plugin"]["version"] == "1.6.0"
     assert manifest["capabilities"]["runtime"]["wardline_aware"] is True
     assert manifest["integrations"]["wardline"]["expected_descriptor_version"] == (
         EXPECTED_DESCRIPTOR_VERSION
@@ -58,7 +58,7 @@ def test_manifest_declares_current_v1_ontology_only() -> None:
     assert isinstance(declared, str)
     decoded = {tuple(token.split("@", 1)) for token in declared.split()}
     assert decoded == set(ACCEPTED_DESCRIPTORS)
-    assert manifest["ontology"]["ontology_version"] == "0.12.0"
+    assert manifest["ontology"]["ontology_version"] == "0.13.0"
     assert manifest["ontology"]["classifier_tags"] == [
         "cli-command",
         "data-model",

@@ -66,9 +66,12 @@ impl ReaderPool {
     /// The probe is a throwaway read-only connection running
     /// `PRAGMA schema_version`, the same cheap corruption check
     /// `loomweave hook session-start` uses. It also validates the Loomweave
-    /// `application_id` and refuses a future `user_version` without mutating
-    /// legacy zero-id files. It runs *before* the pool is built so a bad DB
-    /// never produces a half-live pool.
+    /// `application_id`, refuses a future `user_version` without mutating
+    /// legacy zero-id files, and finishes with `PRAGMA quick_check(1)`
+    /// ([`pragma::verify_quick_check`]) so a header-valid file with damaged
+    /// interior pages is refused with a rebuild instruction rather than
+    /// served. It runs *before* the pool is built so a bad DB never produces
+    /// a half-live pool.
     ///
     /// It validates file-level openability and readability only; it does not
     /// prove the pool can acquire a connection under concurrent load (that
@@ -78,8 +81,9 @@ impl ReaderPool {
     ///
     /// Returns [`crate::StorageError::Sqlite`] if the database cannot be opened
     /// read-only (missing file, permission denied) or the probe read fails
-    /// (corrupt / not a `SQLite` file), and [`crate::StorageError::PoolBuild`]
-    /// if the pool itself cannot be built.
+    /// (corrupt / not a `SQLite` file), [`crate::StorageError::CorruptIndex`]
+    /// if `PRAGMA quick_check` finds page-level damage, and
+    /// [`crate::StorageError::PoolBuild`] if the pool itself cannot be built.
     pub fn open_validated(db_path: impl AsRef<Path>, max_size: usize) -> Result<Self> {
         let db_path = db_path.as_ref();
         let conn = rusqlite::Connection::open_with_flags(
@@ -104,6 +108,22 @@ impl ReaderPool {
         // verify_user_version above; 0 < v < CURRENT is left to migrate-on-open
         // policy and is not refused here.)
         crate::schema::reject_unmigrated_for_read(&conn)?;
+        drop(conn);
+        // Last (it is the only probe that reads past the header): prove the
+        // btree pages are intact so a damaged index fails serve boot with a
+        // clear rebuild instruction instead of answering graph queries with
+        // wrong rows (clarion-8becd5f189). On a *separate read-write* (but
+        // never CREATE) connection: `quick_check` also validates the FTS5
+        // inverted index, and FTS5's integrity hook needs a write-capable
+        // connection — on a read-only one it reports "attempt to write a
+        // readonly database", which would read as corruption. A db file
+        // serve cannot write is unservable anyway (WAL needs the -shm).
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        pragma::apply_read_pragmas(&conn)?;
+        pragma::verify_quick_check(&conn)?;
         drop(conn);
         Self::open(db_path, max_size)
     }

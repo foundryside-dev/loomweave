@@ -7,8 +7,8 @@ satisfied merely because Loomweave's read-only consumer harness passes.
 
 | Fixture | SHA-256 |
 | --- | --- |
-| `crates/loomweave-storage/tests/fixtures/classifier-coverage-v1.golden.json` | `b4860fdaec065e06154af27ba5a630ecf3c26b0ab5a3d18b793a1971cc221cf8` |
-| `docs/federation/fixtures/classification.python.json` | `3f3bb6e20f414c98f5407d7de01c26b285d795864de86e654e297bd807a06c54` |
+| `crates/loomweave-storage/tests/fixtures/classifier-coverage-v1.golden.json` | `f4e41783d58f082427a68137a62288cc5a314848dd79c79a49c531f548ad2fb2` |
+| `docs/federation/fixtures/classification.python.json` | `624f3c42dd2b303cb62349376767d511a56ca855b2b657eeec341d9365aecce9` |
 | `docs/federation/fixtures/get-api-v1-capabilities.json` | `61020b20aadaef75a3de523f0a8f83be03d1d503ffdca719c78d949d20beeced` |
 | `docs/federation/fixtures/loomweave-http-auth-v1.golden.json` | `cd4a8a1598bedafdfe247d47a616e9a82a148e7cf8feaac9299a21550b2c720b` |
 | `docs/federation/fixtures/external-sqlite-compatibility-v1.json` | `a69eea6d887328faf973dbde375fc56b73c45608191dc0db37511cc0aadfe10e` |

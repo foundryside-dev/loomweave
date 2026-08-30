@@ -30,6 +30,52 @@ fn env_flag(name: &str) -> bool {
 
 /// Park forever without consuming CPU (hang simulation). The host's watchdog
 /// must kill us; sleeping in a loop survives spurious wakeups.
+/// Hang on ONE named file only (`LOOMWEAVE_FIXTURE_HANG_AT_FILE=<basename>`):
+/// the host's per-file watchdog must kill us, skip the file, respawn, and
+/// finish the rest of the tree (clarion-78d75e45c9).
+fn hang_if_named_file(file_path: &str) {
+    if let Some(name) = std::env::var_os("LOOMWEAVE_FIXTURE_HANG_AT_FILE")
+        && std::path::Path::new(file_path).file_name() == Some(name.as_os_str())
+    {
+        hang_forever();
+    }
+}
+
+/// `LOOMWEAVE_FIXTURE_RESERVE_VIRTUAL_MIB=<n>`: reserve the mapping once per
+/// process (see the call site's rationale).
+fn reserve_virtual_if_requested() {
+    if let Some(mib) = std::env::var("LOOMWEAVE_FIXTURE_RESERVE_VIRTUAL_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        #[cfg(unix)]
+        {
+            static RESERVE_ONCE: std::sync::Once = std::sync::Once::new();
+            RESERVE_ONCE.call_once(|| reserve_virtual_mib(mib));
+        }
+        #[cfg(not(unix))]
+        let _ = mib;
+    }
+}
+
+/// `LOOMWEAVE_FIXTURE_SPAWN_GRANDCHILD_THEN_HANG`: spawn a long-lived
+/// grandchild (the shape of pyright's `node` under its Python wrapper), then
+/// hang so the host's watchdog kills us. The grandchild inherits our
+/// environment, so the hardening tests' marker scan finds it if it survives
+/// (clarion-ebf404dfbb).
+fn spawn_grandchild_then_hang_if_requested() {
+    if !env_flag("LOOMWEAVE_FIXTURE_SPAWN_GRANDCHILD_THEN_HANG") {
+        return;
+    }
+    let _ = std::process::Command::new("sleep")
+        .arg("3600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    hang_forever();
+}
+
 fn hang_forever() -> ! {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -146,18 +192,7 @@ fn main() {
                 // multiply the charged address space across a multi-file run
                 // (e.g. a 3 GiB knob would spuriously exceed an 8 GiB ceiling
                 // on the third file), which does not model anything real.
-                if let Some(mib) = std::env::var("LOOMWEAVE_FIXTURE_RESERVE_VIRTUAL_MIB")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                {
-                    #[cfg(unix)]
-                    {
-                        static RESERVE_ONCE: std::sync::Once = std::sync::Once::new();
-                        RESERVE_ONCE.call_once(|| reserve_virtual_mib(mib));
-                    }
-                    #[cfg(not(unix))]
-                    let _ = mib;
-                }
+                reserve_virtual_if_requested();
 
                 // Extract the file_path from params.
                 let file_path = raw
@@ -167,6 +202,8 @@ fn main() {
                     .unwrap_or("")
                     .to_owned();
 
+                hang_if_named_file(&file_path);
+                spawn_grandchild_then_hang_if_requested();
                 let params: AnalyzeFileParams = match serde_json::from_value(
                     raw.get("params").cloned().unwrap_or(serde_json::json!({})),
                 ) {

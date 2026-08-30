@@ -231,7 +231,17 @@ stdio `loomweave serve` entry. `--codex` upserts `[mcp_servers.loomweave]` in
 for project discovery instead of pinning `--path`.
 `--hooks` merges a SessionStart entry into `.claude/settings.json` (existing
 hooks are preserved) that runs `loomweave hook session-start` — a fail-soft
-command printing live entity/subsystem/finding counts and index freshness.
+command printing live entity/subsystem/finding counts and index freshness —
+and a Loomweave-managed block into the repository's `post-merge` and
+`post-checkout` git hooks (branch switches only) that runs
+`loomweave hook git-sync`, a detached background refresh when the index is
+stale. Both are fail-soft and never block git or a session. A refresh that
+finds another analyze running is queued and drained when that one finishes;
+a commit that touches nothing Loomweave indexes (docs, CI config) settles in
+about a second on the analyze fast path instead of re-scanning the tree.
+`post-commit` is deliberately not hooked — a commit changes no file content
+the index has not already seen; the index refreshes on merge, branch switch,
+session start, and on demand (`analyze_start`).
 
 To verify (and repair) these surfaces later, run `loomweave doctor`:
 

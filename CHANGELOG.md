@@ -14,6 +14,99 @@ only when an incompatible change is made to that surface. See
 
 Nothing yet.
 
+## [1.6.0] — 2026-08-31
+
+### Changed
+
+- **Git-sync hooks refresh on merge and branch switch, not on every commit.**
+  The managed block now lives in `post-merge` and `post-checkout` (gated on
+  git's branch-switch flag, so `git checkout -- file` does not fire it);
+  `post-commit` is retired and `install` / `doctor --fix` remove Loomweave's
+  block from it, leaving foreign hook content byte-for-byte. A commit changes
+  no file content the index has not already seen through file drift; on a
+  shared checkout per-commit refreshes were 12–148 runs a day over an
+  unchanged tree. (clarion-78d75e45c9, ADR-060)
+
+### Added
+
+- **`analyze` no-indexed-changes fast path.** When the only drift is the
+  commit clock and `git diff <analyzed>..HEAD` touches no ingested path or
+  analyzer input (`loomweave.yaml`, the secrets baseline, `.env*` sidecars),
+  the run settles at HEAD in about a second — no walk, no plugin, no
+  clustering — recording a completed run that carries the base run's stats
+  under a `fast_path` block. Any in-place edit, staged indexed change,
+  untracked source, or observation blindness runs the full pipeline;
+  `--no-incremental` bypasses it. (clarion-78d75e45c9, ADR-060)
+- **Refresh requests coalesce.** A git-sync or SessionStart hook that finds
+  an analyze already running queues a follow-up (a marker beside the analyze
+  lock) that the running analyze drains on exit, instead of forking a child
+  that loses the lock; a burst of N events costs two runs. The hook line says
+  "a follow-up refresh is queued". (clarion-78d75e45c9)
+
+### Fixed
+
+- **Killing a plugin now kills everything it spawned.** The venv's
+  `pyright-langserver` is a Python wrapper around a `node` grandchild; every
+  kill path (pyright restart, watchdog kill, handshake failure, shutdown
+  fallback) killed only the wrapper, leaving a wedged node spinning at
+  `ppid 1` (seen at 103 % CPU for 1 h 40 m with no analyze running). The host
+  and the Python plugin now collect the child's descendants from `/proc`
+  before the kill and SIGKILL the whole tree. (clarion-ebf404dfbb, ADR-061)
+- **`serve` exits when its parent dies.** An MCP client that dies (or hands
+  our pipes to something that outlives it) without closing stdin used to
+  leave `serve` idling forever with its `ephemeral.port` marker published —
+  14 accumulated on one checkout. `serve` now checks its parent pid every
+  ~2 s and, on a reparenting, shuts the HTTP read API down like SIGTERM and
+  exits clean. (clarion-ebf404dfbb, ADR-061)
+- **A per-file plugin timeout no longer fails the whole run.** The host now
+  skips the file that hit the watchdog (its stored rows are retained and it
+  re-dispatches next run), records the `LMWV-PY-TIMEOUT` finding with the
+  file path, respawns the plugin, and continues — bounded to three kills per
+  plugin per run, after which a kill is terminal as before. On a shared
+  checkout 9 of 39 runs in one day had failed this way, each persisting
+  nothing. (clarion-78d75e45c9, ADR-060)
+- **Python: instantiating a class is now a `calls` edge to the class.**
+  pyright reports `Name(...)` as an outgoing call whose target is the class
+  item itself; the plugin only looked that target up in its function index and
+  dropped it as unresolved, so an index could hold zero `calls` edges into any
+  `python:class:*` entity and `entity_callers_list` on a class was always
+  empty. Local, imported, inherited-`__init__`, `@dataclass` and nested classes
+  all resolve now; classes reached only by instantiation become genuinely
+  reachable for dead-code analysis. Ontology 0.12.0 → 0.13.0, so existing
+  indexes re-dispatch on their next incremental run (ADR-059).
+  (clarion-e5224c3aff)
+- **Python: resolved method/attribute calls are no longer double-counted as
+  unresolved sites.** pyright anchors an attribute call on its terminal token
+  (`helper` in `self.helper()`) while the plugin's AST call site spans the
+  whole callee expression, and the two were matched by exact equality — so
+  every resolved `obj.method()` also produced an unresolved site, inflating
+  `unresolved_call_sites_total` and falsely flipping `entity_callers_list`'s
+  `traversal_complete` to `false`. A pyright range now resolves the smallest
+  AST call site containing it. Found while fixing the class-instantiation gap.
+- **MCP argument errors name the accepted parameters.** An unknown argument
+  now fails with `unknown argument for entity_find: name (accepted: kind,
+  limit, pattern, …)` instead of just naming the rejected key. Transcript
+  forensics on a downstream project showed 43 % of `entity_find` calls failing
+  on `name` / `query` and burning a retry to learn the spelling.
+  (clarion-6ce847cfc3)
+- **The SessionStart hook no longer claims it started an analyze that the
+  advisory lock rejected.** The hook (and `hook git-sync`) now probes the
+  analyze lock first: when another analyze holds it the line says so — "another
+  `loomweave analyze` is already running (holds `<lock>`); nothing was started"
+  — and no child is forked just to lose the lock. A failed spawn prints nothing
+  rather than a success line. (clarion-f57c9e74a6)
+- **Bare builtin calls are no longer persisted as unresolved call sites.** The
+  Python plugin drops `len(...)`, `str(...)`, `isinstance(...)` and other calls
+  to unshadowed builtins before they reach `entity_unresolved_call_sites` — they
+  can never resolve to a project entity and were the bulk of the table (279k
+  rows on one project, `len` alone 10k). The same shadowing-aware oracle as the
+  references fast path is used, so an in-file `def len` or a star import keeps
+  the site. The drop is disclosed as
+  `unresolved_call_sites_skipped_builtin_total` in run stats and
+  `index_diff_get.plugin_stats`; `unresolved_call_sites_total` now counts only
+  sites that could have resolved, so it still equals the persisted list length.
+  (clarion-8a862d8f7e)
+
 ## [1.5.1] — 2026-08-30
 
 ### Fixed
@@ -1614,7 +1707,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/foundryside-dev/loomweave/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/foundryside-dev/loomweave/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...v1.5.0
 [1.2.1]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.2.1

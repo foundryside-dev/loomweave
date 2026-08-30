@@ -19,8 +19,8 @@ use crate::ParamError;
 use crate::ServerState;
 use crate::catalogue::{Page, catalogue_summary, missing_signal, paginate};
 use crate::{
-    entity_json, flatten_storage_envelope_result, parse_to_unix_seconds, required_str,
-    success_envelope, tool_error_envelope,
+    entity_json, entity_json_full, flatten_storage_envelope_result, parse_to_unix_seconds,
+    required_str, success_envelope, tool_error_envelope,
 };
 
 /// Bound on guidance sheets scanned per `guidance_for` call. Guidance is
@@ -528,7 +528,11 @@ impl ServerState {
                         // A candidate id resolved but its row vanished (a torn
                         // read): drop it, never error.
                         if let Some(entity) = entity_by_id(conn, &entity_id)? {
-                            candidates.push(entity_json(conn, &entity));
+                            // Resolve is a DISAMBIGUATION surface: a handful
+                            // of candidates the caller must tell apart, so the
+                            // full projection (name, tags, hash) stays — X-6
+                            // slims list rows, not this.
+                            candidates.push(entity_json_full(conn, &entity));
                         }
                     }
                     let result_kind = match candidates.len() {

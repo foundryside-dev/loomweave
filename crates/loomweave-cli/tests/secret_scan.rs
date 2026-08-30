@@ -583,6 +583,52 @@ results:
 }
 
 #[test]
+fn inline_allow_marker_suppresses_secret_and_emits_audit_match() {
+    let project = tempfile::tempdir().unwrap();
+    let plugin = tempfile::tempdir().unwrap();
+    write_secret_fixture_plugin(plugin.path());
+    install_project(project.path());
+    std::fs::write(
+        project.path().join("leaky.sec"),
+        b"aws_access_key_id = 'AKIAIOSFODNN7EXAMPLE'  # secret-scan: allow-this-line\n",
+    )
+    .unwrap();
+
+    loomweave_bin()
+        .arg("analyze")
+        .arg(project.path())
+        .env("PATH", plugin_path(plugin.path()))
+        .assert()
+        .success();
+
+    let db = conn(project.path());
+    let secret_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-SEC-SECRET-DETECTED'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let match_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM findings WHERE rule_id = 'LMWV-INFRA-SECRET-INLINE-ALLOW-MATCH'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let blocked_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE json_extract(properties, '$.briefing_blocked') IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(secret_count, 0);
+    assert_eq!(match_count, 1);
+    assert_eq!(blocked_count, 0);
+}
+
+#[test]
 fn missing_baseline_justification_degrades_to_finding() {
     let project = tempfile::tempdir().unwrap();
     let plugin = tempfile::tempdir().unwrap();

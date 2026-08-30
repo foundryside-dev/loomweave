@@ -25,10 +25,11 @@ mod findings;
 use anyhow::{Context, Result};
 pub(crate) use files::collect_scan_files;
 use findings::{
-    FindingConfidence, FindingKind, FindingSeverity, PendingFinding, secret_detected_finding,
+    FindingConfidence, FindingKind, FindingSeverity, PendingFinding, inline_allow_match_finding,
+    secret_detected_finding,
 };
 use loomweave_core::BriefingBlockReason;
-use loomweave_scanner::{Detection, Scanner, SuppressionResult};
+use loomweave_scanner::{Detection, PartitionedScan, Scanner, SuppressionResult};
 use loomweave_storage::{Writer, commands::EntityRecord};
 use serde_json::json;
 
@@ -49,9 +50,10 @@ const CONFIRM_TOKEN: &str = "yes-i-understand";
 /// `stored_secret_finding_anchor_by_file` must consult ALL of them — a
 /// `per_run_swept_rule_ids_match_storage_mirror` test below asserts the two
 /// stay in lockstep.
-pub(crate) fn per_run_swept_rule_ids() -> [&'static str; 4] {
+pub(crate) fn per_run_swept_rule_ids() -> [&'static str; 5] {
     [
         findings::SECRET_DETECTED,
+        findings::INLINE_ALLOW_MATCH,
         baseline::baseline_match_rule_id(),
         baseline::baseline_no_justification_rule_id(),
         SECRET_OVERRIDE_ALLOWED,
@@ -264,8 +266,9 @@ pub(crate) fn pre_ingest(
     let mut baseline_matches = Vec::new();
     let mut scanned_files = BTreeSet::new();
     let mut scanned_sidecars = BTreeSet::new();
-    let scans =
-        scan_source_files_parallel(project_root, source_files, |buf| scanner.scan_bytes(buf))?;
+    let scans = scan_source_files_parallel(project_root, source_files, |buf| {
+        scanner.scan_bytes_partitioned(buf)
+    })?;
 
     for scan in scans {
         let canonical_file = scan.canonical_file;
@@ -273,6 +276,11 @@ pub(crate) fn pre_ingest(
         if files::is_secret_scan_sidecar(&canonical_file) {
             scanned_sidecars.insert(canonical_file.clone());
         }
+        findings.extend(
+            scan.inline_allowed
+                .iter()
+                .map(|detection| inline_allow_match_finding(&canonical_file, detection)),
+        );
         let baseline_file = project_relative_path(project_root, &canonical_file);
         let SuppressionResult {
             allowed,
@@ -388,6 +396,7 @@ pub(crate) fn pre_ingest(
 struct SourceFileScan {
     canonical_file: PathBuf,
     detections: Vec<Detection>,
+    inline_allowed: Vec<Detection>,
 }
 
 fn scan_source_files_parallel<F>(
@@ -396,7 +405,7 @@ fn scan_source_files_parallel<F>(
     scan_bytes: F,
 ) -> Result<Vec<SourceFileScan>>
 where
-    F: Fn(&[u8]) -> Vec<Detection> + Sync,
+    F: Fn(&[u8]) -> PartitionedScan + Sync,
 {
     if source_files.is_empty() {
         return Ok(Vec::new());
@@ -448,7 +457,7 @@ fn scan_one_source_file<F>(
     scan_bytes: &F,
 ) -> Result<SourceFileScan>
 where
-    F: Fn(&[u8]) -> Vec<Detection> + Sync + ?Sized,
+    F: Fn(&[u8]) -> PartitionedScan + Sync + ?Sized,
 {
     let mut handle = loomweave_core::plugin::jail::safe_open(project_root, file)
         .with_context(|| format!("safe-open {}", file.display()))?;
@@ -457,10 +466,14 @@ where
     handle
         .read_to_end(&mut buf)
         .with_context(|| format!("read {}", file.display()))?;
-    let detections = scan_bytes(&buf);
+    let PartitionedScan {
+        detections,
+        inline_allowed,
+    } = scan_bytes(&buf);
     Ok(SourceFileScan {
         canonical_file,
         detections,
+        inline_allowed,
     })
 }
 
@@ -607,7 +620,7 @@ mod tests {
                 .expect("record thread")
                 .push(std::thread::current().id());
             assert!(buf.starts_with(b"file-"));
-            Vec::new()
+            loomweave_scanner::PartitionedScan::default()
         })
         .expect("parallel scan");
 
@@ -642,8 +655,10 @@ mod tests {
         let link = project.join("link.txt");
         std::os::unix::fs::symlink(&outside, &link).expect("symlink outside");
 
-        let err = scan_source_files_parallel(&project, &[link], |_| Vec::new())
-            .expect_err("out-of-tree symlink must not be read");
+        let err = scan_source_files_parallel(&project, &[link], |_| {
+            loomweave_scanner::PartitionedScan::default()
+        })
+        .expect_err("out-of-tree symlink must not be read");
 
         let message = format!("{err:#}");
         assert!(
@@ -680,5 +695,40 @@ mod tests {
         assert_eq!(file, &secret.canonicalize().expect("canonical secret"));
         assert_eq!(findings.len(), 1);
         assert!(outcome.briefing_blocks_shared().is_empty());
+    }
+
+    #[test]
+    fn pre_ingest_inline_allow_marker_keeps_file_clean_and_emits_audit_fact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marked = tmp.path().join("fixtures.py");
+        std::fs::write(
+            &marked,
+            b"key = 'AKIAIOSFODNN7EXAMPLE'  # secret-scan: allow-this-line\n",
+        )
+        .expect("write marked fixture");
+
+        let outcome = pre_ingest(
+            tmp.path(),
+            &loomweave_core::store::store_dir(tmp.path()),
+            &[marked],
+            &SecretScanOptions::default(),
+        )
+        .expect("pre-ingest");
+
+        assert!(matches!(
+            outcome.per_file_outcomes()[0],
+            PerFileOutcome::Clean { .. }
+        ));
+        assert!(outcome.briefing_blocks_shared().is_empty());
+        let rule_ids = outcome
+            .findings
+            .iter()
+            .map(|finding| finding.rule_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rule_ids,
+            vec!["LMWV-INFRA-SECRET-INLINE-ALLOW-MATCH"],
+            "marker suppression must leave an audit fact and nothing else"
+        );
     }
 }

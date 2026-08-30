@@ -6,6 +6,7 @@ pub mod config;
 pub mod filigree;
 pub mod filigree_url;
 mod index_diff;
+pub use index_diff::{CommitOnlyDrift, commit_only_drift};
 pub mod scan_results;
 pub mod snapshot;
 mod tools;
@@ -3521,8 +3522,13 @@ fn validate_tool_arguments_against_schema(
     };
     for key in arguments.keys() {
         if !properties.contains_key(key) {
+            // Name the accepted parameters in the error: agents that guess
+            // `name` / `query` for `entity_find` otherwise burn a retry just to
+            // learn the spelling (clarion-6ce847cfc3). `properties` is a
+            // serde_json Map (BTreeMap-backed), so the listing is sorted.
+            let accepted = properties.keys().cloned().collect::<Vec<_>>().join(", ");
             return Err(ParamError::new(&format!(
-                "unknown argument for {}: {key}",
+                "unknown argument for {}: {key} (accepted: {accepted})",
                 tool.name
             )));
         }
@@ -4248,21 +4254,26 @@ fn success_envelope(result: Value) -> Value {
     success_envelope_with_truncation(result, None)
 }
 
+/// Success envelope, constants omitted (X-6 / clarion-b24df21158).
+///
+/// The absent-field contract every consumer can rely on: no `error` key means
+/// success (`ok:true` stays as the explicit discriminator); no `truncated`
+/// key means not truncated; no `stats_delta` means no deltas; no
+/// `diagnostics` means none. Only *meaningful* values are serialized — the
+/// previous shape spent ~110 bytes per response re-stating `error:null,
+/// diagnostics:[], truncated:false, truncation_reason:null, stats_delta:{}`
+/// on every single tool call an agent pays tokens to read.
 fn success_envelope_with_truncation(result: Value, truncation_reason: Option<&str>) -> Value {
     let mut envelope = serde_json::Map::new();
     envelope.insert("ok".to_owned(), Value::Bool(true));
     envelope.insert("result".to_owned(), result);
-    envelope.insert("error".to_owned(), Value::Null);
-    envelope.insert("diagnostics".to_owned(), Value::Array(Vec::new()));
-    envelope.insert(
-        "truncated".to_owned(),
-        Value::Bool(truncation_reason.is_some()),
-    );
-    envelope.insert(
-        "truncation_reason".to_owned(),
-        truncation_reason.map_or(Value::Null, |reason| Value::String(reason.to_owned())),
-    );
-    envelope.insert("stats_delta".to_owned(), json!({}));
+    if let Some(reason) = truncation_reason {
+        envelope.insert("truncated".to_owned(), Value::Bool(true));
+        envelope.insert(
+            "truncation_reason".to_owned(),
+            Value::String(reason.to_owned()),
+        );
+    }
     Value::Object(envelope)
 }
 
@@ -4272,7 +4283,9 @@ fn success_envelope_with_truncation_and_stats(
     stats_delta: Value,
 ) -> Value {
     let mut envelope = success_envelope_with_truncation(result, truncation_reason);
-    if let Some(object) = envelope.as_object_mut() {
+    if let Some(object) = envelope.as_object_mut()
+        && stats_delta.as_object().is_none_or(|map| !map.is_empty())
+    {
         object.insert("stats_delta".to_owned(), stats_delta);
     }
     envelope
@@ -4280,7 +4293,9 @@ fn success_envelope_with_truncation_and_stats(
 
 fn success_envelope_with_stats(result: Value, stats_delta: Value) -> Value {
     let mut envelope = success_envelope(result);
-    if let Some(object) = envelope.as_object_mut() {
+    if let Some(object) = envelope.as_object_mut()
+        && stats_delta.as_object().is_none_or(|map| !map.is_empty())
+    {
         object.insert("stats_delta".to_owned(), stats_delta);
     }
     envelope
@@ -4310,7 +4325,6 @@ fn tool_error_envelope_with_diagnostics(
 ) -> Value {
     let mut envelope = serde_json::Map::new();
     envelope.insert("ok".to_owned(), Value::Bool(false));
-    envelope.insert("result".to_owned(), Value::Null);
     envelope.insert(
         "error".to_owned(),
         json!({
@@ -4319,10 +4333,12 @@ fn tool_error_envelope_with_diagnostics(
             "retryable": retryable,
         }),
     );
-    envelope.insert("diagnostics".to_owned(), Value::Array(diagnostics));
-    envelope.insert("truncated".to_owned(), Value::Bool(false));
-    envelope.insert("truncation_reason".to_owned(), Value::Null);
-    envelope.insert("stats_delta".to_owned(), stats_delta);
+    if !diagnostics.is_empty() {
+        envelope.insert("diagnostics".to_owned(), Value::Array(diagnostics));
+    }
+    if stats_delta.as_object().is_none_or(|map| !map.is_empty()) {
+        envelope.insert("stats_delta".to_owned(), stats_delta);
+    }
     Value::Object(envelope)
 }
 
@@ -4755,6 +4771,33 @@ fn tool_json_rpc_response(id: &Value, envelope: &Value) -> Value {
 /// for client-facing tool responses) and by internal payloads — notably the LLM
 /// inference prompt — that must *not* gain a `sei` field (it is neither a tool
 /// return surface nor allowed to change shape; see REQ-C-04 scope).
+/// Best-effort project root derived from the reader connection's db path.
+///
+/// The store lives at `<project_root>/.weft/loomweave/loomweave.db`, so three
+/// `parent()` hops recover the root without threading `ServerState` through
+/// every projection call site. In-memory test connections (no path) and
+/// stores that do not live under the analyzed tree (some worktree layouts)
+/// return `None` and the row keeps its absolute path — relativization is a
+/// token-weight optimisation, never a correctness requirement.
+fn project_root_of(conn: &rusqlite::Connection) -> Option<PathBuf> {
+    let db = PathBuf::from(conn.path()?);
+    Some(db.parent()?.parent()?.parent()?.to_path_buf())
+}
+
+/// Relativize an entity's source path against the store-derived project root.
+fn list_row_source_path(conn: &rusqlite::Connection, path: Option<&str>) -> Value {
+    let Some(path) = path else {
+        return Value::Null;
+    };
+    if let Some(root) = project_root_of(conn)
+        && let Ok(relative) = Path::new(path).strip_prefix(&root)
+        && let Some(relative) = relative.to_str()
+    {
+        return Value::String(relative.to_owned());
+    }
+    Value::String(path.to_owned())
+}
+
 fn entity_identity_json(entity: &EntityRow) -> Value {
     json!({
         "id": entity.id,
@@ -4785,9 +4828,53 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
     // (clarion-307668e2be). The deliberate exception — `summary`, which echoes a
     // caller-named entity's identity + remediation — builds identity via
     // `entity_identity_json` instead, bypassing this gate.
+    //
+    // This is the SLIM list-row projection (X-6 / clarion-b24df21158):
+    // `{id, sei, kind, short_name, source_file_path (project-relative),
+    // source_line_start}` plus the `collision` honesty disclosure when one
+    // exists. A measured `entity_find` page of 20 spent ~550 bytes/row, most
+    // of it on `content_hash` (derivable from nothing a list consumer does),
+    // `name` (redundant with the id's qualname), absolute path prefixes, and
+    // per-row `tags`. Full rows — identity + `content_hash` + line span +
+    // `tags` — stay on the anchor tools (`entity_at`, `entity_source_get`,
+    // orientation's `primary_entity`) via [`entity_json_full`].
     if let Some(reason) = briefing_block_reason(entity) {
         let sei = sei_for_locator(conn, &entity.id).ok().flatten();
-        return blocked_entity_stub(entity, &reason, sei.as_deref());
+        return blocked_entity_stub(conn, entity, &reason, sei.as_deref());
+    }
+    let mut value = json!({
+        "id": entity.id,
+        "sei": sei_for_locator(conn, &entity.id).ok().flatten(),
+        "kind": entity.kind,
+        "short_name": entity.short_name,
+        "source_file_path": list_row_source_path(conn, entity.source_file_path.as_deref()),
+        "source_line_start": entity.source_line_start,
+    });
+    if let Some(object) = value.as_object_mut() {
+        // Disclose a same-locator collision the store absorbed as last-write-wins
+        // (clarion-48af930f2a): this id's row may be a chimera of two source
+        // declarations, so a consumer must not read it (or its edges) as a clean
+        // single declaration. Only present when a collision exists; absence means
+        // none — the disclosure survives row slimming because dropping it would
+        // hide a data-integrity warning, and it costs nothing when absent.
+        if let Some(collision) = collision_json(conn, &entity.id) {
+            object.insert("collision".to_owned(), collision);
+        }
+    }
+    value
+}
+
+/// The FULL entity projection: identity (with `name`, `content_hash`, line
+/// span) + `sei` + inlined `tags` (clarion-057ff2b330) + `collision`.
+///
+/// Reserved for the anchor tools a consumer goes to for one entity's whole
+/// story — `entity_at`, `entity_source_get`'s identity block, orientation's
+/// `primary_entity`. Every *list* surface projects through the slim
+/// [`entity_json`] instead (X-6). Same ADR-013 briefing-block choke point.
+fn entity_json_full(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
+    if let Some(reason) = briefing_block_reason(entity) {
+        let sei = sei_for_locator(conn, &entity.id).ok().flatten();
+        return blocked_entity_stub(conn, entity, &reason, sei.as_deref());
     }
     let mut value = entity_identity_json(entity);
     if let Some(object) = value.as_object_mut() {
@@ -4795,22 +4882,10 @@ fn entity_json(conn: &rusqlite::Connection, entity: &EntityRow) -> Value {
             "sei".to_owned(),
             json!(sei_for_locator(conn, &entity.id).ok().flatten()),
         );
-        // Inline the entity's own categorisation tags (clarion-057ff2b330) so a
-        // tool response shows them without a reverse-index `entity_tag_list`
-        // round-trip. Tags already live in `entity_tags`; this is read-only.
-        // Graceful-degrade to `[]` on any lookup error — a tag read must never
-        // fail the structural tool call (same posture as the SEI join above).
         object.insert(
             "tags".to_owned(),
             json!(tags_for_entity(conn, &entity.id).unwrap_or_default()),
         );
-        // Disclose a same-locator collision the store absorbed as last-write-wins
-        // (clarion-48af930f2a): this id's row may be a chimera of two source
-        // declarations, so a consumer must not read it (or its edges) as a clean
-        // single declaration. Only present when a collision exists; absence means
-        // none. Graceful-degrade to absent on any lookup error — the disclosure
-        // is enrichment and must never fail the structural read (same posture as
-        // the SEI/tags joins above).
         if let Some(collision) = collision_json(conn, &entity.id) {
             object.insert("collision".to_owned(), collision);
         }
@@ -4941,17 +5016,19 @@ fn blocked_sei(entity_id: &str, sei: Option<&str>) -> Value {
 /// high-entropy (a generated symbol embedding a secret), that single field is
 /// re-withheld — the rest of the identity still rides along, and the `sei` is
 /// withheld with a secret-like `id` (see [`blocked_sei`]).
-fn blocked_entity_stub(entity: &EntityRow, reason: &str, sei: Option<&str>) -> Value {
+fn blocked_entity_stub(
+    conn: &rusqlite::Connection,
+    entity: &EntityRow,
+    reason: &str,
+    sei: Option<&str>,
+) -> Value {
     json!({
         "id": redact_secretlike(&entity.id),
         "sei": blocked_sei(&entity.id, sei),
         "kind": entity.kind,
-        "name": redact_secretlike(&entity.name),
         "short_name": redact_secretlike(&entity.short_name),
-        "source_file_path": entity.source_file_path,
+        "source_file_path": list_row_source_path(conn, entity.source_file_path.as_deref()),
         "source_line_start": entity.source_line_start,
-        "source_line_end": entity.source_line_end,
-        "content_hash": entity.content_hash,
         "briefing_blocked": reason,
     })
 }
@@ -5857,7 +5934,7 @@ fn source_for_entity_json(
     entity: &EntityRow,
     context_lines: usize,
 ) -> Value {
-    let identity = entity_json(conn, entity);
+    let identity = entity_json_full(conn, entity);
 
     // Refuse to read or return bytes for an entity whose file the pre-ingest
     // scanner marked `briefing_blocked`. Without this guard, an agent holding
@@ -8044,11 +8121,51 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response["error"]["code"], -32602, "{response}");
-        assert_eq!(
-            response["error"]["message"],
-            "unknown argument for entity_summary_get: safety_override",
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "unknown argument for entity_summary_get: safety_override (accepted: "
+            ),
             "{response}"
         );
+        assert!(
+            message.contains("id"),
+            "accepted list must name `id`: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_find_unknown_argument_names_the_accepted_parameters() {
+        // clarion-6ce847cfc3: 43% of elspeth's entity_find calls failed on
+        // `name` / `query`; the error must teach the right spelling in one shot.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loomweave.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "entity_find",
+                    "arguments": { "name": "caller" }
+                }
+            }))
+            .await
+            .expect("response");
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("unknown argument for entity_find: name (accepted: "),
+            "{response}"
+        );
+        assert!(message.contains("pattern"), "{response}");
     }
 
     #[test]
@@ -8661,19 +8778,24 @@ mod tests {
         entity.source_line_start = Some(10);
         entity.source_line_end = Some(20);
 
+        let conn = rusqlite::Connection::open_in_memory().expect("mem conn");
         let projection = super::blocked_entity_stub(
+            &conn,
             &entity,
             "secret_present",
             Some("loomweave:eid:a82891aadb3647009ddba4a6733f1677"),
         );
         assert_eq!(projection["id"], "python:function:app.login");
         assert_eq!(projection["kind"], "function");
-        assert_eq!(projection["name"], "app.login");
         assert_eq!(projection["short_name"], "login");
         assert_eq!(projection["source_file_path"], "app.py");
         assert_eq!(projection["source_line_start"], 10);
-        assert_eq!(projection["source_line_end"], 20);
-        assert_eq!(projection["content_hash"], "abc123");
+        // Slim stub (X-6): name / line_end / content_hash no longer ride on
+        // LIST rows, blocked or not — the block adds `briefing_blocked` to
+        // the same slim shape every row gets.
+        assert!(projection.get("name").is_none());
+        assert!(projection.get("source_line_end").is_none());
+        assert!(projection.get("content_hash").is_none());
         assert_eq!(projection["briefing_blocked"], "secret_present");
         assert_eq!(
             projection["sei"], "loomweave:eid:a82891aadb3647009ddba4a6733f1677",
@@ -8695,7 +8817,8 @@ mod tests {
         let mut entity = entity_row("python:function:app.login", "app.login", Some("abc123"));
         entity.source_file_path = Some("app.py".to_owned());
 
-        let projection = super::blocked_entity_stub(&entity, "secret_present", None);
+        let conn = rusqlite::Connection::open_in_memory().expect("mem conn");
+        let projection = super::blocked_entity_stub(&conn, &entity, "secret_present", None);
         assert_eq!(projection["id"], "python:function:app.login");
         assert!(
             projection["sei"].is_null(),
@@ -8715,7 +8838,9 @@ mod tests {
         entity.short_name = secret.to_owned();
         entity.source_file_path = Some("g.py".to_owned());
 
+        let conn = rusqlite::Connection::open_in_memory().expect("mem conn");
         let projection = super::blocked_entity_stub(
+            &conn,
             &entity,
             "secret_present",
             Some("loomweave:eid:a82891aadb3647009ddba4a6733f1677"),
@@ -8724,16 +8849,15 @@ mod tests {
             projection["id"].is_null(),
             "high-entropy id must be withheld"
         );
-        assert!(projection["name"].is_null());
         assert!(projection["short_name"].is_null());
         assert!(
             projection["sei"].is_null(),
             "sei must be withheld when its locator is itself secret-like: {projection}"
         );
-        // Non-secret structural identity still rides along.
+        // Non-secret structural identity still rides along (slim shape).
         assert_eq!(projection["kind"], "function");
         assert_eq!(projection["source_file_path"], "g.py");
-        assert_eq!(projection["content_hash"], "abc123");
+        assert!(projection.get("content_hash").is_none());
         assert_eq!(projection["briefing_blocked"], "secret_present");
     }
 
