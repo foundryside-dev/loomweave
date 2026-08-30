@@ -368,10 +368,13 @@ jobs:
           ls -la pkg-plugin
 
       - name: publish loomweave-plugin-python
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: pkg-plugin
           attestations: true
+          # A re-run of a partially published tag must not 400 on packages that
+          # already landed (v1.5.0: rust plugin published, python plugin rejected).
+          skip-existing: true
           repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
 
   publish-rust-plugin:
@@ -404,10 +407,13 @@ jobs:
           ls -la pkg-rust-plugin
 
       - name: publish loomweave-plugin-rust
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: pkg-rust-plugin
           attestations: true
+          # A re-run of a partially published tag must not 400 on packages that
+          # already landed (v1.5.0: rust plugin published, python plugin rejected).
+          skip-existing: true
           repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
 
   publish-loomweave:
@@ -438,10 +444,13 @@ jobs:
           ls -la pkg-loomweave
 
       - name: publish loomweave
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: pkg-loomweave
           attestations: true
+          # A re-run of a partially published tag must not 400 on packages that
+          # already landed (v1.5.0: rust plugin published, python plugin rejected).
+          skip-existing: true
           repository-url: ${{ github.event_name == 'workflow_dispatch' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
 
   publish-crates:

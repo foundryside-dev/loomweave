@@ -12,7 +12,16 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **Release publishing accepts core-metadata 2.5 and tolerates re-runs.** The
+  v1.5.0 tag run published crates.io, the GitHub Release and
+  `loomweave-plugin-rust`, then failed on `loomweave-plugin-python` because the
+  pinned `pypa/gh-action-pypi-publish` bundled a twine that rejects
+  `Metadata-Version: 2.5` (current hatchling output), which skipped the
+  `loomweave` wheel. The action is bumped to 1.14.2 (twine v7) and every PyPI
+  step sets `skip-existing: true` so a re-run of a partially published tag
+  completes instead of 400-ing on packages that already landed.
 
 ## [1.5.0] — 2026-08-29
 
