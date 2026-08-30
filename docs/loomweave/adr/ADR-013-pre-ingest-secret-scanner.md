@@ -234,6 +234,6 @@ reconciliation for incrementally-skipped files, MCP read surface).
 
 - [Loomweave v0.1 design review §3 (Secret exfiltration)](../../implementation/v0.1-reviews/pre-restructure/design-review.md) (lines 88-91) — the CRITICAL flag this ADR retires.
 - [Loomweave v0.1 panel threat model T-10](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) (line 241) — risk scoring and residual-risk framing.
-- [Loomweave v0.1 system design §10 (Pre-ingest redaction)](../v0.1/system-design.md) (lines 1044-1056) — the behaviour this ADR formalises.
-- [Loomweave v0.1 requirements — NFR-SEC-01, NFR-SEC-05](../v0.1/requirements.md) — requirement floor.
+- [Loomweave v0.1 system design §10 (Pre-ingest redaction)](../1.0/system-design.md) (lines 1044-1056) — the behaviour this ADR formalises.
+- [Loomweave v0.1 requirements — NFR-SEC-01, NFR-SEC-05](../1.0/requirements.md) — requirement floor.
 - [detect-secrets baseline format](https://github.com/Yelp/detect-secrets/blob/master/README.md#baseline-file) — the format this ADR's baseline layout matches.

@@ -1,7 +1,7 @@
 # B.2 — Python plugin: class + module entity emission (Sprint 2 / WP3 feature-complete subset)
 
 **Status**: DRAFT — Sprint 2 Tier-B B.2 work-package design
-**Anchoring design**: [detailed-design.md §1 (Plugin implementation — Python specifics)](../../loomweave/v0.1/detailed-design.md#1-plugin-implementation-detail), [system-design.md §6 (Guidance composition; clustering)](../../loomweave/v0.1/system-design.md#6-guidance-system)
+**Anchoring design**: [detailed-design.md §1 (Plugin implementation — Python specifics)](../../loomweave/1.0/detailed-design.md#1-plugin-implementation-detail), [system-design.md §6 (Guidance composition; clustering)](../../loomweave/1.0/system-design.md#7-guidance-system)
 **Accepted ADRs**: [ADR-007](../../loomweave/adr/ADR-007-summary-cache-key.md), [ADR-018](../../loomweave/adr/ADR-018-identity-reconciliation.md), [ADR-021](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md)
 **Predecessor**: [WP3 Sprint-1 baseline](../sprint-1/wp3-python-plugin.md) (function-only extraction)
 **Successor**: B.3 — `contains` edges (planned)

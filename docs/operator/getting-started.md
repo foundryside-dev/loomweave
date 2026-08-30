@@ -30,15 +30,18 @@ The Python plugin will fail at runtime if `pyright-langserver` is not on
 
 ### Required environment variables
 
-For step 4's `summary` question you need an OpenRouter API key:
+For step 4's `entity_summary_get` question you need an OpenRouter API key:
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-v1-...
 ```
 
 `loomweave analyze` (step 2) and the structural MCP tools work without any LLM
-credentials. The key is only consulted when an MCP client calls `summary(id)`
-against an entity that does not yet have a cached summary.
+credentials. The key is only consulted when an MCP client calls
+`entity_summary_get(id)` against an entity that does not yet have a cached
+summary — and only once `llm_policy.enabled: true` **and**
+`llm_policy.allow_live_provider: true` are set in `loomweave.yaml`
+(`loomweave install` seeds the file with both `false`; see [§4](#4-ask)).
 
 ## 1. Install
 
@@ -48,14 +51,14 @@ for the language plugin via GitHub Releases (per
 fallback below only when testing unreleased commits.
 
 ```bash
-TAG=v1.0.0
+TAG=v1.5.1
 curl -L -o loomweave-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf loomweave-x86_64-unknown-linux-gnu.tar.gz
 install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
 
 pipx install \
-  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-plugin-python-1.0.0.tar.gz"
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.5.1.tar.gz"
 ```
 
 Source-install fallback:
@@ -104,9 +107,8 @@ slsa-verifier verify-artifact \
   loomweave-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-The current 1.x release line deliberately does not publish to PyPI or crates.io. GitHub
-Release assets are the source of truth until public registries are introduced
-by a later ADR.
+Tagged releases also publish to PyPI and crates.io, but the GitHub Release
+assets remain the source of truth for this walkthrough.
 
 <a id="path-discipline"></a>
 **`$PATH` discipline matters.** Loomweave's plugin host (per
@@ -150,8 +152,8 @@ Expected output (abridged):
 
 ```
 applying migration version=1 name="0001_initial_schema"
-loomweave install complete loomweave_dir=/tmp/requests-2.32.4/.loomweave
-Initialised /tmp/requests-2.32.4/.loomweave
+loomweave install complete loomweave_dir=/tmp/requests-2.32.4/.weft/loomweave
+Initialised /tmp/requests-2.32.4/.weft/loomweave
 Installed loomweave-workflow skill into ...
 Installed Claude Code MCP config at .../.mcp.json
 Installed Codex MCP config at ~/.codex/config.toml
@@ -241,9 +243,9 @@ loomweave doctor --fix --path /tmp/requests-2.32.4    # repair the skill pack, h
 loomweave doctor --format json --path /tmp/requests-2.32.4  # stable check IDs + machine-readable details
 ```
 
-`doctor` also checks the `loomweave` entry in `.mcp.json` — which `install` does
-not register automatically — and `--fix` adds it (preserving any sibling MCP
-servers and a customised `command`). The non-zero exit on remaining problems
+`doctor` also checks the `loomweave` entry in `.mcp.json` that a bare `install`
+(or `install --claude-code`) registers, and `--fix` re-adds it if it has gone
+missing (preserving any sibling MCP servers and a customised `command`). The non-zero exit on remaining problems
 makes it usable as a CI / pre-commit gate.
 
 The federation diagnostics use the same fail-closed readers as the serving
@@ -271,8 +273,8 @@ them, so `--skills` / `--codex-skills` is what puts the full reference on disk.
 
 ### Enable live LLM (one-time)
 
-The structural MCP tools work out of the box, but `summary(id)` (question 3
-below) needs the live OpenRouter path explicitly opted into. Edit
+The structural MCP tools work out of the box, but `entity_summary_get(id)`
+(question 3 below) needs the live OpenRouter path explicitly opted into. Edit
 `/tmp/requests-2.32.4/loomweave.yaml` and set both:
 
 ```yaml
@@ -284,8 +286,8 @@ llm_policy:
 `OPENROUTER_API_KEY` must also be exported in the environment that
 `loomweave serve` (or your MCP client wrapper) inherits — see the
 prerequisites section above. Skip this block if you don't have a key; the
-other seventeen tools still work, only `summary` will return an "LLM disabled"
-envelope.
+other 47 tools still work, only `entity_summary_get` will return an "LLM
+disabled" envelope.
 
 Run `loomweave config check` after editing to confirm the effective state
 (provider, enabled, live, model) before starting `serve` — it flags the common
@@ -294,48 +296,53 @@ which is now a hard parse error rather than a silent drop).
 
 ### The MCP tools
 
-The MCP surface exposes eighteen tools: the seventeen in the table below, plus
-`subsystem_members` (the modules in a subsystem — the forward direction of
-`subsystem_of`). The table spans entity lookup and navigation
-(`entity_at`/`find_entity`/`callers_of`/`execution_paths_from`/`neighborhood`),
-clustering (`subsystem_of`), source and edge inspection
-(`source_for_entity`/`call_sites`), the one-call orientation packet
-(`orientation_pack`), diagnostics (`project_status`/`index_diff`), the
-`summary` LLM path plus its `summary_preview_cost` estimator, Filigree
-enrichment (`issues_for`), and the background re-index lifecycle
-(`analyze_start`/`analyze_status`/`analyze_cancel`). Seventeen of the eighteen
-are credential-free; only `summary` needs the live LLM. Each is a structured
-graph query, not free-text grep.
+The MCP surface exposes 48 tools. The eighteen core ones are the seventeen in
+the table below, plus `subsystem_member_list` (the modules in a subsystem —
+the forward direction of `entity_subsystem_get`); the remaining thirty are
+faceted, inspection, and shortcut queries (`entity_tag_list`,
+`entity_dead_list`, `entity_semantic_search_list`, …) listed in the
+[README](../../README.md#what-it-does-today) and the `loomweave-workflow`
+skill. The table spans entity lookup and navigation
+(`entity_at`/`entity_find`/`entity_callers_list`/`entity_execution_path_list`/`entity_neighborhood_get`),
+clustering (`entity_subsystem_get`), source and edge inspection
+(`entity_source_get`/`entity_call_site_list`), the one-call orientation packet
+(`entity_orientation_pack_get`), diagnostics (`project_status_get`/`index_diff_get`),
+the `entity_summary_get` LLM path plus its `entity_summary_preview_cost_get`
+estimator, Filigree enrichment (`entity_issue_list`), and the background
+re-index lifecycle (`analyze_start`/`analyze_status_get`/`analyze_cancel`).
+Only `entity_summary_get` needs the live LLM; every other tool is
+credential-free. Each is a structured graph query, not free-text grep.
 
 | Tool | Example invocation |
 |---|---|
 | `entity_at(file, line)` | `entity_at(file="requests/sessions.py", line=480)` — which entity covers this source location? |
-| `find_entity(pattern)` | `find_entity(pattern="Session.send")` — find entities matching a name or summary fragment. |
-| `callers_of(id)` | `callers_of(id="python:function:requests.sessions.Session.send")` — who calls this function? Default confidence is `resolved`. |
-| `execution_paths_from(id, max_depth)` | `execution_paths_from(id="python:function:requests.api.get", max_depth=3)` — bounded calls-only paths from an entry point. |
-| `summary(id)` | `summary(id="python:function:requests.sessions.Session.send")` — structured LLM summary with `purpose` / `behavior` / `relationships` / `risks` fields. Requires the live-LLM opt-in above plus `OPENROUTER_API_KEY`. First call dispatches the LLM and caches; subsequent calls hit the cache. |
-| `issues_for(id)` | `issues_for(id="python:module:requests.sessions")` — Filigree issues attached to this entity, if Filigree is reachable. Returns an `unavailable` envelope if not (Filigree is enrich-only). |
-| `neighborhood(id)` | `neighborhood(id="python:function:requests.sessions.Session.send")` — callers, callees, container, contained entities, and references in one hop. |
-| `subsystem_of(id)` | `subsystem_of(id="python:module:requests.sessions")` — the subsystem an entity belongs to (reverse of `subsystem_members`); a function/class resolves through its containing module. |
-| `project_status()` | `project_status()` — index diagnostics: latest run, entity/edge/finding/briefing-blocked counts, staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint. No arguments, no LLM. |
-| `summary_preview_cost(id)` | `summary_preview_cost(id="python:function:requests.sessions.Session.send")` — preview a `summary` call before spending: cache hit/expired/miss, cached tokens/cost/age, an input-token estimate on a miss, LLM policy, and whether a live call would spend. Never calls the LLM. |
-| `source_for_entity(id, context_lines)` | `source_for_entity(id="python:function:requests.sessions.Session.send", context_lines=10)` — the entity's exact indexed source span plus bounded line-numbered context, each line flagged `in_entity`. Reports `source_status` (`ok`/`missing`/`drifted`/…) instead of a stale snippet. No LLM. |
-| `call_sites(id, role)` | `call_sites(id="python:function:requests.sessions.Session.send", role="caller")` — the actual source line(s) behind calls/references edges: file, line, line text, edge kind, confidence, and resolved/ambiguous/unresolved classification. `role="callee"` shows incoming sites. No LLM. |
-| `orientation_pack(entity \| file, line)` | `orientation_pack(file="requests/sessions.py", line=480)` — one deterministic packet for a location: primary entity, `entity_context` evidence, source-span summary, one-hop neighbors, compact execution paths, related Filigree issues, index/Filigree/LLM health, and suggested next reads. Resolve by `entity` id or by `file`+`line`. No LLM. |
+| `entity_find(pattern)` | `entity_find(pattern="Session.send")` — find entities matching a name or summary fragment. |
+| `entity_callers_list(id)` | `entity_callers_list(id="python:function:requests.sessions.Session.send")` — who calls this function? Default confidence is `resolved`. |
+| `entity_execution_path_list(id, max_depth)` | `entity_execution_path_list(id="python:function:requests.api.get", max_depth=3)` — bounded calls-only paths from an entry point. |
+| `entity_summary_get(id)` | `entity_summary_get(id="python:function:requests.sessions.Session.send")` — structured LLM summary with `purpose` / `behavior` / `relationships` / `risks` fields. Requires the live-LLM opt-in above plus `OPENROUTER_API_KEY`. First call dispatches the LLM and caches; subsequent calls hit the cache. |
+| `entity_issue_list(id)` | `entity_issue_list(id="python:module:requests.sessions")` — Filigree issues attached to this entity, if Filigree is reachable. Returns an `unavailable` envelope if not (Filigree is enrich-only). |
+| `entity_neighborhood_get(id)` | `entity_neighborhood_get(id="python:function:requests.sessions.Session.send")` — callers, callees, container, contained entities, and references in one hop. |
+| `entity_subsystem_get(id)` | `entity_subsystem_get(id="python:module:requests.sessions")` — the subsystem an entity belongs to (reverse of `subsystem_member_list`); a function/class resolves through its containing module. |
+| `project_status_get()` | `project_status_get()` — index diagnostics: latest run, entity/edge/finding/briefing-blocked counts, staleness, per-plugin counts, LLM policy, and the resolved Filigree endpoint. No arguments, no LLM. |
+| `entity_summary_preview_cost_get(id)` | `entity_summary_preview_cost_get(id="python:function:requests.sessions.Session.send")` — preview an `entity_summary_get` call before spending: cache hit/expired/miss, cached tokens/cost/age, an input-token estimate on a miss, LLM policy, and whether a live call would spend. Never calls the LLM. |
+| `entity_source_get(id, context_lines)` | `entity_source_get(id="python:function:requests.sessions.Session.send", context_lines=10)` — the entity's exact indexed source span plus bounded line-numbered context, each line flagged `in_entity`. Reports `source_status` (`ok`/`missing`/`drifted`/…) instead of a stale snippet. No LLM. |
+| `entity_call_site_list(id, role)` | `entity_call_site_list(id="python:function:requests.sessions.Session.send", role="caller")` — the actual source line(s) behind calls/references edges: file, line, line text, edge kind, confidence, and resolved/ambiguous/unresolved classification. `role="callee"` shows incoming sites. No LLM. |
+| `entity_orientation_pack_get(entity \| file, line)` | `entity_orientation_pack_get(file="requests/sessions.py", line=480)` — one deterministic packet for a location: primary entity, `entity_context` evidence, source-span summary, one-hop neighbors, compact execution paths, related Filigree issues, index/Filigree/LLM health, and suggested next reads. Resolve by `entity` id or by `file`+`line`. No LLM. |
 | `analyze_start()` | `analyze_start()` — launch a background `loomweave analyze` re-index and return its `run_id` immediately. One run per project (cross-process lock). No arguments, no LLM. |
-| `analyze_status(run_id)` | `analyze_status(run_id="…")` — live status of a run: `queued`/`running`/`completed`/`failed`/`cancelled`/`skipped_no_plugins`, phase, processed/total files, heartbeat, and recorded stats on a terminal status. No LLM. |
+| `analyze_status_get(run_id)` | `analyze_status_get(run_id="…")` — live status of a run: `queued`/`running`/`completed`/`failed`/`cancelled`/`skipped_no_plugins`, phase, processed/total files, heartbeat, and recorded stats on a terminal status. No LLM. |
 | `analyze_cancel(run_id)` | `analyze_cancel(run_id="…")` — SIGKILL a running analyze's process group (plugin + Pyright) and record its terminal state. No LLM. |
-| `index_diff()` | `index_diff()` — freshness / drift report: latest completed run, indexed-file drift (mtime vs. index), and git working-tree changes correlated against indexed paths. No arguments, no LLM. |
+| `index_diff_get()` | `index_diff_get()` — freshness / drift report: latest completed run, indexed-file drift (mtime vs. index), and git working-tree changes correlated against indexed paths. No arguments, no LLM. |
 
 The three questions to walk through with your agent:
 
-1. **"List the top-level modules in this project."** Exercises `find_entity`
+1. **"List the top-level modules in this project."** Exercises `entity_find`
    with a broad pattern.
-2. **"What calls `requests.get`?"** Exercises `callers_of` against a
+2. **"What calls `requests.get`?"** Exercises `entity_callers_list` against a
    well-known entry point.
 3. **"Summarise `requests.sessions.Session.send`."** Exercises the live LLM
-   path (`summary`), the OpenRouter provider, the budget ledger, and the
-   summary cache. The second invocation of the same `summary(id)` is a cache
+   path (`entity_summary_get`), the OpenRouter provider, the budget ledger, and
+   the summary cache. The second invocation of the same
+   `entity_summary_get(id)` is a cache
    hit; verify by re-asking and noting the near-zero latency.
 
 A successful run gives you three substantive, graph-grounded answers — not
@@ -374,7 +381,7 @@ Expected behaviour:
   language-plugin entity. Source files in the project that the scanner
   also flags (e.g. high-entropy strings in `requests/utils.py`) get
   `properties.briefing_blocked = "secret_present"` on their containing
-  module entity, and the `summary(id)` MCP tool returns a
+  module entity, and the `entity_summary_get(id)` MCP tool returns a
   `briefing_blocked: "secret_present"` envelope instead of dispatching
   the LLM.
 
@@ -429,7 +436,7 @@ is never quarantined. Notarized release artifacts are on the post-1.0 roadmap.
 Add the file to `.weft/loomweave/secrets-baseline.yaml` with a written justification
 (the schema requires it). Full procedure: [secret-scanning.md](./secret-scanning.md).
 
-### `summary` returns an error citing budget or LLM provider
+### `entity_summary_get` returns an error citing budget or LLM provider
 
 Check `OPENROUTER_API_KEY` is set in the environment that `loomweave serve`
 inherits (for Claude Desktop that means the `env` block in the MCP-server
@@ -437,7 +444,7 @@ config). Live LLM calls are also gated by `llm_policy.enabled: true` and
 `llm_policy.allow_live_provider: true` in `loomweave.yaml` — see
 [openrouter.md](./openrouter.md).
 
-### `issues_for` returns an `unavailable` envelope
+### `entity_issue_list` returns an `unavailable` envelope
 
 Expected when Filigree is not reachable. Filigree integration is
 *enrich-only* per the Weft federation axiom — Loomweave's structural answers

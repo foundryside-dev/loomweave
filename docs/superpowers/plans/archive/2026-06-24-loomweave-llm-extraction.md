@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # `loomweave-llm` Crate Extraction — Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.

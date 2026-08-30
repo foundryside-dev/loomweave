@@ -164,6 +164,6 @@ v0.1 tokens carry scope claims — read-only catalog, read-only findings, submit
 
 - [Loomweave v0.1 panel threat model T-02](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) (line 233) — original risk scoring.
 - [Panel threat model §12 recommendation 1](../../implementation/v0.1-reviews/panel-2026-04-17/09-threat-model.md) (line 298) — the specific "authenticated or not listening" prescription.
-- [Loomweave v0.1 system design §10 "Loopback is not a security boundary"](../v0.1/system-design.md) — the paragraph this ADR flips; updated in the same commit.
+- [Loomweave v0.1 system design §10 "Loopback is not a security boundary"](../1.0/system-design.md) — the paragraph this ADR flips; updated in the same commit.
 - [ADR-014](./ADR-014-filigree-registry-backend.md) — supersedes this ADR for the active registry-backend HTTP read API trust model.
 - [Loomweave v0.1 scope commitments — action 5](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) (line 199) — the commitment mandate.

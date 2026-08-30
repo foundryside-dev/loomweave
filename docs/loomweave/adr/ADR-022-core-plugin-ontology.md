@@ -124,9 +124,9 @@ Every kind is plugin-owned, including `file`, `subsystem`, `guidance`. Plugins c
 
 ## References
 
-- [Loomweave v0.1 requirements §Design principles](../v0.1/requirements.md) (line 37) — Principle 3.
-- [REQ-CATALOG-02, REQ-CATALOG-03](../v0.1/requirements.md) — plugin-declared kinds; reserved edge set.
-- [Loomweave v0.1 system design §2](../v0.1/system-design.md) (lines 120-234) — core/plugin responsibility split; plugin manifest contract.
-- [Loomweave v0.1 detailed design §1, §2](../v0.1/detailed-design.md) (lines 56-136, 187-309) — manifest shape; Entity/Edge/Finding structs; core-reserved edge kinds at line 261; core-minted `file`/`subsystem`/`guidance` IDs at lines 228-230.
+- [Loomweave v0.1 requirements §Design principles](../1.0/requirements.md) (line 37) — Principle 3.
+- [REQ-CATALOG-02, REQ-CATALOG-03](../1.0/requirements.md) — plugin-declared kinds; reserved edge set.
+- [Loomweave v0.1 system design §2](../1.0/system-design.md) (lines 120-234) — core/plugin responsibility split; plugin manifest contract.
+- [Loomweave v0.1 detailed design §1, §2](../1.0/detailed-design.md) (lines 56-136, 187-309) — manifest shape; Entity/Edge/Finding structs; core-reserved edge kinds at line 261; core-minted `file`/`subsystem`/`guidance` IDs at lines 228-230.
 - [Weft doctrine §5](../../suite/weft.md) — centralisation-drift failure test; a closed core-defined kind enum qualifies.
 - [Panel synthesis — self-sufficiency review](../../implementation/v0.1-reviews/panel-2026-04-17/04-self-sufficiency.md) — Issue 7 (rule-ID inconsistency) is the empirical case this ADR's namespace rule resolves.

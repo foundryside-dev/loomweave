@@ -111,7 +111,7 @@ Audit was performed by six concurrent subagents (REQ slices A/B/C; NFR slices D/
 
 ### 3.1 P0 — Resolved by session 1 amendments
 
-The initial audit flagged four P0 surface-mismatch findings: `REQ-MCP-02`, `REQ-MCP-03`, `REQ-HTTP-01`, `REQ-HTTP-02`. Investigation of the [Sprint-2 scope amendment](../../implementation/sprint-2/scope-amendment-2026-05.md) showed that all four were explicitly narrowed by the 2026-05-16 amendment (Box B.6 named the 8-tool MVP MCP surface; [ADR-014](../adr/ADR-014-filigree-registry-backend.md) defined the file-registry HTTP subset) but the requirement rows had never received the "Deferred to v0.2" blockquote that `REQ-FINDING-03..06` carries. **Session 1 added those blockquotes (see §0).** No code changes required for these four rows. The P0 list is now empty.
+The initial audit flagged four P0 surface-mismatch findings: `REQ-MCP-02`, `REQ-MCP-03`, `REQ-HTTP-01`, `REQ-HTTP-02`. Investigation of the [Sprint-2 scope amendment](../../../implementation/sprint-2/scope-amendment-2026-05.md) showed that all four were explicitly narrowed by the 2026-05-16 amendment (Box B.6 named the 8-tool MVP MCP surface; [ADR-014](../../adr/ADR-014-filigree-registry-backend.md) defined the file-registry HTTP subset) but the requirement rows had never received the "Deferred to v0.2" blockquote that `REQ-FINDING-03..06` carries. **Session 1 added those blockquotes (see §0).** No code changes required for these four rows. The P0 list is now empty.
 
 The next-bundle of probably-same-shape rows is documented as §5 action #1b — they should be inspected against the amendment and either amended or escalated to genuine work, individually.
 

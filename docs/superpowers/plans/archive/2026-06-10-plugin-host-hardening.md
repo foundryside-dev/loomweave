@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Plugin Host + Rust Plugin Adversarial-Input Hardening — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

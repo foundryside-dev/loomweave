@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Loomweave Comprehensive Read-Only Audit - 2026-06-04 - 5 Agent Current Main
 
 Repository: `/home/john/loomweave`

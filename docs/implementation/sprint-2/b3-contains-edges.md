@@ -1,7 +1,7 @@
 # B.3 — Python plugin: `contains` edges (Sprint 2 / Tier B / first edge kind)
 
 **Status**: DRAFT — Sprint 2 Tier-B B.3 work-package design
-**Anchoring design**: [system-design.md §6 (Guidance composition; clustering)](../../loomweave/v0.1/system-design.md#6-guidance-system), [detailed-design.md §3 (Schemas, edge tables)](../../loomweave/v0.1/detailed-design.md), [B.2 design doc](./b2-class-module-entities.md) (predecessor)
+**Anchoring design**: [system-design.md §6 (Guidance composition; clustering)](../../loomweave/1.0/system-design.md#7-guidance-system), [detailed-design.md §3 (Schemas, edge tables)](../../loomweave/1.0/detailed-design.md), [B.2 design doc](./b2-class-module-entities.md) (predecessor)
 **Accepted ADRs**: [ADR-002](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-003](../../loomweave/adr/ADR-003-entity-id-scheme.md), [ADR-006](../../loomweave/adr/ADR-006-clustering-algorithm.md), [ADR-007](../../loomweave/adr/ADR-007-summary-cache-key.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md), [ADR-024](../../loomweave/adr/ADR-024-guidance-schema-vocabulary.md), [ADR-026](../../loomweave/adr/ADR-026-containment-wire-and-edge-identity.md), [ADR-027](../../loomweave/adr/ADR-027-ontology-version-semver.md)
 **Predecessor**: [B.2 — class + module entity emission](./b2-class-module-entities.md)
 **Successor**: B.1 (multi-file dispatch — WP4 Phase 0+1) and B.4 (catalog rendering)

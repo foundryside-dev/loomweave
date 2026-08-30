@@ -341,8 +341,8 @@ The four-axis declaration is the floor — additional discipline can be layered 
 
 ### Originating analysis (2026-05-22 architecture review)
 
-- Final report `§8 Open Questions`: [`docs/arch-analysis-2026-05-22-1924/04-final-report.md`](../../arch-analysis-2026-05-22-1924/04-final-report.md#8-open-questions-for-the-next-phase) — the five questions this ADR's rule absorbs.
-- Subsystem catalog `loomweave-core` Concerns: [`02-subsystem-catalog.md`](../../arch-analysis-2026-05-22-1924/02-subsystem-catalog.md) §1 — the eleven-limit enumeration; the "every limit is a recompile" tell; the `mock.rs` 876-LOC sign of non-trivial host pipeline state.
+- Final report `§8 Open Questions`: [`docs/arch-analysis-2026-05-22-1924/04-final-report.md`](../../archive/arch-analysis-2026-05-22-1924/04-final-report.md#8-open-questions-for-the-next-phase) — the five questions this ADR's rule absorbs.
+- Subsystem catalog `loomweave-core` Concerns: [`02-subsystem-catalog.md`](../../archive/arch-analysis-2026-05-22-1924/02-subsystem-catalog.md) §1 — the eleven-limit enumeration; the "every limit is a recompile" tell; the `mock.rs` 876-LOC sign of non-trivial host pipeline state.
 - Subsystem catalog `loomweave-storage` Concerns: §2 — the `application_id`/`user_version` gap; the writer-actor cadence constants (256 / 50) at `writer.rs:35,38`.
 
 ### SME roundtable (2026-05-23)

@@ -135,6 +135,7 @@
           <tbody>
             <tr><td><code>--path &lt;DIR&gt;</code></td><td class="wrap">Project directory to check (default: current directory)</td></tr>
             <tr><td><code>--fix</code></td><td class="wrap">Repair problems in place (idempotent). Without it, doctor only reports</td></tr>
+            <tr><td><code>--format &lt;text|json&gt;</code></td><td class="wrap">Output format (default: <code>text</code>)</td></tr>
           </tbody>
         </table>
       </div>
@@ -152,7 +153,7 @@
         <table class="ref">
           <thead><tr><th>Flag</th><th class="wrap">Effect</th></tr></thead>
           <tbody>
-            <tr><td><code>--output &lt;FILE&gt;</code></td><td class="wrap">Destination path for the backup copy</td></tr>
+            <tr><td><code>&lt;OUTPUT&gt;</code></td><td class="wrap">Destination file for the backup copy (positional argument: <code>loomweave db backup [OPTIONS] &lt;OUTPUT&gt;</code>)</td></tr>
             <tr><td><code>--force</code></td><td class="wrap">Overwrite an existing destination file</td></tr>
           </tbody>
         </table>

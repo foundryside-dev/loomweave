@@ -224,7 +224,7 @@ path works; LFS is a v0.2+ knob.
 
 ## References
 
-- [detailed-design.md §3 File layout](../v0.1/detailed-design.md#file-layout) —
+- [detailed-design.md §3 File layout](../1.0/detailed-design.md#file-layout) —
   the prose version of this decision, now superseded by this ADR as the
   normative source.
 - [wp1-scaffold.md UQ-WP1-04](../../implementation/sprint-1/wp1-scaffold.md) —

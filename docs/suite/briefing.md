@@ -10,7 +10,7 @@
 
 **Weft** is a suite for enterprise-grade code governance on small teams. Its v0.1 products — **Loomweave**, **Filigree**, and **Wardline** — are three independent tools that enrich one another through narrow additive protocols. Each is fully authoritative in its domain and fully usable on its own. Loomweave builds a trustworthy catalog of a codebase and answers structural questions. Filigree tracks the issues, findings, and observations that arise from examining that codebase. Wardline declares and enforces the trust topology that constrains how code is allowed to behave. Together they deliver rigor that normally requires enterprise-scale platform teams — without the operational weight, and without any shared runtime, store, or orchestrator. A fourth product, **Shuttle**, is proposed for transactional scoped change execution; see [weft.md](./weft.md) for the suite's founding doctrine, the enrichment-not-load-bearing principle, and the go/no-go test that governs future products.
 
-> **Authoritative source.** The Weft federation axiom, roster, and composition law are now authoritative at the federation hub: `~/loom/doctrine.md` (as of 2026-06-05). The hub's canonical roster is **5 realized members** — Loomweave, Filigree, Wardline, **Legis**, and **Charter** — plus **Shuttle as a roadmap thought-bubble**; the three-member v0.1 framing in this briefing predates Legis and Charter and is kept as Loomweave's local intro. This briefing remains Loomweave's own introduction to the suite as Loomweave sees it.
+> **Authoritative source.** The Weft federation axiom, roster, and composition law are now authoritative at the federation hub: `~/weft/doctrine.md` (as of 2026-06-05). The hub's canonical roster is **5 realized members** — Loomweave, Filigree, Wardline, **Legis**, and **Charter** — plus **Shuttle as a roadmap thought-bubble**; the three-member v0.1 framing in this briefing predates Legis and Charter and is kept as Loomweave's local intro. This briefing remains Loomweave's own introduction to the suite as Loomweave sees it.
 
 ---
 
@@ -129,7 +129,7 @@ Four commitments keep the Weft products from drifting into overlap (see [weft.md
 1. **Loomweave observes, Wardline enforces.** Loomweave detects that an annotation is present; Wardline determines whether the annotated code satisfies the semantic it declares. Loomweave never re-implements Wardline analyses; Wardline never re-implements Loomweave's graph.
 2. **Findings are facts, not just errors.** A unified `Finding` record type carries defects, structural observations, classifications, metrics, and suggestions across all Weft products.
 3. **Each tool is independently useful.** Loomweave works without Filigree (writes findings to local JSONL). Wardline works without Loomweave (has since day one). Filigree works without either.
-4. **Local-first, single-binary, git-committable state.** No hosted service is required; `.loomweave/`, `.filigree/`, and Wardline's JSON state files are all meant to be committed and shared.
+4. **Local-first, single-binary, git-committable state.** No hosted service is required; `.weft/loomweave/`, `.weft/filigree/`, and Wardline's JSON state files are all meant to be committed and shared.
 
 ---
 
@@ -169,7 +169,7 @@ Several changes land in the sibling tools as Loomweave-v0.1 prerequisites. All t
 - **Wardline (v0.1)**: a stable `REGISTRY_VERSION` that Loomweave's plugin pins against; a commitment to maintain legacy-decorator aliases.
 - **Wardline (v0.2)**: a native emitter to Filigree so Loomweave's SARIF translator can be retired per ADR-015.
 
-Loomweave's v0.1 design set spells these asks out in [system-design.md](../loomweave/v0.1/system-design.md) and [detailed-design.md](../loomweave/v0.1/detailed-design.md). Loomweave ships with degraded-mode fallbacks (`--no-filigree`, `--no-wardline`) so operators using only part of the suite still get a coherent product.
+Loomweave's v0.1 design set spells these asks out in [system-design.md](../loomweave/1.0/system-design.md) and [detailed-design.md](../loomweave/1.0/detailed-design.md). Loomweave ships with degraded-mode fallbacks (`--no-filigree`, `--no-wardline`) so operators using only part of the suite still get a coherent product.
 
 ---
 
@@ -178,10 +178,10 @@ Loomweave's v0.1 design set spells these asks out in [system-design.md](../loomw
 | If you want to… | Read |
 |---|---|
 | Read Weft's founding doctrine — federation axiom, composition law, go/no-go test | [weft.md](./weft.md) |
-| Enter the Loomweave v0.1 docset in reading order | [../loomweave/v0.1/README.md](../loomweave/v0.1/README.md) |
-| Read Loomweave's requirements | [../loomweave/v0.1/requirements.md](../loomweave/v0.1/requirements.md) |
-| Read Loomweave's system design | [../loomweave/v0.1/system-design.md](../loomweave/v0.1/system-design.md) |
-| Read Loomweave's detailed design reference | [../loomweave/v0.1/detailed-design.md](../loomweave/v0.1/detailed-design.md) |
+| Enter the Loomweave v0.1 docset in reading order | [../loomweave/1.0/README.md](../loomweave/1.0/README.md) |
+| Read Loomweave's requirements | [../loomweave/1.0/requirements.md](../loomweave/1.0/requirements.md) |
+| Read Loomweave's system design | [../loomweave/1.0/system-design.md](../loomweave/1.0/system-design.md) |
+| Read Loomweave's detailed design reference | [../loomweave/1.0/detailed-design.md](../loomweave/1.0/detailed-design.md) |
 | Read accepted architecture decisions | [../loomweave/adr/README.md](../loomweave/adr/README.md) |
 | Review the planning and review archive | [../implementation/README.md](../implementation/README.md) |
 | Work with Filigree today | Check out the Filigree repository; start with its `CLAUDE.md` and `filigree --help`. |

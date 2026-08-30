@@ -1,6 +1,6 @@
 # ADR-040: Semantic search — opt-in embeddings, sidecar storage, cosine scan
 
-**Status**: Accepted
+**Status**: Accepted; embeddings sidecar path relocated by [ADR-046](./ADR-046-weft-store-consolidation.md)
 **Date**: 2026-06-02
 **Deciders**: john@pgpl.net (with Claude)
 **Context**: WS5b (advanced MCP queries) splits two capabilities out of the WS5 stateless catalogue that need infrastructure beyond a catalog query: `search_semantic` (this ADR) and `find_dead_code` (no ADR — pure graph query). `search_semantic` ranks entities by embedding similarity to a natural-language query, so it needs an embedding provider, vector storage, and a similarity scan. This ADR records the opt-in posture, the provider abstraction, the storage location, and the cost-governance hook.

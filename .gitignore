@@ -10,6 +10,7 @@ Cargo.lock.bak
 # entries below and the blanket .weft/ rule)
 *.db-journal
 *.db-wal
+*.db-shm
 
 # Rust-analyzer / IDE caches
 /.idea
@@ -23,6 +24,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .coverage
+coverage.xml
 htmlcov/
 .claude/
 
@@ -65,9 +67,20 @@ CLAUDE.md
 # Developer config / local tooling — not part of the solution
 .agents/
 /.worktrees/
+/.codex/
 
 # Local tool/federation config — not part of the solution
 .mcp.json
 loomweave.yaml
 .wardline
 dist-reconcile/
+
+# Release build output (release.yml runs maturin/sdist builds with --out dist).
+/dist/
+
+# Editor / merge artifacts
+.DS_Store
+*.orig
+*.rej
+*.swp
+*~

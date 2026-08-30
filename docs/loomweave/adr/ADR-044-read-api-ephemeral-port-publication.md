@@ -1,6 +1,6 @@
 # ADR-044: Read-API Ephemeral Port Publication
 
-**Status**: Accepted
+**Status**: Accepted; port-file path relocated by [ADR-046](./ADR-046-weft-store-consolidation.md)
 **Date**: 2026-06-06
 **Relates to**: [ADR-034](./ADR-034-federation-http-read-api-hardening.md)
 **Tracking**: clarion-7f574bc34f

@@ -4,7 +4,7 @@ Loomweave scans source files before any file content can be used for LLM summari
 
 ## What Gets Blocked
 
-Blocking is file-level. If `src/config.py` contains a detected key, entities from that file remain queryable through structural tools, but the `summary` tool returns a policy envelope instead of calling the LLM provider or writing `summary_cache`.
+Blocking is file-level. If `src/config.py` contains a detected key, entities from that file remain queryable through structural tools, but the `entity_summary_get` tool returns a policy envelope instead of calling the LLM provider or writing `summary_cache`.
 
 Plugin source files and `.env` sidecars are scanned. If a plugin reports an entity for some other in-project path that was not covered by the scanner, Loomweave marks that entity `briefing_blocked: unscanned_source` so source bytes cannot reach the LLM provider without a prior scan.
 
@@ -92,7 +92,7 @@ Filigree integration for scanner findings (WP9-B finding emission) is deferred t
 
 ## Limitations
 
-The scanner is pattern-based. It can miss novel internal key formats and it can flag high-entropy test data. Use a justified baseline for reviewed false positives, and disable LLM dispatch entirely for repos where any source disclosure would be unacceptable — set `llm.allow_live_provider: false` in `loomweave.yaml` (or leave `LOOMWEAVE_LLM_LIVE` unset) so the recording provider is the only path Loomweave will take.
+The scanner is pattern-based. It can miss novel internal key formats and it can flag high-entropy test data. Use a justified baseline for reviewed false positives, and disable LLM dispatch entirely for repos where any source disclosure would be unacceptable — set `llm_policy.allow_live_provider: false` in `loomweave.yaml` (or leave `LOOMWEAVE_LLM_LIVE` unset) so the recording provider is the only path Loomweave will take.
 
 Contextual credential suppression currently recognises shell/Python `#` comments only. It does not recognise `//` or `/* */` comments; use a justified baseline entry for reviewed non-Python test fixtures.
 
@@ -151,7 +151,7 @@ absent.
 a project root that was previously analyzed by a pre-WP5 binary, run
 `loomweave analyze` (with the secret scanner active, which is the default)
 against the project root **before** exposing the HTTP read API or calling
-the `summary` MCP tool. The re-analyze produces a fresh briefing-blocked
+the `entity_summary_get` MCP tool. The re-analyze produces a fresh briefing-blocked
 annotation pass over all current file entities.
 
 This applies only to upgrades from a Loomweave binary built before WP5

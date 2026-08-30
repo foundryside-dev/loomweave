@@ -10,8 +10,8 @@ which entities it covers, a scope level, and optional pinning / expiry
 
 Guidance is authored by operators via the `loomweave guidance` CLI (this guide)
 or proposed by agents through MCP and promoted by an operator. Authored and
-promoted sheets reach consult agents through the `guidance_for` MCP read tool
-and are also composed into auto-generated `summary` prompts with a real
+promoted sheets reach consult agents through the `entity_guidance_list` MCP read
+tool and are also composed into auto-generated `entity_summary_get` prompts with a real
 `guidance_fingerprint` cache key.
 
 All subcommands operate on `.weft/loomweave/loomweave.db`, so **run `loomweave analyze`
@@ -102,7 +102,7 @@ add several rules; a sheet matches an entity if any rule matches.
 
 One of `project | subsystem | package | module | class | function` (ADR-024).
 Scope level drives the **composition order**: when several sheets apply to one
-entity, `guidance_for` ranks them by `scope_rank` ascending — project-scoped
+entity, `entity_guidance_list` ranks them by `scope_rank` ascending — project-scoped
 sheets first, function-scoped last — so narrower, more specific guidance is
 ordered after (and can override) broader guidance. Within a scope level, ties
 break by `authored_at` then id.
@@ -198,7 +198,7 @@ dropped.
 ## Not yet available
 
 These pieces of the guidance system are **deferred** and do not ship today.
-Authored guidance reaches consult agents through both `guidance_for` and
+Authored guidance reaches consult agents through both `entity_guidance_list` and
 auto-generated summaries, but the following are not yet wired:
 
 - **In-browser staleness-review UI (`NG-13`)** — deferred. Ticket:

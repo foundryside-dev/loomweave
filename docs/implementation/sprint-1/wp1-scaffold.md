@@ -1,7 +1,7 @@
 # WP1 — Scaffold + Storage (Sprint 1)
 
 **Status**: DRAFT — pending sprint kickoff
-**Anchoring design**: [system-design.md §4 (Storage)](../../loomweave/v0.1/system-design.md#4-storage), [detailed-design.md §3 (Storage impl)](../../loomweave/v0.1/detailed-design.md#3-storage-implementation)
+**Anchoring design**: [system-design.md §4 (Storage)](../../loomweave/1.0/system-design.md#4-storage), [detailed-design.md §3 (Storage impl)](../../loomweave/1.0/detailed-design.md#3-storage-implementation)
 **Accepted ADRs**: [ADR-001](../../loomweave/adr/ADR-001-rust-for-core.md), [ADR-003](../../loomweave/adr/ADR-003-entity-id-scheme.md), [ADR-011](../../loomweave/adr/ADR-011-writer-actor-concurrency.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md)
 **Backlog ADR that may surface**: ADR-005 (`.loomweave/` git-committable subpaths)
 **Predecessor**: none — WP1 is the foundation of Sprint 1.
@@ -20,7 +20,7 @@ to later sprints where those surfaces are first exercised.
 
 - Cargo workspace at repo root.
 - SQLite schema covering the full table set from
-  [detailed-design.md §3](../../loomweave/v0.1/detailed-design.md#3-storage-implementation):
+  [detailed-design.md §3](../../loomweave/1.0/detailed-design.md#3-storage-implementation):
   tables `entities`, `entity_tags`, `edges`, `findings`, `summary_cache`,
   `runs`, plus the `entity_fts` FTS5 virtual table and its three
   insert/update/delete triggers, the generated-column `ALTER TABLE`
@@ -50,7 +50,7 @@ to later sprints where those surfaces are first exercised.
   - `loomweave install` — creates `.loomweave/` (DB + `config.json` + `.gitignore`
     seeded with the run-log exclusion) and writes a stub `loomweave.yaml` at the
     project root per
-    [detailed-design.md §File layout](../../loomweave/v0.1/detailed-design.md#file-layout)
+    [detailed-design.md §File layout](../../loomweave/1.0/detailed-design.md#file-layout)
     (see L1 note below and ADR-005 trigger in §7).
   - `loomweave analyze <path>` — CLI wiring only. Accepts the path, opens the DB,
     begins a run, but does **not** yet spawn a plugin (that's WP2's wiring). Exits
@@ -75,7 +75,7 @@ Sprint 1 decides these. Sprint 2+ reads and writes against them.
 
 ### L1 — SQLite schema shape
 
-**What locks**: the full table set from [detailed-design.md §3](../../loomweave/v0.1/detailed-design.md#3-storage-implementation),
+**What locks**: the full table set from [detailed-design.md §3](../../loomweave/1.0/detailed-design.md#3-storage-implementation),
 not just the tables the walking skeleton uses. All tables, columns, types, primary
 keys, foreign keys, indexes, and `PRAGMA` settings are written into migration
 `0001_initial_schema.sql` and committed. The walking skeleton only writes rows into
@@ -87,7 +87,7 @@ there is no data; changing later forces migration scripts that each need their o
 tests. Locking the shape now — using the detailed-design as the authoritative source
 — pushes all that rework up-front.
 
-**Canonical source**: [detailed-design.md §3](../../loomweave/v0.1/detailed-design.md#3-storage-implementation).
+**Canonical source**: [detailed-design.md §3](../../loomweave/1.0/detailed-design.md#3-storage-implementation).
 If the detailed-design and the migration file disagree, the migration file wins from
 Sprint 1 onward; the detailed-design must be updated to match.
 
@@ -357,7 +357,7 @@ Steps:
 
 Steps:
 
-- [ ] Transcribe the full schema from [detailed-design.md §3](../../loomweave/v0.1/detailed-design.md#3-storage-implementation) into `0001_initial_schema.sql`. Concretely:
+- [ ] Transcribe the full schema from [detailed-design.md §3](../../loomweave/1.0/detailed-design.md#3-storage-implementation) into `0001_initial_schema.sql`. Concretely:
   - Tables: `entities`, `entity_tags`, `edges`, `findings`, `summary_cache`, `runs`, and `schema_migrations` (meta). Every column, primary key, foreign key, and explicit index as written in §3.
   - Virtual table: `entity_fts` (FTS5, `tokenize = 'porter unicode61'`).
   - Triggers: `entities_ai`, `entities_au`, `entities_ad` keeping `entity_fts` synchronised with `entities`.
@@ -399,7 +399,7 @@ Steps:
 
 Steps:
 
-- [ ] Write failing integration test at `/crates/loomweave-cli/tests/install.rs` using `assert_cmd`: run `loomweave install` in a tempdir; assert `.loomweave/loomweave.db` exists, `.loomweave/config.json` exists with `{"schema_version": 1}`, `.loomweave/.gitignore` exists with expected rules (UQ-WP1-04 resolution), **`<project>/loomweave.yaml`** (project root, not `.loomweave/`; per [detailed-design.md §File layout](../../loomweave/v0.1/detailed-design.md#file-layout) and [system-design.md §Config resolution](../../loomweave/v0.1/system-design.md#config-resolution)) exists with stub content, and `schema_migrations` row count = 1.
+- [ ] Write failing integration test at `/crates/loomweave-cli/tests/install.rs` using `assert_cmd`: run `loomweave install` in a tempdir; assert `.loomweave/loomweave.db` exists, `.loomweave/config.json` exists with `{"schema_version": 1}`, `.loomweave/.gitignore` exists with expected rules (UQ-WP1-04 resolution), **`<project>/loomweave.yaml`** (project root, not `.loomweave/`; per [detailed-design.md §File layout](../../loomweave/1.0/detailed-design.md#file-layout) and [system-design.md §Config resolution](../../loomweave/1.0/system-design.md#config-hierarchy)) exists with stub content, and `schema_migrations` row count = 1.
 - [ ] Second test: running `install` twice in the same dir without `--force` returns a non-zero exit and a clear error message referencing `--force`.
 - [ ] Run tests; expect failure.
 - [ ] Implement `install.rs`:

@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # MCP / command-surface audit — 2026-06-11
 
 **Scope.** Loomweave's command surfaces, audited from the position of the

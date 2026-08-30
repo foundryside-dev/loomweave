@@ -103,6 +103,6 @@ For later versions:
 
 ## References
 
-- [Loomweave v0.1 system design](../v0.1/system-design.md)
-- [Loomweave v0.1 detailed design](../v0.1/detailed-design.md)
+- [Loomweave v0.1 system design](../1.0/system-design.md)
+- [Loomweave v0.1 detailed design](../1.0/detailed-design.md)
 - [Loomweave v0.1 design review](../../implementation/v0.1-reviews/pre-restructure/design-review.md)

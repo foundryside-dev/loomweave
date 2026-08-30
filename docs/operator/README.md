@@ -29,6 +29,15 @@ Windows (owner ruling 2026-07-29, clarion-614022d526).
 - [Guidance](./guidance.md) — authoring guidance sheets with the `loomweave
   guidance` CLI, `--match`/`--scope-level`/`--expires` semantics, staleness
   findings, and the export/import team-sharing workflow.
+- [Clustering](./clustering.md) — subsystem-detection operator notes:
+  configuration, stored subsystems, MCP access, weak-modularity and
+  empty-input behaviour.
+- [HTTP read API](./loomweave-http-read-api.md) — the federation HTTP read
+  surface exposed by `loomweave serve` for sibling products.
+- [v1.0 release rollback](./v1.0-release-rollback.md) — rollback / yank
+  runbook for a published v1.0 release.
+- [v1.0 release governance](./v1.0-release-governance.md) — retired page;
+  redirects to the release handoff.
 - [Release handoff](./release-handoff.md) — retired
   Loomweave-owned GitHub ruleset enforcement and current standalone release
   sequence.
