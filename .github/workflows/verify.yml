@@ -223,7 +223,7 @@ jobs:
           cache-dependency-path: plugins/python/uv.lock
 
       - name: cache pyright runtime
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ~/.cache/pyright-python/
           key: pyright-python-1.1.409-${{ runner.os }}
@@ -283,7 +283,7 @@ jobs:
           cache-dependency-path: plugins/python/uv.lock
 
       - name: cache pyright runtime
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ~/.cache/pyright-python/
           key: pyright-python-1.1.409-${{ runner.os }}-py312
@@ -331,7 +331,7 @@ jobs:
           cache-dependency-path: plugins/python/pyproject.toml
 
       - name: cache pyright runtime
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ~/.cache/pyright-python/
           key: pyright-python-1.1.409-${{ runner.os }}
