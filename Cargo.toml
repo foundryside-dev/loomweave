@@ -21,7 +21,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/foundryside-dev/loomweave"
@@ -75,4 +75,8 @@ xgraph = "2.0.0"
 assert_cmd = "2"
 tempfile = "3"
 nix = { version = "0.28", default-features = false, features = ["resource", "fs"] }
+# Async-signal-safe SIGINT/SIGTERM latch for `serve` (clarion-7ad374bac4) —
+# the safe alternative to a hand-rolled `sigaction` under the workspace's
+# `unsafe_code = "deny"`.
+signal-hook = { version = "0.3", default-features = false }
 rustix = "1.1.4"

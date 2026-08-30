@@ -19,13 +19,13 @@ anyhow.workspace = true
 axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
-loomweave-core = { path = "../loomweave-core", version = "1.5.0" }
-loomweave-llm = { path = "../loomweave-llm", version = "1.5.0" }
-loomweave-analysis = { path = "../loomweave-analysis", version = "1.5.0" }
-loomweave-federation = { path = "../loomweave-federation", version = "1.5.0" }
-loomweave-mcp = { path = "../loomweave-mcp", version = "1.5.0" }
-loomweave-scanner = { path = "../loomweave-scanner", version = "1.5.0" }
-loomweave-storage = { path = "../loomweave-storage", version = "1.5.0" }
+loomweave-core = { path = "../loomweave-core", version = "1.5.1" }
+loomweave-llm = { path = "../loomweave-llm", version = "1.5.1" }
+loomweave-analysis = { path = "../loomweave-analysis", version = "1.5.1" }
+loomweave-federation = { path = "../loomweave-federation", version = "1.5.1" }
+loomweave-mcp = { path = "../loomweave-mcp", version = "1.5.1" }
+loomweave-scanner = { path = "../loomweave-scanner", version = "1.5.1" }
+loomweave-storage = { path = "../loomweave-storage", version = "1.5.1" }
 dotenvy.workspace = true
 fs2.workspace = true
 hmac.workspace = true
@@ -52,6 +52,10 @@ uuid.workspace = true
 # UnsupportedPlatform without ever touching an fd (clarion-4cd5b0b3b9).
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
+# serve's SIGINT/SIGTERM latch (clarion-7ad374bac4): without it those signals
+# kill the process before `PublishedPortGuard` can compare-and-delete the
+# published ephemeral.port marker.
+signal-hook.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
@@ -63,6 +67,11 @@ rusqlite.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 tempfile.workspace = true
+
+# Targeted `kill(pid, SIGTERM/SIGINT)` in tests/serve.rs — pid-addressed,
+# never the process group (which would take the test runner down with it).
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["signal"] }
 
 # Path-only (no version): publish=false and test-only, same rationale as
 # loomweave-plugin-fixture above. Spawned by the privileged bind-mount test in
