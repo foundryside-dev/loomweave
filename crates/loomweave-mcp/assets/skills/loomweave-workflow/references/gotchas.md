@@ -21,9 +21,11 @@ Relocated verbatim from `SKILL.md` (convention C-20 budget).
 - **`entity_callers_list` and `subsystem_member_list` are bounded** (`limit`
   default 50, max 100, plus a numeric-offset `cursor`). Each response carries
   `next_cursor`
-  (null when exhausted) and an explicit `truncated` flag — re-call with
-  `{"cursor": "<next_cursor>"}` to walk the full set. An empty page on a non-null
-  cursor means you paged past the end.
+  (null when exhausted); the envelope adds `truncated:true` +
+  `truncation_reason` only when something WAS cut — an absent `truncated` key
+  means not truncated (likewise absent `error`/`stats_delta`/`diagnostics`
+  mean none). Re-call with `{"cursor": "<next_cursor>"}` to walk the full
+  set. An empty page on a non-null cursor means you paged past the end.
 - **`entity_neighborhood_get` caps each bucket independently** with one
   per-bucket `limit`
   and reports a `truncated` **map** (`{callers, callees, contained,

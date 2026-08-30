@@ -31,8 +31,6 @@
   },
   "responses": {
     "cli-command": {
-      "diagnostics": [],
-      "error": null,
       "ok": true,
       "result": {
         "classification": {
@@ -51,84 +49,44 @@
         },
         "entities": [
           {
-            "content_hash": "1e0bdf0ca83ed0c0a538313f1f63e0ff64c5e33c3c7879e7c86de238382b3248",
             "id": "python:function:command_alpha.command_alpha",
             "kind": "function",
-            "name": "command_alpha.command_alpha",
             "sei": "normalized-sei:15b345ca8d2bc5bd1e416fa7",
             "short_name": "command_alpha",
-            "source_file_path": "<fixture-root>/command_alpha.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_alpha.py",
+            "source_line_start": 1
           },
           {
-            "content_hash": "46fc801b838a5271d9954e2736a4948e99f8d078b1deddf099945d9ec84246f8",
             "id": "python:function:command_bravo.command_bravo",
             "kind": "function",
-            "name": "command_bravo.command_bravo",
             "sei": "normalized-sei:c3cd6ef69be6a9ac7ef1db9c",
             "short_name": "command_bravo",
-            "source_file_path": "<fixture-root>/command_bravo.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_bravo.py",
+            "source_line_start": 1
           },
           {
-            "content_hash": "7e51cfb249b116d11ef53b940a73305a840dea8a5c36b87462250be9e977a278",
             "id": "python:function:command_charlie.command_charlie",
             "kind": "function",
-            "name": "command_charlie.command_charlie",
             "sei": "normalized-sei:fc65f47b2219cff99157f77b",
             "short_name": "command_charlie",
-            "source_file_path": "<fixture-root>/command_charlie.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_charlie.py",
+            "source_line_start": 1
           },
           {
-            "content_hash": "cc74e49c255fcf1cf50a26a8bec4bd31b059f5bdc8ca99d68bf18dd41e13f58d",
             "id": "python:function:command_delta.command_delta",
             "kind": "function",
-            "name": "command_delta.command_delta",
             "sei": "normalized-sei:b6df41531b689f758e443690",
             "short_name": "command_delta",
-            "source_file_path": "<fixture-root>/command_delta.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_delta.py",
+            "source_line_start": 1
           },
           {
-            "content_hash": "e7a2da76d1f10c3af16b8cfab7c980d6ee28b58a8654831ac16243a534daa698",
             "id": "python:function:command_echo.command_echo",
             "kind": "function",
-            "name": "command_echo.command_echo",
             "sei": "normalized-sei:d7fb4dd70aa66f581ea6b93a",
             "short_name": "command_echo",
-            "source_file_path": "<fixture-root>/command_echo.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_echo.py",
+            "source_line_start": 1
           }
         ],
         "facet": {
@@ -162,14 +120,9 @@
           "returned": 5,
           "total": 5
         }
-      },
-      "stats_delta": {},
-      "truncated": false,
-      "truncation_reason": null
+      }
     },
     "entry-point": {
-      "diagnostics": [],
-      "error": null,
       "ok": true,
       "result": {
         "classification": {
@@ -188,84 +141,44 @@
         },
         "entities": [
           {
-            "content_hash": "1e0bdf0ca83ed0c0a538313f1f63e0ff64c5e33c3c7879e7c86de238382b3248",
             "id": "python:function:command_alpha.command_alpha",
             "kind": "function",
-            "name": "command_alpha.command_alpha",
             "sei": "normalized-sei:15b345ca8d2bc5bd1e416fa7",
             "short_name": "command_alpha",
-            "source_file_path": "<fixture-root>/command_alpha.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_alpha.py",
+            "source_line_start": 1
           },
           {
-            "content_hash": "46fc801b838a5271d9954e2736a4948e99f8d078b1deddf099945d9ec84246f8",
             "id": "python:function:command_bravo.command_bravo",
             "kind": "function",
-            "name": "command_bravo.command_bravo",
             "sei": "normalized-sei:c3cd6ef69be6a9ac7ef1db9c",
             "short_name": "command_bravo",
-            "source_file_path": "<fixture-root>/command_bravo.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_bravo.py",
+            "source_line_start": 1
           },
           {
-            "content_hash": "7e51cfb249b116d11ef53b940a73305a840dea8a5c36b87462250be9e977a278",
             "id": "python:function:command_charlie.command_charlie",
             "kind": "function",
-            "name": "command_charlie.command_charlie",
             "sei": "normalized-sei:fc65f47b2219cff99157f77b",
             "short_name": "command_charlie",
-            "source_file_path": "<fixture-root>/command_charlie.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_charlie.py",
+            "source_line_start": 1
           },
           {
-            "content_hash": "cc74e49c255fcf1cf50a26a8bec4bd31b059f5bdc8ca99d68bf18dd41e13f58d",
             "id": "python:function:command_delta.command_delta",
             "kind": "function",
-            "name": "command_delta.command_delta",
             "sei": "normalized-sei:b6df41531b689f758e443690",
             "short_name": "command_delta",
-            "source_file_path": "<fixture-root>/command_delta.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_delta.py",
+            "source_line_start": 1
           },
           {
-            "content_hash": "e7a2da76d1f10c3af16b8cfab7c980d6ee28b58a8654831ac16243a534daa698",
             "id": "python:function:command_echo.command_echo",
             "kind": "function",
-            "name": "command_echo.command_echo",
             "sei": "normalized-sei:d7fb4dd70aa66f581ea6b93a",
             "short_name": "command_echo",
-            "source_file_path": "<fixture-root>/command_echo.py",
-            "source_line_end": 2,
-            "source_line_start": 1,
-            "tags": [
-              "cli-command",
-              "entry-point",
-              "public-surface"
-            ]
+            "source_file_path": "command_echo.py",
+            "source_line_start": 1
           }
         ],
         "facet": {
@@ -299,14 +212,9 @@
           "returned": 5,
           "total": 5
         }
-      },
-      "stats_delta": {},
-      "truncated": false,
-      "truncation_reason": null
+      }
     },
     "http-route": {
-      "diagnostics": [],
-      "error": null,
       "ok": true,
       "result": {
         "classification": {
@@ -358,14 +266,9 @@
           "returned": 0,
           "total": 0
         }
-      },
-      "stats_delta": {},
-      "truncated": false,
-      "truncation_reason": null
+      }
     },
     "exported-api": {
-      "diagnostics": [],
-      "error": null,
       "ok": true,
       "result": {
         "classification": {
@@ -417,10 +320,7 @@
           "returned": 0,
           "total": 0
         }
-      },
-      "stats_delta": {},
-      "truncated": false,
-      "truncation_reason": null
+      }
     }
   }
 }

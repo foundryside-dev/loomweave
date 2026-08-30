@@ -158,8 +158,8 @@ def assert_tool_ok(response: dict[str, object]) -> dict[str, object]:
     assert isinstance(content, list) and content, result
     envelope = json.loads(content[0]["text"])
     assert envelope["ok"] is True, envelope
-    assert envelope["error"] is None, envelope
-    assert "stats_delta" in envelope, envelope
+    assert envelope.get("error") is None, envelope  # absent on success (X-6 slim envelope)
+    # stats_delta is present only when non-empty (X-6 slim envelope)
     return envelope
 
 
@@ -629,7 +629,7 @@ assert "leaf scope" in tools[4]["description"]
 
 entity_hit = assert_tool_ok(responses["entity-hit"])
 assert entity_hit["result"]["entity"]["id"] == "python:function:demo.hello", entity_hit
-assert entity_hit["truncated"] is False
+assert entity_hit.get("truncated") is not True  # absent when not truncated (X-6)
 
 entity_miss = assert_tool_ok(responses["entity-miss"])
 assert entity_miss["result"]["entity"] is None, entity_miss
@@ -684,7 +684,7 @@ assert paths["result"]["root"] == "python:function:demo.hello", paths
 node_ids = {node["id"] for node in paths["result"]["nodes"]}
 assert "python:function:demo.world" in node_ids, paths
 assert all("content_hash" not in node for node in paths["result"]["nodes"]), paths
-assert paths["truncated"] is False, paths
+assert paths.get("truncated") is not True, paths  # absent when not truncated (X-6)
 
 neighborhood = assert_tool_ok(responses["neighborhood"])
 neighbor_callers = {item["entity"]["id"] for item in neighborhood["result"]["callers"]}

@@ -123,18 +123,52 @@ async fn production_tag_handler_exactly_reproduces_all_four_normalized_goldens()
     )
     .expect("insert exact producer coverage");
 
-    for entity in fixture["responses"]["cli-command"]["result"]["entities"]
-        .as_array()
-        .expect("golden entities")
-    {
-        let id = entity["id"].as_str().expect("entity id");
-        let relative = entity["source_file_path"]
-            .as_str()
-            .expect("source path")
-            .strip_prefix("<fixture-root>/")
-            .expect("normalized source path");
+    // Slim list rows (X-6, clarion-b24df21158) carry only
+    // {id, sei, kind, short_name, source_file_path, source_line_start}, so the
+    // reconstruction (a) derives tag membership from WHICH per-tag responses an
+    // entity appears in, and (b) seeds synthetic values for the columns the
+    // response no longer echoes (name / line_end / content_hash) — they cannot
+    // influence the reproduced bytes, which is the point of the slimming.
+    let mut rows: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut tags_by_id: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for tag in ["cli-command", "entry-point", "http-route", "exported-api"] {
+        for entity in fixture["responses"][tag]["result"]["entities"]
+            .as_array()
+            .expect("golden entities")
+        {
+            let id = entity["id"].as_str().expect("entity id").to_owned();
+            tags_by_id
+                .entry(id.clone())
+                .or_default()
+                .insert(tag.to_owned());
+            rows.entry(id).or_insert_with(|| entity.clone());
+        }
+    }
+    // Tags the index holds beyond the four queried (e.g. `public-surface`)
+    // surface only through the empty responses' `known_tags`; per-entity
+    // membership is invisible to the slim rows and irrelevant to the bytes —
+    // pin each such tag to the first entity so `known_tags` reproduces.
+    let first_id = rows.keys().next().expect("at least one entity").clone();
+    for tag in ["cli-command", "entry-point", "http-route", "exported-api"] {
+        let Some(known) = fixture["responses"][tag]["result"]["known_tags"].as_array() else {
+            continue;
+        };
+        for known_tag in known.iter().filter_map(Value::as_str) {
+            tags_by_id
+                .entry(first_id.clone())
+                .or_default()
+                .insert(known_tag.to_owned());
+        }
+    }
+    for (id, entity) in &rows {
+        let relative = entity["source_file_path"].as_str().expect("source path");
+        let relative = relative.strip_prefix("<fixture-root>/").unwrap_or(relative);
         let source_path = project.path().join(relative);
         std::fs::write(&source_path, "# production handler golden\n").expect("seed source");
+        let qualname = id.rsplit(':').next().expect("qualname");
+        let synthetic_hash = format!("golden-hash-{qualname}");
+        let line_start = entity["source_line_start"].as_i64().expect("start line");
         conn.execute(
             "INSERT INTO entities( \
                  id, plugin_id, kind, name, short_name, source_file_path, \
@@ -144,19 +178,19 @@ async fn production_tag_handler_exactly_reproduces_all_four_normalized_goldens()
             params![
                 id,
                 entity["kind"].as_str().expect("kind"),
-                entity["name"].as_str().expect("name"),
+                qualname,
                 entity["short_name"].as_str().expect("short name"),
                 source_path.to_string_lossy(),
-                entity["source_line_start"].as_i64().expect("start line"),
-                entity["source_line_end"].as_i64().expect("end line"),
-                entity["content_hash"].as_str().expect("content hash"),
+                line_start,
+                line_start + 1,
+                synthetic_hash,
             ],
         )
         .expect("insert golden entity");
-        for tag in entity["tags"].as_array().expect("entity tags") {
+        for tag in &tags_by_id[id] {
             conn.execute(
                 "INSERT INTO entity_tags(entity_id, plugin_id, tag) VALUES (?1, 'python', ?2)",
-                params![id, tag.as_str().expect("tag")],
+                params![id, tag],
             )
             .expect("insert golden tag");
         }
@@ -164,11 +198,7 @@ async fn production_tag_handler_exactly_reproduces_all_four_normalized_goldens()
             "INSERT INTO sei_bindings( \
                  sei, current_locator, body_hash, signature, status, born_run_id, updated_run_id, updated_at \
              ) VALUES (?1, ?2, ?3, NULL, 'alive', '<run-id>', '<run-id>', '2026-07-12T00:00:01Z')",
-            params![
-                entity["sei"].as_str().expect("SEI"),
-                id,
-                entity["content_hash"].as_str().expect("content hash"),
-            ],
+            params![entity["sei"].as_str().expect("SEI"), id, synthetic_hash],
         )
         .expect("insert golden SEI");
     }
