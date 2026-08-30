@@ -126,3 +126,45 @@ fn enforce_application_id(conn: &Connection) -> Result<()> {
         }),
     }
 }
+
+/// Prove the on-disk database passes `PRAGMA quick_check(1)`.
+///
+/// `quick_check` walks the btree pages (skipping only `integrity_check`'s
+/// expensive index-content pass), so a file whose header page is intact but
+/// whose interior pages are damaged — invisible to the cheap
+/// `PRAGMA schema_version` header probe — is rejected here instead of being
+/// served as silently-wrong graph rows (clarion-8becd5f189). Cost is O(db
+/// size) and paid once per store open, not per query.
+///
+/// The `(1)` argument stops at the first problem: we only need a verdict and
+/// one representative detail, not a full damage inventory — the recovery is
+/// delete-and-rebuild either way (the index is a regenerable scan).
+///
+/// **`conn` must be write-capable.** `quick_check` also validates FTS5
+/// tables (`entity_fts`), and FTS5's integrity hook fails on a read-only
+/// connection with "attempt to write a readonly database" — which this
+/// function would then misreport as corruption.
+///
+/// # Errors
+///
+/// Returns [`StorageError::CorruptIndex`] when `quick_check` reports damage or
+/// itself fails with `SQLITE_CORRUPT` / `SQLITE_NOTADB` (a badly damaged file
+/// can error out of the pragma instead of returning a row). Any other failure
+/// surfaces as [`StorageError::Sqlite`].
+pub fn verify_quick_check(conn: &Connection) -> Result<()> {
+    match conn.query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0)) {
+        Ok(verdict) if verdict == "ok" => Ok(()),
+        Ok(verdict) => Err(StorageError::CorruptIndex { detail: verdict }),
+        Err(rusqlite::Error::SqliteFailure(err, msg))
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) =>
+        {
+            Err(StorageError::CorruptIndex {
+                detail: msg.unwrap_or_else(|| err.to_string()),
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
+}

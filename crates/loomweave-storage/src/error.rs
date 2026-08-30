@@ -51,6 +51,15 @@ pub enum StorageError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error(
+        "LMWV-INFRA-STORAGE-CORRUPT-DB: PRAGMA quick_check failed: {detail}. \
+         The index file is damaged and would answer graph queries with wrong \
+         rows. The index is a regenerable scan of the codebase: delete \
+         loomweave.db (and its -wal/-shm sidecars) under .weft/loomweave/ and \
+         run `loomweave analyze` to rebuild it"
+    )]
+    CorruptIndex { detail: String },
+
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
