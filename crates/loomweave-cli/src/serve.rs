@@ -883,7 +883,7 @@ fn supervise_stdio_http_and_signals(
         if signo != 0 {
             return handle_termination_signal(signo, http_server.take());
         }
-        if tick % PARENT_PROBE_EVERY_TICKS == 0 && !parent_alive() {
+        if tick.is_multiple_of(PARENT_PROBE_EVERY_TICKS) && !parent_alive() {
             return handle_parent_gone(http_server.take());
         }
         tick = tick.wrapping_add(1);
