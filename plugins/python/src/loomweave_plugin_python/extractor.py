@@ -260,6 +260,7 @@ class ImportsEdgeProperties(TypedDict):
 @dataclass
 class ExtractionStats:
     unresolved_call_sites_total: int = 0
+    unresolved_call_sites_skipped_builtin_total: int = 0
     unresolved_call_sites: list[UnresolvedCallSite] = field(default_factory=list)
     reference_sites_total: int = 0
     references_resolved_total: int = 0
@@ -307,6 +308,9 @@ class ExtractionStats:
             calls_coverage=calls.coverage,
             references_coverage=references.coverage,
             unresolved_call_sites_total=calls.unresolved_call_sites_total,
+            unresolved_call_sites_skipped_builtin_total=(
+                calls.unresolved_call_sites_skipped_builtin_total
+            ),
             unresolved_call_sites=calls.unresolved_call_sites,
             reference_sites_total=references.reference_sites_total,
             references_resolved_total=references.references_resolved_total,

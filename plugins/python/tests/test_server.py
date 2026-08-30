@@ -485,6 +485,7 @@ def test_analyze_file_reports_call_resolver_stats(
     assert extractor_parse_latency_ms > 0
     assert stats == {
         "unresolved_call_sites_total": 3,
+        "unresolved_call_sites_skipped_builtin_total": 0,
         "unresolved_call_sites": [
             {
                 "caller_entity_id": "python:function:demo.caller",

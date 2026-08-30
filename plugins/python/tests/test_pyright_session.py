@@ -55,6 +55,7 @@ from loomweave_plugin_python.pyright_session import (
     _merge_reference_site,
     _position_to_byte,
     _reference_accumulator_to_edge,
+    _reference_fast_path_names,
     _unresolved_call_site_total_for_function,
     _unresolved_call_sites_for_function,
     resolve_host_file_watchdog_secs,
@@ -131,8 +132,58 @@ def test_unresolved_call_site_details_omit_expressions_over_host_cap() -> None:
         node=function_node,
     )
 
-    assert _unresolved_call_site_total_for_function(function, set()) == 1
+    assert _unresolved_call_site_total_for_function(function, set()) == (1, 0)
     assert _unresolved_call_sites_for_function(index, function, set()) == []
+
+
+def test_unresolved_call_sites_drop_unshadowed_builtins_and_disclose_the_count() -> None:
+    # clarion-8a862d8f7e: ``len(...)`` can never resolve to a project entity;
+    # persisting it as an unresolved site is pure noise (10k rows on elspeth).
+    source = "def caller(x):\n    len(x)\n    helper(x)\n    str(x)\n"
+    tree = ast.parse(source)
+    function_node = cast("ast.FunctionDef", tree.body[0])
+    index = _FunctionIndex(
+        source=source,
+        line_starts=(0, len(b"def caller(x):\n")),
+        lines=tuple(source.splitlines(keepends=True)),
+        parse_latency_ms=0,
+        module_id="python:module:demo",
+        by_id={},
+        by_name_position={},
+        entity_by_name_position={},
+        by_short_name={},
+        dunder_call_by_class={},
+        functions=(),
+        entities=(),
+        tree=tree,
+    )
+    call_sites = tuple(
+        _CallSite(
+            line=line, character=4, end_line=line, end_character=4 + len(name), callee_expr=name
+        )
+        for line, name in ((1, "len"), (2, "helper"), (3, "str"))
+    )
+    function = _FunctionInfo(
+        entity_id="python:function:demo.caller",
+        qualified_name="demo.caller",
+        name="caller",
+        line=0,
+        character=4,
+        end_line=3,
+        end_character=10,
+        call_sites=call_sites,
+        node=function_node,
+    )
+    builtin_names = frozenset(_reference_fast_path_names(tree))
+    assert {"len", "str"} <= builtin_names
+
+    assert _unresolved_call_site_total_for_function(function, set(), builtin_names) == (1, 2)
+    sites = _unresolved_call_sites_for_function(index, function, set(), builtin_names)
+    assert [site["callee_expr"] for site in sites] == ["helper"]
+    # Shadowed in-file: the builtin shortcut is off, the site is kept.
+    shadowed = frozenset(_reference_fast_path_names(ast.parse("def len(x):\n    pass\n")))
+    assert "len" not in shadowed
+    assert _unresolved_call_site_total_for_function(function, set(), shadowed) == (2, 1)
 
 
 def _finding_codes(result_findings: Sequence[Finding]) -> set[str]:

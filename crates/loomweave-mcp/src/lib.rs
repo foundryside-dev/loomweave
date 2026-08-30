@@ -3521,8 +3521,13 @@ fn validate_tool_arguments_against_schema(
     };
     for key in arguments.keys() {
         if !properties.contains_key(key) {
+            // Name the accepted parameters in the error: agents that guess
+            // `name` / `query` for `entity_find` otherwise burn a retry just to
+            // learn the spelling (clarion-6ce847cfc3). `properties` is a
+            // serde_json Map (BTreeMap-backed), so the listing is sorted.
+            let accepted = properties.keys().cloned().collect::<Vec<_>>().join(", ");
             return Err(ParamError::new(&format!(
-                "unknown argument for {}: {key}",
+                "unknown argument for {}: {key} (accepted: {accepted})",
                 tool.name
             )));
         }
@@ -8044,11 +8049,51 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response["error"]["code"], -32602, "{response}");
-        assert_eq!(
-            response["error"]["message"],
-            "unknown argument for entity_summary_get: safety_override",
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "unknown argument for entity_summary_get: safety_override (accepted: "
+            ),
             "{response}"
         );
+        assert!(
+            message.contains("id"),
+            "accepted list must name `id`: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_find_unknown_argument_names_the_accepted_parameters() {
+        // clarion-6ce847cfc3: 43% of elspeth's entity_find calls failed on
+        // `name` / `query`; the error must teach the right spelling in one shot.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loomweave.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers);
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "entity_find",
+                    "arguments": { "name": "caller" }
+                }
+            }))
+            .await
+            .expect("response");
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("unknown argument for entity_find: name (accepted: "),
+            "{response}"
+        );
+        assert!(message.contains("pattern"), "{response}");
     }
 
     #[test]
