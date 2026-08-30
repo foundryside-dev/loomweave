@@ -408,3 +408,76 @@ async fn open_validated_accepts_migrated_but_empty_index(/* review #8 */) {
 
     ReaderPool::open_validated(&path, 2).expect("migrated-but-empty index is a valid serve target");
 }
+
+/// Grow the db past one page and stamp garbage into the middle of the second
+/// page, leaving the header (page 1) intact — the shape of damage the cheap
+/// `PRAGMA schema_version` header probe cannot see (clarion-8becd5f189).
+fn corrupt_second_page(path: &std::path::Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let conn = Connection::open(path).expect("open for fill");
+    let page_size: u64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .expect("page size");
+    conn.execute_batch(
+        "CREATE TABLE corrupt_fill(x BLOB); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 512) \
+         INSERT INTO corrupt_fill SELECT randomblob(64) FROM n; \
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("fill and checkpoint");
+    drop(conn);
+    assert!(
+        std::fs::metadata(path).expect("meta").len() > page_size * 2,
+        "fill must span multiple pages for the corruption to land off-header"
+    );
+    let len = std::fs::metadata(path).expect("meta").len();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open raw");
+    // Clobber every page header past page 1: the page-type byte and cell
+    // bookkeeping become garbage, which quick_check cannot miss (scribbling
+    // mid-page can land in unallocated space that no check validates).
+    let mut offset = page_size;
+    while offset < len {
+        file.seek(SeekFrom::Start(offset)).expect("seek");
+        file.write_all(&[0xFF; 24]).expect("scribble");
+        offset += page_size;
+    }
+}
+
+#[test]
+fn quick_check_passes_on_healthy_db_and_flags_page_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    let conn = Connection::open(&path).expect("open");
+    pragma::verify_quick_check(&conn).expect("healthy db passes quick_check");
+    drop(conn);
+
+    corrupt_second_page(&path);
+    let conn = Connection::open(&path).expect("corrupt file still opens lazily");
+    let err = pragma::verify_quick_check(&conn).expect_err("damaged pages must be flagged");
+    assert!(
+        matches!(err, loomweave_storage::StorageError::CorruptIndex { .. }),
+        "expected CorruptIndex, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("LMWV-INFRA-STORAGE-CORRUPT-DB")
+            && err.to_string().contains("loomweave analyze"),
+        "error must carry the code and the rebuild instruction: {err}"
+    );
+}
+
+#[tokio::test]
+async fn open_validated_refuses_page_corrupt_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = prepared_db(&dir);
+    corrupt_second_page(&path);
+    match ReaderPool::open_validated(&path, 2) {
+        Ok(_) => panic!("open_validated must refuse a page-corrupt db"),
+        Err(err) => assert!(
+            matches!(err, loomweave_storage::StorageError::CorruptIndex { .. }),
+            "expected CorruptIndex, got: {err}"
+        ),
+    }
+}

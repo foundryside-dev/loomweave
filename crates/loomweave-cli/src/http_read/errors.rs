@@ -52,7 +52,7 @@ pub(crate) fn classify_read_error(err: &StorageError) -> ReadError {
         // the client's: 500 + logged (via `json_read_error`), never a 4xx that
         // blames the caller's request. A federation client routing on `code`
         // must see STORAGE_ERROR, not INVALID_PATH.
-        StorageError::Corruption(_) => ReadError {
+        StorageError::Corruption(_) | StorageError::CorruptIndex { .. } => ReadError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: ErrorCode::StorageError,
             message: "stored data failed an integrity check",

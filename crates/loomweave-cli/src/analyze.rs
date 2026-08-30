@@ -429,10 +429,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // migrations run) and safe under the analyze lock acquired above; the writer
     // still verifies `user_version` on spawn to reject a forward-incompatible file.
     let stale_source_file_ids = {
-        let mut conn =
-            Connection::open(&db_path).context("open database to apply pending migrations")?;
-        loomweave_storage::pragma::apply_write_pragmas(&conn)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut conn = open_store_healing_corruption(&db_path)?;
         loomweave_storage::schema::apply_migrations(&mut conn)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("apply pending migrations")?;
@@ -2607,6 +2604,56 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
 /// True only for host findings that prove classifier-bearing entity evidence
 /// was rejected or lost. Diagnostics emitted after enumeration (notably the
 /// shutdown-timeout warning) must not downgrade otherwise-complete coverage.
+/// Open the analyze-side store, healing page-level corruption by rebuild.
+///
+/// Runs `PRAGMA quick_check(1)` before anything writes (clarion-8becd5f189).
+/// A store that fails it is deleted — together with its `-wal`/`-shm`
+/// sidecars — and recreated empty, so this run proceeds as a full re-analyze
+/// instead of erroring out (or worse, silently building on damaged pages).
+/// That is the ticket's chosen recovery: the index is a regenerable scan
+/// (~20–30 min on a large tree), so delete-and-rebuild beats any surgical
+/// repair. Safe because the caller already holds the analyze advisory lock;
+/// a concurrent `serve` on the old inode was already refusing to boot via
+/// `ReaderPool::open_validated`'s own `quick_check`.
+///
+/// Only [`loomweave_storage::StorageError::CorruptIndex`] triggers the
+/// rebuild; every other error (permissions, foreign DB, ...) propagates —
+/// deleting the store is justified exactly when the file is proven damaged,
+/// not merely inconvenient.
+fn open_store_healing_corruption(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open(db_path).context("open database to apply pending migrations")?;
+    match loomweave_storage::pragma::verify_quick_check(&conn) {
+        Ok(()) => {
+            loomweave_storage::pragma::apply_write_pragmas(&conn)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(conn)
+        }
+        Err(err @ loomweave_storage::StorageError::CorruptIndex { .. }) => {
+            tracing::warn!(
+                error = %err,
+                "index failed PRAGMA quick_check; deleting the corrupt store and rebuilding from scratch"
+            );
+            drop(conn);
+            for sidecar_suffix in ["", "-wal", "-shm"] {
+                let mut os_path = db_path.as_os_str().to_owned();
+                os_path.push(sidecar_suffix);
+                let path = PathBuf::from(os_path);
+                if let Err(io_err) = fs::remove_file(&path)
+                    && io_err.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(anyhow::anyhow!(io_err))
+                        .with_context(|| format!("delete corrupt store file {}", path.display()));
+                }
+            }
+            let conn = Connection::open(db_path).context("recreate store after corruption")?;
+            loomweave_storage::pragma::apply_write_pragmas(&conn)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(conn)
+        }
+        Err(err) => Err(anyhow::anyhow!("{err}")).context("quick_check on analyze store"),
+    }
+}
+
 fn classifier_evidence_was_rejected(subcode: &str) -> bool {
     matches!(
         subcode,
@@ -7592,6 +7639,79 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::fs;
+
+    /// Build a migrated store, then clobber every page header past page 1 —
+    /// header-probe-invisible damage (the `reader_pool` test twin's recipe).
+    fn corrupt_store(db_path: &Path) {
+        use std::io::{Seek, SeekFrom, Write};
+        let conn = Connection::open(db_path).expect("open for fill");
+        let page_size: u64 = conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("page size");
+        conn.execute_batch(
+            "CREATE TABLE corrupt_fill(x BLOB); \
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 512) \
+             INSERT INTO corrupt_fill SELECT randomblob(64) FROM n; \
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("fill and checkpoint");
+        drop(conn);
+        let len = fs::metadata(db_path).expect("meta").len();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(db_path)
+            .expect("open raw");
+        let mut offset = page_size;
+        while offset < len {
+            file.seek(SeekFrom::Start(offset)).expect("seek");
+            file.write_all(&[0xFF; 24]).expect("scribble");
+            offset += page_size;
+        }
+    }
+
+    #[test]
+    fn open_store_healing_corruption_keeps_a_healthy_store_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("loomweave.db");
+        {
+            let mut conn = Connection::open(&db_path).expect("open");
+            loomweave_storage::pragma::apply_write_pragmas(&conn).expect("pragmas");
+            loomweave_storage::schema::apply_migrations(&mut conn).expect("migrate");
+            conn.execute_batch("CREATE TABLE healthy_marker(x)")
+                .expect("marker");
+        }
+        let conn = open_store_healing_corruption(&db_path).expect("healthy open");
+        // A healthy store must never be rebuilt: the marker survives.
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'healthy_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("marker query");
+        assert_eq!(n, 1, "healthy store must be kept, not rebuilt");
+    }
+
+    #[test]
+    fn open_store_healing_corruption_rebuilds_a_page_corrupt_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("loomweave.db");
+        {
+            let mut conn = Connection::open(&db_path).expect("open");
+            loomweave_storage::pragma::apply_write_pragmas(&conn).expect("pragmas");
+            loomweave_storage::schema::apply_migrations(&mut conn).expect("migrate");
+        }
+        corrupt_store(&db_path);
+        let conn = open_store_healing_corruption(&db_path).expect("must heal, not error");
+        // The store was recreated empty: quick_check passes and the schema is
+        // gone (user_version 0 — the caller's apply_migrations rebuilds it,
+        // and the run proceeds as a full re-analyze).
+        loomweave_storage::pragma::verify_quick_check(&conn).expect("healed store is clean");
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(user_version, 0, "rebuilt store starts from scratch");
+    }
 
     #[test]
     fn relativize_for_emit_strips_project_root_else_passes_through() {
