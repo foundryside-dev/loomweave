@@ -14,12 +14,10 @@ and trust-topology tools.
 
 ## Status
 
-**Public release: v1.5.0. Local checkout: v1.5.1.** `v1.5.0` is the latest
-public GitHub release (crates.io and `loomweave-plugin-rust` on PyPI; the
-`loomweave-plugin-python` and `loomweave` wheels for 1.5.0 never published — see
-the 1.5.1 changelog). This checkout and the local uv build are versioned `1.5.1`,
-the patch release that completes the PyPI publish. The current source and
-public release line include:
+**Public release: v1.5.1. Local checkout: v1.6.0.** `v1.5.1` is the latest
+public GitHub release (crates.io and all three PyPI packages). This checkout
+and the local uv build are versioned `1.6.0`; `v1.6.0` is intentionally not
+tagged or published yet. The current source and public release line include:
 
 - **Python and Rust first-party plugins.** The Python plugin extracts modules,
   classes, functions, calls, references, decorators, and inheritance edges. The
@@ -110,7 +108,7 @@ loomweave analyze
 loomweave serve
 ```
 
-This versioned `1.5.1` checkout can also be installed locally:
+This versioned `1.6.0` checkout can also be installed locally:
 
 ```bash
 # From this repository checkout
@@ -120,7 +118,7 @@ pipx install ./packaging/rust-plugin-dist
 ```
 
 The `loomweave` package metadata in this checkout depends on both
-`loomweave-plugin-python==1.5.1` and `loomweave-plugin-rust==1.5.1`; installing
+`loomweave-plugin-python==1.6.0` and `loomweave-plugin-rust==1.6.0`; installing
 that local package lands the CLI and both plugin executables in the same
 environment.
 
