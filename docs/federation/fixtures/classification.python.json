@@ -3,16 +3,16 @@
   "generated_with": {
     "loomweave_cli": {
       "path": "<repo-root>/target/debug/loomweave",
-      "version": "1.5.0"
+      "version": "1.5.1"
     },
     "rust_plugin": {
       "path": "<repo-root>/target/debug/loomweave-rust-plugin",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "ontology_version": "0.9.0"
     },
     "python_plugin": {
       "path": "<repo-root>/plugins/python/.venv/bin/loomweave-plugin-python",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "ontology_version": "0.12.0"
     }
   },
