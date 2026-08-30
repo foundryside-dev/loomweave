@@ -3779,3 +3779,65 @@ fn http_get_response(bind: &str, path: &str) -> Result<HttpJsonResponse, String>
         serde_json::from_str(&body).map_err(|err| format!("parse json body {body:?}: {err}"))?;
     Ok(HttpJsonResponse { status_code, body })
 }
+
+/// clarion-7ad374bac4: SIGTERM (e.g. a Codex-owned serve being reaped) must
+/// not strand the published `.weft/loomweave/ephemeral.port` marker —
+/// consumers would classify HTTP as configured from a dead port. serve's
+/// signal latch shuts the HTTP read API down (dropping the
+/// compare-and-delete `PublishedPortGuard`) and exits with the conventional
+/// `128 + signo` code, proving the handler ran instead of the
+/// destructor-skipping default disposition.
+#[test]
+fn sigterm_removes_published_ephemeral_port() {
+    signal_removes_published_ephemeral_port(nix::sys::signal::Signal::SIGTERM, 143);
+}
+
+/// Same contract for Ctrl-C on a foreground serve.
+#[test]
+fn sigint_removes_published_ephemeral_port() {
+    signal_removes_published_ephemeral_port(nix::sys::signal::Signal::SIGINT, 130);
+}
+
+fn signal_removes_published_ephemeral_port(signal: nix::sys::signal::Signal, expected_exit: i32) {
+    let dir = tempfile::tempdir().expect("temp project");
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .assert()
+        .success();
+    // Explicit loopback `:0`: OS-assigned port, no cross-test races, and a
+    // loopback bind is what publishes the ephemeral.port marker.
+    write_http_config(dir.path(), "127.0.0.1:0");
+
+    let child = spawn_serve(dir.path());
+    let port_path = loomweave_federation::loomweave_port::published_port_path(dir.path());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !port_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "serve never published ephemeral.port"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Targeted kill of the serve pid ONLY — never the process group, which
+    // would take the test runner down with it.
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid fits in i32"));
+    nix::sys::signal::kill(pid, signal).expect("deliver termination signal");
+
+    let output =
+        wait_for_child_exit(child, Duration::from_secs(10)).expect("serve exits after the signal");
+    assert_eq!(
+        output.status.code(),
+        Some(expected_exit),
+        "serve must exit via its {signal:?} handler (128 + signo), not the default \
+         disposition; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !port_path.exists(),
+        "{signal:?} must not strand the published ephemeral.port marker; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

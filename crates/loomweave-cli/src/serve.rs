@@ -60,7 +60,87 @@ fn choose_serve_route(kind: loomweave_core::worktree::WorktreeKind, db_exists: b
     }
 }
 
+/// Process-wide SIGINT/SIGTERM latch for `serve` (clarion-7ad374bac4).
+///
+/// `serve` publishes its actually-bound HTTP port to
+/// `<store>/ephemeral.port` (ADR-044) and relies on
+/// `http_read::PublishedPortGuard`'s Drop to compare-and-delete it — which
+/// covers graceful shutdown, error return, and panic-unwind, but NOT the
+/// default SIGINT/SIGTERM dispositions (Ctrl-C on a foreground serve, or a
+/// supervisor such as Codex SIGTERM-ing its MCP children), which terminate
+/// the process without running destructors and strand the marker; consumers
+/// then classify HTTP as configured from a dead port. The handler is
+/// async-signal-safe: it only stores the signal number into a static atomic
+/// (`signal-hook`'s `flag::register_usize`), which the supervision loop in
+/// [`supervise_stdio_with_http`] polls on its existing 100ms tick.
+#[cfg(unix)]
+mod termination_signal {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, LazyLock, Once};
+
+    /// `0` = no termination signal observed yet; otherwise the raw signal
+    /// number (SIGINT = 2, SIGTERM = 15).
+    static RECEIVED: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+    static INSTALL: Once = Once::new();
+
+    /// Install the latch handlers. Idempotent, and called ONLY from the real
+    /// `serve` entry ([`super::run`]) — never from library code paths that
+    /// unit tests exercise concurrently, so tests never mutate process-wide
+    /// signal dispositions.
+    pub(super) fn install() {
+        INSTALL.call_once(|| {
+            for signal in [
+                signal_hook::consts::signal::SIGINT,
+                signal_hook::consts::signal::SIGTERM,
+            ] {
+                let observed =
+                    usize::try_from(signal).expect("SIGINT/SIGTERM numbers are positive");
+                if let Err(err) =
+                    signal_hook::flag::register_usize(signal, Arc::clone(&RECEIVED), observed)
+                {
+                    // Degraded, not fatal: serve still works; only the
+                    // signal-time ephemeral.port cleanup is lost (the same
+                    // posture as SIGKILL, which read-side validation
+                    // tolerates).
+                    tracing::warn!(
+                        signal,
+                        error = %err,
+                        "could not install termination-signal handler; ephemeral.port \
+                         cleanup on this signal is unavailable"
+                    );
+                }
+            }
+        });
+    }
+
+    pub(super) fn flag() -> &'static AtomicUsize {
+        &RECEIVED
+    }
+}
+
+/// Non-unix stub: Linux is the supported platform
+/// (`docs/operator/README.md`); elsewhere the latch never fires and `serve`
+/// keeps its pre-existing behavior (Drop-guard cleanup on graceful paths
+/// only).
+#[cfg(not(unix))]
+mod termination_signal {
+    use std::sync::atomic::AtomicUsize;
+
+    static RECEIVED: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn install() {}
+
+    pub(super) fn flag() -> &'static AtomicUsize {
+        &RECEIVED
+    }
+}
+
 pub fn run(path: &Path, config_path: Option<&Path>) -> Result<()> {
+    // Latch SIGINT/SIGTERM before any route can publish an ephemeral.port
+    // marker, so a signal during the whole serve lifetime reaches the
+    // supervision loop's cleanup instead of the destructor-skipping default
+    // disposition (clarion-7ad374bac4).
+    termination_signal::install();
     // Resolved once, before any gate (pinned decision 1, Task 5): a linked
     // worktree always routes to the full `ServerState` path with a `building`
     // readiness gate, never to `serve_no_index` — Task 3's eager,
@@ -733,11 +813,48 @@ fn run_mcp_stdio(
     Ok(())
 }
 
+/// The supervision loop's terminal outcome, separated from
+/// `std::process::exit` so the signal path is unit-testable without
+/// delivering real signals (clarion-7ad374bac4, see
+/// `tests::supervisor_signal_shuts_down_http_and_reports_signal_exit`).
+#[derive(Debug)]
+enum SupervisedOutcome {
+    /// The MCP stdio thread finished (client closed stdin, an error, or a
+    /// supervised HTTP failure) — the pre-existing return path, unchanged.
+    Stdio(Result<()>),
+    /// SIGINT/SIGTERM was observed: the HTTP read API has already been shut
+    /// down (its `PublishedPortGuard` compare-and-deleted this instance's
+    /// ephemeral.port marker) and the caller must exit the process with this
+    /// conventional `128 + signo` code — the stdio thread is blocked on
+    /// stdin and can never be joined.
+    SignalExit(i32),
+}
+
 fn supervise_stdio_with_http(
     stdio: StdioServe,
-    mut http_server: Option<crate::http_read::HttpReadServer>,
+    http_server: Option<crate::http_read::HttpReadServer>,
 ) -> Result<()> {
+    match supervise_stdio_http_and_signals(stdio, http_server, termination_signal::flag()) {
+        SupervisedOutcome::Stdio(result) => result,
+        SupervisedOutcome::SignalExit(code) => {
+            // HTTP cleanup already ran inside the loop; do NOT wait on the
+            // stdin-blocked stdio thread — terminate promptly with the
+            // conventional signal exit code (130 SIGINT / 143 SIGTERM).
+            std::process::exit(code)
+        }
+    }
+}
+
+fn supervise_stdio_http_and_signals(
+    stdio: StdioServe,
+    mut http_server: Option<crate::http_read::HttpReadServer>,
+    signal_flag: &std::sync::atomic::AtomicUsize,
+) -> SupervisedOutcome {
     let serve_result = loop {
+        let signo = signal_flag.load(std::sync::atomic::Ordering::SeqCst);
+        if signo != 0 {
+            return handle_termination_signal(signo, http_server.take());
+        }
         match stdio.result_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(result) => break result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -752,27 +869,62 @@ fn supervise_stdio_with_http(
                             "failed to stop HTTP read API after supervised failure"
                         );
                     }
-                    return Err(err.context("HTTP read API failed while MCP stdio was running"));
+                    return SupervisedOutcome::Stdio(Err(
+                        err.context("HTTP read API failed while MCP stdio was running")
+                    ));
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                stdio
+                let join_result = stdio
                     .join
                     .join()
-                    .map_err(|_| anyhow!("MCP stdio server thread panicked"))?;
-                return Err(anyhow!("MCP stdio server thread exited without a result"));
+                    .map_err(|_| anyhow!("MCP stdio server thread panicked"))
+                    .and_then(|()| Err(anyhow!("MCP stdio server thread exited without a result")));
+                return SupervisedOutcome::Stdio(join_result);
             }
         }
     };
-    stdio
-        .join
-        .join()
-        .map_err(|_| anyhow!("MCP stdio server thread panicked"))?;
+    if stdio.join.join().is_err() {
+        return SupervisedOutcome::Stdio(Err(anyhow!("MCP stdio server thread panicked")));
+    }
     let shutdown_result = match http_server {
         Some(server) => server.shutdown().context("stop HTTP read API"),
         None => Ok(()),
     };
-    finish_supervised_result(serve_result, shutdown_result)
+    SupervisedOutcome::Stdio(finish_supervised_result(serve_result, shutdown_result))
+}
+
+/// The "signal observed" step of the supervision loop: shut the HTTP read
+/// API down and report the exit code. Shutting down joins the HTTP thread,
+/// which drops `http_read::PublishedPortGuard` — whose compare-and-delete
+/// removes ONLY this instance's ephemeral.port marker. That guard stays the
+/// single deletion mechanism: unlinking the file here directly would strand
+/// or clobber a second serve instance's overwritten port (the two-serve
+/// scenario `loomweave_port::remove_published_port_if_matches` exists for).
+fn handle_termination_signal(
+    signo: usize,
+    http_server: Option<crate::http_read::HttpReadServer>,
+) -> SupervisedOutcome {
+    if let Some(server) = http_server
+        && let Err(err) = server.shutdown()
+    {
+        tracing::warn!(
+            error = %err,
+            "failed to stop HTTP read API on termination signal; the published \
+             ephemeral.port marker may be stranded"
+        );
+    }
+    tracing::info!(
+        signal = signo,
+        "termination signal observed; HTTP read API stopped and ephemeral.port released"
+    );
+    SupervisedOutcome::SignalExit(termination_exit_code(signo))
+}
+
+/// Conventional fatal-signal exit code: `128 + signo` — 130 for SIGINT,
+/// 143 for SIGTERM.
+fn termination_exit_code(signo: usize) -> i32 {
+    128_i32.saturating_add(i32::try_from(signo).unwrap_or(0))
 }
 
 /// Construct the embedding provider for `search_semantic` from config. Returns
@@ -970,6 +1122,117 @@ mod tests {
             format!("{err:#}").contains("stdio failed first"),
             "unexpected error: {err:#}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // clarion-7ad374bac4: the supervisor's "signal observed" step —
+    // shutdown + ephemeral.port cleanup + conventional exit code —
+    // exercised via the injected flag, no real signals.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn termination_exit_code_uses_the_128_plus_signo_convention() {
+        assert_eq!(termination_exit_code(2), 130, "SIGINT");
+        assert_eq!(termination_exit_code(15), 143, "SIGTERM");
+    }
+
+    /// A `StdioServe` whose thread blocks "on stdin" forever (a channel that
+    /// never delivers), exactly like the real MCP stdio thread during an
+    /// externally-signalled serve. The thread is never joined on the signal
+    /// path — it dies with the (test) process.
+    fn stdin_blocked_stdio() -> (StdioServe, mpsc::Sender<()>) {
+        let (result_tx, result_rx) = mpsc::channel::<Result<()>>();
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        let join = thread::spawn(move || {
+            let _ = unblock_rx.recv();
+            drop(result_tx);
+        });
+        (StdioServe { result_rx, join }, unblock_tx)
+    }
+
+    #[test]
+    fn supervisor_signal_shuts_down_http_and_reports_signal_exit() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("loomweave.db");
+        let readers = loomweave_storage::ReaderPool::open(&db, 4).expect("open reader pool");
+        let config = loomweave_federation::config::HttpReadConfig {
+            enabled: true,
+            // Explicit loopback `:0` — OS-assigned, no cross-test port races,
+            // and loopback means the ephemeral.port marker IS published.
+            bind: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+            ..loomweave_federation::config::HttpReadConfig::default()
+        };
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-00000000007a")
+                .expect("parse synthetic instance id");
+        let port_path = loomweave_federation::loomweave_port::published_port_path(tmp.path());
+        let server = crate::http_read::spawn(
+            tmp.path().to_path_buf(),
+            db,
+            readers,
+            instance_id,
+            port_path.clone(),
+            &config,
+            None,
+        )
+        .expect("spawn HTTP read API")
+        .expect("enabled => Some(server)");
+        assert!(
+            port_path.exists(),
+            "fixture sanity: ephemeral.port must be published while serving"
+        );
+
+        let (stdio, _unblock_tx) = stdin_blocked_stdio();
+        // SIGTERM "already delivered": the handler stored the signal number.
+        let signal_flag = AtomicUsize::new(15);
+        let outcome = supervise_stdio_http_and_signals(stdio, Some(server), &signal_flag);
+
+        match outcome {
+            SupervisedOutcome::SignalExit(code) => assert_eq!(
+                code, 143,
+                "SIGTERM must map to the conventional 143 exit code"
+            ),
+            SupervisedOutcome::Stdio(result) => {
+                panic!("signal must win over the stdin-blocked stdio thread, got {result:?}")
+            }
+        }
+        assert!(
+            !port_path.exists(),
+            "the HTTP shutdown must have dropped PublishedPortGuard, whose \
+             compare-and-delete removes this instance's ephemeral.port marker"
+        );
+    }
+
+    /// Regression pin for the no-signal path: with the flag never set, the
+    /// supervisor behaves exactly as before — the stdio result is returned
+    /// once the MCP thread finishes.
+    #[test]
+    fn supervisor_without_signal_returns_the_stdio_result() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (result_tx, result_rx) = mpsc::channel::<Result<()>>();
+        let join = thread::spawn(move || {
+            result_tx
+                .send(Err(anyhow!("stdio finished with an error")))
+                .expect("deliver stdio result");
+        });
+        let stdio = StdioServe { result_rx, join };
+
+        let signal_flag = AtomicUsize::new(0);
+        match supervise_stdio_http_and_signals(stdio, None, &signal_flag) {
+            SupervisedOutcome::Stdio(result) => {
+                let err = result.expect_err("the stdio error must be preserved");
+                assert!(
+                    format!("{err:#}").contains("stdio finished with an error"),
+                    "unexpected error: {err:#}"
+                );
+            }
+            SupervisedOutcome::SignalExit(code) => {
+                panic!("no signal was set, but the supervisor reported SignalExit({code})")
+            }
+        }
     }
 
     // ---------------------------------------------------------------
