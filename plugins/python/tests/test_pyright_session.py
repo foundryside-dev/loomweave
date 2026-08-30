@@ -58,6 +58,7 @@ from loomweave_plugin_python.pyright_session import (
     _position_to_byte,
     _reference_accumulator_to_edge,
     _reference_fast_path_names,
+    _resolved_call_site_keys,
     _unresolved_call_site_total_for_function,
     _unresolved_call_sites_for_function,
     resolve_host_file_watchdog_secs,
@@ -188,6 +189,54 @@ def test_unresolved_call_sites_drop_unshadowed_builtins_and_disclose_the_count()
     assert _unresolved_call_site_total_for_function(function, set(), shadowed) == (2, 1)
 
 
+def test_resolved_call_site_keys_map_pyright_token_ranges_onto_ast_callee_ranges() -> None:
+    """pyright anchors an attribute call's ``fromRange`` on the terminal token
+    (``helper`` in ``self.helper()``); the AST call site spans the whole callee
+    expression. Exact-key matching therefore only ever matched bare ``Name()``
+    calls, so every resolved method call was ALSO counted unresolved. A range
+    resolves the SMALLEST call site that contains it -- so in
+    ``Svc().helper()`` the ``Svc`` token claims the inner site and ``helper``
+    the outer one -- and a range inside no site resolves nothing.
+    """
+    site = _CallSite
+    sites = (
+        site(line=1, character=4, end_line=1, end_character=15, callee_expr="self.helper"),
+        site(line=2, character=4, end_line=2, end_character=16, callee_expr="Svc().helper"),
+        site(line=2, character=4, end_line=2, end_character=7, callee_expr="Svc"),
+        site(line=3, character=4, end_line=3, end_character=13, callee_expr="free_func"),
+        site(line=4, character=4, end_line=5, end_character=9, callee_expr="a.b(\n).c"),
+    )
+    function = _FunctionInfo(
+        entity_id="python:function:demo.f",
+        qualified_name="demo.f",
+        name="f",
+        line=0,
+        character=4,
+        end_line=6,
+        end_character=0,
+        call_sites=sites,
+        node=cast("ast.FunctionDef", ast.parse("def f():\n    pass\n").body[0]),
+    )
+    resolved = _resolved_call_site_keys(
+        function,
+        [
+            (1, 9, 1, 15),  # ``helper`` token inside ``self.helper``
+            (2, 4, 2, 7),  # ``Svc`` == the inner site exactly
+            (2, 10, 2, 16),  # ``helper`` token of ``Svc().helper``
+            (3, 4, 3, 13),  # bare name, exact
+            (5, 6, 5, 9),  # ``c`` token on the second line of a multi-line callee
+            (7, 0, 7, 3),  # inside no call site at all
+        ],
+    )
+    assert resolved == {
+        (1, 4, 1, 15),
+        (2, 4, 2, 16),
+        (2, 4, 2, 7),
+        (3, 4, 3, 13),
+        (4, 4, 5, 9),
+    }
+
+
 def _finding_codes(result_findings: Sequence[Finding]) -> set[str]:
     return {str(finding["subcode"]) for finding in result_findings}
 
@@ -310,6 +359,126 @@ def test_pyright_session_resolves_direct_call(tmp_path: Path, pyright_langserver
     assert result.edges[0]["source_byte_start"] < result.edges[0]["source_byte_end"]
     assert result.pyright_query_latency_ms[0] > 0
     assert result.pyright_index_parse_latency_ms[0] > 0
+    assert result.unresolved_call_sites_total == 0
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolves_class_instantiation_as_call_to_class(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    """clarion-e5224c3aff: ``Name(...)`` naming a class is a call to that class.
+
+    pyright reports every instantiation as an outgoing call whose target IS the
+    class item (its selection range sits on the class name), whether the class
+    defines ``__init__`` itself, inherits it, or gets it synthesised by
+    ``@dataclass``. Those targets used to be looked up only in the FUNCTION
+    index and so were silently dropped as unresolved -- an index of a real
+    project held zero ``calls`` edges into any ``python:class:*`` entity.
+    """
+    _write_module(
+        tmp_path,
+        """
+        from dataclasses import dataclass
+
+
+        class WithInit:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+
+        class Child(WithInit):
+            pass
+
+
+        @dataclass
+        class Record:
+            value: int
+        """,
+        name="models.py",
+    )
+    module = _write_module(
+        tmp_path,
+        """
+        from models import Child, Record, WithInit
+
+
+        class Local:
+            pass
+
+
+        def build():
+            WithInit(1)
+            Child(2)
+            Record(3)
+            Local()
+        """,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_calls(module, ["python:function:demo.build"])
+
+    assert [(edge["from_id"], edge["to_id"], edge["confidence"]) for edge in result.edges] == [
+        ("python:function:demo.build", "python:class:models.WithInit", "resolved"),
+        ("python:function:demo.build", "python:class:models.Child", "resolved"),
+        ("python:function:demo.build", "python:class:models.Record", "resolved"),
+        ("python:function:demo.build", "python:class:demo.Local", "resolved"),
+    ]
+    assert result.unresolved_call_sites_total == 0
+    assert result.unresolved_call_sites == []
+
+
+@pytest.mark.pyright
+def test_pyright_session_resolved_attribute_calls_are_not_double_counted_as_unresolved(
+    tmp_path: Path,
+    pyright_langserver: str,
+) -> None:
+    """A method/attribute call pyright resolved must not ALSO be an unresolved site.
+
+    Found while fixing clarion-e5224c3aff: ``self.helper()``, ``svc.free_func()``
+    and ``s.run()`` each produced a resolved edge AND an unresolved site,
+    because the site match keyed on pyright's token range. The partition
+    (resolved + unresolved + skipped builtins == AST call sites) is what the
+    host and ``entity_callers_list``'s ``traversal_complete`` rely on.
+    """
+    module = _write_module(
+        tmp_path,
+        """
+        def free_func() -> int:
+            return 1
+
+
+        class Svc:
+            def helper(self) -> int:
+                return 1
+
+            def run(self) -> int:
+                return self.helper()
+
+
+        def outer() -> int:
+            import demo
+
+            s = Svc()
+            return demo.free_func() + s.run() + Svc().helper()
+        """,
+    )
+
+    with PyrightSession(tmp_path, executable=pyright_langserver) as session:
+        result = session.resolve_calls(
+            module,
+            ["python:function:demo.Svc.run", "python:function:demo.outer"],
+        )
+
+    assert sorted((edge["from_id"], edge["to_id"]) for edge in result.edges) == [
+        ("python:function:demo.Svc.run", "python:function:demo.Svc.helper"),
+        ("python:function:demo.outer", "python:class:demo.Svc"),
+        ("python:function:demo.outer", "python:class:demo.Svc"),
+        ("python:function:demo.outer", "python:function:demo.Svc.helper"),
+        ("python:function:demo.outer", "python:function:demo.Svc.run"),
+        ("python:function:demo.outer", "python:function:demo.free_func"),
+    ]
+    assert result.unresolved_call_sites == []
     assert result.unresolved_call_sites_total == 0
 
 

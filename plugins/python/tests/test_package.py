@@ -58,7 +58,7 @@ def test_manifest_declares_current_v1_ontology_only() -> None:
     assert isinstance(declared, str)
     decoded = {tuple(token.split("@", 1)) for token in declared.split()}
     assert decoded == set(ACCEPTED_DESCRIPTORS)
-    assert manifest["ontology"]["ontology_version"] == "0.12.0"
+    assert manifest["ontology"]["ontology_version"] == "0.13.0"
     assert manifest["ontology"]["classifier_tags"] == [
         "cli-command",
         "data-model",

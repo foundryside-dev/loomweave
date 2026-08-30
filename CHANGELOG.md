@@ -14,6 +14,24 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
+- **Python: instantiating a class is now a `calls` edge to the class.**
+  pyright reports `Name(...)` as an outgoing call whose target is the class
+  item itself; the plugin only looked that target up in its function index and
+  dropped it as unresolved, so an index could hold zero `calls` edges into any
+  `python:class:*` entity and `entity_callers_list` on a class was always
+  empty. Local, imported, inherited-`__init__`, `@dataclass` and nested classes
+  all resolve now; classes reached only by instantiation become genuinely
+  reachable for dead-code analysis. Ontology 0.12.0 → 0.13.0, so existing
+  indexes re-dispatch on their next incremental run (ADR-059).
+  (clarion-e5224c3aff)
+- **Python: resolved method/attribute calls are no longer double-counted as
+  unresolved sites.** pyright anchors an attribute call on its terminal token
+  (`helper` in `self.helper()`) while the plugin's AST call site spans the
+  whole callee expression, and the two were matched by exact equality — so
+  every resolved `obj.method()` also produced an unresolved site, inflating
+  `unresolved_call_sites_total` and falsely flipping `entity_callers_list`'s
+  `traversal_complete` to `false`. A pyright range now resolves the smallest
+  AST call site containing it. Found while fixing the class-instantiation gap.
 - **MCP argument errors name the accepted parameters.** An unknown argument
   now fails with `unknown argument for entity_find: name (accepted: kind,
   limit, pattern, …)` instead of just naming the rejected key. Transcript

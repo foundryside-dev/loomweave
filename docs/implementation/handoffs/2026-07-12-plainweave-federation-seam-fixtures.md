@@ -17,8 +17,8 @@ basename expected by both repositories.
 
 | Fixture | SHA-256 |
 |---|---|
-| `crates/loomweave-storage/tests/fixtures/classifier-coverage-v1.golden.json` | `56757861e9109e77210b77fcdca5cd7759880d2841211e0647c048c95825850e` |
-| `docs/federation/fixtures/classification.python.json` | `201be66be1bd50c4fc0e9e0fe5ecf242811fd1e823a4fa5969468012c95f216d` |
+| `crates/loomweave-storage/tests/fixtures/classifier-coverage-v1.golden.json` | `f4e41783d58f082427a68137a62288cc5a314848dd79c79a49c531f548ad2fb2` |
+| `docs/federation/fixtures/classification.python.json` | `624f3c42dd2b303cb62349376767d511a56ca855b2b657eeec341d9365aecce9` |
 | `docs/federation/fixtures/get-api-v1-capabilities.json` | `61020b20aadaef75a3de523f0a8f83be03d1d503ffdca719c78d949d20beeced` |
 | `docs/federation/fixtures/loomweave-http-auth-v1.golden.json` | `cd4a8a1598bedafdfe247d47a616e9a82a148e7cf8feaac9299a21550b2c720b` |
 | `docs/federation/fixtures/external-sqlite-compatibility-v1.json` | `46fc47a9553dbad9151ee3e0f760a5e4b1d6b967a1a4c1e376d3073de4c15d1a` |
