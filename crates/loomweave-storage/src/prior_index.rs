@@ -68,6 +68,14 @@ pub struct PluginIndexMarker {
     /// plugin's files. Versioned per plugin so an absent plugin cannot inherit
     /// a newer contract merely because another plugin completed a run.
     pub host_syntax_finding_contract: i64,
+    /// Host-discovered resolver-environment fingerprint; `None` for plugins
+    /// without one or for rows written before migration 0015.
+    ///
+    /// clarion-5cf9643de9: a language-server plugin's call/reference evidence
+    /// depends on which interpreter its resolver ran against, so a changed (or
+    /// never-recorded) fingerprint forces the same full re-dispatch as a
+    /// plugin/ontology version bump.
+    pub resolver_environment: Option<String>,
 }
 
 /// Upsert one prior-index row (`INSERT OR REPLACE` on the `locator` PK).
@@ -204,7 +212,7 @@ pub fn clear_prior_index(conn: &Connection) -> Result<()> {
 pub fn load_plugin_index_markers(conn: &Connection) -> Result<HashMap<String, PluginIndexMarker>> {
     let mut stmt = conn.prepare(
         "SELECT plugin_id, plugin_version, ontology_version, \
-                host_syntax_finding_contract \
+                host_syntax_finding_contract, resolver_environment \
          FROM plugin_index_meta",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -213,6 +221,7 @@ pub fn load_plugin_index_markers(conn: &Connection) -> Result<HashMap<String, Pl
             plugin_version: row.get::<_, String>(1)?,
             ontology_version: row.get::<_, String>(2)?,
             host_syntax_finding_contract: row.get::<_, i64>(3)?,
+            resolver_environment: row.get::<_, Option<String>>(4)?,
         })
     })?;
     let mut out = HashMap::new();
@@ -239,18 +248,20 @@ pub fn upsert_plugin_index_marker(
     conn.execute(
         "INSERT INTO plugin_index_meta \
             (plugin_id, plugin_version, ontology_version, \
-             host_syntax_finding_contract, recorded_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
+             host_syntax_finding_contract, resolver_environment, recorded_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
          ON CONFLICT(plugin_id) DO UPDATE SET \
             plugin_version   = excluded.plugin_version, \
             ontology_version = excluded.ontology_version, \
             host_syntax_finding_contract = excluded.host_syntax_finding_contract, \
+            resolver_environment = excluded.resolver_environment, \
             recorded_at      = excluded.recorded_at",
         params![
             marker.plugin_id,
             marker.plugin_version,
             marker.ontology_version,
             marker.host_syntax_finding_contract,
+            marker.resolver_environment,
             recorded_at
         ],
     )?;
@@ -405,7 +416,47 @@ mod tests {
             plugin_version: version.to_owned(),
             ontology_version: ontology.to_owned(),
             host_syntax_finding_contract: 2,
+            resolver_environment: None,
         }
+    }
+
+    /// clarion-5cf9643de9: the same marker with a recorded resolver
+    /// environment.
+    fn marker_with_resolver(
+        plugin_id: &str,
+        version: &str,
+        ontology: &str,
+        resolver_environment: Option<&str>,
+    ) -> PluginIndexMarker {
+        PluginIndexMarker {
+            resolver_environment: resolver_environment.map(str::to_owned),
+            ..marker(plugin_id, version, ontology)
+        }
+    }
+
+    #[test]
+    fn plugin_marker_resolver_environment_roundtrips_both_ways() {
+        // clarion-5cf9643de9: the fingerprint must survive a write/read cycle
+        // AND be clearable back to NULL — a project that loses its venv goes
+        // from a pinned path to `unpinned:...`, and a plugin that stops
+        // declaring a language-server runtime goes back to no fingerprint at
+        // all. A `COALESCE`-style upsert would pin the stale value forever and
+        // silently stop forcing the re-dispatch this marker exists to force.
+        let conn = migrated_conn();
+        let with = marker_with_resolver("python", "1.5.0", "0.9.0", Some("x"));
+        upsert_plugin_index_marker(&conn, &with, "t0").unwrap();
+        assert_eq!(
+            load_plugin_index_markers(&conn).unwrap()["python"].resolver_environment,
+            Some("x".to_owned())
+        );
+
+        let without = marker_with_resolver("python", "1.5.0", "0.9.0", None);
+        upsert_plugin_index_marker(&conn, &without, "t1").unwrap();
+        assert_eq!(
+            load_plugin_index_markers(&conn).unwrap()["python"],
+            without,
+            "clearing the fingerprint must round-trip to NULL, not keep the old value"
+        );
     }
 
     #[test]

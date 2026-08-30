@@ -68,11 +68,11 @@ impl HashedSecret {
             });
         }
         let mut out = [0u8; 20];
-        for (idx, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
-            let hi = hex_value(chunk[0]).ok_or_else(|| HexDigestError {
+        for (idx, &[hi_byte, lo_byte]) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let hi = hex_value(hi_byte).ok_or_else(|| HexDigestError {
                 message: format!("invalid hex at byte {}", idx * 2),
             })?;
-            let lo = hex_value(chunk[1]).ok_or_else(|| HexDigestError {
+            let lo = hex_value(lo_byte).ok_or_else(|| HexDigestError {
                 message: format!("invalid hex at byte {}", idx * 2 + 1),
             })?;
             out[idx] = (hi << 4) | lo;

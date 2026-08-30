@@ -204,12 +204,14 @@ fn run_actor(
             }
             WriterCmd::ReplaceAnchoredEdgesForSourceFile {
                 source_file_id,
+                prune_resolution_coverage,
                 ack,
             } => {
                 let res = replace_anchored_edges_for_source_file(
                     conn,
                     &mut state,
                     &source_file_id,
+                    prune_resolution_coverage,
                     commits_observed,
                 );
                 reply(ack, res);
@@ -387,6 +389,24 @@ fn run_actor(
                 let res = query_time_write(conn, &mut state, commits_observed, |conn| {
                     crate::sei::append_sei_lineage(conn, &entry)
                 });
+                reply(ack, res);
+            }
+            WriterCmd::UpsertSourceFileResolutionCoverage {
+                source_file_id,
+                coverage,
+                content_changed,
+                updated_at,
+                ack,
+            } => {
+                let res = upsert_resolution_coverage_in_run(
+                    conn,
+                    &mut state,
+                    &source_file_id,
+                    &coverage,
+                    content_changed,
+                    &updated_at,
+                    commits_observed,
+                );
                 reply(ack, res);
             }
             WriterCmd::ReplaceUnresolvedCallSitesForCaller {
@@ -1108,6 +1128,7 @@ fn replace_anchored_edges_for_source_file(
     conn: &mut Connection,
     state: &mut ActorState,
     source_file_id: &str,
+    prune_resolution_coverage: bool,
     commits_observed: &AtomicUsize,
 ) -> Result<()> {
     if state.current_run.is_none() {
@@ -1133,6 +1154,50 @@ fn replace_anchored_edges_for_source_file(
     conn.execute(
         "DELETE FROM entity_unresolved_call_sites WHERE source_file_id = ?1",
         params![source_file_id],
+    )?;
+    // A vanished file loses its coverage claim with its evidence. A
+    // re-analysed file keeps the row: the upsert that follows overwrites it
+    // and needs the prior `redispatch_attempts` to count consecutive runs.
+    if prune_resolution_coverage {
+        conn.execute(
+            "DELETE FROM source_file_resolution_coverage WHERE source_file_id = ?1",
+            params![source_file_id],
+        )?;
+    }
+    bump_writes_and_maybe_commit(conn, state, commits_observed)?;
+    Ok(())
+}
+
+fn upsert_resolution_coverage_in_run(
+    conn: &mut Connection,
+    state: &mut ActorState,
+    source_file_id: &str,
+    coverage: &crate::resolution_coverage::SourceFileResolutionCoverage,
+    content_changed: bool,
+    updated_at: &str,
+    commits_observed: &AtomicUsize,
+) -> Result<()> {
+    let Some(run_id) = state.current_run.clone() else {
+        return Err(StorageError::WriterProtocol(
+            "UpsertSourceFileResolutionCoverage received without a preceding BeginRun".to_owned(),
+        ));
+    };
+    if !state.in_tx {
+        begin_write_tx(conn, state)?;
+        state.in_tx = true;
+    }
+    validate_source_file_anchor(
+        conn,
+        Some(source_file_id),
+        "UpsertSourceFileResolutionCoverage source_file_id",
+    )?;
+    crate::resolution_coverage::upsert_source_file_resolution_coverage(
+        conn,
+        source_file_id,
+        coverage,
+        content_changed,
+        &run_id,
+        updated_at,
     )?;
     bump_writes_and_maybe_commit(conn, state, commits_observed)?;
     Ok(())

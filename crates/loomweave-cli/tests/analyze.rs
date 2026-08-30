@@ -318,6 +318,7 @@ file_scope = ["module"]
 #[cfg(unix)]
 const PHASE3_PLUGIN_SCRIPT: &str = r#"#!/usr/bin/python3
 import json
+import os
 import pathlib
 import sys
 
@@ -353,6 +354,10 @@ TARGETS = {
     "weak_a": ["weak_b"],
 }
 
+# clarion-7fc41105ea: files still to poison after a crash stem (one plugin
+# process serves the whole run, so a module-level cell carries the window).
+POISON_REMAINING = [0]
+
 
 while True:
     msg = read_frame()
@@ -363,6 +368,20 @@ while True:
         raise SystemExit(0)
     ident = msg["id"]
     if method == "initialize":
+        # clarion-5cf9643de9: opt-in env observation. When the host exports an
+        # interpreter to a language-server plugin, this is how the test sees it.
+        # Inert (and cheap) when the variable is unset, which is every other
+        # test sharing this script.
+        dump_to = os.environ.get("LOOMWEAVE_PHASE3_DUMP_ENV_TO")
+        if dump_to:
+            # ONE key, never the whole environment: the test only asks whether
+            # the host pinned an interpreter, and writing the runner's full env
+            # to disk in a repo with a pre-ingest secret scanner is a hazard for
+            # no gain. Empty file when the host exported nothing.
+            observed = os.environ.get("LOOMWEAVE_PYTHON_INTERPRETER")
+            pathlib.Path(dump_to).write_text(
+                "" if observed is None else f"LOOMWEAVE_PYTHON_INTERPRETER={observed}\n"
+            )
         write_frame({
             "jsonrpc": "2.0",
             "id": ident,
@@ -377,6 +396,49 @@ while True:
         path = msg["params"]["file_path"]
         stem = pathlib.Path(path).stem
         module_id = f"phase3fixture:module:{stem}"
+        # clarion-3e517d4aff: `LOOMWEAVE_PHASE3_DEGRADE_STEM=<stem>` makes the
+        # plugin report transient-degraded call resolution for that file — the
+        # shape a timed-out / poisoned resolver produces.
+        stats = {}
+        if os.environ.get("LOOMWEAVE_PHASE3_DEGRADE_STEM") == stem:
+            stats["resolution_coverage"] = {
+                "calls": {"status": "degraded", "reason": "fixture_timeout", "transient": True},
+                "references": {"status": "complete", "transient": False},
+            }
+        # `LOOMWEAVE_PHASE3_COLLATERAL_STEMS=a,b`: those files report the
+        # collateral shape (resolver already disabled by an earlier file).
+        if stem in os.environ.get("LOOMWEAVE_PHASE3_COLLATERAL_STEMS", "").split(","):
+            stats["resolution_coverage"] = {
+                "calls": {"status": "degraded", "reason": "fixture_poisoned",
+                          "transient": True, "collateral": True},
+                "references": {"status": "complete", "transient": False},
+            }
+        # clarion-7fc41105ea: `LOOMWEAVE_PHASE3_CRASH_STEMS=a,b` models files
+        # whose OWN request kills the resolver (self-inflicted, transient,
+        # collateral=false). `LOOMWEAVE_PHASE3_CRASH_POISONS_NEXT=<n>` (default
+        # 0) is the pre-fix shape: the n files dispatched after a crash come
+        # back collateral. With the window at 0 the resolver "restarted
+        # immediately" and the next file sees a live process.
+        crash_stems = os.environ.get("LOOMWEAVE_PHASE3_CRASH_STEMS", "").split(",")
+        if stem in crash_stems and crash_stems != [""]:
+            stats["resolution_coverage"] = {
+                "calls": {"status": "degraded", "reason": "fixture_crash", "transient": True},
+                "references": {"status": "complete", "transient": False},
+            }
+            POISON_REMAINING[0] = int(os.environ.get("LOOMWEAVE_PHASE3_CRASH_POISONS_NEXT", "0"))
+        elif POISON_REMAINING[0] > 0:
+            POISON_REMAINING[0] -= 1
+            stats["resolution_coverage"] = {
+                "calls": {"status": "degraded", "reason": "fixture_poisoned",
+                          "transient": True, "collateral": True},
+                "references": {"status": "complete", "transient": False},
+            }
+        # `LOOMWEAVE_PHASE3_ORDER_LOG=<path>`: append each dispatched stem so a
+        # test can assert the host's dispatch order.
+        order_log = os.environ.get("LOOMWEAVE_PHASE3_ORDER_LOG")
+        if order_log:
+            with open(order_log, "a", encoding="utf-8") as handle:
+                handle.write(stem + "\n")
         edges = [
             {
                 "kind": "imports",
@@ -402,7 +464,7 @@ while True:
                     },
                 ],
                 "edges": edges,
-                "stats": {},
+                "stats": stats,
             },
         })
     elif method == "shutdown":
@@ -4725,6 +4787,933 @@ fn analyze_incremental_repeated_unchanged_runs_keep_skipping() {
 
 #[test]
 #[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_redispatches_file_whose_resolution_was_degraded() {
+    // clarion-3e517d4aff: a byte-identical file whose last analysis reported
+    // transient-degraded call resolution is NOT done. Run 1 degrades `hole`;
+    // run 2 must re-dispatch it (skipping only `ok`) even though nothing
+    // changed on disk; once run 2 reports it complete, run 3 skips both.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("hole.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("ok.p3"), b"module\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let coverage = |file: &str| -> (String, i64) {
+        Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT calls_status, calls_transient FROM source_file_resolution_coverage \
+                 WHERE source_file_id = ?1",
+                [format!("core:file:{file}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("coverage row")
+    };
+
+    let output = loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "hole")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("analyze stdout is utf8");
+    assert!(
+        stdout.contains("call resolution degraded: 1 file (re-dispatched next run)"),
+        "completion line must be loud about degraded resolution: {stdout}"
+    );
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(stats["resolution_degraded_files"].as_u64(), Some(1));
+    assert_eq!(coverage("hole.p3"), ("degraded".to_owned(), 1));
+    assert_eq!(coverage("ok.p3"), ("complete".to_owned(), 0));
+
+    // Run 2: the plugin recovers; `hole` must be re-dispatched, `ok` skipped.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    let stats = latest_run_stats(project_dir.path());
+    assert_eq!(
+        stats["skipped_files"].as_u64(),
+        Some(1),
+        "the degraded file must be re-dispatched; only the healthy one skips"
+    );
+    assert_eq!(stats["resolution_degraded_files"].as_u64(), Some(0));
+    assert_eq!(coverage("hole.p3"), ("complete".to_owned(), 0));
+
+    // Run 3: both complete and unchanged → both skipped.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2)
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_dispatches_collateral_files_before_the_troublemaker() {
+    // clarion-3e517d4aff: when one file's own resolution failed (self-inflicted)
+    // and others were degraded as collateral behind it, the re-dispatch must
+    // put the troublemaker LAST so it can only poison what follows it.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    // Walk order is alphabetical: `aaa_trouble` would naturally go first.
+    std::fs::write(project_dir.path().join("aaa_trouble.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("mmm_victim.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("zzz_victim.p3"), b"module\n").unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "aaa_trouble")
+        .env("LOOMWEAVE_PHASE3_COLLATERAL_STEMS", "mmm_victim,zzz_victim")
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["resolution_degraded_files"].as_u64(),
+        Some(3)
+    );
+
+    let order_log = project_dir.path().join("dispatch-order.log");
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_ORDER_LOG", &order_log)
+        .assert()
+        .success();
+    let order = std::fs::read_to_string(&order_log).expect("dispatch order log");
+    let stems: Vec<&str> = order.lines().collect();
+    assert_eq!(
+        stems,
+        vec!["mmm_victim", "zzz_victim", "aaa_trouble"],
+        "collateral files first, the self-inflicted troublemaker last"
+    );
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "all three were degraded last run, so all three re-dispatch"
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_stops_redispatching_after_the_budget_is_spent() {
+    // clarion-3e517d4aff: a file that stays transient-degraded run after run
+    // must stop forcing re-dispatch after MAX_REDISPATCH_ATTEMPTS, or one
+    // pathological file makes every incremental run pay the full cost. It
+    // stays degraded (doctor + read surface) — only the re-dispatch stops.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("stuck.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("fine.p3"), b"module\n").unwrap();
+    let degraded_run = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "stuck")
+            .assert()
+            .success();
+        latest_run_stats(project_dir.path())["skipped_files"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(degraded_run(), 0, "run 1: fresh index, nothing skippable");
+    // Budget is 3 attempts: runs 2, 3, 4 re-dispatch `stuck` (attempts 1..=3).
+    for run in 2..=4 {
+        assert_eq!(
+            degraded_run(),
+            1,
+            "run {run}: `stuck` re-dispatches, `fine` skips"
+        );
+    }
+    // Run 5: the budget is spent — `stuck` is skipped like any unchanged file.
+    assert_eq!(
+        degraded_run(),
+        2,
+        "run 5: exhausted file no longer re-dispatches"
+    );
+    let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
+    let (status, attempts): (String, i64) = conn
+        .query_row(
+            "SELECT calls_status, redispatch_attempts FROM source_file_resolution_coverage \
+             WHERE source_file_id = 'core:file:stuck.p3'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "degraded", "exhausted, but still honestly degraded");
+    assert_eq!(attempts, 3);
+
+    // Editing the file re-arms it: the content change re-dispatches it and,
+    // with the plugin healthy again, the row heals and the counter resets.
+    std::fs::write(project_dir.path().join("stuck.p3"), b"module\nchanged\n").unwrap();
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    let (status, attempts): (String, i64) = conn
+        .query_row(
+            "SELECT calls_status, redispatch_attempts FROM source_file_resolution_coverage \
+             WHERE source_file_id = 'core:file:stuck.p3'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((status.as_str(), attempts), ("complete", 0));
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_persists_edges_alongside_a_degraded_transient_coverage_claim() {
+    // clarion-7f527d3d32 pins the HOST half of partial evidence: the fixture
+    // plugin answers with edges AND a transient-degraded `calls` claim in one
+    // `analyze_file` result, and the store must keep both — the coverage
+    // claim is a statement about completeness, not a reason to drop what
+    // was resolved. This is a host invariant that predates the ticket (the
+    // writer never gated edge persistence on coverage); it is pinned here
+    // because the plugin-side fix relies on it. The PLUGIN half — that the
+    // Python plugin actually hands back the edges it resolved before a
+    // mid-file pyright timeout instead of discarding them — is not reachable
+    // from this fixture and is covered by
+    // plugins/python/tests/test_server.py
+    // (`test_analyze_file_hands_back_partial_call_edges_alongside_degraded_coverage`)
+    // and the `ScriptedCallSession` tests in test_pyright_session.py.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("auth_a.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("auth_b.p3"), b"module\n").unwrap();
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "auth_a")
+        .assert()
+        .success();
+
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let (status, transient): (String, i64) = conn
+        .query_row(
+            "SELECT calls_status, calls_transient FROM source_file_resolution_coverage \
+             WHERE source_file_id = 'core:file:auth_a.p3'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((status.as_str(), transient), ("degraded", 1));
+
+    let edge_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE kind = 'imports' \
+             AND from_id = 'phase3fixture:module:auth_a' \
+             AND to_id = 'phase3fixture:module:auth_b'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        edge_count, 1,
+        "degraded coverage must not drop edges the plugin already emitted"
+    );
+    // The transient claim is what makes the next incremental run re-dispatch
+    // the file; the kept edge must survive as the file's evidence until then.
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_redispatches_after_doctor_resets_an_exhausted_budget() {
+    // clarion-7f527d3d32: once a file has spent MAX_REDISPATCH_ATTEMPTS it
+    // stops re-dispatching. `doctor --fix` resets that budget so the next
+    // incremental run picks the file up again; a dry-run `doctor` must not.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("stuck.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("fine.p3"), b"module\n").unwrap();
+    let degraded_run = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .env("LOOMWEAVE_PHASE3_DEGRADE_STEM", "stuck")
+            .assert()
+            .success();
+    };
+    // Run 1 is fresh; runs 2..=4 spend the three re-dispatch attempts; run 5
+    // proves the budget is exhausted (stuck is skipped).
+    for _ in 1..=5 {
+        degraded_run();
+    }
+
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let row = || -> (String, i64) {
+        Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT calls_status, redispatch_attempts FROM source_file_resolution_coverage \
+                 WHERE source_file_id = 'core:file:stuck.p3'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row(), ("degraded".to_owned(), 3), "budget exhausted");
+
+    let doctor_check = |fix: bool| -> serde_json::Value {
+        let mut cmd = loomweave_bin();
+        cmd.arg("doctor");
+        if fix {
+            cmd.arg("--fix");
+        }
+        let output = cmd
+            .args(["--format", "json"])
+            .arg("--path")
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<serde_json::Value>(&output).expect("doctor json")
+    };
+    let coverage_check = |report: &serde_json::Value| -> serde_json::Value {
+        report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "index.resolution_coverage")
+            .expect("resolution_coverage check present")
+            .clone()
+    };
+
+    // Dry run: reports the exhausted file, resets nothing.
+    let dry_run = coverage_check(&doctor_check(false));
+    assert_eq!(dry_run["status"], "warning", "{dry_run}");
+    assert_eq!(dry_run["details"]["exhausted_files"], 1, "{dry_run}");
+    assert!(
+        dry_run["details"]
+            .get("reset_redispatch_budget_files")
+            .is_none(),
+        "dry run must not report a reset: {dry_run}"
+    );
+    assert_eq!(
+        row(),
+        ("degraded".to_owned(), 3),
+        "dry run must not touch the budget counter"
+    );
+
+    // --fix: resets the budget and says how many rows it reset.
+    let fixed_report = doctor_check(true);
+    let fixed = coverage_check(&fixed_report);
+    // An action ran (`fixed: true`) but the file stays degraded until the
+    // next analyze, so the check remains a warning and keeps its place in
+    // `next_actions` — never status `fixed`.
+    assert_eq!(fixed["status"], "warning", "{fixed}");
+    assert_eq!(fixed["fixed"], true, "{fixed}");
+    assert_eq!(
+        fixed["details"]["reset_redispatch_budget_files"], 1,
+        "{fixed}"
+    );
+    assert!(
+        fixed_report["next_actions"]
+            .as_array()
+            .expect("next_actions array")
+            .iter()
+            .any(|action| action
+                .as_str()
+                .is_some_and(|a| a.contains("loomweave analyze"))),
+        "an agent reading only next_actions must still be told to analyze: {fixed_report}"
+    );
+    assert_eq!(row(), ("degraded".to_owned(), 0), "budget re-armed");
+
+    // Next incremental run (plugin healthy): only `fine` skips; `stuck` is
+    // re-dispatched and heals.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(1),
+        "only `fine.p3` should skip; `stuck.p3` must be re-dispatched by the reset budget"
+    );
+    assert_eq!(row(), ("complete".to_owned(), 0));
+}
+
+#[cfg(unix)]
+fn phase3_coverage_row(db_path: &std::path::Path, file: &str) -> (String, i64, i64) {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT calls_status, calls_transient, calls_collateral \
+             FROM source_file_resolution_coverage WHERE source_file_id = ?1",
+            [format!("core:file:{file}")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("coverage row")
+}
+
+#[cfg(unix)]
+fn phase3_collateral_rows(db_path: &std::path::Path) -> i64 {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM source_file_resolution_coverage \
+             WHERE calls_collateral = 1 OR references_collateral = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("collateral count")
+}
+
+#[cfg(unix)]
+fn phase3_self_inflicted_files(db_path: &std::path::Path) -> Vec<String> {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT source_file_id FROM source_file_resolution_coverage \
+             WHERE calls_status = 'degraded' AND calls_transient = 1 AND calls_collateral = 0 \
+             ORDER BY source_file_id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap()
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_crash_poisons_next_files_when_window_is_set() {
+    // clarion-7fc41105ea: the fixture's crash knob models a file whose own
+    // request kills the resolver. With a poison window set, the files
+    // dispatched right after it come back collateral — the pre-fix shape
+    // (447 re-dispatched, 2 self-inflicted, 443 collateral on elspeth).
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    for stem in ["aaa_trouble", "bbb_next", "ccc_next", "ddd_clean"] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n").unwrap();
+    }
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "aaa_trouble")
+        .env("LOOMWEAVE_PHASE3_CRASH_POISONS_NEXT", "2")
+        .assert()
+        .success();
+
+    assert_eq!(
+        phase3_coverage_row(&db_path, "aaa_trouble.p3"),
+        ("degraded".to_owned(), 1, 0),
+        "the crashing file is self-inflicted"
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "bbb_next.p3"),
+        ("degraded".to_owned(), 1, 1)
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "ccc_next.p3"),
+        ("degraded".to_owned(), 1, 1)
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "ddd_clean.p3"),
+        ("complete".to_owned(), 0, 0),
+        "the poison window is exactly two files wide"
+    );
+    assert_eq!(phase3_collateral_rows(&db_path), 2);
+    assert_eq!(
+        latest_run_stats(project_dir.path())["resolution_degraded_files"].as_u64(),
+        Some(3)
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_crash_with_immediate_restart_has_zero_collateral() {
+    // clarion-7fc41105ea: with the plugin restarting the resolver immediately
+    // after a self-inflicted crash (no poison window), the crashing file stays
+    // self-inflicted and NOTHING behind it is marked collateral.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    for stem in ["aaa_clean", "mmm_trouble", "zzz_clean"] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n").unwrap();
+    }
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "mmm_trouble")
+        .assert()
+        .success();
+
+    assert_eq!(
+        phase3_collateral_rows(&db_path),
+        0,
+        "an immediately-restarted crash must not poison the files behind it"
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "mmm_trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "zzz_clean.p3"),
+        ("complete".to_owned(), 0, 0)
+    );
+    assert_eq!(
+        latest_run_stats(project_dir.path())["resolution_degraded_files"].as_u64(),
+        Some(1)
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_two_crash_stems_each_self_inflicted_with_clean_file_between_on_first_run() {
+    // clarion-7fc41105ea: two independent troublemakers on a fresh (path-
+    // sorted) run. Each is self-inflicted, the clean file dispatched between
+    // them is untouched, and no collateral row exists anywhere.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    for stem in ["aaa_trouble", "ggg_clean", "mmm_trouble"] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n").unwrap();
+    }
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let order_log = project_dir.path().join("dispatch-order.log");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "aaa_trouble,mmm_trouble")
+        .env("LOOMWEAVE_PHASE3_ORDER_LOG", &order_log)
+        .assert()
+        .success();
+
+    let order = std::fs::read_to_string(&order_log).expect("dispatch order log");
+    assert_eq!(
+        order.lines().collect::<Vec<_>>(),
+        vec!["aaa_trouble", "ggg_clean", "mmm_trouble"],
+        "first run dispatches in walk order: the clean file sits between the troublemakers"
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "aaa_trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "mmm_trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "ggg_clean.p3"),
+        ("complete".to_owned(), 0, 0),
+        "the file between two crashes survives untouched"
+    );
+    assert_eq!(phase3_collateral_rows(&db_path), 0);
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_two_crash_stems_both_self_inflicted_and_adjacent_on_second_run() {
+    // clarion-7fc41105ea: on the second run both troublemakers are known
+    // self-inflicted, so `order_self_inflicted_last` pushes both to the tail
+    // together (adjacent — no clean file between them by construction). Both
+    // stay self-inflicted and nothing is collateral.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    for stem in ["aaa_trouble", "ggg_clean", "mmm_trouble"] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n").unwrap();
+    }
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "aaa_trouble,mmm_trouble")
+        .assert()
+        .success();
+
+    // Run 2: `ggg_clean` skips (complete, unchanged); both troublemakers are
+    // re-dispatched at the tail and crash again.
+    let order_log = project_dir.path().join("dispatch-order.log");
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "aaa_trouble,mmm_trouble")
+        .env("LOOMWEAVE_PHASE3_ORDER_LOG", &order_log)
+        .assert()
+        .success();
+
+    let order = std::fs::read_to_string(&order_log).expect("dispatch order log");
+    assert_eq!(
+        order.lines().collect::<Vec<_>>(),
+        vec!["aaa_trouble", "mmm_trouble"],
+        "both self-inflicted files re-dispatch together at the tail"
+    );
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(1),
+        "only the clean file skips"
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "aaa_trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+    assert_eq!(
+        phase3_coverage_row(&db_path, "mmm_trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+    assert_eq!(phase3_collateral_rows(&db_path), 0);
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_self_inflicted_set_is_stable_across_two_runs() {
+    // clarion-7fc41105ea acceptance (ii): the set of self-inflicted files is
+    // identical across two consecutive incremental runs — no rotation.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    for stem in [
+        "aaa_clean",
+        "bbb_trouble",
+        "ccc_clean",
+        "ddd_trouble",
+        "eee_clean",
+    ] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n").unwrap();
+    }
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+    let run = || {
+        loomweave_bin()
+            .args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", &plugin_path)
+            .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "bbb_trouble,ddd_trouble")
+            .assert()
+            .success();
+        phase3_self_inflicted_files(&db_path)
+    };
+
+    let first = run();
+    assert_eq!(
+        first,
+        vec![
+            "core:file:bbb_trouble.p3".to_owned(),
+            "core:file:ddd_trouble.p3".to_owned()
+        ]
+    );
+    assert_eq!(phase3_collateral_rows(&db_path), 0);
+
+    let second = run();
+    assert_eq!(
+        second, first,
+        "self-inflicted set must not rotate run to run"
+    );
+    assert_eq!(phase3_collateral_rows(&db_path), 0);
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(3),
+        "the three clean files skip; only the troublemakers re-dispatch"
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_order_log_still_shows_self_inflicted_last_with_crash_stem() {
+    // clarion-7fc41105ea: the crash shape must keep the clarion-3e517d4aff
+    // ordering — a self-inflicted crasher goes last on re-dispatch, even
+    // though it would sort first by path.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    for stem in ["aaa_trouble", "mmm_victim", "zzz_victim"] {
+        std::fs::write(project_dir.path().join(format!("{stem}.p3")), b"module\n").unwrap();
+    }
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "aaa_trouble")
+        .env("LOOMWEAVE_PHASE3_CRASH_POISONS_NEXT", "2")
+        .assert()
+        .success();
+
+    let order_log = project_dir.path().join("dispatch-order.log");
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_ORDER_LOG", &order_log)
+        .assert()
+        .success();
+    let order = std::fs::read_to_string(&order_log).expect("dispatch order log");
+    assert_eq!(
+        order.lines().collect::<Vec<_>>(),
+        vec!["mmm_victim", "zzz_victim", "aaa_trouble"],
+        "collateral victims first, the crashing troublemaker last"
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_sticky_self_inflicted_survives_a_poisoned_rerun() {
+    // clarion-7fc41105ea: a known troublemaker that gets swept into another
+    // file's poison window on the next run is NOT exonerated — the store
+    // keeps its self-inflicted mark while the bytes are unchanged.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("trouble.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("fine.p3"), b"module\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "trouble")
+        .assert()
+        .success();
+    assert_eq!(
+        phase3_coverage_row(&db_path, "trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+
+    // Run 2: the plugin reports `trouble` as collateral this time.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_COLLATERAL_STEMS", "trouble")
+        .assert()
+        .success();
+    assert_eq!(
+        phase3_coverage_row(&db_path, "trouble.p3"),
+        ("degraded".to_owned(), 1, 0),
+        "being poisoned this run does not exonerate a known troublemaker"
+    );
+    assert_eq!(phase3_collateral_rows(&db_path), 0);
+    assert_eq!(
+        phase3_self_inflicted_files(&db_path),
+        vec!["core:file:trouble.p3".to_owned()]
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_content_change_unsticks_self_inflicted_mark() {
+    // clarion-7fc41105ea: editing the troublemaker re-arms attribution — a
+    // collateral claim against changed bytes is persisted as collateral.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("trouble.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("fine.p3"), b"module\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "trouble")
+        .assert()
+        .success();
+    assert_eq!(
+        phase3_coverage_row(&db_path, "trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+
+    std::fs::write(project_dir.path().join("trouble.p3"), b"module\nchanged\n").unwrap();
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_COLLATERAL_STEMS", "trouble")
+        .assert()
+        .success();
+    assert_eq!(
+        phase3_coverage_row(&db_path, "trouble.p3"),
+        ("degraded".to_owned(), 1, 1),
+        "changed bytes un-stick the mark: the new claim is taken as given"
+    );
+    assert_eq!(phase3_self_inflicted_files(&db_path), Vec::<String>::new());
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_no_incremental_unsticks_self_inflicted_mark() {
+    // ADR-057 §4: `--no-incremental` is the operator's documented remedy for
+    // a wrongly-stuck self-inflicted mark. It has no prior hashes, so every
+    // file counts as content-changed and a collateral claim is taken as
+    // given — even though the contract-change re-dispatch path bypasses the
+    // incremental partition.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("trouble.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("fine.p3"), b"module\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "trouble")
+        .assert()
+        .success();
+    assert_eq!(
+        phase3_coverage_row(&db_path, "trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+
+    // Bytes unchanged; the plugin now reports `trouble` as collateral.
+    loomweave_bin()
+        .args(["analyze", "--no-incremental"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_COLLATERAL_STEMS", "trouble")
+        .assert()
+        .success();
+    assert_eq!(
+        phase3_coverage_row(&db_path, "trouble.p3"),
+        ("degraded".to_owned(), 1, 1),
+        "--no-incremental re-arms attribution: the collateral claim is persisted as given"
+    );
+    assert_eq!(phase3_self_inflicted_files(&db_path), Vec::<String>::new());
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_contract_change_redispatch_still_reports_content_changes() {
+    // ADR-057 §4: an ordinary incremental run right after a plugin marker
+    // change bypasses the partition, but a file whose bytes genuinely changed
+    // in that run must still un-stick its self-inflicted mark.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("trouble.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("fine.p3"), b"module\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_CRASH_STEMS", "trouble")
+        .assert()
+        .success();
+    assert_eq!(
+        phase3_coverage_row(&db_path, "trouble.p3"),
+        ("degraded".to_owned(), 1, 0)
+    );
+
+    // Force the contract-change path: stale the stored plugin marker.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE plugin_index_meta SET plugin_version = '0.0.0-stale'",
+            [],
+        )
+        .unwrap();
+    }
+    std::fs::write(project_dir.path().join("trouble.p3"), b"module\nchanged\n").unwrap();
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .env("LOOMWEAVE_PHASE3_COLLATERAL_STEMS", "trouble")
+        .assert()
+        .success();
+    assert_eq!(
+        phase3_coverage_row(&db_path, "trouble.p3"),
+        ("degraded".to_owned(), 1, 1),
+        "a real edit during a contract-change re-dispatch still un-sticks the mark"
+    );
+    assert_eq!(phase3_self_inflicted_files(&db_path), Vec::<String>::new());
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_incremental_bootstraps_redispatch_for_uncovered_failure_shaped_files() {
+    // clarion-3e517d4aff: an index analysed by a pre-fix binary has no coverage
+    // rows at all. A file that owns a callable-looking entity yet carries zero
+    // `calls` edges and zero unresolved sites is the failure shape, and must
+    // be re-dispatched once so the fixed plugin can (re)claim coverage.
+    let (project_dir, _plugin_dir, plugin_path) = phase3_env();
+    std::fs::write(project_dir.path().join("legacy.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("plain.p3"), b"module\n").unwrap();
+    let db_path = project_dir.path().join(".weft/loomweave/loomweave.db");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+
+    // Simulate the pre-fix index: no coverage rows, and `legacy` owns a
+    // function-like child entity with no call evidence.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("DELETE FROM source_file_resolution_coverage;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, plugin_id, kind, name, short_name, parent_id, \
+             source_file_id, source_file_path, properties, created_at, updated_at) \
+             VALUES ('phase3fixture:function:legacy.f', 'phase3fixture', 'function', \
+             'legacy.f', 'f', 'phase3fixture:module:legacy', 'core:file:legacy.p3', \
+             ?1, '{}', 't', 't')",
+            [project_dir
+                .path()
+                .join("legacy.p3")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (kind, from_id, to_id, confidence, properties, source_file_id) \
+             VALUES ('contains', 'phase3fixture:module:legacy', \
+             'phase3fixture:function:legacy.f', 'resolved', '{}', 'core:file:legacy.p3')",
+            [],
+        )
+        .unwrap();
+    }
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(1),
+        "`legacy` (failure shape, no coverage row) re-dispatches; `plain` (module only) skips"
+    );
+    // The re-dispatch wrote a coverage row, so the bootstrap does not repeat.
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &plugin_path)
+        .assert()
+        .success();
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2)
+    );
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
 fn analyze_no_incremental_forces_full_reanalysis() {
     // The --no-incremental escape hatch disables the skip entirely: an unchanged
     // re-run re-analyses every file (skipped_files = 0).
@@ -4871,6 +5860,180 @@ fn analyze_ontology_bump_forces_full_reanalysis() {
         Some(0),
         "a plugin version bump must also force a full re-analyse (the marker keys on the \
          (version, ontology_version) pair)"
+    );
+}
+
+/// clarion-5cf9643de9: the phase3 fixture manifest with a language-server
+/// runtime declared, so `analyze` runs project-interpreter discovery for it.
+#[cfg(unix)]
+fn phase3_pyright_manifest() -> String {
+    let manifest = PHASE3_PLUGIN_MANIFEST.replace(
+        "\n[ontology]\n",
+        "\n[capabilities.runtime.pyright]\npin = \"1.1.409\"\n\n[ontology]\n",
+    );
+    assert_ne!(
+        manifest, PHASE3_PLUGIN_MANIFEST,
+        "the pyright capability must actually be inserted"
+    );
+    manifest
+}
+
+/// Write an executable `#!/bin/sh` stub that stands in for a Python
+/// interpreter. Discovery only stats the file and checks its mode bits, so the
+/// stub is never executed — which is what keeps this test hermetic.
+#[cfg(unix)]
+fn write_interpreter_stub(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn plugin_resolver_environment(project_root: &std::path::Path, plugin_id: &str) -> Option<String> {
+    let conn = Connection::open(project_root.join(".weft/loomweave/loomweave.db")).unwrap();
+    conn.query_row(
+        "SELECT resolver_environment FROM plugin_index_meta WHERE plugin_id = ?1",
+        [plugin_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .unwrap()
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "fixture plugin script is a unix shebang")]
+fn analyze_interpreter_change_forces_full_reanalysis() {
+    // clarion-5cf9643de9: a language-server plugin's call/reference evidence
+    // depends on WHICH interpreter its resolver ran against. Under an `analyze`
+    // launched from an agent hook the project venv is not on `PATH`, so pyright
+    // resolved against the system interpreter, every `tests/` -> `src/` target
+    // came back empty, and the incremental skip pinned the hole for good: the
+    // files were byte-identical, so a later run with the venv present skipped
+    // them and never healed the evidence.
+    //
+    // The fix records the host-discovered interpreter as
+    // `plugin_index_meta.resolver_environment` and treats a move in it exactly
+    // like a plugin/ontology bump. This test drives the interpreter from a
+    // project-owned `.venv` to a bare `PATH` guess between two byte-identical
+    // runs and asserts the re-dispatch fires (and fires only once).
+    let project_dir = tempfile::tempdir().unwrap();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let path_stub_dir = tempfile::tempdir().unwrap();
+    write_phase3_plugin(plugin_dir.path());
+    std::fs::write(
+        plugin_dir.path().join("plugin.toml"),
+        phase3_pyright_manifest(),
+    )
+    .unwrap();
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(project_dir.path())
+        .assert()
+        .success();
+    let plugin_only_path =
+        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    let plugin_and_stub_path = std::env::join_paths([
+        plugin_dir.path().to_path_buf(),
+        path_stub_dir.path().to_path_buf(),
+    ])
+    .unwrap();
+
+    std::fs::write(project_dir.path().join("res_a.p3"), b"module\n").unwrap();
+    std::fs::write(project_dir.path().join("res_b.p3"), b"module\n").unwrap();
+    // `analyze` canonicalises the project root before discovery, so the
+    // recorded fingerprint is rooted at the canonical path.
+    let canonical_root = project_dir.path().canonicalize().unwrap();
+    let dotvenv = canonical_root.join(".venv/bin/python");
+    write_interpreter_stub(&dotvenv);
+    let path_stub = path_stub_dir.path().join("python3");
+    write_interpreter_stub(&path_stub);
+    // Observed OUTSIDE the project tree so it never becomes an analysis input.
+    let env_dump = plugin_dir.path().join("plugin-env.txt");
+
+    // The ambient shell must not decide the answer: an activated venv or an
+    // operator override would silently outrank the fixtures below.
+    let analyze = |path: &std::ffi::OsString, dump: Option<&std::path::Path>| {
+        let mut cmd = loomweave_bin();
+        cmd.args(["analyze"])
+            .arg(project_dir.path())
+            .env("PATH", path)
+            .env_remove("VIRTUAL_ENV")
+            .env_remove("CONDA_PREFIX")
+            .env_remove("LOOMWEAVE_PYTHON_INTERPRETER")
+            .env_remove("LOOMWEAVE_PHASE3_DUMP_ENV_TO");
+        if let Some(dump) = dump {
+            // Remove first: the assertions below read this file as evidence of
+            // what THIS run's plugin child saw. A leftover from an earlier run
+            // would let a run that never started a plugin pass a negative
+            // assertion vacuously.
+            let _ = std::fs::remove_file(dump);
+            cmd.env("LOOMWEAVE_PHASE3_DUMP_ENV_TO", dump);
+        }
+        cmd.assert().success();
+    };
+
+    // Run 1 (fresh): the project's own `.venv` wins discovery, is recorded as
+    // the marker, and is exported to the plugin child.
+    analyze(&plugin_only_path, Some(&env_dump));
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "first run has no prior index, so it skips nothing"
+    );
+    assert_eq!(
+        plugin_resolver_environment(project_dir.path(), "phase3fixture"),
+        Some(dotvenv.display().to_string()),
+        "the recorded fingerprint must be the absolute, unresolved .venv interpreter"
+    );
+    let dumped = std::fs::read_to_string(&env_dump).unwrap();
+    assert!(
+        dumped
+            .lines()
+            .any(|line| line == format!("LOOMWEAVE_PYTHON_INTERPRETER={}", dotvenv.display())),
+        "the plugin child must receive the host's pinned interpreter; got:\n{dumped}"
+    );
+
+    // Run 2 (unchanged): the marker matches, so the byte-hash skip re-engages.
+    // Without this the next assertion would be vacuously true.
+    analyze(&plugin_only_path, None);
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2),
+        "an unchanged incremental re-run with an unchanged interpreter skips both files"
+    );
+
+    // Run 3: the venv disappears and only a bare `PATH` python3 remains. Source
+    // is byte-identical, so ONLY the resolver environment moved.
+    std::fs::remove_dir_all(canonical_root.join(".venv")).unwrap();
+    analyze(&plugin_and_stub_path, Some(&env_dump));
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(0),
+        "a changed resolver interpreter must force a full re-dispatch despite \
+         byte-identical source — otherwise the stale call evidence is pinned forever"
+    );
+    assert_eq!(
+        plugin_resolver_environment(project_dir.path(), "phase3fixture"),
+        Some(format!("unpinned:{}", path_stub.display())),
+        "a bare PATH guess is recorded as unpinned, so acquiring a venv at the same \
+         path still moves the marker"
+    );
+    let dumped = std::fs::read_to_string(&env_dump).expect(
+        "the plugin child must have run and rewritten the dump — an unreadable file \
+         means the negative assertion below would be vacuous",
+    );
+    assert_eq!(
+        dumped, "",
+        "an unpinned guess must NOT be exported to the plugin as an authoritative pin"
+    );
+
+    // Run 4 (unchanged again): the force-full is one-shot per interpreter
+    // change, not a permanent disabling of incremental analysis.
+    analyze(&plugin_and_stub_path, None);
+    assert_eq!(
+        latest_run_stats(project_dir.path())["skipped_files"].as_u64(),
+        Some(2),
+        "once the new interpreter is recorded, an unchanged re-run skips again"
     );
 }
 

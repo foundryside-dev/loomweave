@@ -882,6 +882,9 @@ fn schema_migrations_records_each_applied_migration() {
             "0010_dedupe_findings_drop_run_scoped_ids",
             "0011_plugin_index_meta",
             "0012_plugin_syntax_finding_contract",
+            "0013_source_file_resolution_coverage",
+            "0014_resolution_coverage_redispatch_budget",
+            "0015_plugin_resolver_environment",
         ]
     );
 }
@@ -936,6 +939,34 @@ fn migration_0012_adds_per_plugin_syntax_finding_contract() {
     assert!(
         columns.contains(&"host_syntax_finding_contract".to_owned()),
         "migration 0012 must version syntax-finding identity per plugin: {columns:?}"
+    );
+}
+
+#[test]
+fn migration_0015_adds_per_plugin_resolver_environment() {
+    // clarion-5cf9643de9: the interpreter a language-server plugin resolved
+    // against is part of its evidence contract, so it is versioned per plugin
+    // alongside the tag-schema marker. Nullable: non-language-server plugins
+    // have no resolver environment, and pre-0015 rows have never recorded one
+    // (which `analyze` reads as "changed" and heals with one re-dispatch).
+    let tempdir = tempfile::tempdir().unwrap();
+    let conn = open_fresh(&tempdir);
+    let columns: Vec<(String, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT name, \"notnull\" FROM pragma_table_info('plugin_index_meta')")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.map(std::result::Result::unwrap).collect()
+    };
+    let found = columns
+        .iter()
+        .find(|(name, _)| name == "resolver_environment");
+    assert_eq!(
+        found,
+        Some(&("resolver_environment".to_owned(), 0)),
+        "migration 0015 must add a NULLABLE plugin_index_meta.resolver_environment: {columns:?}"
     );
 }
 

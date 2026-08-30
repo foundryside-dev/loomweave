@@ -2855,6 +2855,7 @@ async fn replace_edges_for_source_file_removes_only_stale_anchored_edges() {
     }
     send::<()>(&tx, |ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
         source_file_id: "core:file:demo.py".to_owned(),
+        prune_resolution_coverage: false,
         ack,
     })
     .await
@@ -3321,6 +3322,7 @@ async fn replace_edges_for_source_file_removes_unresolved_call_sites() {
     .unwrap();
     send::<()>(&tx, |ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
         source_file_id: "core:file:demo.py".to_owned(),
+        prune_resolution_coverage: false,
         ack,
     })
     .await

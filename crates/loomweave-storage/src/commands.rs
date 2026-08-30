@@ -194,6 +194,12 @@ pub enum WriterCmd {
     /// invariants.
     ReplaceAnchoredEdgesForSourceFile {
         source_file_id: String,
+        /// Also drop the file's resolution-coverage row. `true` for a file
+        /// that vanished from disk; `false` on the per-file re-analysis path,
+        /// where the row is about to be upserted and its
+        /// `redispatch_attempts` history must survive
+        /// (clarion-3e517d4aff).
+        prune_resolution_coverage: bool,
         ack: Ack<()>,
     },
     /// Replace the persisted Phase 3 subsystem projection with the current
@@ -401,6 +407,21 @@ pub enum WriterCmd {
         caller_entity_id: String,
         caller_content_hash: String,
         sites: Vec<UnresolvedCallSiteRecord>,
+        ack: Ack<()>,
+    },
+    /// Record the per-file call / reference resolution coverage the plugin
+    /// claimed for `source_file_id` (clarion-3e517d4aff). Rides the active run
+    /// transaction so a crash cannot leave a file's edges replaced without its
+    /// coverage claim; a transient-degraded claim makes the incremental skip
+    /// re-dispatch the file next run.
+    UpsertSourceFileResolutionCoverage {
+        source_file_id: String,
+        coverage: crate::resolution_coverage::SourceFileResolutionCoverage,
+        /// Whether the file's bytes differ from its last-analysed hash.
+        /// Un-sticks the self-inflicted mark (see
+        /// [`crate::resolution_coverage::upsert_source_file_resolution_coverage`]).
+        content_changed: bool,
+        updated_at: String,
         ack: Ack<()>,
     },
     /// Commit the in-flight transaction, update the run row to the given

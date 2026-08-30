@@ -258,7 +258,43 @@ impl PathEscapeBreaker {
 ///
 /// Applied via `RLIMIT_AS` in the plugin's child process before `exec`.
 /// Task 6 calls `apply_prlimit_as` inside `CommandExt::pre_exec`.
+///
+/// ADR-035 declaration —
+/// **Basis:** ADR-021 §2d; generous for a CPython/tree-sitter working set.
+/// **Override surface:** none (internal; `loomweave.yaml:plugin_limits.max_rss_mib`
+/// is promised by ADR-021 §4 and not yet implemented). Manifests may only lower it.
+/// **Retune trigger:** an `LMWV-INFRA-PLUGIN-OOM-KILLED` finding from a
+/// well-behaved non-language-server plugin.
+/// **Coupling:** language-server plugins are exempt — see
+/// [`LANGUAGE_SERVER_MAX_AS_MIB`] and `host::effective_as_mib`.
 pub const DEFAULT_MAX_RSS_MIB: u64 = 2 * 1024; // 2 GiB
+
+/// Address-space ceiling for plugins that declare
+/// `[capabilities.runtime.pyright]` (they spawn a Node language server):
+/// **8 GiB**, applied via `RLIMIT_AS` instead of [`DEFAULT_MAX_RSS_MIB`].
+///
+/// `RLIMIT_AS` bounds *virtual* address space. V8 reserves virtual regions
+/// (code range, heap sandbox, per-isolate cages) far larger than the memory it
+/// ever touches, so the 2 GiB ceiling killed `pyright-langserver` on a
+/// 13.6k-line file while it was using ~766 MB of real memory — surfacing as a
+/// self-inflicted `pyright_transport_failure` with no stderr (clarion-353c5b9aa5).
+///
+/// ADR-035 declaration —
+/// **Basis:** measured on elspeth 2026-08-29: unlimited AS completed the file
+/// (1,715 calls edges, 21.6 s); 2 GiB died at 766 MB RSS. 8 GiB leaves ~4×
+/// headroom over Node's default old-space size on a 64-bit host.
+/// **Override surface:** none (internal). The manifest's `expected_max_rss_mb`
+/// is ignored for AS on these plugins — it documents RSS, not virtual space.
+/// **Retune trigger:** an OOM-killed finding from a language-server plugin, or a
+/// pyright major bump that changes V8's reservation strategy. Note that
+/// [`apply_prlimit_as`] clamps this ceiling to the process's inherited hard
+/// `RLIMIT_AS`, so on a host whose hard limit sits below 8 GiB the plugin
+/// runs at that lower ceiling instead of failing to spawn — a
+/// language-server OOM on such a host may reflect the host's hard limit,
+/// not this constant.
+/// **Coupling:** `host::effective_as_mib`; `host::effective_max_nproc` (the
+/// same manifest capability selects both exemptions); ADR-021 §2d.
+pub const LANGUAGE_SERVER_MAX_AS_MIB: u64 = 8 * 1024; // 8 GiB
 
 /// Compute the effective RSS ceiling as the minimum of the manifest value and
 /// the core default.
@@ -295,15 +331,28 @@ pub const DEFAULT_MAX_NPROC: u64 = 32;
 /// `pre_exec` is safe because `pre_exec` runs after `fork()` but before
 /// `exec()`, so only the child's address-space limit is affected.
 ///
+/// The requested ceiling is clamped to the process's *inherited* hard
+/// `RLIMIT_AS` before it is applied, with `hard == soft` preserved. An
+/// unprivileged process cannot raise its own inherited hard limit — on a
+/// host whose hard `RLIMIT_AS` sits below the requested ceiling (e.g.
+/// below [`LANGUAGE_SERVER_MAX_AS_MIB`]'s 8 GiB), applying the ceiling
+/// unclamped would fail `setrlimit` with `EPERM`, surfacing as a
+/// `HostError::Spawn` instead of a normal OOM finding. Clamping to the
+/// inherited hard limit keeps the call infallible on such hosts (`min()`
+/// is a no-op when the hard limit is `RLIM_INFINITY`, since that constant
+/// is `u64::MAX`).
+///
 /// # Errors
 ///
-/// Returns `std::io::Error` on `setrlimit` failure.
+/// Returns `std::io::Error` on `getrlimit`/`setrlimit` failure.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn apply_prlimit_as(max_rss_mib: u64) -> std::io::Result<()> {
-    use nix::sys::resource::{Resource, setrlimit};
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
     let bytes = max_rss_mib.saturating_mul(1024 * 1024);
-    setrlimit(Resource::RLIMIT_AS, bytes, bytes).map_err(std::io::Error::from)
+    let (_, hard) = getrlimit(Resource::RLIMIT_AS).map_err(std::io::Error::from)?;
+    let target = bytes.min(hard);
+    setrlimit(Resource::RLIMIT_AS, target, target).map_err(std::io::Error::from)
 }
 
 /// Apply `RLIMIT_NOFILE` (always) and `RLIMIT_NPROC` (when `max_nproc` is
@@ -576,6 +625,56 @@ mod tests {
     fn apply_prlimit_linux_child_process_returns_ok() {
         let result = apply_prlimit_as(DEFAULT_MAX_RSS_MIB);
         assert!(result.is_ok(), "apply_prlimit_as must succeed: {result:?}");
+    }
+
+    /// `apply_prlimit_as` clamps a requested ceiling above the inherited hard
+    /// limit down to that hard limit, keeping `hard == soft`, rather than
+    /// failing `setrlimit` with `EPERM`.
+    ///
+    /// Unlike `apply_prlimit_linux_returns_ok` above, this test lowers its own
+    /// process's `RLIMIT_AS` hard limit directly rather than forking a child.
+    /// That is safe under `cargo nextest`, which runs each test in its own
+    /// process (ADR-023 pins nextest as the CI runner) — a lowered hard limit
+    /// here cannot starve any sibling test, because there are no siblings in
+    /// this process. It would NOT be safe under plain `cargo test`'s
+    /// thread-per-test model, where lowering the process-wide hard limit
+    /// would leak into every other test thread; that is why the test above
+    /// still uses the child-process dance.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_prlimit_as_clamps_to_inherited_hard_limit() {
+        use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit, setrlimit};
+
+        let three_gib: u64 = 3 * 1024 * 1024 * 1024;
+
+        let (_, original_hard) = getrlimit(Resource::RLIMIT_AS).expect("getrlimit (baseline)");
+        if original_hard != RLIM_INFINITY && original_hard < three_gib {
+            // The environment already constrains us below the ceiling this
+            // test needs to demonstrate the clamp against. Skip rather than
+            // fail spuriously — there's nothing to lower to 3 GiB.
+            return;
+        }
+
+        setrlimit(Resource::RLIMIT_AS, three_gib, three_gib)
+            .expect("lower this process's own RLIMIT_AS hard limit to 3 GiB");
+
+        // Request the 8 GiB language-server ceiling; it must be clamped to
+        // the 3 GiB hard limit we just set, not fail with EPERM.
+        let result = apply_prlimit_as(LANGUAGE_SERVER_MAX_AS_MIB);
+        assert!(
+            result.is_ok(),
+            "apply_prlimit_as must clamp to the inherited hard limit, not fail: {result:?}"
+        );
+
+        let (soft, hard) = getrlimit(Resource::RLIMIT_AS).expect("getrlimit (after clamp)");
+        assert_eq!(
+            soft, three_gib,
+            "soft limit must be clamped down to the inherited hard limit"
+        );
+        assert_eq!(
+            hard, three_gib,
+            "hard limit must stay at 3 GiB (hard == soft, and hard cannot rise)"
+        );
     }
 
     #[test]

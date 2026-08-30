@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import IO, Any
 
 from loomweave_plugin_python import __version__
-from loomweave_plugin_python.extractor import extract_with_stats
+from loomweave_plugin_python.extractor import ExtractionStats, extract_with_stats
+from loomweave_plugin_python.interpreter import ProjectInterpreter, discover_project_interpreter
 from loomweave_plugin_python.pyright_session import PyrightRunState, PyrightSession
 from loomweave_plugin_python.stdout_guard import install_stdio
 from loomweave_plugin_python.wardline_descriptor import WardlineVocabulary, load_wardline_descriptor
@@ -64,6 +65,7 @@ class ServerState:
     pyright_files_since_restart: int = 0
     pyright_run_state: PyrightRunState = field(default_factory=PyrightRunState)
     wardline_vocabulary: WardlineVocabulary | None = field(default=None)
+    interpreter: ProjectInterpreter | None = field(default=None)
 
 
 def read_frame(stream: IO[bytes]) -> dict[str, Any] | None:
@@ -152,11 +154,19 @@ def handle_initialize(params: dict[str, Any], state: ServerState) -> dict[str, A
             "loomweave-plugin-python: Wardline vocabulary descriptor unavailable; "
             "continuing without Wardline annotation metadata\n",
         )
+    state.interpreter = discover_project_interpreter(state.project_root or Path.cwd())
     return {
         "name": "loomweave-plugin-python",
         "version": __version__,
         "ontology_version": ONTOLOGY_VERSION,
-        "capabilities": {"wardline": wardline.as_capability()},
+        "capabilities": {
+            "wardline": wardline.as_capability(),
+            "python_interpreter": {
+                "path": state.interpreter.path,
+                "source": state.interpreter.source,
+                "pinned": state.interpreter.pinned,
+            },
+        },
     }
 
 
@@ -181,6 +191,23 @@ def _resolve_module_path(file_path_raw: str, state: ServerState) -> str:
     return file_path_raw
 
 
+def _pyright_run_stats(run_state: PyrightRunState) -> dict[str, int]:
+    """Run-wide pyright restart accounting (clarion-7fc41105ea).
+
+    These are CUMULATIVE for the run and reported unchanged on every file, so
+    the host must aggregate them with ``max``, never by summing.
+    """
+    return {
+        "pyright_restart_count": run_state.restart_count,
+        "pyright_file_attributed_restart_count": run_state.file_attributed_restart_count,
+        "pyright_file_attributed_respawn_failure_count": (
+            run_state.file_attributed_respawn_failure_count
+        ),
+        "pyright_ceiling_deferred_restart_count": run_state.ceiling_deferred_restart_count,
+        "pyright_init_latency_total_ms": run_state.pyright_init_latency_total_ms,
+    }
+
+
 def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str, Any]:
     """Read the requested file, extract entities + edges, return AnalyzeFileResult shape."""
     empty_stats = {
@@ -194,6 +221,8 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "pyright_query_latency_ms": [],
         "pyright_index_parse_latency_ms": [],
         "extractor_parse_latency_ms": 0,
+        **_pyright_run_stats(state.pyright_run_state),
+        "resolution_coverage": ExtractionStats().resolution_coverage_wire(),
     }
     file_path_raw = params.get("file_path")
     if not isinstance(file_path_raw, str):
@@ -203,6 +232,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         state.pyright = PyrightSession(
             state.project_root or path.parent,
             run_state=state.pyright_run_state,
+            interpreter=state.interpreter,
         )
     try:
         source = path.read_text(encoding="utf-8")
@@ -237,6 +267,8 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         "pyright_query_latency_ms": result.stats.pyright_query_latency_ms,
         "pyright_index_parse_latency_ms": result.stats.pyright_index_parse_latency_ms,
         "extractor_parse_latency_ms": result.stats.extractor_parse_latency_ms,
+        **_pyright_run_stats(state.pyright_run_state),
+        "resolution_coverage": result.stats.resolution_coverage_wire(),
     }
     return {
         "entities": result.entities,

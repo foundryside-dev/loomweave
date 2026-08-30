@@ -18,6 +18,7 @@ pub mod pragma;
 pub mod prior_index;
 pub mod query;
 pub mod reader;
+pub mod resolution_coverage;
 pub mod retry;
 pub mod runs;
 pub mod schema;
@@ -82,6 +83,12 @@ pub use query::{
     unresolved_caller_count_for_target, unresolved_callers_for_target,
 };
 pub use reader::ReaderPool;
+pub use resolution_coverage::{
+    FacetCoverageRecord, MAX_REDISPATCH_ATTEMPTS, RedispatchCandidate, ResolutionCoverageSummary,
+    SourceFileResolutionCoverage, degraded_call_coverage_file_count,
+    degraded_resolution_coverage_summary, files_needing_resolution_redispatch,
+    reset_exhausted_redispatch_budget, upsert_source_file_resolution_coverage,
+};
 pub use retry::{RetryPolicy, begin_immediate};
 pub use runs::{mark_abandoned_running_runs_failed, mark_stale_running_runs_failed};
 pub use sei::{

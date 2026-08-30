@@ -57,6 +57,8 @@ These four controls are applied to every plugin unconditionally, regardless of m
 
 **2d — Per-plugin RSS limit.** Applied at spawn via `prlimit(RLIMIT_AS)` on Linux, `setrlimit(RLIMIT_AS)` on macOS (POSIX path). Default: **2 GiB** virtual-memory cap (configurable via `loomweave.yaml:plugin_limits.max_rss_mib`, floor 512 MiB). Process killed by OS on cap exceed; the core detects the SIGKILL exit (`WIFSIGNALED && WTERMSIG == 9`) and emits `LMWV-INFRA-PLUGIN-OOM-KILLED`. Crash-loop counter increments.
 
+**Amendment 2026-08-29 (clarion-353c5b9aa5).** `RLIMIT_AS` bounds *virtual* address space, and a Node/V8 language server reserves virtual regions far larger than its resident set: the 2 GiB ceiling killed `pyright-langserver` at ~766 MB RSS on a 13.6k-line file. Plugins declaring `[capabilities.runtime.pyright]` therefore receive `LANGUAGE_SERVER_MAX_AS_MIB` (**8 GiB**) instead of `min(manifest, 2 GiB)`; the manifest's `expected_max_rss_mb` is documentation of RSS for those plugins and does not cap AS. Selection lives in `host::effective_as_mib`, keyed on the same capability that already exempts these plugins from `RLIMIT_NPROC`. Every other plugin keeps the 2 GiB rule above.
+
 The four subcodes of `LMWV-INFRA-PLUGIN-VIOLATION` — `PATH-ESCAPE`, `FRAME-OVERSIZE`, `ENTITY-CAP`, `OOM-KILLED` — are plugin-independent and surface in every compat report.
 
 ### Layer 3 — Crash-loop circuit breaker interaction (ADR-002 carries through)
@@ -129,7 +131,7 @@ Use cgroup v2 (`systemd-run --user --scope` or direct cgroup mounts) for per-plu
 - Plugin authors have one more contract to satisfy — the four limits are real and can bite a plugin that emits millions of noisy `LMWV-FACT-*` findings. Mitigation: the `expected_entities_per_file` manifest declaration produces a sanity-warning (`LMWV-INFRA-PLUGIN-ENTITY-OVERRUN-WARNING`) well before the hard cap, so the first sign of trouble isn't a killed plugin.
 - The `prlimit` approach doesn't cover RSS only — `RLIMIT_AS` caps virtual memory, which overcounts for plugins that `mmap` large file ranges (e.g., tree-sitter's incremental parse buffers). Mitigation: default cap of 2 GiB is generous enough that a well-behaved plugin won't trip it; operators on constrained hosts who do trip it get a specific finding subcode.
 - Full sandbox is deferred; a malicious plugin that stays under the four caps can still exfiltrate source to a network destination. This is a known v0.2 gap and is named in the "NOT in Layer 2" list and in v0.1 release notes.
-- Language-server plugins (those declaring `capabilities.runtime.pyright`) run with **no** `RLIMIT_NPROC` cap, so their process *count* is not bounded — see the "process-count control" limitation under Alternative 4. `RLIMIT_AS` (per-process memory) and the crash-loop counter remain in force; the accepted residual risk is a fork-bomb from a *first-party* language-server plugin, which the system-wide `ulimit -u` still backstops.
+- Language-server plugins (those declaring `capabilities.runtime.pyright`) run with **no** `RLIMIT_NPROC` cap, so their process *count* is not bounded — see the "process-count control" limitation under Alternative 4. `RLIMIT_AS` remains in force at the wider 8 GiB language-server ceiling (§2d amendment) together with the crash-loop counter — per process; with no `RLIMIT_NPROC` cap the aggregate is unbounded, backstopped only by the OS. The accepted residual risk is a fork-bomb from a *first-party* language-server plugin, which the system-wide `ulimit -u` still backstops.
 
 ### Neutral
 

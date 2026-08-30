@@ -70,9 +70,14 @@ Of those, `entity_callers_list` / `entity_neighborhood_get` /
 static blind spots the query did **not** search:
 `"attribute-receiver-calls"` (like `ctx.svc.run()`) and
 `"unresolved-static-calls"` (the project holds call sites the static resolver
-could not bind — common for cross-module/cross-crate calls). A non-empty
-`scope_excludes` means an empty/short result is **not** a guaranteed true
-negative.
+could not bind — common for cross-module/cross-crate calls), and
+`"degraded-call-resolution"` (at least one analysed file's plugin reported
+that its call resolver timed out, crashed, or was disabled — that file holds
+neither `calls` edges nor unresolved sites, so its callers are invisible at
+**every** confidence tier, `inferred` included; the caller tools also report
+`degraded_call_coverage_files`, and the next `analyze` re-dispatches the
+transient ones automatically). A non-empty `scope_excludes` means an
+empty/short result is **not** a guaranteed true negative.
 
 The recovery path that works in **every** posture: `entity_callers_list` and
 `entity_neighborhood_get` also return `unresolved_name_matches` — the count of

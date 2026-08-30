@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict
 
+from loomweave_plugin_python.call_resolver import FacetCoverage
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
@@ -64,6 +66,7 @@ class ReferenceResolutionResult:
     pyright_query_latency_ms: list[int] = field(default_factory=list)
     pyright_index_parse_latency_ms: list[int] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    coverage: FacetCoverage = field(default_factory=FacetCoverage)
 
 
 class ReferenceResolver(Protocol):

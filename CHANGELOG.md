@@ -12,6 +12,10 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.5.0] — 2026-08-29
+
 ### Added
 
 - **Isolated worktree indexes.** A linked Git worktree now gets its own
@@ -97,6 +101,34 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
+- **A transient pyright failure no longer leaves a permanent hole in the call
+  graph** (clarion-3e517d4aff). The Python plugin degraded to *empty* call /
+  reference evidence — not an error — whenever pyright timed out, crashed, or
+  tripped its restart cap (after which every later file in the run silently
+  got nothing). The host persisted that as a completed analysis and the
+  incremental skip then pinned the byte-identical file forever, so
+  `entity_callers_list` answered `[]` with `traversal_complete: true` for
+  callees whose callers were never extracted (elspeth: 617 of 2,779
+  function-bearing files). Now every `analyze_file` result carries a per-file
+  `resolution_coverage` claim (`calls` / `references`: `complete` |
+  `degraded`, with a `transient` flag); the host records it in a new
+  `source_file_resolution_coverage` table (migration 0013) and force-
+  re-dispatches `degraded && transient` files on the next incremental run.
+  Indexes built by an older binary self-heal: a file with no coverage row
+  that owns symbols yet carries zero `calls` edges and zero unresolved sites
+  is re-dispatched once. The completion line and `runs.stats`
+  (`resolution_degraded_files`) say how many files degraded this run; the
+  caller-navigation tools add `"degraded-call-resolution"` to
+  `scope_excludes` (withdrawing `traversal_complete`) plus a
+  `degraded_call_coverage_files` count while any such file exists; and
+  `loomweave doctor` gains an `index.resolution_coverage` check. Re-dispatch
+  is ordered and bounded (migration 0014): files whose *own* resolution
+  failed are dispatched last (a `collateral` flag on the claim marks files
+  that were merely behind the troublemaker), and a file that stays degraded
+  for 3 consecutive runs stops forcing re-dispatch until its bytes change —
+  so one pathological file cannot make every incremental run pay the full
+  cost. The external SQLite read ceiling advances to `user_version` 14
+  (additive columns only).
 - **Stale syntax findings now retire when files are fixed.** A file whose
   parse error was fixed no longer keeps its old `*-SYNTAX-ERROR` finding
   forever: a per-plugin sweep retires findings for files whose
@@ -118,6 +150,25 @@ only when an incompatible change is made to that surface. See
   installed catalogue has never been analysed or lacks its local instance
   identity. `loomweave doctor --fix` materialises a private project UUID and
   runs an authoritative analysis to regenerate classifier coverage metadata.
+- **The Python plugin no longer trusts the launcher's `PATH` for call
+  resolution** (clarion-5cf9643de9, [ADR-058](docs/loomweave/adr/ADR-058-project-interpreter-discovery.md)).
+  `pyright-langserver` type-checks against whatever `python` it finds unless
+  pinned; under an agent hook that was the system interpreter, which cannot
+  import the project's own editable install, so `tests/` → `src/` call
+  targets came back empty while coverage still said `complete`, and the
+  incremental skip pinned the hole. Both the host and the Python plugin now
+  run the same fixed discovery order (`LOOMWEAVE_PYTHON_INTERPRETER`
+  override → `.venv` → `VIRTUAL_ENV` → `CONDA_PREFIX` → first
+  `python`/`python3` on `PATH` → none) and pin pyright's `python.pythonPath`
+  to the result. An unpinned interpreter now honestly demotes an
+  otherwise-`complete` facet to `degraded` (`interpreter_unpinned`); a new
+  `plugin_index_meta.resolver_environment` fingerprint (migration 0015)
+  forces a full re-dispatch of the plugin's files when the interpreter
+  changes, and `doctor`'s coverage remedy names the fix
+  (`LOOMWEAVE_PYTHON_INTERPRETER` or `.venv`). `doctor` also gains an
+  `index.runs` check that reaps `running` rows abandoned by a dead builder.
+  The external SQLite read ceiling advances to `user_version` 15
+  (`plugin_index_meta` only; not part of the external safe projection).
 
 ## 1.5.0 — 2026-07-12
 
@@ -1498,7 +1549,7 @@ normative.
   Filigree's intake (WP9-B) is deferred per the [Sprint 2 scope amendment](docs/implementation/sprint-2/scope-amendment-2026-05.md).
   `issues_for(id)` (the WP9-A binding for reading from Filigree) ships in 1.0.
   *(WP9-B core shipped post-1.0 — see the Filigree-finding-emission entry under
-  [Unreleased]; only the REQ-FINDING-05/-06 lifecycle tail remains deferred.)*
+  [1.5.0]; only the REQ-FINDING-05/-06 lifecycle tail remains deferred.)*
 - **HTTP file language inference** uses persisted plugin manifest language when
   available, with a narrow core-extension fallback for files that predate
   manifest capture.
@@ -1543,7 +1594,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...v1.5.0
 [1.2.1]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/foundryside-dev/loomweave/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/foundryside-dev/loomweave/compare/v1.0.1...v1.1.0

@@ -14,6 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use loomweave_storage::EXTERNAL_READ_MAX_USER_VERSION;
 use rusqlite::Connection;
 #[cfg(unix)]
 use tempfile::TempDir;
@@ -1344,11 +1345,19 @@ fn doctor_reports_external_sqlite_current_legacy_and_older_states() {
     let current_check = check(&json, "federation.sqlite_compatibility");
     assert_eq!(current_check["status"], "ok", "{current_check}");
     assert_eq!(current_check["details"]["compatibility"], "compatible");
-    assert_eq!(current_check["details"]["user_version"], 12);
+    // Derived, not hardcoded: a schema migration advances the reviewed external
+    // ceiling, and this assertion must track it rather than re-pinning a literal
+    // that goes stale on every bump.
+    assert_eq!(
+        current_check["details"]["user_version"],
+        EXTERNAL_READ_MAX_USER_VERSION
+    );
     let (_, text) = doctor(current.path(), false);
     assert!(
         text.contains("federation.sqlite_compatibility")
-            && text.contains("compatible at user_version=12"),
+            && text.contains(&format!(
+                "compatible at user_version={EXTERNAL_READ_MAX_USER_VERSION}"
+            )),
         "text output must carry the same current compatibility verdict:\n{text}"
     );
 
@@ -1538,7 +1547,10 @@ fn doctor_rejects_foreign_and_too_new_external_sqlite_before_catalogue_queries()
     write_healthy_db(too_new.path());
     Connection::open(too_new.path().join(".weft/loomweave/loomweave.db"))
         .unwrap()
-        .execute_batch("PRAGMA user_version = 13;")
+        .execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            EXTERNAL_READ_MAX_USER_VERSION + 1
+        ))
         .unwrap();
     let (code, json) = doctor_json(too_new.path(), false);
     let incompatible = check(&json, "federation.sqlite_compatibility");
@@ -2692,5 +2704,38 @@ fn doctor_rejects_a_malformed_linked_worktree_instance_id() {
             .unwrap_or_default()
             .contains("malformed"),
         "{instance}"
+    );
+}
+
+/// `doctor --fix` installs the managed git-sync hooks into a repo that gained
+/// git after install, and a repeat doctor run sees them as present — the
+/// warning → fixed → ok lifecycle for `hook.git_sync`.
+#[test]
+fn doctor_fix_installs_missing_git_sync_hooks() {
+    let project = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], project.path());
+    write_healthy_db(project.path());
+    // Repo gains git AFTER install: the read-only doctor must warn (not gate),
+    // and --fix must converge the hooks to present.
+    run_git(project.path(), &["init", "-q"]);
+
+    let (code, json) = doctor_json(project.path(), false);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["status"], "warning", "{hooks}");
+    assert_eq!(code, 0, "a missing enrichment must not gate-fail: {json}");
+
+    let (_, json) = doctor_json(project.path(), true);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["fixed"], true, "{hooks}");
+
+    let (code, json) = doctor_json(project.path(), false);
+    let hooks = check(&json, "hook.git_sync");
+    assert_eq!(hooks["status"], "ok", "{hooks}");
+    assert_eq!(code, 0, "{json}");
+    let hook_file = project.path().join(".git/hooks/post-commit");
+    let content = std::fs::read_to_string(hook_file).unwrap();
+    assert!(
+        content.contains("loomweave hook git-sync --path ."),
+        "installed hook must run git-sync: {content}"
     );
 }

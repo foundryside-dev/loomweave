@@ -771,6 +771,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         if let Err(error) = writer
             .send_wait(|ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
                 source_file_id: source_file_id.clone(),
+                prune_resolution_coverage: true,
                 ack,
             })
             .await
@@ -852,12 +853,37 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     // entity (module first) resolved from the already-committed rows, seeded
     // into the scan outcome for every skipped file below.
     let incremental = !options.no_incremental;
+    // Files the incremental partition must re-dispatch even though their bytes
+    // are unchanged (clarion-3e517d4aff): the last run recorded transient
+    // degraded call/reference resolution for them, or they were indexed before
+    // coverage was recorded and look like the failure shape. Keyed like
+    // `prior_file_hashes` (canonical absolute `source_file_path`).
+    let mut forced_redispatch_files: HashSet<String> = HashSet::new();
+    // The subset of `forced_redispatch_files` whose OWN resolution failed
+    // (timeout / crash on that file, not collateral from an earlier one).
+    // Dispatched last so a troublemaker can only poison what follows it.
+    let mut self_inflicted_redispatch_files: HashSet<String> = HashSet::new();
     let (prior_file_hashes, mut prior_locs_by_file, prior_index_snapshot, prior_anchor_by_file) =
         if incremental {
             match Connection::open(&db_path) {
                 Ok(conn) => {
                     let files =
                         loomweave_storage::previously_analyzed_files(&conn).unwrap_or_default();
+                    match loomweave_storage::files_needing_resolution_redispatch(&conn) {
+                        Ok(candidates) => {
+                            for candidate in candidates {
+                                if candidate.self_inflicted {
+                                    self_inflicted_redispatch_files
+                                        .insert(candidate.source_file_path.clone());
+                                }
+                                forced_redispatch_files.insert(candidate.source_file_path);
+                            }
+                        }
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "cannot read resolution coverage; degraded files will not be re-dispatched"
+                        ),
+                    }
                     let locs = loomweave_storage::prior_locators_by_file(&conn).unwrap_or_default();
                     let snapshot = loomweave_storage::load_prior_index(&conn).unwrap_or_default();
                     // Anchor continuity for a skipped secret-bearing file
@@ -895,6 +921,13 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 HashMap::new(),
             )
         };
+    if !forced_redispatch_files.is_empty() {
+        tracing::info!(
+            file_count = forced_redispatch_files.len(),
+            self_inflicted = self_inflicted_redispatch_files.len(),
+            "re-dispatching unchanged files whose last call/reference resolution was degraded"
+        );
+    }
     // clarion-e12d424f1d: the per-plugin tag-schema markers from the last
     // successful run, keyed by plugin_id. Each plugin's live manifest
     // (version, ontology_version) is compared against its stored marker below;
@@ -955,6 +988,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut references_skipped_external_total: u64 = 0;
     let mut references_skipped_cap_total: u64 = 0;
     let mut imports_skipped_external_total: u64 = 0;
+    // Files this run analysed whose plugin reported degraded call or
+    // reference resolution (clarion-3e517d4aff). Loud on the completion line:
+    // each is a call-graph hole the next incremental run will re-dispatch.
+    let mut resolution_degraded_files_total: u64 = 0;
     // Anchored resolving edges (`imports`/`implements`) whose endpoints were
     // never stored this run — dropped-and-counted by the seen-entity-set gate
     // (D1 external / D2 gitignored-superset / D3 mid-run staleness). Flushing
@@ -965,6 +1002,10 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut unresolved_reference_sites_total: u64 = 0;
     let mut pyright_latency = P95Accumulator::default();
     let mut pyright_index_parse_latency = P95Accumulator::default();
+    // Pyright restart accounting (clarion-7fc41105ea). The plugin reports its
+    // RUN-cumulative counters on every file, so the run total is the max seen,
+    // never a sum (summing would multiply by the file count).
+    let mut pyright_restart_accounting = PyrightRestartAccounting::default();
     let mut extractor_parse_latency = P95Accumulator::default();
     let mut run_outcome: RunOutcome = RunOutcome::Completed;
     let mut breaker = CrashLoopBreaker::default();
@@ -1008,6 +1049,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let plugin_id = plugin.manifest.plugin.plugin_id.clone();
         let syntax_error_rule_id =
             format!("{}SYNTAX-ERROR", plugin.manifest.ontology.rule_id_prefix);
+        // Rules whose finding identity includes the file anchor (see
+        // `host_finding_record_id`): the manifest syntax rule plus the pyright
+        // restart / poison-frame rules (clarion-7fc41105ea).
+        let anchor_scoped_rule_ids: [&str; 3] = [
+            &syntax_error_rule_id,
+            PLUGIN_PYRIGHT_RESTART_RULE_ID,
+            PLUGIN_PYRIGHT_POISON_FRAME_RULE_ID,
+        ];
         let coverage_index = plugin_classifier_coverage
             .iter()
             .position(|coverage| coverage.plugin_id() == plugin_id)
@@ -1050,6 +1099,24 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let plugin_version = plugin.manifest.plugin.version.clone();
         let ontology_version = plugin.manifest.ontology.ontology_version.clone();
         let prior_plugin_marker = prior_plugin_markers.get(&plugin_id);
+        // clarion-5cf9643de9: the interpreter pyright resolves against is part
+        // of the evidence contract. A change (or an unrecorded prior) forces the
+        // same full re-dispatch as a plugin/ontology bump. `None` for plugins
+        // that declare no language-server runtime, so they are never affected.
+        // `project_root` is canonicalised (line ~355) and `spawn_unhandshaken`
+        // canonicalises the same root before running the same discovery, so the
+        // fingerprint recorded here and the interpreter exported to the child
+        // are computed from an identical base path.
+        let resolver_environment =
+            loomweave_core::resolver_environment_for(&plugin.manifest, &project_root);
+        let resolver_environment_changed = match prior_plugin_marker {
+            Some(prior) => prior.resolver_environment != resolver_environment,
+            // No stored marker at all — the same fail-toward-work direction the
+            // tag-schema comparison takes below. `is_some()` rather than `true`
+            // so a non-language-server plugin is not dragged into a re-dispatch
+            // by a signal that can never apply to it.
+            None => resolver_environment.is_some(),
+        };
         let plugin_tag_schema_changed = match prior_plugin_marker {
             Some(prior) => {
                 prior.plugin_version != plugin_version || prior.ontology_version != ontology_version
@@ -1063,23 +1130,39 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         let host_syntax_finding_contract_changed = prior_plugin_marker.is_none_or(|prior| {
             prior.host_syntax_finding_contract != HOST_SYNTAX_FINDING_CONTRACT_VERSION
         });
-        let plugin_index_contract_changed =
-            plugin_tag_schema_changed || host_syntax_finding_contract_changed;
+        let plugin_index_contract_changed = plugin_tag_schema_changed
+            || host_syntax_finding_contract_changed
+            || resolver_environment_changed;
         if incremental && plugin_index_contract_changed && !prior_plugin_markers.is_empty() {
             tracing::info!(
                 plugin_id = %plugin_id,
                 plugin_version = %plugin_version,
                 ontology_version = %ontology_version,
                 host_syntax_finding_contract_changed,
+                resolver_environment_changed,
                 "plugin index contract changed since last run; forcing full re-dispatch \
                  of this plugin's files"
             );
+            if resolver_environment_changed {
+                // Name the new fingerprint so an operator reading the log can
+                // see WHICH interpreter this run's evidence was resolved
+                // against — the whole point of the marker.
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    resolver_environment = resolver_environment.as_deref().unwrap_or("<none>"),
+                    prior_resolver_environment = prior_plugin_marker
+                        .and_then(|prior| prior.resolver_environment.as_deref())
+                        .unwrap_or("<none>"),
+                    "resolver environment moved since last run"
+                );
+            }
         }
         current_plugin_markers.push(loomweave_storage::PluginIndexMarker {
             plugin_id: plugin_id.clone(),
             plugin_version,
             ontology_version,
             host_syntax_finding_contract: HOST_SYNTAX_FINDING_CONTRACT_VERSION,
+            resolver_environment,
         });
 
         // Wave 2 / T3.1: partition into files to re-analyse (changed, new,
@@ -1097,14 +1180,58 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
         // keyed on the core `file` entity, not per language plugin, so there is
         // nothing plugin-scoped to clear; overriding the partition is both the
         // correct scope and the safe one.
-        let (plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
+        //
+        // clarion-7fc41105ea: the same hash consultation also decides whether
+        // each dispatched file's BYTES changed (as opposed to being forced
+        // back through unchanged), which the coverage upsert needs to un-stick
+        // a self-inflicted mark (ADR-057). A contract-change re-dispatch
+        // bypasses the partition, but it must still CONSULT the hashes for
+        // every file, or the flag is never raised in exactly the two cases
+        // the store documents as re-arming: `--no-incremental` (no prior
+        // hashes at all, so every file counts as changed — the operator's
+        // documented remedy for a wrongly-stuck mark) and a genuine edit made
+        // in the same run as a plugin/ontology bump.
+        let mut content_changed_files: HashSet<String> = HashSet::new();
+        let (mut plugin_files, skipped_files): (Vec<PathBuf>, Vec<PathBuf>) =
             if plugin_index_contract_changed {
+                for path in &plugin_files {
+                    if file_reanalysis_reason(
+                        &project_root,
+                        path,
+                        &prior_file_hashes,
+                        &forced_redispatch_files,
+                    )
+                    .bytes_changed()
+                        && let Some(key) = canonical_path_key(path)
+                    {
+                        content_changed_files.insert(key);
+                    }
+                }
                 (plugin_files, Vec::new())
             } else {
                 plugin_files.into_iter().partition(|path| {
-                    file_needs_reanalysis(&project_root, path, &prior_file_hashes)
+                    let reason = file_reanalysis_reason(
+                        &project_root,
+                        path,
+                        &prior_file_hashes,
+                        &forced_redispatch_files,
+                    );
+                    if reason.bytes_changed()
+                        && let Some(key) = canonical_path_key(path)
+                    {
+                        content_changed_files.insert(key);
+                    }
+                    reason.must_dispatch()
                 })
             };
+        let content_changed_files = Arc::new(content_changed_files);
+        // Dispatch order (clarion-3e517d4aff): files whose own resolution
+        // failed last run go LAST. When one of them exhausts the resolver's
+        // restart budget, only the files after it are poisoned — so the
+        // collateral set (dispatched first) heals instead of being re-poisoned
+        // behind the same file every run. Stable, so walk order is otherwise
+        // preserved.
+        order_self_inflicted_last(&mut plugin_files, &self_inflicted_redispatch_files);
         plugin_classifier_coverage[coverage_index].record_retained(skipped_files.len());
         // Locators of THIS plugin's skipped-unchanged entities. These rows stay in
         // the committed DB untouched this run (they are guarded against orphan
@@ -1283,6 +1410,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 &pid_clone,
                 &exec_clone,
                 &files_clone,
+                &content_changed_files,
                 &briefing_blocks_clone,
                 &scanned_files_clone,
                 &progress_clone,
@@ -1328,6 +1456,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         .record_many(batch.stats.pyright_index_parse_latency_ms.clone());
                     extractor_parse_latency
                         .record_many(batch.stats.extractor_parse_latency_ms.clone());
+                    pyright_restart_accounting.observe(&batch.stats);
 
                     secret_scan_outcome.remember_finding_anchors(&batch.entities);
                     let batch_entity_ids: Vec<String> =
@@ -1346,6 +1475,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     {
                         Ok(effects) => {
                             plugin_entity_count += effects.entity_count;
+                            if effects.resolution_degraded {
+                                resolution_degraded_files_total += 1;
+                            }
                             plugin_classifier_coverage[coverage_index]
                                 .record_completed_file(effects.degraded_source_files.clone());
                             syntax_classified_source_files
@@ -1454,9 +1586,9 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 warn_sweep_scope_withheld(&plugin_id, "anchorless syntax degradation");
             }
         }
-        let mut syntax_merges = legacy_plugin_syntax_merges(
+        let mut syntax_merges = legacy_anchor_scoped_merges(
             reported_findings,
-            &syntax_error_rule_id,
+            &anchor_scoped_rule_ids,
             &plugin_id,
             &project_root,
             &project_anchor,
@@ -1505,7 +1637,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         hf,
                         &plugin_id,
                         &anchor_id,
-                        Some(&syntax_error_rule_id),
+                        &anchor_scoped_rule_ids,
                         &run_id,
                         &started_at,
                     ));
@@ -1563,7 +1695,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                         hf,
                         &plugin_id,
                         &anchor_id,
-                        Some(&syntax_error_rule_id),
+                        &anchor_scoped_rule_ids,
                         &run_id,
                         &started_at,
                     ));
@@ -1851,6 +1983,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "resolution_degraded_files": resolution_degraded_files_total,
                 "plugin_edges_dropped_unseen_total": plugin_edges_dropped_unseen_total,
                 "source_walk_skipped_entries": source_walk_skipped_entries,
                 "source_walk_error_samples": source_walk_error_samples,
@@ -1860,6 +1993,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
+                "pyright_restart_count": pyright_restart_accounting.restart_count,
+                "pyright_file_attributed_restart_count":
+                    pyright_restart_accounting.file_attributed_restart_count,
+                "pyright_file_attributed_respawn_failure_count":
+                    pyright_restart_accounting.file_attributed_respawn_failure_count,
+                "pyright_ceiling_deferred_restart_count":
+                    pyright_restart_accounting.ceiling_deferred_restart_count,
+                "pyright_init_latency_total_ms": pyright_restart_accounting.init_latency_total_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
                 "failure_findings": failure_finding_count,
                 "classifier_coverage": classifier_coverage,
@@ -2275,6 +2416,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "references_skipped_external_total": references_skipped_external_total,
                 "references_skipped_cap_total": references_skipped_cap_total,
                 "imports_skipped_external_total": imports_skipped_external_total,
+                "resolution_degraded_files": resolution_degraded_files_total,
                 "plugin_edges_dropped_unseen_total": plugin_edges_dropped_unseen_total,
                 "source_walk_skipped_entries": source_walk_skipped_entries,
                 "source_walk_error_samples": source_walk_error_samples,
@@ -2284,6 +2426,14 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "pyright_query_latency_p95_ms": pyright_query_latency_p95_ms,
                 "pyright_index_parse_latency_p95_ms": pyright_index_parse_latency_p95_ms,
                 "extractor_parse_latency_p95_ms": extractor_parse_latency_p95_ms,
+                "pyright_restart_count": pyright_restart_accounting.restart_count,
+                "pyright_file_attributed_restart_count":
+                    pyright_restart_accounting.file_attributed_restart_count,
+                "pyright_file_attributed_respawn_failure_count":
+                    pyright_restart_accounting.file_attributed_respawn_failure_count,
+                "pyright_ceiling_deferred_restart_count":
+                    pyright_restart_accounting.ceiling_deferred_restart_count,
+                "pyright_init_latency_total_ms": pyright_restart_accounting.init_latency_total_ms,
                 "clustering": phase3_output.clustering_stats.clone(),
                 "failure_findings": failure_finding_count,
                 "failure_reason": reason,
@@ -2393,6 +2543,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             subsystems,
             edges,
             skipped_files_total,
+            resolution_degraded_files_total,
             emit_marker.as_deref(),
         ),
         None => format!(
@@ -2558,17 +2709,35 @@ struct PlannedSeiWrite {
 /// that skip unchanged files. When unchanged files were skipped, the line is
 /// annotated so an operator does not mistake a fast incremental pass for a graph
 /// that shrank.
+#[allow(clippy::too_many_arguments)]
 fn format_analyze_complete(
     run_id: &str,
     entities: i64,
     subsystems: i64,
     edges: i64,
     skipped_files: u64,
+    resolution_degraded_files: u64,
     emit_marker: Option<&str>,
 ) -> String {
     let incremental = if skipped_files > 0 {
         let noun = if skipped_files == 1 { "file" } else { "files" };
         format!("; incremental: {skipped_files} unchanged {noun} skipped")
+    } else {
+        String::new()
+    };
+    // A degraded resolver is loud too (clarion-3e517d4aff): these files hold
+    // call-graph holes until a later run re-dispatches them, and an operator
+    // reading only this line must not take the graph totals as complete.
+    let degraded = if resolution_degraded_files > 0 {
+        let noun = if resolution_degraded_files == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        format!(
+            "; call resolution degraded: {resolution_degraded_files} {noun} \
+             (re-dispatched next run)"
+        )
     } else {
         String::new()
     };
@@ -2579,7 +2748,7 @@ fn format_analyze_complete(
     let emit = emit_marker.map_or_else(String::new, |m| format!("; {m}"));
     format!(
         "analyze complete: run {run_id} completed \
-         (graph: {entities} entities incl. {subsystems} subsystems, {edges} edges{incremental}){emit}"
+         (graph: {entities} entities incl. {subsystems} subsystems, {edges} edges{incremental}{degraded}){emit}"
     )
 }
 
@@ -4216,20 +4385,32 @@ fn load_prior_syntax_findings(
     Ok(findings)
 }
 
-fn legacy_plugin_syntax_merges(
+/// Plan a lifecycle merge of each anchor-scoped finding's LEGACY row (the
+/// pre-anchoring `(plugin, subcode, message)` id, see
+/// [`legacy_host_finding_record_id`]) into its anchored id. Covers every rule
+/// in `anchor_scoped_rule_ids` — the manifest syntax rule and, since
+/// clarion-7fc41105ea, the pyright restart / poison-frame rules — so an index
+/// written before a rule became anchor-scoped does not keep the old row as a
+/// duplicate open finding beside the new one. The general stale sweep cannot
+/// be relied on for this: it is gated off whenever a file is incrementally
+/// skipped, i.e. on every routine run. The merge is guarded on the legacy
+/// row's anchor matching the new one (the writer no-ops otherwise), so a
+/// legacy row last written from a different file is left for the sweep.
+fn legacy_anchor_scoped_merges(
     plugin_findings: &[HostFinding],
-    rule_id: &str,
+    anchor_scoped_rule_ids: &[&str],
     plugin_id: &str,
     project_root: &Path,
     project_anchor: &str,
 ) -> Vec<FindingLifecycleMerge> {
     plugin_findings
         .iter()
-        .filter(|finding| finding.subcode == rule_id)
+        .filter(|finding| anchor_scoped_rule_ids.contains(&finding.subcode.as_str()))
         .filter_map(|finding| {
             finding.metadata.get("anchor_file_path")?;
             let anchor = host_finding_anchor_id(finding, project_root, project_anchor);
-            let canonical = host_finding_record_id(finding, plugin_id, &anchor, Some(rule_id));
+            let canonical =
+                host_finding_record_id(finding, plugin_id, &anchor, anchor_scoped_rule_ids);
             let superseded = legacy_host_finding_record_id(finding, plugin_id);
             (canonical != superseded).then_some(FindingLifecycleMerge {
                 canonical,
@@ -4286,7 +4467,7 @@ fn suppress_plugin_syntax_fallbacks(
         };
         let anchor_id = host_finding_anchor_id(plugin_finding, project_root, project_anchor);
         let canonical_id =
-            host_finding_record_id(plugin_finding, plugin_id, &anchor_id, Some(rule_id));
+            host_finding_record_id(plugin_finding, plugin_id, &anchor_id, &[rule_id]);
         merges.push(FindingLifecycleMerge {
             canonical: canonical_id,
             superseded: fallback.id,
@@ -4426,6 +4607,14 @@ fn project_anchor_record(
 /// Core-emitted per-file analysis-timeout subcode (REQ-ANALYZE-06). Host-side:
 /// the plugin is killed when a single `analyze_file` exceeds the deadline.
 const PLUGIN_TIMEOUT_RULE_ID: &str = "LMWV-PY-TIMEOUT";
+/// Python plugin: pyright died and was restarted (clarion-7fc41105ea). Anchored
+/// to the file whose request found it dead, so identity must be file-scoped —
+/// a run that restarts on two files persists two rows, not one.
+const PLUGIN_PYRIGHT_RESTART_RULE_ID: &str = "LMWV-PY-PYRIGHT-RESTART";
+/// Python plugin: the restart cap was exhausted on this file's request and
+/// call resolution is disabled for the rest of the run. File-scoped like
+/// [`PLUGIN_PYRIGHT_RESTART_RULE_ID`].
+const PLUGIN_PYRIGHT_POISON_FRAME_RULE_ID: &str = "LMWV-PY-PYRIGHT-POISON-FRAME";
 const PLUGIN_JAIL_OPEN_RULE_ID: &str = "LMWV-INFRA-PLUGIN-JAIL-OPEN-FAILED";
 
 /// Per-file `analyze_file` deadline. ADR-035 tuning: basis — a single file's
@@ -4515,16 +4704,17 @@ fn infra_severity(subcode: &str) -> &'static str {
 /// anchored to `anchor_id` (REQ-ANALYZE-06). The id is deterministic so
 /// `InsertFinding` is idempotent across `--resume`; the manifest-derived syntax
 /// rule includes the anchor because plugins commonly reuse one parse-error
-/// message across files.
+/// message across files, as do the pyright restart / poison-frame rules
+/// (clarion-7fc41105ea) whose message is the same fixed text on every file.
 fn host_finding_to_record(
     hf: &HostFinding,
     plugin_id: &str,
     anchor_id: &str,
-    anchor_scoped_rule_id: Option<&str>,
+    anchor_scoped_rule_ids: &[&str],
     run_id: &str,
     now: &str,
 ) -> FindingRecord {
-    let id = host_finding_record_id(hf, plugin_id, anchor_id, anchor_scoped_rule_id);
+    let id = host_finding_record_id(hf, plugin_id, anchor_id, anchor_scoped_rule_ids);
     let evidence = serde_json::json!({
         "plugin_id": plugin_id,
         "metadata": hf.metadata,
@@ -4552,13 +4742,18 @@ fn host_finding_to_record(
     }
 }
 
+/// Identity is `(plugin_id, subcode, anchor_id, message)` for the rules in
+/// `anchor_scoped_rule_ids` and `(plugin_id, subcode, message)` for the rest.
+/// No per-event discriminator: findings are current-state (ADR-047), so a
+/// rule that fires repeatedly on the same file keeps one row and the per-run
+/// event count lives in `runs.stats`.
 fn host_finding_record_id(
     hf: &HostFinding,
     plugin_id: &str,
     anchor_id: &str,
-    anchor_scoped_rule_id: Option<&str>,
+    anchor_scoped_rule_ids: &[&str],
 ) -> String {
-    if anchor_scoped_rule_id != Some(hf.subcode.as_str()) {
+    if !anchor_scoped_rule_ids.contains(&hf.subcode.as_str()) {
         return legacy_host_finding_record_id(hf, plugin_id);
     }
     let discriminator = blake3::hash(
@@ -5543,6 +5738,11 @@ struct PluginFileBatch {
     /// sweep — a dispatched file that never yields a persisted batch was not
     /// examined and must stay out of the sweep's bound.
     source_file_path: String,
+    /// Whether the file's bytes differ from the hash the prior run stored
+    /// (clarion-7fc41105ea). A forced re-dispatch of a byte-identical file
+    /// reports `false`; the coverage upsert uses it to decide whether a
+    /// self-inflicted mark may be un-stuck.
+    content_changed: bool,
     /// `(entity_id_string, record)` pairs accepted from one analyzed file.
     entities: Vec<(String, EntityRecord)>,
     /// Manifest-declared semantic roles for this plugin's entity kinds.
@@ -5614,6 +5814,29 @@ struct PersistedPluginBatch {
     sei_descriptors: Vec<NewEntityDescriptor>,
     syntax_fallbacks: Vec<FindingRecord>,
     degraded_source_files: BTreeSet<String>,
+    /// The plugin reported degraded call or reference resolution for this
+    /// file (clarion-3e517d4aff); counted into `resolution_degraded_files`.
+    resolution_degraded: bool,
+}
+
+/// Map the plugin's wire-level coverage claim onto the persisted record. A
+/// plugin that makes no claim (`None`) is recorded as complete: it is a purely
+/// syntactic extractor with nothing that can fail transiently.
+fn resolution_coverage_record(
+    coverage: Option<&loomweave_core::ResolutionCoverage>,
+) -> loomweave_storage::SourceFileResolutionCoverage {
+    let facet = |facet: &loomweave_core::FacetCoverage| loomweave_storage::FacetCoverageRecord {
+        degraded: facet.is_degraded(),
+        reason: facet.reason.clone(),
+        transient: facet.transient,
+        collateral: facet.collateral,
+    };
+    coverage.map_or_else(Default::default, |coverage| {
+        loomweave_storage::SourceFileResolutionCoverage {
+            calls: facet(&coverage.calls),
+            references: facet(&coverage.references),
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -5710,6 +5933,7 @@ async fn persist_plugin_file_batch(
     writer
         .send_wait(|ack| WriterCmd::ReplaceAnchoredEdgesForSourceFile {
             source_file_id: batch.source_file_id.clone(),
+            prune_resolution_coverage: false,
             ack,
         })
         .await
@@ -5735,12 +5959,36 @@ async fn persist_plugin_file_batch(
             .with_context(|| format!("ReplaceUnresolvedCallSitesForCaller for {caller_id}"))?;
     }
 
+    // The coverage claim lands in the same run transaction as the evidence it
+    // qualifies (clarion-3e517d4aff): a file whose resolver failed is recorded
+    // as degraded so the next incremental run re-dispatches it instead of
+    // treating the empty evidence as a completed analysis.
+    let coverage = resolution_coverage_record(batch.stats.resolution_coverage.as_ref());
+    let resolution_degraded = coverage.is_degraded();
+    writer
+        .send_wait(|ack| WriterCmd::UpsertSourceFileResolutionCoverage {
+            source_file_id: batch.source_file_id.clone(),
+            coverage,
+            content_changed: batch.content_changed,
+            updated_at: iso8601_now(),
+            ack,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| {
+            format!(
+                "UpsertSourceFileResolutionCoverage for {}",
+                batch.source_file_id
+            )
+        })?;
+
     Ok(PersistedPluginBatch {
         entity_count,
         prior_index_entries,
         sei_descriptors,
         syntax_fallbacks,
         degraded_source_files,
+        resolution_degraded,
     })
 }
 
@@ -5812,6 +6060,47 @@ struct BatchStats {
     pyright_query_latency_ms: Vec<u64>,
     pyright_index_parse_latency_ms: Vec<u64>,
     extractor_parse_latency_ms: Vec<u64>,
+    /// Run-cumulative pyright restart accounting as of this file
+    /// (clarion-7fc41105ea). Aggregated with `max`, not summed — see
+    /// [`loomweave_core::AnalyzeFileStats::pyright_restart_count`].
+    pyright_restart_count: u64,
+    pyright_file_attributed_restart_count: u64,
+    pyright_file_attributed_respawn_failure_count: u64,
+    pyright_ceiling_deferred_restart_count: u64,
+    pyright_init_latency_total_ms: u64,
+    /// Per-file resolution coverage claim (clarion-3e517d4aff). `None` when
+    /// the plugin makes no claim; persisted as `complete`.
+    resolution_coverage: Option<loomweave_core::ResolutionCoverage>,
+}
+
+/// Run-level pyright restart accounting (clarion-7fc41105ea). The plugin
+/// reports its run-cumulative counters on every file result, so each field is
+/// the maximum observed, never a sum.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PyrightRestartAccounting {
+    restart_count: u64,
+    file_attributed_restart_count: u64,
+    file_attributed_respawn_failure_count: u64,
+    ceiling_deferred_restart_count: u64,
+    init_latency_total_ms: u64,
+}
+
+impl PyrightRestartAccounting {
+    fn observe(&mut self, stats: &BatchStats) {
+        self.restart_count = self.restart_count.max(stats.pyright_restart_count);
+        self.file_attributed_restart_count = self
+            .file_attributed_restart_count
+            .max(stats.pyright_file_attributed_restart_count);
+        self.file_attributed_respawn_failure_count = self
+            .file_attributed_respawn_failure_count
+            .max(stats.pyright_file_attributed_respawn_failure_count);
+        self.ceiling_deferred_restart_count = self
+            .ceiling_deferred_restart_count
+            .max(stats.pyright_ceiling_deferred_restart_count);
+        self.init_latency_total_ms = self
+            .init_latency_total_ms
+            .max(stats.pyright_init_latency_total_ms);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5949,6 +6238,7 @@ fn run_plugin_blocking(
     plugin_id: &str,
     executable: &Path,
     files: &[PathBuf],
+    content_changed_files: &Arc<HashSet<String>>,
     briefing_blocks: &Arc<BTreeMap<PathBuf, loomweave_core::BriefingBlockReason>>,
     scanned_source_files: &Arc<BTreeSet<PathBuf>>,
     progress: &ProgressReporter,
@@ -6110,6 +6400,14 @@ fn run_plugin_blocking(
                 pyright_query_latency_ms: stats.pyright_query_latency_ms.clone(),
                 pyright_index_parse_latency_ms: stats.pyright_index_parse_latency_ms.clone(),
                 extractor_parse_latency_ms: Vec::new(),
+                pyright_restart_count: stats.pyright_restart_count,
+                pyright_file_attributed_restart_count: stats.pyright_file_attributed_restart_count,
+                pyright_file_attributed_respawn_failure_count: stats
+                    .pyright_file_attributed_respawn_failure_count,
+                pyright_ceiling_deferred_restart_count: stats
+                    .pyright_ceiling_deferred_restart_count,
+                pyright_init_latency_total_ms: stats.pyright_init_latency_total_ms,
+                resolution_coverage: stats.resolution_coverage.clone(),
             };
             if stats.extractor_parse_latency_ms > 0 {
                 file_stats
@@ -6223,6 +6521,8 @@ fn run_plugin_blocking(
                     source_file_path: crate::secret_scan::canonical_or_original(file)
                         .display()
                         .to_string(),
+                    content_changed: canonical_path_key(file)
+                        .is_some_and(|key| content_changed_files.contains(&key)),
                     entities: file_entities,
                     kind_roles: kind_roles.clone(),
                     edges: immediate_edges,
@@ -6884,21 +7184,76 @@ fn canonical_path_key(path: &Path) -> Option<String> {
 /// fail-toward-work direction — on any uncertainty: the path cannot be
 /// canonicalised, the prior run recorded no whole-file hash for it (a new file),
 /// or the file is unhashable now. Skips only on a confident byte-identical match.
-fn file_needs_reanalysis(
+/// Stable-partition `files` so paths in `self_inflicted` (canonical keys) come
+/// after every other path. See the dispatch-order note at the call site.
+fn order_self_inflicted_last(files: &mut [PathBuf], self_inflicted: &HashSet<String>) {
+    if self_inflicted.is_empty() {
+        return;
+    }
+    files.sort_by_cached_key(|path| {
+        canonical_path_key(path).is_some_and(|key| self_inflicted.contains(&key))
+    });
+}
+
+/// Why (or whether) a file must be re-analysed. Distinguishes the two
+/// re-dispatch causes because the coverage upsert treats them differently
+/// (clarion-7fc41105ea): a self-inflicted mark survives a forced re-dispatch
+/// of unchanged bytes but not a content change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReanalysisReason {
+    /// Confident byte-identical match with no forced re-dispatch: skip.
+    NotNeeded,
+    /// Bytes are identical, but the file is in `forced_redispatch_files`.
+    ForcedRedispatchUnchanged,
+    /// Hash mismatch, or no prior hash (`--no-incremental`): the bytes are
+    /// known to differ from what the prior run analysed.
+    ContentChanged,
+    /// The bytes could not be compared (unreadable, or no canonical path
+    /// key). Re-analysed like a change, but NOT reported as one: a byte
+    /// change is the un-stick signal for the sticky self-inflicted mark
+    /// (`resolution_coverage`), and an I/O hiccup on an unchanged
+    /// troublemaker must not exonerate it.
+    ContentUnknown,
+}
+
+impl ReanalysisReason {
+    /// Whether the file must be dispatched to the plugin this run.
+    fn must_dispatch(self) -> bool {
+        !matches!(self, Self::NotNeeded)
+    }
+
+    /// Whether the file's bytes are KNOWN to differ from the prior run — the
+    /// only reason that may enter `content_changed_files`.
+    fn bytes_changed(self) -> bool {
+        matches!(self, Self::ContentChanged)
+    }
+}
+
+fn file_reanalysis_reason(
     project_root: &Path,
     path: &Path,
     prior_file_hashes: &HashMap<String, String>,
-) -> bool {
+    forced_redispatch_files: &HashSet<String>,
+) -> ReanalysisReason {
     let Some(key) = canonical_path_key(path) else {
-        return true;
+        return ReanalysisReason::ContentUnknown;
     };
     let Some(prior) = prior_file_hashes.get(&key) else {
-        return true;
+        return ReanalysisReason::ContentChanged;
     };
-    match whole_file_hash(project_root, path) {
-        Some(current) => &current != prior,
-        None => true,
+    let Some(current) = whole_file_hash(project_root, path) else {
+        return ReanalysisReason::ContentUnknown;
+    };
+    if &current != prior {
+        return ReanalysisReason::ContentChanged;
     }
+    // A byte-identical file whose last analysis was degraded is NOT done
+    // (clarion-3e517d4aff): its resolver failed, and its empty evidence must
+    // not be pinned by the hash skip.
+    if forced_redispatch_files.contains(&key) {
+        return ReanalysisReason::ForcedRedispatchUnchanged;
+    }
+    ReanalysisReason::NotNeeded
 }
 
 fn content_hash_for_entity(
@@ -7320,7 +7675,7 @@ mod tests {
     fn analyze_complete_full_run_reports_whole_graph_totals() {
         // A full run (no unchanged files skipped) reports the graph totals with
         // the subsystem breakdown, matching `project_status` phrasing.
-        let line = format_analyze_complete("run-1", 263, 5, 496, 0, None);
+        let line = format_analyze_complete("run-1", 263, 5, 496, 0, 0, None);
         assert_eq!(
             line,
             "analyze complete: run run-1 completed \
@@ -7332,7 +7687,7 @@ mod tests {
     fn analyze_complete_incremental_run_annotates_skipped_files() {
         // An incremental run that skipped unchanged files reports the SAME graph
         // totals (not the tiny insert delta) plus an explicit incremental marker.
-        let line = format_analyze_complete("run-2", 263, 5, 496, 29, None);
+        let line = format_analyze_complete("run-2", 263, 5, 496, 29, 0, None);
         assert_eq!(
             line,
             "analyze complete: run run-2 completed \
@@ -7342,8 +7697,28 @@ mod tests {
     }
 
     #[test]
+    fn analyze_complete_reports_degraded_call_resolution_loudly() {
+        // clarion-3e517d4aff: a run whose plugin reported degraded resolution
+        // for some files must say so on the completion line — those files are
+        // call-graph holes until the next run re-dispatches them.
+        let line = format_analyze_complete("run-5", 263, 5, 496, 29, 3, None);
+        assert_eq!(
+            line,
+            "analyze complete: run run-5 completed \
+             (graph: 263 entities incl. 5 subsystems, 496 edges; \
+             incremental: 29 unchanged files skipped; \
+             call resolution degraded: 3 files (re-dispatched next run))"
+        );
+        let one = format_analyze_complete("run-6", 10, 0, 4, 0, 1, None);
+        assert!(
+            one.ends_with("call resolution degraded: 1 file (re-dispatched next run))"),
+            "{one}"
+        );
+    }
+
+    #[test]
     fn analyze_complete_incremental_singular_file_uses_singular_noun() {
-        let line = format_analyze_complete("run-3", 10, 0, 4, 1, None);
+        let line = format_analyze_complete("run-3", 10, 0, 4, 1, 0, None);
         assert_eq!(
             line,
             "analyze complete: run run-3 completed \
@@ -7362,6 +7737,7 @@ mod tests {
             10,
             0,
             4,
+            0,
             0,
             Some("emit:unreachable (connection refused)"),
         );
@@ -8432,9 +8808,9 @@ mod tests {
         };
 
         let plugin_findings = [plugin_finding];
-        let legacy_merges = legacy_plugin_syntax_merges(
+        let legacy_merges = legacy_anchor_scoped_merges(
             &plugin_findings,
-            rule_id,
+            &[rule_id],
             "fixture",
             Path::new("/project"),
             "core:project:project",
@@ -8613,7 +8989,7 @@ mod tests {
             message: "entity failed to deserialise".to_owned(),
             metadata: std::collections::BTreeMap::new(),
         };
-        let rec = host_finding_to_record(&hf, "python", "core:project:demo", None, "run-1", "t");
+        let rec = host_finding_to_record(&hf, "python", "core:project:demo", &[], "run-1", "t");
         assert_eq!(rec.rule_id, "LMWV-INFRA-PLUGIN-MALFORMED-ENTITY");
         assert_eq!(rec.entity_id, "core:project:demo");
         assert_eq!(rec.severity, "WARN");
@@ -8640,13 +9016,13 @@ mod tests {
                 &syntax,
                 "fixture",
                 "core:file:one.syn",
-                Some("LMWV-FIXTURE-SYNTAX-ERROR")
+                &["LMWV-FIXTURE-SYNTAX-ERROR"]
             ),
             host_finding_record_id(
                 &syntax,
                 "fixture",
                 "core:file:two.syn",
-                Some("LMWV-FIXTURE-SYNTAX-ERROR")
+                &["LMWV-FIXTURE-SYNTAX-ERROR"]
             ),
             "the manifest-derived syntax rule must be scoped to its file anchor"
         );
@@ -8655,11 +9031,234 @@ mod tests {
                 &related_diagnostic,
                 "fixture",
                 "core:file:one.syn",
-                Some("LMWV-FIXTURE-SYNTAX-ERROR")
+                &["LMWV-FIXTURE-SYNTAX-ERROR"]
             ),
             legacy_host_finding_record_id(&related_diagnostic, "fixture"),
             "an unrelated diagnostic that merely shares the suffix must retain its identity"
         );
+    }
+
+    fn pyright_restart_finding(anchor_file_path: &str) -> HostFinding {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("anchor_file_path".to_owned(), anchor_file_path.to_owned());
+        HostFinding {
+            subcode: PLUGIN_PYRIGHT_RESTART_RULE_ID.to_owned(),
+            message: "pyright subprocess exited; restarting".to_owned(),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn pyright_restart_accounting_takes_the_max_not_the_sum() {
+        // clarion-7fc41105ea: the plugin reports run-cumulative counters on
+        // every file; 3 files at "2 restarts so far" is 2 restarts, not 6.
+        let mut acc = PyrightRestartAccounting::default();
+        for (restarts, latency) in [(1, 300), (2, 900), (2, 900)] {
+            acc.observe(&BatchStats {
+                pyright_restart_count: restarts,
+                pyright_file_attributed_restart_count: restarts,
+                pyright_init_latency_total_ms: latency,
+                ..BatchStats::default()
+            });
+        }
+        assert_eq!(
+            acc,
+            PyrightRestartAccounting {
+                restart_count: 2,
+                file_attributed_restart_count: 2,
+                file_attributed_respawn_failure_count: 0,
+                ceiling_deferred_restart_count: 0,
+                init_latency_total_ms: 900,
+            }
+        );
+    }
+
+    #[test]
+    fn restart_finding_ids_are_anchor_scoped_across_files() {
+        // clarion-7fc41105ea: one run restarting pyright on two different
+        // files must persist two rows, not collapse to one by message text.
+        let scoped = &[
+            "LMWV-PY-SYNTAX-ERROR",
+            PLUGIN_PYRIGHT_RESTART_RULE_ID,
+            PLUGIN_PYRIGHT_POISON_FRAME_RULE_ID,
+        ];
+        let a = pyright_restart_finding("a.py");
+        let b = pyright_restart_finding("b.py");
+        assert_ne!(
+            host_finding_record_id(&a, "python", "core:file:a.py", scoped),
+            host_finding_record_id(&b, "python", "core:file:b.py", scoped),
+        );
+        let mut poison = pyright_restart_finding("a.py");
+        poison.subcode = PLUGIN_PYRIGHT_POISON_FRAME_RULE_ID.to_owned();
+        assert_ne!(
+            host_finding_record_id(&poison, "python", "core:file:a.py", scoped),
+            host_finding_record_id(&poison, "python", "core:file:b.py", scoped),
+        );
+    }
+
+    #[test]
+    fn repeat_restart_findings_on_the_same_file_collapse_to_one_row() {
+        // ADR-047: findings are current-state, not an append-log — one row
+        // per (plugin, subcode, anchor, message); per-run restart cardinality
+        // lives in `runs.stats`.
+        let scoped = &[PLUGIN_PYRIGHT_RESTART_RULE_ID];
+        let first = pyright_restart_finding("a.py");
+        let second = pyright_restart_finding("a.py");
+        assert_eq!(
+            host_finding_record_id(&first, "python", "core:file:a.py", scoped),
+            host_finding_record_id(&second, "python", "core:file:a.py", scoped),
+        );
+    }
+
+    #[test]
+    fn legacy_pyright_rows_are_merged_into_the_anchored_id() {
+        // clarion-7fc41105ea review: before the pyright restart / poison-frame
+        // rules became anchor-scoped their rows lived under the legacy
+        // `(plugin, subcode, message)` id. Re-emitting the same event must plan
+        // a lifecycle merge of that legacy row into the new anchored id, exactly
+        // as the manifest syntax rule does, or the old row lingers as a
+        // duplicate open finding on every incremental run (the general sweep
+        // is gated off whenever a file is skipped).
+        let scoped: [&str; 3] = [
+            "LMWV-PY-SYNTAX-ERROR",
+            PLUGIN_PYRIGHT_RESTART_RULE_ID,
+            PLUGIN_PYRIGHT_POISON_FRAME_RULE_ID,
+        ];
+        let restart = pyright_restart_finding("pkg/a.py");
+        let mut poison = pyright_restart_finding("pkg/b.py");
+        poison.subcode = PLUGIN_PYRIGHT_POISON_FRAME_RULE_ID.to_owned();
+        let unrelated = HostFinding {
+            subcode: "LMWV-PY-TIMEOUT".to_owned(),
+            message: "timed out".to_owned(),
+            metadata: restart.metadata.clone(),
+        };
+        let findings = [restart.clone(), poison.clone(), unrelated];
+
+        let merges = legacy_anchor_scoped_merges(
+            &findings,
+            &scoped,
+            "python",
+            Path::new("/project"),
+            "core:project:project",
+        );
+
+        assert_eq!(merges.len(), 2, "one merge per anchor-scoped finding");
+        for (merge, finding) in merges.iter().zip([&restart, &poison]) {
+            let anchor =
+                host_finding_anchor_id(finding, Path::new("/project"), "core:project:project");
+            assert_eq!(
+                merge.canonical,
+                host_finding_record_id(finding, "python", &anchor, &scoped)
+            );
+            assert_eq!(
+                merge.superseded,
+                legacy_host_finding_record_id(finding, "python")
+            );
+            assert_ne!(merge.canonical, merge.superseded);
+            assert_eq!(merge.expected_superseded_entity, anchor);
+        }
+    }
+
+    #[test]
+    fn legacy_merge_skips_anchorless_findings() {
+        // Without a file anchor the anchored id degenerates to the project
+        // anchor; there is nothing to migrate.
+        let scoped = [PLUGIN_PYRIGHT_RESTART_RULE_ID];
+        let mut finding = pyright_restart_finding("pkg/a.py");
+        finding.metadata.clear();
+        let merges = legacy_anchor_scoped_merges(
+            &[finding],
+            &scoped,
+            "python",
+            Path::new("/project"),
+            "core:project:project",
+        );
+        assert!(merges.is_empty());
+    }
+
+    fn reanalysis_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path().canonicalize().expect("canonical root");
+        let file = root.join("demo.py");
+        fs::write(&file, "x = 1\n").unwrap();
+        let key = canonical_path_key(&file).expect("canonical key");
+        (tempdir, root, file, key)
+    }
+
+    #[test]
+    fn file_reanalysis_reason_reports_content_changed_when_hash_differs() {
+        let (_guard, root, file, key) = reanalysis_fixture();
+        let prior = HashMap::from([(key, "not-the-real-hash".to_owned())]);
+        assert_eq!(
+            file_reanalysis_reason(&root, &file, &prior, &HashSet::new()),
+            ReanalysisReason::ContentChanged
+        );
+    }
+
+    #[test]
+    fn file_reanalysis_reason_reports_content_changed_without_a_prior_hash() {
+        // `--no-incremental` (no prior hashes at all) is the operator's
+        // documented remedy for a wrongly-stuck mark: every file counts as
+        // changed.
+        let (_guard, root, file, _key) = reanalysis_fixture();
+        assert_eq!(
+            file_reanalysis_reason(&root, &file, &HashMap::new(), &HashSet::new()),
+            ReanalysisReason::ContentChanged
+        );
+    }
+
+    #[test]
+    fn file_reanalysis_reason_reports_content_unknown_when_unreadable() {
+        // clarion-7fc41105ea review: an I/O hiccup on an UNCHANGED file must
+        // still re-dispatch it, but must not masquerade as a content change —
+        // `ContentChanged` is the un-stick signal for the sticky
+        // self-inflicted mark, and an unreadable troublemaker is not exonerated.
+        let (_guard, root, _file, _key) = reanalysis_fixture();
+        let dir = root.join("pkg");
+        fs::create_dir_all(&dir).unwrap();
+        let key = canonical_path_key(&dir).expect("canonical key");
+        let prior = HashMap::from([(key.clone(), "prior".to_owned())]);
+        let forced = HashSet::from([key]);
+        assert_eq!(
+            file_reanalysis_reason(&root, &dir, &prior, &forced),
+            ReanalysisReason::ContentUnknown
+        );
+        // No canonical key (the path does not exist) is the same posture.
+        assert_eq!(
+            file_reanalysis_reason(&root, &root.join("missing.py"), &prior, &forced),
+            ReanalysisReason::ContentUnknown
+        );
+    }
+
+    #[test]
+    fn file_reanalysis_reason_distinguishes_forced_from_unchanged() {
+        let (_guard, root, file, key) = reanalysis_fixture();
+        let current = whole_file_hash(&root, &file).expect("hash");
+        let prior = HashMap::from([(key.clone(), current)]);
+        assert_eq!(
+            file_reanalysis_reason(&root, &file, &prior, &HashSet::new()),
+            ReanalysisReason::NotNeeded
+        );
+        assert_eq!(
+            file_reanalysis_reason(&root, &file, &prior, &HashSet::from([key])),
+            ReanalysisReason::ForcedRedispatchUnchanged
+        );
+    }
+
+    #[test]
+    fn only_content_changed_feeds_the_content_changed_set() {
+        // The dispatch partition consults these two predicates; pin that an
+        // unknown-content re-dispatch is dispatched but never recorded as a
+        // byte change.
+        use ReanalysisReason as R;
+        assert!(!R::NotNeeded.must_dispatch());
+        assert!(R::ForcedRedispatchUnchanged.must_dispatch());
+        assert!(R::ContentChanged.must_dispatch());
+        assert!(R::ContentUnknown.must_dispatch());
+        assert!(!R::NotNeeded.bytes_changed());
+        assert!(!R::ForcedRedispatchUnchanged.bytes_changed());
+        assert!(R::ContentChanged.bytes_changed());
+        assert!(!R::ContentUnknown.bytes_changed());
     }
 
     #[test]
