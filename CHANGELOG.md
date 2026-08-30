@@ -41,6 +41,19 @@ only when an incompatible change is made to that surface. See
 
 ### Fixed
 
+- **Killing a plugin now kills everything it spawned.** The venv's
+  `pyright-langserver` is a Python wrapper around a `node` grandchild; every
+  kill path (pyright restart, watchdog kill, handshake failure, shutdown
+  fallback) killed only the wrapper, leaving a wedged node spinning at
+  `ppid 1` (seen at 103 % CPU for 1 h 40 m with no analyze running). The host
+  and the Python plugin now collect the child's descendants from `/proc`
+  before the kill and SIGKILL the whole tree. (clarion-ebf404dfbb, ADR-061)
+- **`serve` exits when its parent dies.** An MCP client that dies (or hands
+  our pipes to something that outlives it) without closing stdin used to
+  leave `serve` idling forever with its `ephemeral.port` marker published —
+  14 accumulated on one checkout. `serve` now checks its parent pid every
+  ~2 s and, on a reparenting, shuts the HTTP read API down like SIGTERM and
+  exits clean. (clarion-ebf404dfbb, ADR-061)
 - **A per-file plugin timeout no longer fails the whole run.** The host now
   skips the file that hit the watchdog (its stored rows are retained and it
   re-dispatches next run), records the `LMWV-PY-TIMEOUT` finding with the

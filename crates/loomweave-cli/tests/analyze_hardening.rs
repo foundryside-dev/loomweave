@@ -696,3 +696,30 @@ fn file_watchdog_respawns_are_bounded() {
     assert_eq!(finding_count(&conn, "LMWV-PY-TIMEOUT"), 4);
     assert_no_leaked_child(&marker_pair);
 }
+
+/// clarion-ebf404dfbb: the watchdog kill must take the plugin's whole process
+/// tree. The fixture spawns a grandchild (pyright's `node` shape) and hangs;
+/// after the run neither the plugin nor the grandchild may survive — the
+/// marker scan covers both because the grandchild inherits the environment.
+#[test]
+fn watchdog_kill_takes_the_plugin_grandchild_too() {
+    let fixture_bin = fixture_binary_path();
+    let plugin_dir = setup_plugin_dir(&fixture_bin);
+    let (project_dir, new_path) = setup_project(&plugin_dir);
+    let (marker_key, marker_value, marker_pair) = unique_marker("grandchild");
+
+    loomweave_bin()
+        .args(["analyze"])
+        .arg(project_dir.path())
+        .env("PATH", &new_path)
+        .env(&marker_key, &marker_value)
+        .env("LOOMWEAVE_FIXTURE_SPAWN_GRANDCHILD_THEN_HANG", "1")
+        .env("LOOMWEAVE_PLUGIN_FILE_TIMEOUT_MS", "500")
+        .timeout(ANALYZE_BACKSTOP)
+        .assert()
+        .success();
+
+    let conn = open_db(&project_dir);
+    assert_eq!(finding_count(&conn, "LMWV-PY-TIMEOUT"), 1);
+    assert_no_leaked_child(&marker_pair);
+}

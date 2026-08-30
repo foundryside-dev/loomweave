@@ -58,6 +58,24 @@ fn reserve_virtual_if_requested() {
     }
 }
 
+/// `LOOMWEAVE_FIXTURE_SPAWN_GRANDCHILD_THEN_HANG`: spawn a long-lived
+/// grandchild (the shape of pyright's `node` under its Python wrapper), then
+/// hang so the host's watchdog kills us. The grandchild inherits our
+/// environment, so the hardening tests' marker scan finds it if it survives
+/// (clarion-ebf404dfbb).
+fn spawn_grandchild_then_hang_if_requested() {
+    if !env_flag("LOOMWEAVE_FIXTURE_SPAWN_GRANDCHILD_THEN_HANG") {
+        return;
+    }
+    let _ = std::process::Command::new("sleep")
+        .arg("3600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    hang_forever();
+}
+
 fn hang_forever() -> ! {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -185,6 +203,7 @@ fn main() {
                     .to_owned();
 
                 hang_if_named_file(&file_path);
+                spawn_grandchild_then_hang_if_requested();
                 let params: AnalyzeFileParams = match serde_json::from_value(
                     raw.get("params").cloned().unwrap_or(serde_json::json!({})),
                 ) {

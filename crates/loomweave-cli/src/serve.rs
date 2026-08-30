@@ -828,13 +828,32 @@ enum SupervisedOutcome {
     /// conventional `128 + signo` code — the stdio thread is blocked on
     /// stdin and can never be joined.
     SignalExit(i32),
+    /// The parent process went away without closing our stdin (an MCP client
+    /// that died, or handed our pipes to something that outlived it —
+    /// clarion-ebf404dfbb: 14 idle `serve`s on one checkout). The HTTP read
+    /// API has been shut down like the signal path; the caller exits clean.
+    ParentGone,
 }
 
 fn supervise_stdio_with_http(
     stdio: StdioServe,
     http_server: Option<crate::http_read::HttpReadServer>,
 ) -> Result<()> {
-    match supervise_stdio_http_and_signals(stdio, http_server, termination_signal::flag()) {
+    // Parent liveness: `getppid` is a safe std call (no `prctl`/PDEATHSIG,
+    // which would need unsafe FFI). A reparenting — to pid 1 or a subreaper —
+    // means the process that launched us is gone.
+    #[cfg(unix)]
+    let initial_parent = std::os::unix::process::parent_id();
+    #[cfg(unix)]
+    let parent_alive = move || std::os::unix::process::parent_id() == initial_parent;
+    #[cfg(not(unix))]
+    let parent_alive = || true;
+    match supervise_stdio_http_and_signals(
+        stdio,
+        http_server,
+        termination_signal::flag(),
+        &parent_alive,
+    ) {
         SupervisedOutcome::Stdio(result) => result,
         SupervisedOutcome::SignalExit(code) => {
             // HTTP cleanup already ran inside the loop; do NOT wait on the
@@ -842,19 +861,32 @@ fn supervise_stdio_with_http(
             // conventional signal exit code (130 SIGINT / 143 SIGTERM).
             std::process::exit(code)
         }
+        // Same reasoning: the stdio thread is parked on a stdin nobody will
+        // close; exit promptly and cleanly.
+        SupervisedOutcome::ParentGone => std::process::exit(0),
     }
 }
+
+/// Loop iterations (100 ms each) between parent-liveness probes: ~2 s, so a
+/// dead client is noticed promptly without a `getppid` per tick.
+const PARENT_PROBE_EVERY_TICKS: u32 = 20;
 
 fn supervise_stdio_http_and_signals(
     stdio: StdioServe,
     mut http_server: Option<crate::http_read::HttpReadServer>,
     signal_flag: &std::sync::atomic::AtomicUsize,
+    parent_alive: &dyn Fn() -> bool,
 ) -> SupervisedOutcome {
+    let mut tick: u32 = 0;
     let serve_result = loop {
         let signo = signal_flag.load(std::sync::atomic::Ordering::SeqCst);
         if signo != 0 {
             return handle_termination_signal(signo, http_server.take());
         }
+        if tick % PARENT_PROBE_EVERY_TICKS == 0 && !parent_alive() {
+            return handle_parent_gone(http_server.take());
+        }
+        tick = tick.wrapping_add(1);
         match stdio.result_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(result) => break result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -919,6 +951,23 @@ fn handle_termination_signal(
         "termination signal observed; HTTP read API stopped and ephemeral.port released"
     );
     SupervisedOutcome::SignalExit(termination_exit_code(signo))
+}
+
+fn handle_parent_gone(http_server: Option<crate::http_read::HttpReadServer>) -> SupervisedOutcome {
+    if let Some(server) = http_server
+        && let Err(err) = server.shutdown()
+    {
+        tracing::warn!(
+            error = %err,
+            "failed to stop HTTP read API after the parent process went away; the \
+             published ephemeral.port marker may be stranded"
+        );
+    }
+    tracing::info!(
+        "parent process went away without closing stdin; HTTP read API stopped and \
+         ephemeral.port released — exiting"
+    );
+    SupervisedOutcome::ParentGone
 }
 
 /// Conventional fatal-signal exit code: `128 + signo` — 130 for SIGINT,
@@ -1187,7 +1236,7 @@ mod tests {
         let (stdio, _unblock_tx) = stdin_blocked_stdio();
         // SIGTERM "already delivered": the handler stored the signal number.
         let signal_flag = AtomicUsize::new(15);
-        let outcome = supervise_stdio_http_and_signals(stdio, Some(server), &signal_flag);
+        let outcome = supervise_stdio_http_and_signals(stdio, Some(server), &signal_flag, &|| true);
 
         match outcome {
             SupervisedOutcome::SignalExit(code) => assert_eq!(
@@ -1197,11 +1246,61 @@ mod tests {
             SupervisedOutcome::Stdio(result) => {
                 panic!("signal must win over the stdin-blocked stdio thread, got {result:?}")
             }
+            SupervisedOutcome::ParentGone => panic!("the parent probe said alive"),
         }
         assert!(
             !port_path.exists(),
             "the HTTP shutdown must have dropped PublishedPortGuard, whose \
              compare-and-delete removes this instance's ephemeral.port marker"
+        );
+    }
+
+    /// clarion-ebf404dfbb: a parent that died without closing our stdin must
+    /// not leave `serve` idling forever. With the liveness probe reporting
+    /// the parent gone, the supervisor shuts the HTTP read API down (marker
+    /// released) and reports `ParentGone` even though the stdio thread is
+    /// parked on stdin.
+    #[test]
+    fn supervisor_exits_when_the_parent_process_goes_away() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("loomweave.db");
+        let readers = loomweave_storage::ReaderPool::open(&db, 4).expect("open reader pool");
+        let config = loomweave_federation::config::HttpReadConfig {
+            enabled: true,
+            bind: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+            ..loomweave_federation::config::HttpReadConfig::default()
+        };
+        let instance_id =
+            crate::instance::parse_instance_id_for_test("00000000-0000-4000-8000-00000000007b")
+                .expect("parse synthetic instance id");
+        let port_path = loomweave_federation::loomweave_port::published_port_path(tmp.path());
+        let server = crate::http_read::spawn(
+            tmp.path().to_path_buf(),
+            db,
+            readers,
+            instance_id,
+            port_path.clone(),
+            &config,
+            None,
+        )
+        .expect("spawn HTTP read API")
+        .expect("enabled => Some(server)");
+        assert!(port_path.exists());
+
+        let (stdio, _unblock_tx) = stdin_blocked_stdio();
+        let signal_flag = AtomicUsize::new(0);
+        let outcome =
+            supervise_stdio_http_and_signals(stdio, Some(server), &signal_flag, &|| false);
+
+        assert!(
+            matches!(outcome, SupervisedOutcome::ParentGone),
+            "a dead parent must end supervision, got {outcome:?}"
+        );
+        assert!(
+            !port_path.exists(),
+            "the HTTP shutdown must release this instance's ephemeral.port marker"
         );
     }
 
@@ -1221,7 +1320,7 @@ mod tests {
         let stdio = StdioServe { result_rx, join };
 
         let signal_flag = AtomicUsize::new(0);
-        match supervise_stdio_http_and_signals(stdio, None, &signal_flag) {
+        match supervise_stdio_http_and_signals(stdio, None, &signal_flag, &|| true) {
             SupervisedOutcome::Stdio(result) => {
                 let err = result.expect_err("the stdio error must be preserved");
                 assert!(
@@ -1232,6 +1331,7 @@ mod tests {
             SupervisedOutcome::SignalExit(code) => {
                 panic!("no signal was set, but the supervisor reported SignalExit({code})")
             }
+            SupervisedOutcome::ParentGone => panic!("the parent probe said alive"),
         }
     }
 
