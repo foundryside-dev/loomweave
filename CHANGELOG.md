@@ -12,6 +12,10 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.6.0] — 2026-08-31
+
 ### Changed
 
 - **Git-sync hooks refresh on merge and branch switch, not on every commit.**
@@ -1703,7 +1707,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/foundryside-dev/loomweave/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/foundryside-dev/loomweave/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...v1.5.0
 [1.2.1]: https://github.com/foundryside-dev/loomweave/compare/v1.2.0...v1.2.1
