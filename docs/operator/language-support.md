@@ -17,10 +17,11 @@ produced an entity. The differences below are entirely in what the plugins
 |---|---|---|
 | Status | first-party, v1.0 | first-party, 1.x |
 | Source backend | `pyright` (type-resolved) | `syn` (parse-only, in-project symbol table) |
-| Ontology version | 0.12.0 | 0.9.0 |
+| Ontology version | 0.13.0 | 0.9.0 |
 | Wardline-aware | **yes** (`wardline:*` trust tags) | no |
 | **Entity kinds** | `function`, `class`, `module` | `module`, `struct`, `enum`, `trait`, `function`, `impl`, `type_alias`, `const`, `static`, `macro` |
 | **Structural edges** | `contains`, `calls`, `references`, `imports` | `contains`, `calls`, `references`, `imports` |
+| `calls` targets | functions **and classes** (instantiation `Name(...)` is a call to the class, ADR-059) | functions only (`Type::new()` resolves; tuple-struct `Type(..)` is an unresolved site) |
 | **Relation edges** | `inherits_from`, `decorates` | `implements`, `derives` |
 | Call/ref resolution tiers | `resolved` / `ambiguous` / `inferred` (pyright) | `resolved` (in-project only; external targets dropped) |
 | **Categorisation / reachability-root tags** | **yes** — see below | **yes** — see below (ADR-054) |

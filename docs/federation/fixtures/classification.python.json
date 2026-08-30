@@ -13,7 +13,7 @@
     "python_plugin": {
       "path": "<repo-root>/plugins/python/.venv/bin/loomweave-plugin-python",
       "version": "1.6.0",
-      "ontology_version": "0.12.0"
+      "ontology_version": "0.13.0"
     }
   },
   "normalization": [

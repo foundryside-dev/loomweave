@@ -357,7 +357,7 @@ _TYPE_PARAMETER_NODE_NAMES = frozenset({"ParamSpec", "TypeVar", "TypeVarTuple"})
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
 
 class LspTimeoutError(TimeoutError):
@@ -1147,7 +1147,7 @@ class PyrightSession:
                 edge["properties"] = {"candidates": candidate_ids}
             function_edges.append(edge)
 
-        return function_edges, set(grouped)
+        return function_edges, _resolved_call_site_keys(function, grouped)
 
     def _resolve_references_with_pyright(
         self,
@@ -2137,8 +2137,13 @@ class PyrightSession:
         if index.parse_status == "syntax_error":
             return None
         key = _range_start_key(raw_selection)
-        if key is not None and key in index.by_name_position:
-            return index.by_name_position[key].entity_id
+        # Functions AND classes: pyright reports ``Name(...)`` naming a class
+        # as an outgoing call whose target item IS the class (selection range
+        # on the class name) -- never its ``__init__`` -- so an instantiation
+        # is a ``calls`` edge to the class entity (clarion-e5224c3aff). The
+        # function-only index dropped every such target as unresolved.
+        if key is not None and key in index.entity_by_name_position:
+            return index.entity_by_name_position[key]
         return _containing_function_id(index, raw_selection)
 
     def _is_internal_project_path(self, path: Path) -> bool:
@@ -2565,6 +2570,44 @@ def _is_builtin_call_site(call_site: _CallSite, builtin_names: frozenset[str]) -
     rebinding, to a project entity -- only pyright can tell.
     """
     return call_site.callee_expr in builtin_names
+
+
+def _resolved_call_site_keys(
+    function: _FunctionInfo,
+    resolved_ranges: Iterable[tuple[int, int, int, int]],
+) -> set[tuple[int, int, int, int]]:
+    """The AST call-site keys the resolved ranges account for.
+
+    pyright anchors an outgoing call's ``fromRange`` on the callee's terminal
+    token (``helper`` in ``self.helper()``), while ``_CallSite`` spans the
+    whole callee expression (``self.helper``). Matching the two by equality
+    only ever succeeded for bare ``Name()`` calls, so every resolved attribute
+    call was also reported as an unresolved site -- breaking the partition
+    (resolved + unresolved + skipped builtins == AST call sites) the host and
+    ``entity_callers_list``'s ``traversal_complete`` depend on. A range
+    resolves the SMALLEST call site containing it: in ``Svc().helper()`` the
+    ``Svc`` token claims the inner site and ``helper`` the outer one.
+    """
+    sites_by_line: dict[int, list[_CallSite]] = {}
+    for site in function.call_sites:
+        for line in range(site.line, site.end_line + 1):
+            sites_by_line.setdefault(line, []).append(site)
+    resolved: set[tuple[int, int, int, int]] = set()
+    for start_line, start_character, end_line, end_character in resolved_ranges:
+        best: _CallSite | None = None
+        for site in sites_by_line.get(start_line, ()):
+            if (site.line, site.character) > (start_line, start_character):
+                continue
+            if (end_line, end_character) > (site.end_line, site.end_character):
+                continue
+            if best is None or (site.end_line - site.line, site.end_character - site.character) < (
+                best.end_line - best.line,
+                best.end_character - best.character,
+            ):
+                best = site
+        if best is not None:
+            resolved.add((best.line, best.character, best.end_line, best.end_character))
+    return resolved
 
 
 def _unresolved_call_site_total_for_function(
