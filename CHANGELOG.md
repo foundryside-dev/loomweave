@@ -12,7 +12,31 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **MCP argument errors name the accepted parameters.** An unknown argument
+  now fails with `unknown argument for entity_find: name (accepted: kind,
+  limit, pattern, …)` instead of just naming the rejected key. Transcript
+  forensics on a downstream project showed 43 % of `entity_find` calls failing
+  on `name` / `query` and burning a retry to learn the spelling.
+  (clarion-6ce847cfc3)
+- **The SessionStart hook no longer claims it started an analyze that the
+  advisory lock rejected.** The hook (and `hook git-sync`) now probes the
+  analyze lock first: when another analyze holds it the line says so — "another
+  `loomweave analyze` is already running (holds `<lock>`); nothing was started"
+  — and no child is forked just to lose the lock. A failed spawn prints nothing
+  rather than a success line. (clarion-f57c9e74a6)
+- **Bare builtin calls are no longer persisted as unresolved call sites.** The
+  Python plugin drops `len(...)`, `str(...)`, `isinstance(...)` and other calls
+  to unshadowed builtins before they reach `entity_unresolved_call_sites` — they
+  can never resolve to a project entity and were the bulk of the table (279k
+  rows on one project, `len` alone 10k). The same shadowing-aware oracle as the
+  references fast path is used, so an in-file `def len` or a star import keeps
+  the site. The drop is disclosed as
+  `unresolved_call_sites_skipped_builtin_total` in run stats and
+  `index_diff_get.plugin_stats`; `unresolved_call_sites_total` now counts only
+  sites that could have resolved, so it still equals the persisted list length.
+  (clarion-8a862d8f7e)
 
 ## [1.5.1] — 2026-08-30
 

@@ -338,6 +338,7 @@ fn plugin_stats_subset(stats: &Value) -> Value {
         "references_skipped_external_total": pick("references_skipped_external_total"),
         "references_skipped_cap_total": pick("references_skipped_cap_total"),
         "unresolved_call_sites_total": pick("unresolved_call_sites_total"),
+        "unresolved_call_sites_skipped_builtin_total": pick("unresolved_call_sites_skipped_builtin_total"),
         "unresolved_reference_sites_total": pick("unresolved_reference_sites_total"),
     })
 }

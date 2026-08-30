@@ -641,11 +641,13 @@ class PyrightSession:
         latency_started = time.perf_counter()
         coverage = FacetCoverage()
         try:
-            edges, unresolved, unresolved_sites, abort = self._resolve_with_pyright(
-                path,
-                index,
-                requested,
-                deadline,
+            edges, unresolved, skipped_builtin, unresolved_sites, abort = (
+                self._resolve_with_pyright(
+                    path,
+                    index,
+                    requested,
+                    deadline,
+                )
             )
         # These two arms remain reachable only from the ``didOpen`` notify
         # that precedes the per-function loop: nothing was visited yet, so
@@ -659,6 +661,7 @@ class PyrightSession:
             )
             edges = []
             unresolved = ast_call_sites_total
+            skipped_builtin = 0
             unresolved_sites = []
             coverage = FacetCoverage.degraded("pyright_timeout", transient=True)
         except (LspTransportClosedError, BrokenPipeError, OSError) as exc:
@@ -667,6 +670,7 @@ class PyrightSession:
             self._record_arrival_death(str(exc))
             edges = []
             unresolved = ast_call_sites_total
+            skipped_builtin = 0
             unresolved_sites = []
             coverage = FacetCoverage.degraded("pyright_restarting", transient=True, collateral=True)
         else:
@@ -692,6 +696,7 @@ class PyrightSession:
         return CallResolutionResult(
             edges=edges,
             unresolved_call_sites_total=unresolved,
+            unresolved_call_sites_skipped_builtin_total=skipped_builtin,
             unresolved_call_sites=unresolved_sites,
             pyright_query_latency_ms=[latency_ms],
             pyright_index_parse_latency_ms=self._pop_index_parse_latencies(),
@@ -881,7 +886,7 @@ class PyrightSession:
         index: _FunctionIndex,
         functions: Sequence[_FunctionInfo],
         deadline: float,
-    ) -> tuple[list[CallsRawEdge], int, list[UnresolvedCallSite], _CallPassAbort | None]:
+    ) -> tuple[list[CallsRawEdge], int, int, list[UnresolvedCallSite], _CallPassAbort | None]:
         uri = path.as_uri()
         self._notify(
             "textDocument/didOpen",
@@ -898,9 +903,17 @@ class PyrightSession:
         try:
             edges: list[CallsRawEdge] = []
             unresolved_total = 0
+            skipped_builtin_total = 0
             unresolved_sites: list[UnresolvedCallSite] = []
             abort: _CallPassAbort | None = None
             remaining_start = len(functions)
+            # A bare call to an unshadowed builtin (``len(x)``, ``str(v)``,
+            # ``isinstance(...)``) can never resolve to a project entity, so
+            # it is neither an unresolved site worth persisting nor evidence
+            # of a resolution gap. Same shadowing-aware oracle the references
+            # pass uses; a star import disables it for the file
+            # (clarion-8a862d8f7e).
+            builtin_names = frozenset(_reference_fast_path_names(index.tree))
             for position, function in enumerate(functions):
                 try:
                     function_edges, resolved_ranges = self._resolve_function_with_pyright(
@@ -918,12 +931,20 @@ class PyrightSession:
                     remaining_start = position
                     break
                 edges.extend(function_edges)
-                unresolved_total += _unresolved_call_site_total_for_function(
+                counted, skipped = _unresolved_call_site_total_for_function(
                     function,
                     resolved_ranges,
+                    builtin_names,
                 )
+                unresolved_total += counted
+                skipped_builtin_total += skipped
                 unresolved_sites.extend(
-                    _unresolved_call_sites_for_function(index, function, resolved_ranges),
+                    _unresolved_call_sites_for_function(
+                        index,
+                        function,
+                        resolved_ranges,
+                        builtin_names,
+                    ),
                 )
             if abort is not None:
                 # INVARIANT: this fallback is only correct because a function is
@@ -938,11 +959,17 @@ class PyrightSession:
                 # its sites unresolved); track "functions with edges appended"
                 # explicitly instead of relying on ``position`` if you add one.
                 for function in functions[remaining_start:]:
-                    unresolved_total += _unresolved_call_site_total_for_function(function, set())
-                    unresolved_sites.extend(
-                        _unresolved_call_sites_for_function(index, function, set()),
+                    counted, skipped = _unresolved_call_site_total_for_function(
+                        function,
+                        set(),
+                        builtin_names,
                     )
-            return edges, unresolved_total, unresolved_sites, abort
+                    unresolved_total += counted
+                    skipped_builtin_total += skipped
+                    unresolved_sites.extend(
+                        _unresolved_call_sites_for_function(index, function, set(), builtin_names),
+                    )
+            return edges, unresolved_total, skipped_builtin_total, unresolved_sites, abort
         finally:
             # The pipe may be the very thing that just failed: a notify over a
             # dead transport must not raise and discard the evidence above.
@@ -2385,27 +2412,50 @@ def _function_call_sites(
     return visitor.call_sites
 
 
+def _is_builtin_call_site(call_site: _CallSite, builtin_names: frozenset[str]) -> bool:
+    """A bare ``Name(...)`` call whose name is an unshadowed builtin in this file.
+
+    Attribute calls (``pytest.raises``) are deliberately NOT matched: they may
+    resolve to an external module (counted by the external skip) or, under a
+    rebinding, to a project entity -- only pyright can tell.
+    """
+    return call_site.callee_expr in builtin_names
+
+
 def _unresolved_call_site_total_for_function(
     function: _FunctionInfo,
     resolved_ranges: set[tuple[int, int, int, int]],
-) -> int:
-    return sum(
-        1
-        for call_site in function.call_sites
-        if (
+    builtin_names: frozenset[str] = frozenset(),
+) -> tuple[int, int]:
+    """``(unresolved, skipped_builtin)`` for one function's call sites.
+
+    The two are disjoint and, with the resolved sites, partition the AST call
+    sites; the host treats the unresolved-site LIST as authoritative only when
+    its length equals ``unresolved``, so a builtin skip must leave both.
+    """
+    unresolved = 0
+    skipped_builtin = 0
+    for call_site in function.call_sites:
+        range_key = (
             call_site.line,
             call_site.character,
             call_site.end_line,
             call_site.end_character,
         )
-        not in resolved_ranges
-    )
+        if range_key in resolved_ranges:
+            continue
+        if _is_builtin_call_site(call_site, builtin_names):
+            skipped_builtin += 1
+            continue
+        unresolved += 1
+    return unresolved, skipped_builtin
 
 
 def _unresolved_call_sites_for_function(
     index: _FunctionIndex,
     function: _FunctionInfo,
     resolved_ranges: set[tuple[int, int, int, int]],
+    builtin_names: frozenset[str] = frozenset(),
 ) -> list[UnresolvedCallSite]:
     unresolved: list[UnresolvedCallSite] = []
     for site_ordinal, call_site in enumerate(function.call_sites):
@@ -2416,6 +2466,8 @@ def _unresolved_call_sites_for_function(
             call_site.end_character,
         )
         if range_key in resolved_ranges:
+            continue
+        if _is_builtin_call_site(call_site, builtin_names):
             continue
         if len(call_site.callee_expr.encode("utf-8")) > MAX_UNRESOLVED_CALLEE_EXPR_BYTES:
             continue

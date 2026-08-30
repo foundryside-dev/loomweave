@@ -641,6 +641,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             "dropped_edges_total": 0,
             "ambiguous_edges_total": 0,
             "unresolved_call_sites_total": 0,
+            "unresolved_call_sites_skipped_builtin_total": 0,
             "reference_sites_total": 0,
             "references_resolved_total": 0,
             "references_skipped_external_total": 0,
@@ -983,6 +984,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
     let mut total_entity_count: u64 = 0;
     let mut total_edge_count: u64 = 0;
     let mut unresolved_call_sites_total: u64 = 0;
+    let mut unresolved_call_sites_skipped_builtin_total: u64 = 0;
     let mut reference_sites_total: u64 = 0;
     let mut references_resolved_total: u64 = 0;
     let mut references_skipped_external_total: u64 = 0;
@@ -1443,6 +1445,8 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             match message {
                 PluginBatchMessage::File(mut batch) => {
                     unresolved_call_sites_total += batch.stats.unresolved_call_sites_total;
+                    unresolved_call_sites_skipped_builtin_total +=
+                        batch.stats.unresolved_call_sites_skipped_builtin_total;
                     reference_sites_total += batch.stats.reference_sites_total;
                     references_resolved_total += batch.stats.references_resolved_total;
                     references_skipped_external_total +=
@@ -1978,6 +1982,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "dropped_edges_total": dropped_edges_total,
                 "ambiguous_edges_total": ambiguous_edges_total,
                 "unresolved_call_sites_total": unresolved_call_sites_total,
+                "unresolved_call_sites_skipped_builtin_total": unresolved_call_sites_skipped_builtin_total,
                 "reference_sites_total": reference_sites_total,
                 "references_resolved_total": references_resolved_total,
                 "references_skipped_external_total": references_skipped_external_total,
@@ -2411,6 +2416,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                 "dropped_edges_total": dropped_edges_total,
                 "ambiguous_edges_total": ambiguous_edges_total,
                 "unresolved_call_sites_total": unresolved_call_sites_total,
+                "unresolved_call_sites_skipped_builtin_total": unresolved_call_sites_skipped_builtin_total,
                 "reference_sites_total": reference_sites_total,
                 "references_resolved_total": references_resolved_total,
                 "references_skipped_external_total": references_skipped_external_total,
@@ -6051,6 +6057,7 @@ fn drop_unready_plugin_edges(pending_edges: &mut Vec<DescribedEdgeRecord>) -> u6
 #[derive(Debug, Default)]
 struct BatchStats {
     unresolved_call_sites_total: u64,
+    unresolved_call_sites_skipped_builtin_total: u64,
     reference_sites_total: u64,
     references_resolved_total: u64,
     references_skipped_external_total: u64,
@@ -6391,6 +6398,8 @@ fn run_plugin_blocking(
             progress.file_completed();
             let mut file_stats = BatchStats {
                 unresolved_call_sites_total: stats.unresolved_call_sites_total,
+                unresolved_call_sites_skipped_builtin_total: stats
+                    .unresolved_call_sites_skipped_builtin_total,
                 reference_sites_total: stats.reference_sites_total,
                 references_resolved_total: stats.references_resolved_total,
                 references_skipped_external_total: stats.references_skipped_external_total,

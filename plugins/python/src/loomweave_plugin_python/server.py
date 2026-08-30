@@ -212,6 +212,7 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
     """Read the requested file, extract entities + edges, return AnalyzeFileResult shape."""
     empty_stats = {
         "unresolved_call_sites_total": 0,
+        "unresolved_call_sites_skipped_builtin_total": 0,
         "unresolved_call_sites": [],
         "reference_sites_total": 0,
         "references_resolved_total": 0,
@@ -258,6 +259,9 @@ def handle_analyze_file(params: dict[str, Any], state: ServerState) -> dict[str,
         state.pyright_files_since_restart = 0
     stats = {
         "unresolved_call_sites_total": result.stats.unresolved_call_sites_total,
+        "unresolved_call_sites_skipped_builtin_total": (
+            result.stats.unresolved_call_sites_skipped_builtin_total
+        ),
         "unresolved_call_sites": result.stats.unresolved_call_sites,
         "reference_sites_total": result.stats.reference_sites_total,
         "references_resolved_total": result.stats.references_resolved_total,
