@@ -25,7 +25,7 @@ from loomweave_plugin_python.pyright_session import (
     PyrightSession,
 )
 from loomweave_plugin_python.reference_resolver import ReferenceResolutionResult, ReferenceSite
-from tests.test_pyright_session import ScriptedCallSession
+from tests.test_pyright_session import _PINNED_TEST_INTERPRETER, ScriptedCallSession
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -591,14 +591,15 @@ def test_analyze_file_hands_back_partial_call_edges_alongside_degraded_coverage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """clarion-7f527d3d32: a mid-file pyright timeout keeps the edges already resolved.
+    """clarion-7f527d3d32 + clarion-bf3986e301: a mid-file pyright timeout
+    keeps the edges already resolved -- and no longer degrades the facet.
 
     Drives the real ``PyrightSession`` calls pass (only the LSP transport is
     scripted) through ``handle_analyze_file`` so the wire result the host
     persists is what is asserted: the first function's ``calls`` edge is in
-    ``edges`` next to a degraded/transient ``calls`` claim, and the second
-    function's site is the one counted unresolved. Before the fix the
-    ``except LspTimeoutError`` arm in ``resolve_calls`` zeroed ``edges``.
+    ``edges``, the timed-out function is skipped with its site counted
+    unresolved, and the pass COMPLETES (skip-and-continue) instead of
+    claiming ``pyright_timeout`` and being re-dispatched every run.
     """
     demo = tmp_path / "demo.py"
     demo.write_text(
@@ -616,7 +617,10 @@ def test_analyze_file_hands_back_partial_call_edges_alongside_degraded_coverage(
             module=demo,
             callee_by_caller=dict.fromkeys(functions, callee),
             fail_on="python:function:demo.second",
-            **kwargs,
+            # The server passes its own (discovered, here unpinned) interpreter;
+            # pin it so the completing pass is asserted as ``complete`` rather
+            # than demoted to ``interpreter_unpinned`` by the honesty gate.
+            **{**kwargs, "interpreter": _PINNED_TEST_INTERPRETER},
         )
 
     monkeypatch.setattr(server_module, "PyrightSession", scripted_session, raising=False)
@@ -630,9 +634,8 @@ def test_analyze_file_hands_back_partial_call_edges_alongside_degraded_coverage(
     ]
     stats = response["stats"]
     assert stats["resolution_coverage"]["calls"] == {
-        "status": "degraded",
-        "reason": "pyright_timeout",
-        "transient": True,
+        "status": "complete",
+        "transient": False,
         "collateral": False,
     }
     # Arithmetic closure on the wire: one site resolved, one unresolved.

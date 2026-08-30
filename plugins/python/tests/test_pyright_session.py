@@ -39,7 +39,9 @@ from loomweave_plugin_python.pyright_session import (
     MAX_CONSECUTIVE_TIMEOUT_FILES,
     MAX_PYRIGHT_RESTARTS_PER_RUN,
     PYRIGHT_CALL_TIMEOUT_SECS,
+    PYRIGHT_FILE_TIMEOUT_BASE_SECS,
     PYRIGHT_FILE_TIMEOUT_CAP_SECS,
+    PYRIGHT_FILE_TIMEOUT_PER_LINE_SECS,
     PYRIGHT_SHUTDOWN_TIMEOUT_SECS,
     LspTimeoutError,
     LspTransportClosedError,
@@ -2048,6 +2050,7 @@ class BudgetProbeSession(PyrightSession):
             call_timeout_secs=10.0,
             file_timeout_base_secs=0.01,
             file_timeout_per_function_secs=0.0,
+            file_timeout_per_line_secs=0.0,
         )
         self.request_timeouts: list[float] = []
 
@@ -2269,13 +2272,13 @@ def test_pyright_session_file_deadline_scales_with_function_count(tmp_path: Path
     path = tmp_path / "demo.py"
 
     before = time.monotonic()
-    deadline = session._deadline_for_file(path, n_functions=6)  # noqa: SLF001
+    deadline = session._deadline_for_file(path, n_functions=6, n_lines=0)  # noqa: SLF001
     after = time.monotonic()
 
     assert before + 5.0 <= deadline <= after + 5.0
     # The deadline is memoised per file: the references pass re-asks with the
     # same path and must share the calls pass's budget, not restart it.
-    assert session._deadline_for_file(path, n_functions=1000) == deadline  # noqa: SLF001
+    assert session._deadline_for_file(path, n_functions=1000, n_lines=0) == deadline  # noqa: SLF001
 
 
 def test_default_call_timeout_admits_a_large_file_warm_up_query() -> None:
@@ -2295,7 +2298,7 @@ def test_budgeted_timeout_grants_the_call_timeout_when_the_file_budget_is_larger
     session = PyrightSession(tmp_path, executable=sys.executable)
     path = tmp_path / "big.py"
     # 290 functions → base 10 + 0.25*290 = 82.5 s file budget (< 90 s cap).
-    deadline = session._deadline_for_file(path, n_functions=290)  # noqa: SLF001
+    deadline = session._deadline_for_file(path, n_functions=290, n_lines=0)  # noqa: SLF001
     grant = session._budgeted_timeout(deadline)  # noqa: SLF001
     assert 30.0 - 0.5 <= grant <= 30.0
     # ...and never more than what is left of the file budget.
@@ -2353,10 +2356,29 @@ def test_pyright_session_file_deadline_is_capped_for_very_large_files(tmp_path: 
     )
 
     before = time.monotonic()
-    deadline = session._deadline_for_file(tmp_path / "demo.py", n_functions=1000)  # noqa: SLF001
+    deadline = session._deadline_for_file(tmp_path / "demo.py", n_functions=1000, n_lines=0)  # noqa: SLF001
     after = time.monotonic()
 
     assert before + 10.0 <= deadline <= after + 10.0
+
+
+def test_pyright_session_file_budget_scales_with_lines_for_def_sparse_files(
+    tmp_path: Path,
+) -> None:
+    # clarion-bf3986e301: elspeth's tool_batch.py (2,354 lines, 17 defs) got
+    # base + 17 * 0.25 ~= 14 s under the per-function-only budget. The line
+    # term buys a def-sparse monster the time its code volume demands; the
+    # per-function term still governs the common many-small-defs shape, and
+    # the cap still bounds both.
+    session = PyrightSession(tmp_path, executable=sys.executable)
+
+    sparse = session._file_timeout_for(17, 2354)  # noqa: SLF001
+    assert sparse == pytest.approx(
+        PYRIGHT_FILE_TIMEOUT_BASE_SECS + 2354 * PYRIGHT_FILE_TIMEOUT_PER_LINE_SECS
+    )
+    dense = session._file_timeout_for(200, 400)  # noqa: SLF001
+    assert dense == pytest.approx(PYRIGHT_FILE_TIMEOUT_BASE_SECS + 200 * 0.25)
+    assert session._file_timeout_for(17, 100_000) == PYRIGHT_FILE_TIMEOUT_CAP_SECS  # noqa: SLF001
 
 
 def test_pyright_session_default_file_timeout_cap_stays_under_the_host_watchdog() -> None:
@@ -2420,6 +2442,7 @@ class ScriptedCallSession(PyrightSession):
         self.budget_expired = False
         self.visited: list[str] = []
         self.closed_documents = 0
+        self.cancel_requests = 0
 
     def _ensure_process(self) -> bool:
         return True
@@ -2436,6 +2459,8 @@ class ScriptedCallSession(PyrightSession):
             return
         if method == "textDocument/didClose":
             self.closed_documents += 1
+        if method == "$/cancelRequest":
+            self.cancel_requests += 1
 
     def _file_budget_expired(self, deadline: float) -> bool:
         return self.budget_expired or super()._file_budget_expired(deadline)
@@ -2451,6 +2476,10 @@ class ScriptedCallSession(PyrightSession):
         if not self.fake_spawn and method in ("initialize", "shutdown"):
             # A real spawn needs the real handshake over the real transport.
             return super()._request(method, params, timeout_secs)
+        # Mirror the real ``_request``'s in-flight bookkeeping so the skip
+        # path's ``$/cancelRequest`` is observable through the fake.
+        self._request_id_in_flight = self._next_id
+        self._next_id += 1
         index = self._function_index_for_path(self.module)
         if method == "textDocument/prepareCallHierarchy":
             position = cast("dict[str, int]", params["position"])
@@ -2524,9 +2553,43 @@ def _assert_partial_call_evidence(
     assert session.closed_documents == 1
 
 
-def test_pyright_session_call_resolution_timeout_before_any_function_is_visited_is_fully_unresolved(
+def _assert_skipped_function_call_evidence(
+    session: ScriptedCallSession,
+    module: Path,
+    result: CallResolutionResult | dict[str, object],
+    *,
+    resolved: str,
+    skipped: str,
+) -> None:
+    """Skip-and-continue closure (clarion-bf3986e301): one function's per-query
+    timeout costs ONLY that function; the pass completes with its sites
+    disclosed as unresolved and the abandoned computation cancelled."""
+    assert isinstance(result, CallResolutionResult)
+    total = _ast_call_sites_total(session, module, _TWO_CALLERS)
+    # Arithmetic closure is the load-bearing check: it catches a double-count
+    # (edges kept AND the same sites counted unresolved) that "the resolved
+    # function's edge is present" cannot.
+    assert len(result.edges) + result.unresolved_call_sites_total == total
+    assert [edge["from_id"] for edge in result.edges] == [resolved]
+    assert result.edges[0]["to_id"] == "python:function:demo.callee"
+    assert [site["caller_entity_id"] for site in result.unresolved_call_sites] == [skipped]
+    assert not result.coverage.is_degraded
+    assert session.cancel_requests == 1
+    assert session.closed_documents == 1
+    findings = [
+        finding
+        for finding in result.findings
+        if finding["subcode"] == FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT
+    ]
+    assert [finding["metadata"]["function"] for finding in findings] == [skipped]
+    assert all(finding["metadata"]["skipped_function"] is True for finding in findings)
+
+
+def test_pyright_session_timeout_on_the_first_function_skips_it_and_resolves_the_rest(
     tmp_path: Path,
 ) -> None:
+    # Pre-clarion-bf3986e301 this was the worst case: a timeout on the FIRST
+    # function forfeited the whole file. Now it costs only that function.
     module = _write_module(tmp_path, _TWO_CALLER_MODULE)
 
     with ScriptedCallSession(
@@ -2534,19 +2597,21 @@ def test_pyright_session_call_resolution_timeout_before_any_function_is_visited_
         module=module,
         callee_by_caller=_CALLEE_BY_CALLER,
         fail_on="python:function:demo.first",
+        interpreter=_PINNED_TEST_INTERPRETER,
     ) as session:
         result = session.resolve_calls(module, _TWO_CALLERS)
 
-    assert result.edges == []
-    assert result.unresolved_call_sites_total == _ast_call_sites_total(
-        session, module, _TWO_CALLERS
+    _assert_skipped_function_call_evidence(
+        session,
+        module,
+        result,
+        resolved="python:function:demo.second",
+        skipped="python:function:demo.first",
     )
-    assert {site["caller_entity_id"] for site in result.unresolved_call_sites} == set(_TWO_CALLERS)
-    assert result.coverage == FacetCoverage.degraded("pyright_timeout", transient=True)
-    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+    assert session.visited == _TWO_CALLERS
 
 
-def test_pyright_session_call_resolution_timeout_keeps_edges_resolved_before_the_timeout(
+def test_pyright_session_call_resolution_timeout_skips_the_function_and_keeps_the_rest(
     tmp_path: Path,
 ) -> None:
     module = _write_module(tmp_path, _TWO_CALLER_MODULE)
@@ -2556,12 +2621,44 @@ def test_pyright_session_call_resolution_timeout_keeps_edges_resolved_before_the
         module=module,
         callee_by_caller=_CALLEE_BY_CALLER,
         fail_on="python:function:demo.second",
+        interpreter=_PINNED_TEST_INTERPRETER,
     ) as session:
         result = session.resolve_calls(module, _TWO_CALLERS)
 
-    _assert_partial_call_evidence(session, module, result, reason="pyright_timeout")
+    _assert_skipped_function_call_evidence(
+        session,
+        module,
+        result,
+        resolved="python:function:demo.first",
+        skipped="python:function:demo.second",
+    )
     assert session.visited == _TWO_CALLERS
-    assert FINDING_PYRIGHT_CALL_RESOLUTION_TIMEOUT in _finding_codes(result.findings)
+
+
+def test_pyright_session_all_functions_timing_out_stays_degraded_for_the_wedge_breaker(
+    tmp_path: Path,
+) -> None:
+    # A pass where EVERY function timed out resolved nothing: claiming
+    # ``complete`` would lie AND reset the consecutive-timeout streak the
+    # ADR-057 wedge breaker keys on. It stays ``pyright_timeout``.
+    source = "def callee():\n    pass\n\ndef only():\n    callee()\n"
+    module = _write_module(tmp_path, source)
+    run_state = PyrightRunState()
+
+    with ScriptedCallSession(
+        tmp_path,
+        module=module,
+        callee_by_caller={"python:function:demo.only": "python:function:demo.callee"},
+        fail_on="python:function:demo.only",
+        run_state=run_state,
+        interpreter=_PINNED_TEST_INTERPRETER,
+    ) as session:
+        result = session.resolve_calls(module, ["python:function:demo.only"])
+
+    assert result.edges == []
+    assert result.coverage == FacetCoverage.degraded("pyright_timeout", transient=True)
+    assert run_state.consecutive_timeout_files == 1
+    assert session.cancel_requests == 1
 
 
 def test_pyright_session_call_resolution_timeout_mid_function_item_loop_keeps_arithmetic_closure(
@@ -2577,14 +2674,22 @@ def test_pyright_session_call_resolution_timeout_mid_function_item_loop_keeps_ar
         fail_at="callHierarchy/outgoingCalls",
         items_per_function=2,
         fail_on_item=1,
+        interpreter=_PINNED_TEST_INTERPRETER,
     ) as session:
         result = session.resolve_calls(module, _TWO_CALLERS)
 
     # ``second``'s first call-hierarchy item resolved a genuine candidate before
     # its second item timed out. A function's edges are appended only after its
     # whole item sub-loop finishes, so that partial per-item state must be
-    # discarded (counted unresolved), never kept AND counted.
-    _assert_partial_call_evidence(session, module, result, reason="pyright_timeout")
+    # discarded (counted unresolved), never kept AND counted -- the skip only
+    # changes what happens NEXT (continue, not abort).
+    _assert_skipped_function_call_evidence(
+        session,
+        module,
+        result,
+        resolved="python:function:demo.first",
+        skipped="python:function:demo.second",
+    )
 
 
 def test_pyright_session_call_resolution_file_budget_expiry_keeps_edges_resolved_before_it(
@@ -2636,7 +2741,14 @@ def test_pyright_session_call_resolution_transport_failure_keeps_edges_resolved_
     assert run_state.file_attributed_restart_count == 1
     assert run_state.restart_count == 0
     assert session.spawns == 1
-    assert FINDING_PYRIGHT_RESTART in _finding_codes(result.findings)
+    restart_findings = [
+        finding for finding in result.findings if finding["subcode"] == FINDING_PYRIGHT_RESTART
+    ]
+    assert restart_findings
+    # clarion-bf3986e301 direction 3: the restart finding carries the dead
+    # process's stderr tail so the next crash class is attributable without
+    # a manual probe. (Empty here -- the fake has no stderr -- but present.)
+    assert all("stderr_tail" in finding["metadata"] for finding in restart_findings)
 
 
 class PartialReferenceTransportFailureSession(PartialReferenceTimeoutSession):
@@ -2991,7 +3103,7 @@ def test_pyright_session_transient_spawn_failure_is_collateral(
     )
 
 
-def test_pyright_session_pure_timeout_is_self_inflicted_and_does_not_restart(
+def test_pyright_session_pure_timeout_skips_the_function_and_does_not_restart(
     tmp_path: Path,
 ) -> None:
     module = _write_module(tmp_path, _TWO_CALLER_MODULE)
@@ -3006,17 +3118,20 @@ def test_pyright_session_pure_timeout_is_self_inflicted_and_does_not_restart(
     ) as session:
         result = session.resolve_calls(module, _TWO_CALLERS)
 
-    assert result.coverage == FacetCoverage.degraded(
-        "pyright_timeout", transient=True, collateral=False
-    )
     # A timeout means pyright is alive but slow: restarting would throw away
-    # its warm cache for nothing (ADR-057 deviation from the ticket text).
-    # Only a STREAK of ``MAX_CONSECUTIVE_TIMEOUT_FILES`` timed-out files is
-    # read as a wedged process -- see the breaker tests below.
+    # its warm cache for nothing (ADR-057 deviation from the ticket text) --
+    # and since clarion-bf3986e301 a per-query timeout also does not abort:
+    # the one slow function is skipped (its computation cancelled) and the
+    # pass completes, so the file is not re-dispatched every run for it.
+    assert not result.coverage.is_degraded or result.coverage.reason == "interpreter_unpinned"
+    assert result.unresolved_call_sites_total >= 1
     assert run_state.restart_count == 0
     assert run_state.file_attributed_restart_count == 0
-    assert run_state.consecutive_timeout_files == 1
+    # A pass that completes (some functions genuinely answered) resets the
+    # wedge streak; only an all-functions-timeout file feeds it.
+    assert run_state.consecutive_timeout_files == 0
     assert session.spawns == 0
+    assert session.cancel_requests == 1
 
 
 def test_pyright_session_unrelated_read_error_in_flight_is_not_a_restart(
@@ -3173,6 +3288,7 @@ def test_pyright_session_restart_extends_shared_file_deadline_without_cross_face
         spawn_latency_secs=3.0,
         file_timeout_base_secs=10.0,
         file_timeout_per_function_secs=0.0,
+        file_timeout_per_line_secs=0.0,
         run_state=run_state,
     ) as session:
         anchor = session.clock
