@@ -177,13 +177,16 @@ fn main() -> Result<()> {
 ///
 /// Most operator commands want `.env` loaded (e.g. a `.env`-supplied `RUST_LOG`,
 /// or a Filigree `token_env` consumed by `guidance promote` / `sarif import`).
-/// Two cases must NOT load it, because they would import repository-controlled
+/// Three cases must NOT load it, because they would import repository-controlled
 /// values into a subprocess environment before those values have been vetted:
 ///
 /// - `analyze` (and `worktree analyze`, which runs the identical pipeline):
 ///   project `.env` contents are scanned as source sidecars by the
 ///   pre-ingest secret scanner and must not reach plugin subprocess
 ///   environments before that gate runs.
+/// - `hook`: a stale index starts a detached `analyze`, so loading `.env` in the
+///   hook would bypass the direct `analyze` exclusion by passing those values to
+///   the child in its inherited environment.
 /// - `guidance create` / `guidance edit`: authoring spawns `$VISUAL`/`$EDITOR`
 ///   (see `guidance::edit_in_editor`), so a repository `.env` supplying
 ///   `VISUAL`/`EDITOR` — or `PATH`, etc. — would execute attacker-controlled
@@ -198,6 +201,7 @@ fn should_load_dotenv(command: &cli::Command) -> bool {
             | cli::Command::Worktree {
                 command: cli::WorktreeCommand::Analyze { .. },
             }
+            | cli::Command::Hook { .. }
             | cli::Command::Guidance {
                 command: cli::GuidanceCommand::Create { .. } | cli::GuidanceCommand::Edit { .. },
             }
@@ -238,6 +242,19 @@ mod tests {
             "analyze",
             "--",
             "some-worktree"
+        ]));
+    }
+
+    #[test]
+    fn session_start_hook_does_not_load_dotenv() {
+        // A stale session-start hook spawns analyze; repo values must not be
+        // inherited by that child before analyze's secret scan runs.
+        assert!(!loads(&[
+            "loomweave",
+            "hook",
+            "session-start",
+            "--path",
+            ".",
         ]));
     }
 
