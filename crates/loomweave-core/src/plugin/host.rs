@@ -1600,11 +1600,11 @@ ontology_version = "0.1.0"
         std::fs::set_permissions(&venv, std::fs::Permissions::from_mode(0o755)).unwrap();
         let empty = |_: &str| -> Option<OsString> { None };
 
-        // A pyright plugin is handed the project's own `.venv` interpreter.
+        // Repository-local interpreters are untrusted and are not exported.
         assert_eq!(
             exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &empty),
-            Some(venv.clone()),
-            "a language-server plugin must be pinned to the project interpreter"
+            None,
+            "a language-server plugin must not execute a repository interpreter"
         );
         // A plugin that does not declare the pyright runtime never triggers
         // discovery: the variable means nothing to it, and exporting it would
@@ -1625,18 +1625,14 @@ ontology_version = "0.1.0"
             None,
             "an operator override must survive untouched"
         );
-        // ...but an EMPTY value is not an override. Both discoveries treat
-        // `""` as unset on the override rung (`if override:` in Python,
-        // `.filter(|v| !v.is_empty())` in Rust), so a bare `is_some()` guard
-        // here would suppress the export for a variable the plugin then also
-        // ignores — leaving the child with no interpreter at all, which is the
-        // launcher-dependent hole this export exists to close.
+        // An EMPTY value is not an override, and does not make repository
+        // interpreter discovery safe.
         let empty_override =
             |key: &str| -> Option<OsString> { (key == PYTHON_INTERPRETER_ENV).then(OsString::new) };
         assert_eq!(
             exported_interpreter(&pyright_small_rss_manifest(), dir.path(), &empty_override),
-            Some(venv.clone()),
-            "an empty override is unset: the host still exports its own pinned choice"
+            None,
+            "an empty override must not permit a repository interpreter"
         );
         // An UNPINNED (bare `PATH`) choice is not exported: presenting a guess
         // to the plugin as an authoritative pin buys nothing over its own

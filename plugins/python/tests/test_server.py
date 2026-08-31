@@ -931,7 +931,7 @@ def test_analyze_file_stats_carry_cumulative_pyright_restart_counters(
     assert stats["pyright_init_latency_total_ms"] == 4321
 
 
-def test_initialize_discovers_and_advertises_the_project_interpreter(
+def test_initialize_does_not_advertise_a_repository_interpreter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_python = tmp_path / ".venv" / "bin" / "python"
@@ -939,6 +939,9 @@ def test_initialize_discovers_and_advertises_the_project_interpreter(
     fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     fake_python.chmod(0o755)
     monkeypatch.delenv("LOOMWEAVE_PYTHON_INTERPRETER", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+    monkeypatch.setenv("PATH", "")
     state = server_module.ServerState()
 
     response = server_module.handle_initialize(
@@ -946,12 +949,12 @@ def test_initialize_discovers_and_advertises_the_project_interpreter(
     )
 
     assert response["capabilities"]["python_interpreter"] == {
-        "path": str(fake_python.resolve()),
-        "source": "dotvenv",
-        "pinned": True,
+        "path": None,
+        "source": "none",
+        "pinned": False,
     }
     assert state.interpreter is not None
-    assert state.interpreter.pinned
+    assert not state.interpreter.pinned
 
 
 def test_analyze_file_hands_the_discovered_interpreter_to_pyright(

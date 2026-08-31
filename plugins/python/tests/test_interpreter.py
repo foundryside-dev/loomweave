@@ -25,18 +25,18 @@ def _make_python(path: Path) -> Path:
     return path
 
 
-def test_dotvenv_wins_over_virtual_env_and_path(tmp_path: Path) -> None:
-    dotvenv = _make_python(tmp_path / ".venv" / "bin" / "python")
-    other = _make_python(tmp_path / "elsewhere" / "bin" / "python")
-    environ = {"VIRTUAL_ENV": str(other.parent.parent), "PATH": str(other.parent)}
+def test_repository_dotvenv_is_ignored(tmp_path: Path) -> None:
+    _make_python(tmp_path / ".venv" / "bin" / "python")
+    trusted = _make_python(tmp_path / "elsewhere" / "bin" / "python")
 
-    found = discover_project_interpreter(tmp_path, environ)
+    found = discover_project_interpreter(
+        tmp_path, {"VIRTUAL_ENV": str(trusted.parent.parent)}
+    )
 
-    assert found == ProjectInterpreter(path=str(dotvenv), source="dotvenv")
+    assert found == ProjectInterpreter(path=str(trusted), source="virtual_env")
     assert found.pinned
 
-
-def test_override_env_wins_over_dotvenv(tmp_path: Path) -> None:
+def test_override_env_wins_over_other_sources(tmp_path: Path) -> None:
     _make_python(tmp_path / ".venv" / "bin" / "python")
     override = _make_python(tmp_path / "custom" / "python")
 
@@ -50,13 +50,12 @@ def test_override_env_wins_over_dotvenv(tmp_path: Path) -> None:
 def test_unusable_override_is_ignored_and_discovery_continues(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    dotvenv = _make_python(tmp_path / ".venv" / "bin" / "python")
     missing = tmp_path / "nope" / "python"
 
     found = discover_project_interpreter(tmp_path, {INTERPRETER_OVERRIDE_ENV: str(missing)})
 
-    assert found.source == "dotvenv"
-    assert found.path == str(dotvenv)
+    assert found.source == "none"
+    assert found.path is None
     assert INTERPRETER_OVERRIDE_ENV in capsys.readouterr().err
 
 
@@ -97,7 +96,7 @@ def test_nothing_found_is_none_and_unpinned(tmp_path: Path) -> None:
     assert not found.pinned
 
 
-def test_non_executable_dotvenv_python_is_not_a_hit(tmp_path: Path) -> None:
+def test_non_executable_dotvenv_python_is_ignored(tmp_path: Path) -> None:
     target = tmp_path / ".venv" / "bin" / "python"
     target.parent.mkdir(parents=True)
     target.write_text("", encoding="utf-8")
@@ -110,11 +109,11 @@ def test_non_executable_dotvenv_python_is_not_a_hit(tmp_path: Path) -> None:
 
 
 def test_environ_defaults_to_os_environ(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    dotvenv = _make_python(tmp_path / ".venv" / "bin" / "python")
+    venv = _make_python(tmp_path / "trusted" / "bin" / "python")
     monkeypatch.delenv(INTERPRETER_OVERRIDE_ENV, raising=False)
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv.parent.parent))
 
-    assert discover_project_interpreter(tmp_path).path == str(dotvenv)
-
+    assert discover_project_interpreter(tmp_path).path == str(venv)
 
 def test_empty_environ_does_not_leak_to_os_environ(tmp_path: Path) -> None:
     # With an empty environ (no PATH), even if os.environ has a python on PATH,
@@ -125,20 +124,15 @@ def test_empty_environ_does_not_leak_to_os_environ(tmp_path: Path) -> None:
     assert not found.pinned
 
 
-def test_symlink_paths_are_preserved(tmp_path: Path) -> None:
-    # Create a real interpreter at base/python3.12 and symlink .venv/bin/python to it.
+def test_repository_dotvenv_symlink_is_ignored(tmp_path: Path) -> None:
     base_python = _make_python(tmp_path / "base" / "python3.12")
-    venv_bin = tmp_path / ".venv" / "bin"
-    venv_bin.mkdir(parents=True)
-    symlink_python = venv_bin / "python"
+    symlink_python = tmp_path / ".venv" / "bin" / "python"
+    symlink_python.parent.mkdir(parents=True)
     symlink_python.symlink_to(base_python)
 
-    found = discover_project_interpreter(tmp_path, {})
-
-    # The result should be the symlink path, not the target.
-    assert found.path == str(symlink_python)
-    assert found.source == "dotvenv"
-
+    assert discover_project_interpreter(tmp_path, {}) == ProjectInterpreter(
+        path=None, source="none"
+    )
 
 def test_path_with_python_and_python3_in_different_dirs(tmp_path: Path) -> None:
     # Create python3 in dirA and python in dirB; PATH is dirA:dirB.

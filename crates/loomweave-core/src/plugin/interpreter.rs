@@ -37,8 +37,6 @@ pub const PYTHON_INTERPRETER_ENV: &str = "LOOMWEAVE_PYTHON_INTERPRETER";
 pub enum InterpreterSource {
     /// [`PYTHON_INTERPRETER_ENV`] named an executable file.
     Override,
-    /// `<project_root>/.venv/bin/python` — the project's own virtualenv.
-    DotVenv,
     /// `$VIRTUAL_ENV/bin/python` — an activated virtualenv.
     VirtualEnv,
     /// `$CONDA_PREFIX/bin/python` — an activated conda environment.
@@ -60,7 +58,7 @@ pub struct ProjectInterpreter {
 }
 
 impl ProjectInterpreter {
-    /// Project-owned (override / `.venv` / `VIRTUAL_ENV` / `CONDA_PREFIX`).
+    /// Explicitly selected (override / `VIRTUAL_ENV` / `CONDA_PREFIX`).
     #[must_use]
     pub fn pinned(&self) -> bool {
         !matches!(
@@ -72,7 +70,7 @@ impl ProjectInterpreter {
     /// Stable string for `plugin_index_meta.resolver_environment`.
     ///
     /// An unpinned choice is tagged so it can never compare equal to a pinned
-    /// path with the same bytes: acquiring a project venv at a location that
+    /// path with the same bytes: activating an environment whose interpreter
     /// happened to be first on `PATH` still moves the marker.
     #[must_use]
     pub fn fingerprint(&self) -> String {
@@ -184,17 +182,13 @@ fn which(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
 /// Resolve the project's interpreter in the contract order (module docs).
 /// `env` abstracts `std::env::var_os` so tests can inject an environment.
 ///
-/// `project_root` MUST be canonicalised by the caller. Discovery joins
-/// `.venv/bin/python` onto the root as given and normalises only lexically, so
-/// a symlinked root yields a symlinked interpreter path and a different
-/// [`ProjectInterpreter::fingerprint`]. `analyze` (which records the
-/// fingerprint) and `PluginHost::spawn_unhandshaken` (which exports the
-/// interpreter) both canonicalise first; dropping it at either site would skew
-/// the marker against the exported interpreter and re-dispatch every run. See
-/// `the_root_canonicalisation_at_both_call_sites_is_load_bearing`.
+/// `project_root` remains part of the cross-language API but is deliberately
+/// not inspected for interpreters. Pyright executes its configured Python, so
+/// selecting `<project_root>/.venv/bin/python` would execute untrusted
+/// repository content without an operator trust decision.
 #[must_use]
 pub fn discover_project_interpreter(
-    project_root: &Path,
+    _project_root: &Path,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> ProjectInterpreter {
     if let Some(raw) = env(PYTHON_INTERPRETER_ENV).filter(|value| !value.is_empty()) {
@@ -208,12 +202,6 @@ pub fn discover_project_interpreter(
             override_path = %raw.to_string_lossy(),
             "{PYTHON_INTERPRETER_ENV} is not an executable file; ignoring the override"
         );
-    }
-    if let Some(path) = usable(&project_root.join(".venv/bin/python")) {
-        return ProjectInterpreter {
-            path: Some(path),
-            source: InterpreterSource::DotVenv,
-        };
     }
     for (var, source) in [
         ("VIRTUAL_ENV", InterpreterSource::VirtualEnv),
@@ -284,53 +272,6 @@ mod tests {
         // fails loudly. Pinning the literal makes a rename a deliberate act
         // with a test to update on both sides.
         assert_eq!(PYTHON_INTERPRETER_ENV, "LOOMWEAVE_PYTHON_INTERPRETER");
-    }
-
-    #[test]
-    fn the_root_canonicalisation_at_both_call_sites_is_load_bearing() {
-        // `analyze` computes the fingerprint from its canonicalised
-        // `project_root`; `PluginHost::spawn_unhandshaken` re-canonicalises the
-        // root it is handed before running the SAME discovery to decide what to
-        // export. They agree only because BOTH canonicalise and canonicalise is
-        // idempotent.
-        //
-        // Discovery itself is deliberately NOT root-invariant: it joins
-        // `.venv/bin/python` onto the root as given and lexically normalises,
-        // so a symlinked root yields a symlinked interpreter path. That is
-        // correct for a venv (see the symlink test below) but it means dropping
-        // the canonicalisation at either call site would silently skew the
-        // recorded marker against the exported interpreter — an index that
-        // re-dispatches every run. This test pins the skew so that removal
-        // fails loudly here rather than quietly in production.
-        let dir = tempfile::tempdir().unwrap();
-        let real_root = dir.path().join("real");
-        let venv = make_python(&real_root.join(".venv/bin/python"));
-        let link_root = dir.path().join("link");
-        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
-        let canonical_root = link_root.canonicalize().unwrap();
-
-        assert_eq!(
-            discover_project_interpreter(&canonical_root, &env(&HashMap::new())).path,
-            Some(venv),
-            "a canonical root finds the project .venv at its real path"
-        );
-        // Idempotence — the property the two call sites actually rely on.
-        assert_eq!(
-            discover_project_interpreter(&canonical_root, &env(&HashMap::new())).fingerprint(),
-            discover_project_interpreter(
-                &canonical_root.canonicalize().unwrap(),
-                &env(&HashMap::new())
-            )
-            .fingerprint(),
-            "canonicalising twice must not move the fingerprint"
-        );
-        // And the skew a dropped canonicalisation would introduce.
-        assert_ne!(
-            discover_project_interpreter(&link_root, &env(&HashMap::new())).fingerprint(),
-            discover_project_interpreter(&canonical_root, &env(&HashMap::new())).fingerprint(),
-            "an UNcanonicalised root yields a different fingerprint — which is why both \
-             `analyze` and `spawn_unhandshaken` must canonicalise before discovering"
-        );
     }
 
     /// Sets the process CWD for the duration of a test and restores it on drop
@@ -416,19 +357,6 @@ mod tests {
             "empty values on every rung must discover nothing — NOT the CWD's python"
         );
 
-        // An empty override falls through to `.venv` without taking the
-        // warning path (that branch is for an operator who set a BAD path, not
-        // for an unset variable), and an empty PATH cannot outrank it.
-        let dotvenv = make_python(&root.join(".venv/bin/python"));
-        assert_eq!(
-            discover_project_interpreter(&root, &env(&all_empty)),
-            ProjectInterpreter {
-                path: Some(dotvenv),
-                source: InterpreterSource::DotVenv
-            },
-            "an empty override falls through to .venv"
-        );
-
         // Control: a NON-empty PATH naming a directory with no interpreter
         // reaches the same `None`, the legitimate way.
         let empty_dir = dir.path().join("empty");
@@ -441,33 +369,23 @@ mod tests {
     }
 
     #[test]
-    fn dotvenv_wins_over_virtual_env_and_path() {
+    fn repository_dotvenv_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let dotvenv = make_python(&dir.path().join(".venv/bin/python"));
-        let other = make_python(&dir.path().join("elsewhere/bin/python"));
-        let map = HashMap::from([
-            (
-                "VIRTUAL_ENV",
-                dir.path().join("elsewhere").display().to_string(),
-            ),
-            ("PATH", other.parent().unwrap().display().to_string()),
-        ]);
+        make_python(&dir.path().join(".venv/bin/python"));
+        let trusted = make_python(&dir.path().join("elsewhere/bin/python"));
+        let map = HashMap::from([(
+            "VIRTUAL_ENV",
+            dir.path().join("elsewhere").display().to_string(),
+        )]);
         let found = discover_project_interpreter(dir.path(), &env(&map));
-        assert_eq!(
-            found,
-            ProjectInterpreter {
-                path: Some(dotvenv.clone()),
-                source: InterpreterSource::DotVenv
-            }
-        );
-        assert!(found.pinned());
-        assert_eq!(found.fingerprint(), dotvenv.display().to_string());
+        assert_eq!(found.path, Some(trusted));
+        assert_eq!(found.source, InterpreterSource::VirtualEnv);
     }
 
     #[test]
     fn override_wins_and_an_unusable_override_falls_through() {
         let dir = tempfile::tempdir().unwrap();
-        let dotvenv = make_python(&dir.path().join(".venv/bin/python"));
+        make_python(&dir.path().join(".venv/bin/python"));
         let custom = make_python(&dir.path().join("custom/python"));
         let map = HashMap::from([(PYTHON_INTERPRETER_ENV, custom.display().to_string())]);
         assert_eq!(
@@ -479,8 +397,8 @@ mod tests {
             dir.path().join("nope").display().to_string(),
         )]);
         let found = discover_project_interpreter(dir.path(), &env(&map));
-        assert_eq!(found.source, InterpreterSource::DotVenv);
-        assert_eq!(found.path, Some(dotvenv));
+        assert_eq!(found.source, InterpreterSource::None);
+        assert_eq!(found.path, None);
     }
 
     #[test]
@@ -544,12 +462,9 @@ mod tests {
             discover_project_interpreter(dir.path(), &env(&map)).path,
             Some(real.clone())
         );
-        let link = dir.path().join(".venv/bin/python");
-        fs::create_dir_all(link.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // A repository-local symlink is not considered without an explicit override.
         let found = discover_project_interpreter(dir.path(), &env(&HashMap::new()));
-        assert_eq!(found.path, Some(link), "the symlink path, not its target");
-        assert_eq!(found.source, InterpreterSource::DotVenv);
+        assert_eq!(found.source, InterpreterSource::None);
     }
 
     #[test]
@@ -558,7 +473,7 @@ mod tests {
         // separator at construction, so `is_file()` succeeds and the plugin
         // pins the override. Rust's `metadata`/`access(2)` on the raw
         // `…/python/` fail with ENOTDIR, so without the strip the HOST would
-        // fall through to `.venv` (or export nothing) while the PLUGIN pinned
+        // export nothing while the PLUGIN pinned
         // the operator's path — the two disagreeing on the same environment,
         // which is the failure mode this module exists to prevent. The
         // returned path must also be the stripped, normalised one, byte-equal

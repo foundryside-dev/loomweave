@@ -4492,10 +4492,13 @@ def test_workspace_configuration_carries_python_path_when_pinned(tmp_path: Path)
     with PyrightSession(
         tmp_path,
         executable=str(script),
-        env={"CONFIG_MARKER": str(marker), "LOOMWEAVE_PYTHON_INTERPRETER": ""},
+        env={
+            "CONFIG_MARKER": str(marker),
+            "LOOMWEAVE_PYTHON_INTERPRETER": str(fake_python),
+        },
         init_timeout_secs=1.0,
     ) as session:
-        assert session.interpreter.source == "dotvenv"
+        assert session.interpreter.source == "override"
         result = session.resolve_calls(module, ["python:function:demo.caller"])
 
     python_section = json.loads(marker.read_text())
@@ -4664,10 +4667,10 @@ def test_interpreter_is_announced_once_per_session_not_once_per_spawn(
     with PyrightSession(
         tmp_path,
         executable=str(script),
-        env={"LOOMWEAVE_PYTHON_INTERPRETER": ""},
+        env={"LOOMWEAVE_PYTHON_INTERPRETER": str(fake_python)},
         init_timeout_secs=5.0,
     ) as session:
-        assert session.interpreter.source == "dotvenv"
+        assert session.interpreter.source == "override"
         session.resolve_calls(module, ["python:function:demo.caller"])
         first = capsys.readouterr().err
         # A killed process forces a second, real `_spawn_and_initialize`.
@@ -4678,7 +4681,7 @@ def test_interpreter_is_announced_once_per_session_not_once_per_spawn(
     announcements = [line for line in first.splitlines() if "pyright interpreter" in line]
     assert len(announcements) == 1, first
     assert str(fake_python) in announcements[0]
-    assert "source=dotvenv" in announcements[0]
+    assert "source=override" in announcements[0]
     assert "pinned=True" in announcements[0]
     # Non-vacuity FIRST: without a genuine second spawn the assertion below is
     # free, and a failure there would point at the wrong thing.
