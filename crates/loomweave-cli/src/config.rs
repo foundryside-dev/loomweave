@@ -401,7 +401,7 @@ fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
         )
     };
 
-    let selection = select_provider_with_env(&config, |name| std::env::var(name).ok());
+    let selection = select_provider_with_env(&config, loomweave_core::dotenv::var);
 
     println!("loomweave.yaml:        {source}");
     println!("LLM enabled:           {}", config.llm.enabled);
@@ -483,8 +483,7 @@ fn run_semantic_status(path: &Path, explicit_config: Option<&Path>) -> Result<()
 fn print_semantic_status_fields(sidecar_path: &Path, config: &McpConfig) {
     let semantic = &config.semantic_search;
     let count = embedding_sidecar_count(sidecar_path);
-    let has_key = std::env::var(&semantic.api_key_env)
-        .ok()
+    let has_key = loomweave_core::dotenv::var(&semantic.api_key_env)
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
     let provider_available = semantic_provider_available(semantic, has_key).unwrap_or(false);

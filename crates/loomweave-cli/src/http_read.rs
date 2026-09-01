@@ -260,7 +260,7 @@ pub fn spawn(
         port_path,
         config,
         worktree_gate,
-        |name| std::env::var(name).ok(),
+        loomweave_core::dotenv::var,
     )
 }
 

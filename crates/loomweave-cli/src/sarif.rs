@@ -21,7 +21,7 @@ pub fn run_import(file: &Path, scan_source_opt: Option<String>, project_path: &P
     // the daemon's auto-minted .weft/filigree/federation_token, dogfood-4 A5)
     let client = FiligreeHttpClient::from_config_with_project_root(
         &mcp_config.integrations.filigree,
-        |name| std::env::var(name).ok(),
+        loomweave_core::dotenv::var,
         Some(&project_root),
     )
     .context("build Filigree HTTP client")?

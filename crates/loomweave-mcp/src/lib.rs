@@ -3774,7 +3774,7 @@ fn read_llm_config_status(
 }
 
 fn llm_config_status_json(path: &Path, created_or_absent: bool, config: &McpConfig) -> Value {
-    let selection = select_provider_with_env(config, |name| std::env::var(name).ok());
+    let selection = select_provider_with_env(config, loomweave_core::dotenv::var);
     let (live, selection_error) = match &selection {
         Ok(
             ProviderSelection::OpenRouter { .. }
@@ -3841,8 +3841,7 @@ fn semantic_config_status_json(
 ) -> Value {
     let semantic = &config.semantic_search;
     let sidecar_count = semantic_sidecar_count(sidecar_path);
-    let has_key = std::env::var(&semantic.api_key_env)
-        .ok()
+    let has_key = loomweave_core::dotenv::var(&semantic.api_key_env)
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
     let provider_error = semantic_provider_error(semantic, has_key).map(Value::String);

@@ -2224,7 +2224,7 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
             }
             let mcp_config = load_mcp_config(&project_root, options.config_path.as_deref());
             match crate::serve::build_embedding_provider(&mcp_config.semantic_search, |name| {
-                std::env::var(name).ok()
+                loomweave_core::dotenv::var(name)
             }) {
                 Ok(Some(provider)) => match populate_semantic_embeddings(
                     &worktree_ctx.store_paths.embeddings,
@@ -5515,7 +5515,7 @@ async fn post_findings_batch(
     // (clarion-2833649dd9).
     let root_refs: Vec<&Path> = sibling_roots.iter().map(PathBuf::as_path).collect();
     let resolution =
-        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, |name| std::env::var(name).ok());
+        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, loomweave_core::dotenv::var);
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -5535,7 +5535,7 @@ async fn post_findings_batch(
         let thread_refs: Vec<&Path> = thread_roots.iter().map(PathBuf::as_path).collect();
         let client = FiligreeHttpClient::from_config_with_project_roots(
             &thread_cfg,
-            |name| std::env::var(name).ok(),
+            loomweave_core::dotenv::var,
             &thread_refs,
             thread_winning.as_deref(),
         )
@@ -5665,7 +5665,7 @@ async fn prune_unseen_findings_in_filigree(
     // emission uses (clarion-2833649dd9).
     let root_refs: Vec<&Path> = sibling_roots.iter().map(PathBuf::as_path).collect();
     let resolution =
-        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, |name| std::env::var(name).ok());
+        resolve_filigree_url_with_roots(filigree_cfg, &root_refs, loomweave_core::dotenv::var);
     let mut resolved_cfg = filigree_cfg.clone();
     if let Some(url) = resolution.resolved_url {
         resolved_cfg.base_url = url;
@@ -5686,7 +5686,7 @@ async fn prune_unseen_findings_in_filigree(
         let thread_refs: Vec<&Path> = thread_roots.iter().map(PathBuf::as_path).collect();
         let client = FiligreeHttpClient::from_config_with_project_roots(
             &thread_cfg,
-            |name| std::env::var(name).ok(),
+            loomweave_core::dotenv::var,
             &thread_refs,
             thread_winning.as_deref(),
         )
