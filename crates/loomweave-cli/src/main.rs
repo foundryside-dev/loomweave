@@ -74,6 +74,7 @@ fn main() -> Result<()> {
         cli::Command::Analyze {
             path,
             config,
+            populate_semantic_embeddings,
             allow_unredacted_secrets,
             confirm_allow_unredacted_secrets,
             run_id,
@@ -102,6 +103,7 @@ fn main() -> Result<()> {
                 path,
                 analyze::AnalyzeOptions {
                     config_path: config,
+                    populate_semantic_embeddings,
                     secret_scan,
                     run_id,
                     resume_run_id: resume,

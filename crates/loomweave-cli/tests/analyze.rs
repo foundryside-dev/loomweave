@@ -1296,109 +1296,11 @@ fn analyze_classifier_coverage_counts_incrementally_retained_files() {
 }
 
 #[cfg(unix)]
-fn spawn_embedding_mock() -> (String, std::thread::JoinHandle<Vec<String>>) {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::time::{Duration, Instant};
-
-    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("set read timeout");
-        let mut buffer = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        let mut header_end = None;
-        while header_end.is_none() {
-            let read = stream.read(&mut chunk).expect("read headers");
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            header_end = buffer
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|i| i + 4);
-        }
-        let Some(header_end) = header_end else {
-            return String::from_utf8_lossy(&buffer).into_owned();
-        };
-        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_ascii_lowercase();
-        let content_length = headers
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        while buffer.len().saturating_sub(header_end) < content_length {
-            let read = stream.read(&mut chunk).expect("read body");
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-        }
-        String::from_utf8_lossy(&buffer).into_owned()
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
-    let addr = listener.local_addr().expect("mock addr");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking embedding mock");
-    let handle = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut requests = Vec::new();
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let request = read_http_request(&mut stream);
-                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("{}");
-                    let payload: serde_json::Value =
-                        serde_json::from_str(body).expect("embedding request json");
-                    let count = payload["input"].as_array().map_or(0, Vec::len);
-                    let data: Vec<serde_json::Value> = (0..count)
-                        .map(|index| {
-                            let first_dim =
-                                f64::from(u32::try_from(index + 1).expect("fixture index fits"));
-                            serde_json::json!({
-                                "object": "embedding",
-                                "index": index,
-                                "embedding": [first_dim, 1.0],
-                            })
-                        })
-                        .collect();
-                    let response = serde_json::json!({
-                        "object": "list",
-                        "data": data,
-                        "model": "test-embed",
-                    })
-                    .to_string();
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                        response.len(),
-                        response
-                    )
-                    .expect("write embedding response");
-                    requests.push(request);
-                    return requests;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(err) => panic!("embedding mock accept failed: {err}"),
-            }
-        }
-        requests
-    });
-    (format!("http://{addr}"), handle)
-}
-
-#[cfg(unix)]
 #[test]
-fn analyze_persists_plugin_tags_and_populates_embedding_sidecar() {
+fn analyze_persists_plugin_tags_without_automatic_embeddings() {
     let project_dir = tempfile::tempdir().unwrap();
     let plugin_dir = tempfile::tempdir().unwrap();
     write_categorised_plugin(plugin_dir.path());
-    let (embedding_url, embedding_server) = spawn_embedding_mock();
 
     loomweave_bin()
         .args(["install", "--path"])
@@ -1418,7 +1320,7 @@ fn analyze_persists_plugin_tags_and_populates_embedding_sidecar() {
 semantic_search:
   enabled: true
   provider: local_openai
-  endpoint_url: {embedding_url}
+  endpoint_url: http://127.0.0.1:9
   model_id: test-embed
   dimensions: 2
   timeout_seconds: 2
@@ -1438,16 +1340,12 @@ semantic_search:
         .assert()
         .success();
 
-    let requests = embedding_server.join().expect("embedding mock thread");
-    assert_eq!(
-        requests.len(),
-        1,
-        "analyze should call the embedding provider"
-    );
     assert!(
-        requests[0].contains("Launches service"),
-        "embedding text should include plugin docstring; request was {}",
-        requests[0]
+        !project_dir
+            .path()
+            .join(".weft/loomweave/embeddings.db")
+            .exists(),
+        "analyze must not contact a project-configured embedding provider without explicit consent"
     );
 
     let conn = Connection::open(project_dir.path().join(".weft/loomweave/loomweave.db")).unwrap();
@@ -1462,23 +1360,6 @@ semantic_search:
         )
         .expect("query persisted tags");
     assert_eq!(tag_count, 1, "plugin-emitted tags must be persisted");
-
-    let sidecar = project_dir.path().join(".weft/loomweave/embeddings.db");
-    assert!(sidecar.exists(), "analyze should create embeddings sidecar");
-    let sidecar_conn = Connection::open(sidecar).unwrap();
-    let embedding_count: i64 = sidecar_conn
-        .query_row(
-            "SELECT COUNT(*) FROM entity_embeddings \
-             WHERE entity_id = 'catfixture:function:app.main' \
-               AND model_id = 'test-embed'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("query sidecar embeddings");
-    assert_eq!(
-        embedding_count, 1,
-        "function embedding should be present after analyze"
-    );
 }
 
 #[test]

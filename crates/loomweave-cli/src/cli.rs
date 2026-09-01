@@ -97,6 +97,11 @@ pub enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
 
+        /// Populate semantic embeddings after analysis. This may send source-derived
+        /// text and the configured API credential to the semantic-search endpoint.
+        #[arg(long)]
+        populate_semantic_embeddings: bool,
+
         /// Allow analysis of files containing unredacted secrets. Requires a
         /// confirmation step when detections are present.
         #[arg(long)]

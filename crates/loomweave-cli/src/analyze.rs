@@ -301,6 +301,9 @@ impl Drop for ProgressHeartbeatGuard {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnalyzeOptions {
     pub(crate) config_path: Option<PathBuf>,
+    /// Explicit operator consent to send source-derived embedding inputs to the
+    /// endpoint configured by the analyzed project.
+    pub(crate) populate_semantic_embeddings: bool,
     pub(crate) secret_scan: crate::secret_scan::SecretScanOptions,
     /// Caller-supplied run id (MCP `analyze_start`); `None` generates one.
     pub(crate) run_id: Option<String>,
@@ -1836,40 +1839,44 @@ pub(crate) async fn run_with_options(project_path: PathBuf, options: AnalyzeOpti
                     "tier-subsystem findings skipped (run already committed successfully)"
                 ),
             }
-            let mcp_config = load_mcp_config(&project_root, options.config_path.as_deref());
-            match crate::serve::build_embedding_provider(&mcp_config.semantic_search, |name| {
-                std::env::var(name).ok()
-            }) {
-                Ok(Some(provider)) => match populate_semantic_embeddings(
-                    &project_root,
-                    &db_path,
-                    &mcp_config.semantic_search,
-                    provider,
-                )
-                .await
-                {
-                    Ok(stats) if stats.embedded > 0 || stats.skipped_fresh > 0 => tracing::info!(
-                        run_id = %run_id,
-                        model_id = %stats.model_id,
-                        considered = stats.considered,
-                        skipped_fresh = stats.skipped_fresh,
-                        embedded = stats.embedded,
-                        tokens_input = stats.tokens_input,
-                        "semantic embedding population complete"
-                    ),
-                    Ok(_) => {}
+            if options.populate_semantic_embeddings {
+                let mcp_config = load_mcp_config(&project_root, options.config_path.as_deref());
+                match crate::serve::build_embedding_provider(&mcp_config.semantic_search, |name| {
+                    std::env::var(name).ok()
+                }) {
+                    Ok(Some(provider)) => match populate_semantic_embeddings(
+                        &project_root,
+                        &db_path,
+                        &mcp_config.semantic_search,
+                        provider,
+                    )
+                    .await
+                    {
+                        Ok(stats) if stats.embedded > 0 || stats.skipped_fresh > 0 => {
+                            tracing::info!(
+                                run_id = %run_id,
+                                model_id = %stats.model_id,
+                                considered = stats.considered,
+                                skipped_fresh = stats.skipped_fresh,
+                                embedded = stats.embedded,
+                                tokens_input = stats.tokens_input,
+                                "semantic embedding population complete"
+                            )
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            run_id = %run_id,
+                            error = %e,
+                            "semantic embedding population skipped (run already committed successfully)"
+                        ),
+                    },
+                    Ok(None) => {}
                     Err(e) => tracing::warn!(
                         run_id = %run_id,
                         error = %e,
-                        "semantic embedding population skipped (run already committed successfully)"
+                        "semantic embedding provider unavailable (run already committed successfully)"
                     ),
-                },
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    run_id = %run_id,
-                    error = %e,
-                    "semantic embedding provider unavailable (run already committed successfully)"
-                ),
+                }
             }
             // REQ-GUIDANCE-05 (WS6 T4a): guidance-staleness findings (EXPIRED +
             // CHURN-STALE). Runs on EVERY analyze, deliberately OUTSIDE the SEI
