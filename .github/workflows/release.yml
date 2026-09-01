@@ -68,8 +68,25 @@ jobs:
     name: Verify (pre-release gates)
     uses: ./.github/workflows/verify.yml
 
+  release-governance:
+    name: GitHub release governance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+
+      - name: Enforce repository release controls
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python scripts/check-github-release-governance.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --branch main
+
   build-rust:
-    needs: [verify, assert-on-main]
+    needs: [verify, assert-on-main, release-governance]
     # assert-on-main is push-only (skipped on workflow_dispatch). GitHub's
     # default success() gate would then skip every job that needs it, so the
     # manual dispatch dry-run would build nothing. Run when verify passed and
@@ -146,7 +163,7 @@ jobs:
           retention-days: 7
 
   build-wheels:
-    needs: [verify, assert-on-main]
+    needs: [verify, assert-on-main, release-governance]
     # Run on dispatch (assert-on-main skipped) and tag push; block on verify
     # failure or a not-on-main tag. See build-rust for the full rationale.
     if: >-
@@ -204,7 +221,7 @@ jobs:
           retention-days: 7
 
   build-rust-plugin:
-    needs: [verify, assert-on-main]
+    needs: [verify, assert-on-main, release-governance]
     # Run on dispatch (assert-on-main skipped) and tag push; block on verify
     # failure or a not-on-main tag. See build-rust for the full rationale.
     if: >-
@@ -262,7 +279,7 @@ jobs:
           retention-days: 7
 
   build-plugin:
-    needs: [verify, assert-on-main]
+    needs: [verify, assert-on-main, release-governance]
     # Run on dispatch (assert-on-main skipped) and tag push; block on verify
     # failure or a not-on-main tag. See build-rust for the full rationale.
     if: >-
