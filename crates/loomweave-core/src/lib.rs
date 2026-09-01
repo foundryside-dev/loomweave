@@ -7,6 +7,7 @@
 //! remain accessible via `loomweave_core::plugin::transport::*` and siblings.
 
 pub mod classifier_coverage;
+pub mod dotenv;
 pub mod entity_id;
 pub mod errors;
 pub mod hardened_git;

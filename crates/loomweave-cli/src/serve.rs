@@ -489,7 +489,7 @@ fn run_server(
     } else {
         McpConfig::default()
     };
-    let provider_selection = select_provider_with_env(&config, |name| std::env::var(name).ok())?;
+    let provider_selection = select_provider_with_env(&config, loomweave_core::dotenv::var)?;
     let llm_diagnostics = llm_diagnostics(&provider_selection, &config.llm);
     // Announce the *effective* LLM posture on stderr so a misconfigured provider
     // is never silently disabled (agent-first-feedback §2.1/§2.6). stdout is the
@@ -516,7 +516,7 @@ fn run_server(
         &worktree_ctx.effective_store,
     )?;
     let embedding_provider =
-        build_embedding_provider(&config.semantic_search, |name| std::env::var(name).ok())?;
+        build_embedding_provider(&config.semantic_search, loomweave_core::dotenv::var)?;
 
     // Sibling (Filigree) local-state discovery: source root first, then
     // primary root, deduplicated — a linked worktree may run its own
@@ -537,7 +537,7 @@ fn run_server(
     let filigree_resolution = loomweave_federation::filigree_url::resolve_filigree_url_with_roots(
         &config.integrations.filigree,
         &sibling_roots,
-        |name| std::env::var(name).ok(),
+        loomweave_core::dotenv::var,
     );
     let mut filigree_config = config.integrations.filigree.clone();
     if let Some(resolved) = &filigree_resolution.resolved_url {
@@ -549,7 +549,7 @@ fn run_server(
     // weft-gated read (the wardline-findings joins) 401s (dogfood-4 A5).
     let filigree_client = FiligreeHttpClient::from_config_with_project_roots(
         &filigree_config,
-        |name| std::env::var(name).ok(),
+        loomweave_core::dotenv::var,
         &sibling_roots,
         // Paired resolution (clarion-f93e006216): the minted token must come
         // from the same root the URL's port rung won at, never a stale token
@@ -1082,7 +1082,7 @@ fn build_llm_provider(
             Some(Arc::new(RecordingProvider::from_recordings(recordings)) as Arc<dyn LlmProvider>)
         }
         ProviderSelection::OpenRouter { api_key_env } => {
-            let api_key = std::env::var(&api_key_env).ok();
+            let api_key = loomweave_core::dotenv::var(&api_key_env);
             let provider = OpenRouterProvider::from_config(OpenRouterProviderConfig {
                 api_key,
                 allow_live_provider: true,

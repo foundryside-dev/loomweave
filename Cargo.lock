@@ -1086,7 +1086,6 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
- "dotenvy",
  "fs2",
  "hmac",
  "ignore",
@@ -1127,6 +1126,7 @@ name = "loomweave-core"
 version = "1.6.0"
 dependencies = [
  "blake3",
+ "dotenvy",
  "nix",
  "serde",
  "serde_json",
