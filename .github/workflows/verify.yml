@@ -39,7 +39,7 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt, llvm-tools-preview
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
 
       # Python is used by the migration-retirement guard and lockstep guards
       # below. Pin >= 3.11 explicitly so the stdlib `tomllib` is available
@@ -200,7 +200,7 @@ jobs:
           toolchain: stable
           components: clippy
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
           key: ${{ matrix.target }}
 
@@ -322,7 +322,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
