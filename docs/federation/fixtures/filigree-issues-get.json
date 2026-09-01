@@ -20,7 +20,6 @@
   "examples": [
     {
       "name": "live_v_issue_detail_200",
-      "requires_seeded_state": true,
       "note": "Open, un-claimed task issue → 200 with the full 25-field IssueWeft projection. The entity's own primary key is named issue_id (the id→issue_id weft rename); reference fields keep their names. status_category derives from status; is_ready is computed from blockers; the four lifecycle/commit anchors are null for an open, un-claimed, un-closed issue.",
       "request": {
         "method": "GET",
