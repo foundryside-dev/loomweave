@@ -29,6 +29,7 @@
 //! provenance only.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -659,26 +660,21 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
         || "instructions".to_owned(),
         |n| n.to_string_lossy().into_owned(),
     );
-    let temp_path: PathBuf = parent.join(format!(
-        ".{}.loomweave.tmp-{}",
-        file_name,
-        std::process::id()
-    ));
-
-    // Cleanup guard: drop the staged temp file if any step after creating it
-    // fails, so a failed write never leaks a `.tmp-*` sibling.
-    if let Err(err) = write_temp_then_rename(&temp_path, path, content) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
-    }
-    Ok(())
-}
-
-fn write_temp_then_rename(temp_path: &Path, path: &Path, content: &str) -> Result<()> {
-    fs::write(temp_path, content).with_context(|| format!("write {}", temp_path.display()))?;
+    // `NamedTempFile` chooses an unpredictable name and creates it exclusively.
+    // Unlike `fs::write` on a predictable path, this cannot follow a pre-planted
+    // symlink to an attacker-selected file. Keeping it in `parent` also ensures
+    // the final persist is a same-filesystem atomic rename.
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}.loomweave.tmp-"))
+        .tempfile_in(parent)
+        .with_context(|| format!("create temporary file in {}", parent.display()))?;
+    temp.write_all(content.as_bytes())
+        .with_context(|| format!("write {}", temp.path().display()))?;
     #[cfg(unix)]
-    preserve_mode(path, temp_path)?;
-    fs::rename(temp_path, path)
+    preserve_mode(path, temp.path())?;
+    let temp_path = temp.path().to_path_buf();
+    temp.persist(path)
+        .map_err(|err| err.error)
         .with_context(|| format!("rename {} -> {}", temp_path.display(), path.display()))?;
     Ok(())
 }
@@ -1193,6 +1189,41 @@ filigree tracks tasks for this project.\n\
             std::fs::read_to_string(&path).unwrap(),
             "populated content\n",
             "populated target must be untouched by a refused empty write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_follow_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "do not overwrite\n").unwrap();
+
+        // This is the deterministic staging name used by the vulnerable
+        // implementation. A repository could commit such a link, or another
+        // local process could create it after learning the installer's PID.
+        let planted = dir
+            .path()
+            .join(format!(".CLAUDE.md.loomweave.tmp-{}", std::process::id()));
+        symlink(&victim, &planted).unwrap();
+
+        super::atomic_write(&path, "safe contents\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "safe contents\n");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not overwrite\n",
+            "the planted temp symlink must never be followed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "an unrelated planted path must not be renamed over the target"
         );
     }
 
