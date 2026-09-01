@@ -115,12 +115,10 @@ pub enum WorktreeContextError {
     /// administrative identity as a UTF-8 string, so a non-UTF-8 source
     /// root, primary root, Git administrative directory, or derived
     /// admin-identity fragment is rejected here, before any store directory
-    /// is created or any git output is trusted further. This is a deliberate
-    /// departure from [`crate::hardened_git::list_untracked_files`]'s lossy
-    /// decode: that function's output is display-only, so silently
-    /// substituting the Unicode replacement character for invalid bytes is
-    /// safe there. Here the decoded value becomes a filesystem path and a
-    /// hash input, so silent mangling could route two different worktrees to
+    /// is created or any git output is trusted further. It is the same strict
+    /// decode [`crate::hardened_git::GitProbeOutput::stdout_utf8`] applies to
+    /// every corpus git probe: the decoded value becomes a filesystem path and
+    /// a hash input, so silent mangling could route two different worktrees to
     /// the same (or a bogus) store.
     ///
     /// `field` identifies which resolution input failed to decode as UTF-8:
