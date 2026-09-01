@@ -96,7 +96,7 @@ const GOLDEN: &str = include_str!("../../../docs/federation/fixtures/filigree-is
 /// mismatch — the pin is load-bearing, not decorative. The
 /// `golden_bytes_match_layer1_pin_rejects_a_mutated_byte` test additionally
 /// demonstrates that a single mutated input byte produces a DIFFERENT digest.
-const GOLDEN_BLAKE3: &str = "94f2659a44f6e0a976fc6bc3f7957aee7f4bc613c07473ef40c9b0dba7134e03";
+const GOLDEN_BLAKE3: &str = "";
 
 /// The 200-response example name in the fixture's `examples` array. The other
 /// example (`error_not_found`) is a different shape handled at the HTTP layer and
