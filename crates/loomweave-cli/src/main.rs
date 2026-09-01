@@ -1,5 +1,6 @@
 mod analyze;
 mod analyze_lock;
+mod atomic_fs;
 mod cli;
 mod config;
 mod db;

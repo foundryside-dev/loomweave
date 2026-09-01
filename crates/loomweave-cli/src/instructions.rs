@@ -987,14 +987,11 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
         || "instructions".to_owned(),
         |n| n.to_string_lossy().into_owned(),
     );
-    // `NamedTempFile` chooses an unpredictable name and creates it exclusively.
-    // Unlike `fs::write` on a predictable path, this cannot follow a pre-planted
-    // symlink to an attacker-selected file. Keeping it in `parent` also ensures
-    // the final persist is a same-filesystem atomic rename.
-    let mut temp = tempfile::Builder::new()
-        .prefix(&format!(".{file_name}.loomweave.tmp-"))
-        .tempfile_in(parent)
-        .with_context(|| format!("create temporary file in {}", parent.display()))?;
+    // Exclusive, unpredictable staging (see `atomic_fs`): a pre-planted symlink
+    // at a guessable sibling name can never be written through, and the final
+    // persist stays a same-filesystem atomic rename.
+    let mut temp =
+        crate::atomic_fs::staging_file_in(parent, &format!(".{file_name}.loomweave.tmp-"))?;
     temp.write_all(content.as_bytes())
         .with_context(|| format!("write {}", temp.path().display()))?;
     #[cfg(unix)]

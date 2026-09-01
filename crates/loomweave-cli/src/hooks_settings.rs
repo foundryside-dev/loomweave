@@ -15,7 +15,6 @@
 //! array of matcher-groups, each `{ "matcher"?, "hooks": [ {type,command} ] }`.
 
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -343,16 +342,12 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
 }
 
 fn write_and_swap(dir: &Path, dest: &Path, serialized: &str) -> Result<()> {
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".settings.json.tmp-")
-        .tempfile_in(dir)
-        .with_context(|| format!("create staging file in {}", dir.display()))?;
-    writeln!(tmp, "{serialized}")
-        .with_context(|| format!("write staging file in {}", dir.display()))?;
-    tmp.persist(dest)
-        .map_err(|err| err.error)
-        .with_context(|| format!("rename staging file -> {}", dest.display()))?;
-    Ok(())
+    debug_assert_eq!(dest.parent(), Some(dir));
+    crate::atomic_fs::replace_file(
+        dest,
+        ".settings.json.tmp-",
+        format!("{serialized}\n").as_bytes(),
+    )
 }
 
 #[cfg(test)]
