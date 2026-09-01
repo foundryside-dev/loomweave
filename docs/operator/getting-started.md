@@ -51,14 +51,14 @@ for the language plugin via GitHub Releases (per
 fallback below only when testing unreleased commits.
 
 ```bash
-TAG=v1.5.1
+TAG=v1.6.1
 curl -L -o loomweave-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf loomweave-x86_64-unknown-linux-gnu.tar.gz
 install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
 
 pipx install \
-  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.5.1.tar.gz"
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.6.1.tar.gz"
 ```
 
 Source-install fallback:

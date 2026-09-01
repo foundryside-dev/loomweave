@@ -14,6 +14,81 @@ only when an incompatible change is made to that surface. See
 
 Nothing yet.
 
+## [1.6.1] — 2026-09-02
+
+Security patch release. Every item below closes a way a *hostile analyzed
+repository* — a checkout the operator merely opened, with `serve` or the
+session hook launched automatically by an agent harness — could influence
+what Loomweave executes, writes, or sends. Reported via a batch of Codex
+security PRs (#142–#151); reviewed, rebased onto the release branch, and where
+the reported fix covered only one instance of a class, widened to the class.
+
+### Security
+
+- **A repository `.env` is now a credential sidecar, never environment**
+  (ADR-062, closes the class behind #143). Operator commands used to load
+  `<cwd>/.env` into the process environment. Because `dotenvy` only sets
+  variables that are *unset*, a committed `.env` could fill exactly the
+  normally-unset ones: `LOOMWEAVE_FILIGREE_MCP_COMMAND` /
+  `LOOMWEAVE_WARPLINE_MCP_COMMAND` (which program `serve` executes for the
+  sibling MCP launchers), `LD_PRELOAD`, `PYTHONPATH`, `HTTPS_PROXY` — and every
+  child `serve` spawns (`analyze_start`'s `loomweave analyze`, the linked-
+  worktree bootstrap, `git`) inherited all of it. `.env` is now parsed once
+  into a private map read *only* by Loomweave's own config-named credential
+  lookups (`api_key_env`, `token_env` / `identity_token_env`, `RUST_LOG`); the
+  real environment always wins. Nothing from `.env` reaches a child process or
+  a `std::env::var` override any more, by construction.
+  *Behaviour change:* variables that only third-party code read from `.env`
+  (`HTTPS_PROXY`, `SSL_CERT_FILE`, …) must now be exported in the shell or the
+  MCP server `env` block. The session-start hook additionally never parses the
+  file at all (#149, from Codex #143).
+- **Exclusive, unpredictable staging for every atomic write** (from Codex
+  #145 and #150, widened to all seven sites). Every "write a sibling temp,
+  then rename over the destination" path staged at a PID-derived name
+  (`<file>.tmp-<pid>`) inside a directory the repository controls; a committed
+  symlink at that name turned the staging write into a write-through to
+  wherever it pointed (`fs::write` and SQLite both follow symlinks). All sites
+  — `CLAUDE.md`/`AGENTS.md` instructions, `.claude/settings.json`, `.mcp.json`,
+  the store `.gitignore`, `loomweave db backup`, the skill-pack directory swap,
+  and the federation `ephemeral.port` marker — now create their staging entry
+  with `O_CREAT|O_EXCL` on a random name (`tempfile`), keep it in the
+  destination's directory so the rename stays atomic, and request `0o666` so
+  the resulting mode still follows the umask exactly as `fs::write` did.
+- **The Filigree MCP launcher runs Python in isolated mode** (`-I`, from
+  Codex #146). `<python> -m filigree.mcp_server` ran with the analyzed project
+  as its working directory, so a repository committing `filigree/mcp_server.py`
+  shadowed the installed package on the first MCP tool call.
+- **LLM source excerpts are jailed to the project root** (from Codex #151). A
+  poisoned catalogue row could name any local file as an entity's
+  `source_file_path` and have its contents folded into a live `summary` /
+  inferred-calls prompt. The path is now re-validated at use time (lexical and
+  canonical containment, symlink escapes rejected) and fails closed with the
+  existing `invalid-path` envelope before any provider call.
+
+### Changed
+
+- **Pinned GitHub Actions refreshed** (dependabot #105–#108, #144):
+  `actions/cache` 5.0.5 → 6.1.0, `actions/setup-python` 6.2.0 → 7.0.0,
+  `actions/checkout` 7.0.0 → 7.0.1, `actions/upload-pages-artifact` 3.0.1 →
+  5.0.0, `Swatinem/rust-cache` to the current v2 commit. CI-only.
+- **Documentation and repository hygiene sweep** (#140): federation-hub paths
+  now point at `~/weft`, `docs/` gains index pages for `federation/`,
+  `archive/`, `product/`, and the operator guides, the ADR index catches up
+  to ADR-056, the README install example names the current release, and a
+  machine-local Codex MCP config leaves the tree (`.codex/` gitignored).
+
+### Not merged (tracked instead)
+
+- Codex #142 (drop the `.venv` interpreter rung) reverses ADR-058 and re-opens
+  the launcher-dependent resolution bug; the narrow hardening — skip
+  `.venv/bin/python` only when it is git-tracked — is clarion-9b3cf287b7.
+- Codex #147 (CLI consent flag for analyze-time embeddings) disables
+  operator-enabled embeddings on every real launch path and covers one of two
+  egress surfaces; the operator-trust gate for a repository-committed
+  `loomweave.yaml` (endpoint + credential env-var name) is clarion-dee44f1a66.
+- Codex #148 (restore live release-governance gate) reverses the retirement
+  recorded in `docs/operator/release-handoff.md`; closed.
+
 ## [1.6.0] — 2026-08-31
 
 ### Changed
@@ -1707,7 +1782,8 @@ normative.
 - Operator guides under [`docs/operator/`](docs/operator/) — getting-started,
   OpenRouter setup, HTTP read API.
 
-[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/foundryside-dev/loomweave/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/foundryside-dev/loomweave/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/foundryside-dev/loomweave/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/foundryside-dev/loomweave/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/foundryside-dev/loomweave/compare/v1.4.0...v1.5.0
