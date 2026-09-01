@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Loomweave dogfood evaluation — senior-user verdict (2026-05-29)
 
 Evaluator: senior engineer, day-one orientation via the 8 MCP query tools only.

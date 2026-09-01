@@ -15,7 +15,7 @@ produced an entity. The differences below are entirely in what the plugins
 
 | Capability | Python (`loomweave-plugin-python`) | Rust (`loomweave-plugin-rust`) |
 |---|---|---|
-| Status | first-party, v1.0 | first-party, 1.x |
+| Status | first-party, 1.x | first-party, 1.x |
 | Source backend | `pyright` (type-resolved) | `syn` (parse-only, in-project symbol table) |
 | Ontology version | 0.13.0 | 0.9.0 |
 | Wardline-aware | **yes** (`wardline:*` trust tags) | no |

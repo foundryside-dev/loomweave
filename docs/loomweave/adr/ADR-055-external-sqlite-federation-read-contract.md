@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-07-12
 **Deciders**: john
-**Extends**: [ADR-011](./ADR-011-writer-actor-and-sqlite.md), [ADR-035](./ADR-035-sqlite-operational-tuning.md)
+**Extends**: [ADR-011](./ADR-011-writer-actor-concurrency.md), [ADR-035](./ADR-035-operational-tuning-discipline.md)
 
 ## Context
 

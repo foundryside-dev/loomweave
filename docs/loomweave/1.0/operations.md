@@ -3,7 +3,7 @@
 Operator-facing reference for the constraints around Loomweave's local-state
 directory. v1.0 is local-first; the storage subsystem is plain SQLite under
 `.weft/loomweave/`. The constraints below come straight out of
-[ADR-011](../adr/ADR-011-storage-architecture.md) (writer-actor + reader-pool
+[ADR-011](../adr/ADR-011-writer-actor-concurrency.md) (writer-actor + reader-pool
 over SQLite) and the v1.0 tag-cut gap-register entries DOC-11, STO-01,
 STO-04, and STO-05.
 
@@ -138,7 +138,7 @@ single command that takes a snapshot without requiring `analyze` and
 
 ## References
 
-- [ADR-011 — Storage Architecture](../adr/ADR-011-storage-architecture.md)
+- [ADR-011 — Storage Architecture](../adr/ADR-011-writer-actor-concurrency.md)
   — writer-actor and reader-pool design, normative source for §1 and §3.
 - [`docs/implementation/v1.0-tag-cut/gap-register.md`](../../implementation/v1.0-tag-cut/gap-register.md)
   — DOC-11, STO-01, STO-04, STO-05 gap entries that drove this document.

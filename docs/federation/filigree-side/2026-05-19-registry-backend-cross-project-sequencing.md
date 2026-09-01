@@ -1,7 +1,7 @@
 # Registry-Backend & File-Identity Displacement — Cross-Project Sequencing Memo
 
 **Status:** Draft (2026-05-19)
-**Scope:** Sequencing memo for bringing Loomweave ADR-014's vision forward across Filigree and Loomweave. Pairs with [Filigree ADR-014](../architecture/decisions/ADR-014-registry-backend-and-file-identity-displacement.md).
+**Scope:** Sequencing memo for bringing Loomweave ADR-014's vision forward across Filigree and Loomweave. Pairs with [Filigree ADR-014](./ADR-014-registry-backend-and-file-identity-displacement.md).
 **Sibling docs:**
 - Loomweave ADR-014 (the original 2026-04-18 design)
 - Loomweave ADR-029 (entity-associations, shipped 2026-05-17)

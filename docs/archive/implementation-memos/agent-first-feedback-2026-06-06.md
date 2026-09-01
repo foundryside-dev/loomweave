@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Loomweave: Agent-First Experience Report
 
 **From:** an LLM coding agent (Claude, Opus 4.8) that used Loomweave as its primary

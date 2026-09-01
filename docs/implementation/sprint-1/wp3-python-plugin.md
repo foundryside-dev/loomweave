@@ -1,7 +1,7 @@
 # WP3 — Python Plugin v0.1 Baseline (Sprint 1)
 
 **Status**: DRAFT — blocked-by WP2
-**Anchoring design**: [detailed-design.md §1 (Plugin implementation — Python specifics)](../../loomweave/v0.1/detailed-design.md#1-plugin-implementation-detail), [system-design.md §2](../../loomweave/v0.1/system-design.md#2-core--plugin-architecture)
+**Anchoring design**: [detailed-design.md §1 (Plugin implementation — Python specifics)](../../loomweave/1.0/detailed-design.md#1-plugin-implementation-detail), [system-design.md §2](../../loomweave/1.0/system-design.md#2-core--plugin-architecture)
 **Accepted ADRs**: [ADR-018](../../loomweave/adr/ADR-018-identity-reconciliation.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md), [ADR-023](../../loomweave/adr/ADR-023-tooling-baseline.md)
 **Predecessor**: [WP2](./wp2-plugin-host.md).
 **Blocks**: the Sprint 1 walking-skeleton demo.

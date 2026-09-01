@@ -45,7 +45,7 @@ blocker count is unchanged.)
 
 ## Originating-review key
 
-- **arch-2026-05-20** — [`../arch-analysis-2026-05-20-2124/04-final-report.md`](../arch-analysis-2026-05-20-2124/04-final-report.md) and siblings
+- **arch-2026-05-20** — [`../../archive/arch-analysis-2026-05-20-2124/04-final-report.md`](../../archive/arch-analysis-2026-05-20-2124/04-final-report.md) and siblings
 - **deep-dive-arch** — Architecture critique subagent, 2026-05-22
 - **deep-dive-security** — Threat analyst subagent, 2026-05-22
 - **deep-dive-pipeline** — Pipeline reviewer subagent, 2026-05-22

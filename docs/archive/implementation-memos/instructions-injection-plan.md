@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Plan: inject Loomweave agent-orientation guidance into CLAUDE.md / AGENTS.md
 
 Status: proposal / sketch (2026-06-06)

@@ -1,7 +1,9 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Phase B — Rename agent brief (Clarion → Loomweave, Loom → Weft)
 
 > Standalone task brief for a fresh agent. Assumes zero context from prior sessions.
-> Companion to the master plan `docs/implementation/2026-06-05-loomweave-1.0-rename-and-pypi-plan.md` (Phase B is the spec). Phases A/C/D are NOT in scope here.
+> Companion to the master plan `docs/archive/implementation-memos/2026-06-05-loomweave-1.0-rename-and-pypi-plan.md` (Phase B is the spec). Phases A/C/D are NOT in scope here.
 
 ---
 
@@ -11,7 +13,7 @@ You are executing a large, trap-laden product rename in a Rust + Python monorepo
 Rename the product **Clarion → Loomweave** and the framework/suite **Loom → Weft**, and recut the version **1.3.0 → 1.0.0**, as ONE atomic change on a single branch. This is a triage problem (~403 working-set files mention `clarion`), NOT a blind sweep: most renames, a handful of buckets must NOT be touched, a few are cross-product.
 
 ## READ FIRST (authoritative detail)
-- `docs/implementation/2026-06-05-loomweave-1.0-rename-and-pypi-plan.md` — **Phase B** is your spec (workstreams WS1–WS9, the reference-triage recipe, the do-not-rename list, the execution strategy, and the verification gate). Phases C/D are NOT yours (PyPI packaging + infra come later).
+- `docs/archive/implementation-memos/2026-06-05-loomweave-1.0-rename-and-pypi-plan.md` — **Phase B** is your spec (workstreams WS1–WS9, the reference-triage recipe, the do-not-rename list, the execution strategy, and the verification gate). Phases C/D are NOT yours (PyPI packaging + infra come later).
 - Skim `docs/superpowers/specs/2026-06-05-loomweave-pypi-distribution-design.md` for context only.
 
 ## Naming hierarchy (the target end state)

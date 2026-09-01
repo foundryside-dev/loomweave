@@ -89,13 +89,13 @@ and live LLM spend. The core tool families are:
 
 ```bash
 # 1. Install from the current GitHub Release
-TAG=v1.4.0
+TAG=v1.5.1
 curl -L -o loomweave-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf loomweave-x86_64-unknown-linux-gnu.tar.gz
 install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
 pipx install \
-  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.4.0.tar.gz"
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.5.1.tar.gz"
 
 # 2. Initialise a project
 cd /path/to/your/python/repo

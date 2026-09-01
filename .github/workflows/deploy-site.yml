@@ -6,9 +6,10 @@
 # the build first sparse-fetches the kit into site/vendor/site-kit (via the
 # preinstall hook in package.json) and resolves it as a file: dependency.
 #
-# NOTE: this supersedes the legacy `docs.yml`, which publishes the hand-rolled
-# www/ site to the gh-pages branch. Retire docs.yml and switch the Pages source
-# to "GitHub Actions" once this Astro site is the live loomweave.foundryside.dev.
+# This workflow is the SOLE publisher of loomweave.foundryside.dev. The legacy
+# `docs.yml` (which pushed the hand-rolled www/ site to the gh-pages branch)
+# was retired in 3d2749b; www/ is retained in the repo as unpublished source
+# only and is deployed by no workflow.
 name: Deploy site
 
 on:

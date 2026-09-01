@@ -147,7 +147,7 @@ Operators declare subsystems in `loomweave.yaml`; clustering is skipped.
 ## References
 
 - [Traag, Waltman, van Eck 2019 — "From Louvain to Leiden: guaranteeing well-connected communities"](https://www.nature.com/articles/s41598-019-41695-z) — the paper defining Leiden's refinement step and the disconnected-community defect in Louvain.
-- [Loomweave v0.1 system design §2, §6 (Phase 3 Clustering)](../v0.1/system-design.md) — Phase 3 position in the pipeline; core-ownership of clustering.
-- [Loomweave v0.1 detailed design §4 (loomweave.yaml clustering config)](../v0.1/detailed-design.md) (lines 937-941) — the config surface this ADR commits to.
-- [Loomweave v0.1 detailed design Appendix — petgraph dependency note](../v0.1/detailed-design.md) (line 1644) — implementation-level note on vendoring.
-- [Loomweave v0.1 requirements — REQ-CATALOG-06](../v0.1/requirements.md) — structural discovery requirement this ADR serves.
+- [Loomweave v0.1 system design §2, §6 (Phase 3 Clustering)](../1.0/system-design.md) — Phase 3 position in the pipeline; core-ownership of clustering.
+- [Loomweave v0.1 detailed design §4 (loomweave.yaml clustering config)](../1.0/detailed-design.md) (lines 937-941) — the config surface this ADR commits to.
+- [Loomweave v0.1 detailed design Appendix — petgraph dependency note](../1.0/detailed-design.md) (line 1644) — implementation-level note on vendoring.
+- [Loomweave v0.1 requirements — REQ-CATALOG-06](../1.0/requirements.md) — structural discovery requirement this ADR serves.

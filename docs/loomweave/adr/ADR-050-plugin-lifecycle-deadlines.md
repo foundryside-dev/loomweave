@@ -155,7 +155,7 @@ New finding subcodes: `LMWV-INFRA-PLUGIN-ABORTED`, `LMWV-INFRA-PLUGIN-SHUTDOWN-T
 
 ## References
 
-- Implementation plan: `docs/superpowers/plans/2026-06-10-plugin-host-hardening.md` (ticket clarion-7bc08e05c0; decisions D1–D9, empirical syn crash-depth probe).
+- Implementation plan: `docs/superpowers/plans/archive/2026-06-10-plugin-host-hardening.md` (ticket clarion-7bc08e05c0; decisions D1–D9, empirical syn crash-depth probe).
 - `crates/loomweave-cli/src/analyze.rs` — `PluginWatchdog` / `WatchdogPhase`, the three deadline constants, `reap_and_classify_exit`.
 - `crates/loomweave-core/src/plugin/host.rs` — `spawn_unhandshaken` / `spawn` split; `host_findings.rs` — `FINDING_PLUGIN_ABORTED`.
 - `crates/loomweave-plugin-rust/src/parse_guard.rs` — caps, lexer, `with_pinned_stack`, probe-mirroring tests.

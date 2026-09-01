@@ -13,7 +13,7 @@
 This codebase has a full design ladder (`docs/clarion/1.0/{requirements,system-design,detailed-design}.md` + 34 ADRs) **and** two prior arch-analyses:
 
 - `docs/arch-analysis-2026-05-22-1924/` — thorough 7-subsystem structural archaeology, done **deliberately without design docs** (2026-05-22).
-- `docs/implementation/arch-analysis-2026-05-20-2124/` — RC1-era release-readiness pass with quality + handover docs (2026-05-20).
+- `docs/archive/arch-analysis-2026-05-20-2124/` — RC1-era release-readiness pass with quality + handover docs (2026-05-20).
 
 Therefore the structural map already exists. **The value of this run is the delta:**
 
