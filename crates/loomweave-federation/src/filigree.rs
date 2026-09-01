@@ -966,15 +966,27 @@ fn resolve_filigree_mcp_command(project_root: Option<&Path>) -> (String, Vec<Str
             .and_then(|runtime| runtime.get("python_executable"))
             .and_then(serde_json::Value::as_str)
     {
-        let mut args = vec!["-m".to_owned(), "filigree.mcp_server".to_owned()];
-        if let Some(root) = project_root {
-            args.push("--project".to_owned());
-            args.push(root.display().to_string());
-        }
-        return (python.to_owned(), args);
+        return filigree_python_mcp_command(python, project_root);
     }
 
     filigree_mcp_fallback_command()
+}
+
+/// Launch the installed Filigree module without allowing the analyzed project
+/// (which is also the child process's working directory) onto Python's import
+/// path. Without isolated mode, a repository-owned `filigree/mcp_server.py`
+/// would shadow the trusted package when Python handles `-m`.
+fn filigree_python_mcp_command(python: &str, project_root: Option<&Path>) -> (String, Vec<String>) {
+    let mut args = vec![
+        "-I".to_owned(),
+        "-m".to_owned(),
+        "filigree.mcp_server".to_owned(),
+    ];
+    if let Some(root) = project_root {
+        args.push("--project".to_owned());
+        args.push(root.display().to_string());
+    }
+    (python.to_owned(), args)
 }
 
 /// Last-resort launcher when the env override is unset and `filigree mcp-status`
@@ -2058,7 +2070,7 @@ mod tests {
     /// The last-resort launcher fallback is the standalone `filigree-mcp` binary,
     /// NOT `filigree mcp` (which is not a valid filigree subcommand and would exit
     /// with a usage error → broken pipe, the same defect the Warpline consumer
-    /// hit). The happy path resolves `python -m filigree.mcp_server` via
+    /// hit). The happy path resolves `python -I -m filigree.mcp_server` via
     /// `filigree mcp-status`; this guards only the fallback constant.
     #[test]
     fn fallback_command_is_filigree_mcp_binary_not_subcommand() {
@@ -2067,6 +2079,24 @@ mod tests {
         assert!(
             args.is_empty(),
             "the MCP server takes no subcommand: {args:?}"
+        );
+    }
+
+    #[test]
+    fn python_mcp_command_isolates_imports_from_project_root() {
+        let root = Path::new("/untrusted/project");
+        let (program, args) = filigree_python_mcp_command("/venv/bin/python", Some(root));
+
+        assert_eq!(program, "/venv/bin/python");
+        assert_eq!(
+            args,
+            [
+                "-I",
+                "-m",
+                "filigree.mcp_server",
+                "--project",
+                "/untrusted/project"
+            ]
         );
     }
 
