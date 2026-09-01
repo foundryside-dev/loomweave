@@ -1977,7 +1977,7 @@ fn analyze_phase3_is_stable_on_unchanged_incremental_rerun() {
                      related_entities, message, evidence, properties, supports, supported_by, \
                      status, filigree_issue_id, created_at, updated_at\
                  ) VALUES (\
-                     ?1, 'loomweave', '1.6.0', ?2, 'LMWV-FIXTURE-SUBSYSTEM', 'fact', 'WARN', \
+                     ?1, 'loomweave', '1.6.1', ?2, 'LMWV-FIXTURE-SUBSYSTEM', 'fact', 'WARN', \
                      'core:subsystem:obsolete', '[]', 'fixture', '{}', '{}', '[]', '[]', \
                      ?3, ?4, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'\
                  )",
