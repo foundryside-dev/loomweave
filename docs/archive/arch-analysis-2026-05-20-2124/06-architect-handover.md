@@ -19,7 +19,7 @@ hardening, but not yet release-ready by policy.
   one P4 future issue was ready.
 - Old architecture-analysis directory was removed at user request.
 - New root-and-branch analysis lives in
-  `docs/implementation/arch-analysis-2026-05-20-2124/`.
+  `docs/archive/arch-analysis-2026-05-20-2124/` (archived from `docs/implementation/`).
 
 ## Read First
 

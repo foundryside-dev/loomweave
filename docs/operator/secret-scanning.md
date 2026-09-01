@@ -92,7 +92,7 @@ Filigree integration for scanner findings (WP9-B finding emission) is deferred t
 
 ## Limitations
 
-The scanner is pattern-based. It can miss novel internal key formats and it can flag high-entropy test data. Use a justified baseline for reviewed false positives, and disable LLM dispatch entirely for repos where any source disclosure would be unacceptable — set `llm_policy.allow_live_provider: false` in `loomweave.yaml` (or leave `LOOMWEAVE_LLM_LIVE` unset) so the recording provider is the only path Loomweave will take.
+The scanner is pattern-based. It can miss novel internal key formats and it can flag high-entropy test data. Use a justified baseline for reviewed false positives, and disable LLM dispatch entirely for repos where any source disclosure would be unacceptable — set `llm_policy.enabled: false` in `loomweave.yaml`. That is the master switch: no provider is constructed and every LLM-backed tool returns an `LlmDisabled` envelope. `allow_live_provider: false` alone is not enough, because `LOOMWEAVE_LLM_LIVE=1` in the environment `serve` inherits re-enables live dispatch; and the recording provider is only ever selected by `provider: recording`, never as a fallback.
 
 Contextual credential suppression currently recognises shell/Python `#` comments only. It does not recognise `//` or `/* */` comments; use a justified baseline entry for reviewed non-Python test fixtures.
 

@@ -421,4 +421,4 @@ filigree close clarion-141e9c08c8 --actor claude
 
 ## Validate before execution (recommended)
 
-This is a structural refactor touching a load-bearing crate boundary. **RECOMMENDED SUB-SKILL:** run `/review-plan docs/plans/2026-06-24-loomweave-llm-extraction.md` (reality / architecture / quality / systems reviewers) before executing. Proceed on `APPROVED` / `APPROVED_WITH_WARNINGS`; revise on `CHANGES_REQUESTED`.
+This is a structural refactor touching a load-bearing crate boundary. **RECOMMENDED SUB-SKILL:** run `/review-plan docs/superpowers/plans/archive/2026-06-24-loomweave-llm-extraction.md` (reality / architecture / quality / systems reviewers) before executing. Proceed on `APPROVED` / `APPROVED_WITH_WARNINGS`; revise on `CHANGES_REQUESTED`.

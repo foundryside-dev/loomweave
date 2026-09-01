@@ -783,7 +783,7 @@ Loomweave reads `wardline.exceptions.json` at analyse time; entities referenced 
 
 #### REQ-INTEG-WARDLINE-05 — SARIF baseline ingest for translator
 
-> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP10 SARIF translator). The translator surface (`loomweave sarif import`) itself is deferred — see [REQ-INTEG-FILIGREE-04](#req-finding-04--general-purpose-sarif--filigree-translator) — so the baseline-ingest path it feeds is moot until WP10 lands.
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP10 SARIF translator). The translator surface (`loomweave sarif import`) itself is deferred — see [REQ-FINDING-04](#req-finding-04--general-purpose-sarif--filigree-translator) — so the baseline-ingest path it feeds is moot until WP10 lands.
 
 Loomweave reads `wardline.sarif.baseline.json` (read-only) for the `loomweave sarif import` translator path — the 663-result baseline is the source for Wardline-to-Filigree finding flow in v0.1.
 

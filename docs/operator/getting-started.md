@@ -286,8 +286,10 @@ llm_policy:
 `OPENROUTER_API_KEY` must also be exported in the environment that
 `loomweave serve` (or your MCP client wrapper) inherits — see the
 prerequisites section above. Skip this block if you don't have a key; the
-other 47 tools still work, only `entity_summary_get` will return an "LLM
-disabled" envelope.
+credential-free tools still work, and the LLM-backed paths —
+`entity_summary_get`, `entity_summary_preview_cost_get`, graph queries asked
+for `confidence: "inferred"`, and `entity_semantic_search_list` against a
+hosted embedding provider — return an "LLM disabled" envelope instead.
 
 Run `loomweave config check` after editing to confirm the effective state
 (provider, enabled, live, model) before starting `serve` — it flags the common
@@ -310,8 +312,11 @@ clustering (`entity_subsystem_get`), source and edge inspection
 the `entity_summary_get` LLM path plus its `entity_summary_preview_cost_get`
 estimator, Filigree enrichment (`entity_issue_list`), and the background
 re-index lifecycle (`analyze_start`/`analyze_status_get`/`analyze_cancel`).
-Only `entity_summary_get` needs the live LLM; every other tool is
-credential-free. Each is a structured graph query, not free-text grep.
+Of these, only `entity_summary_get` needs the live LLM; the graph queries are
+credential-free at their default confidence (asking for
+`confidence: "inferred"` routes through the LLM and, without the opt-in,
+returns an "LLM disabled" envelope). Each is a structured graph query, not
+free-text grep.
 
 | Tool | Example invocation |
 |---|---|
