@@ -11,6 +11,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+tempfile.workspace = true
 blake3.workspace = true
 loomweave-core = { path = "../loomweave-core", version = "1.6.0" }
 reqwest.workspace = true
@@ -20,4 +21,3 @@ serde_norway.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

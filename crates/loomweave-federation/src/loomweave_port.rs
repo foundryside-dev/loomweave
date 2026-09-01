@@ -113,15 +113,27 @@ pub fn publish_port_at(port_path: &Path, port: u16) -> std::io::Result<()> {
         ));
     };
     std::fs::create_dir_all(dir)?;
-    // One `serve` per process publishes, so the PID makes the temp name unique
-    // within this directory without needing a random suffix.
-    let tmp = dir.join(format!("ephemeral.port.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, format!("{port}\n"))?;
-    if let Err(err) = std::fs::rename(&tmp, port_path) {
-        // A successful write + failed rename would otherwise strand the temp.
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
+    // Exclusive, unpredictable staging: `.weft/loomweave/` is inside the
+    // analyzed checkout, so a guessable sibling name (the old
+    // `ephemeral.port.<pid>.tmp`) pre-planted as a symlink would have turned
+    // this write into a write-through. `O_EXCL` on a random name means the
+    // staging file is ours or the publish fails; the `NamedTempFile` unlinks
+    // it on every failure path, so a failed persist strands nothing.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("ephemeral.port.").suffix(".tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Match what `fs::write` produced (0o666 & ~umask): siblings resolve
+        // the port by reading this file.
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
+    let mut tmp = builder.tempfile_in(dir)?;
+    {
+        use std::io::Write as _;
+        tmp.write_all(format!("{port}\n").as_bytes())?;
+    }
+    tmp.persist(port_path).map_err(|err| err.error)?;
     Ok(())
 }
 
@@ -169,6 +181,35 @@ pub fn remove_published_port_if_matches_at(port_path: &Path, port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_port_never_follows_a_planted_staging_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        let port_path = dir.path().join("store").join("ephemeral.port");
+        std::fs::create_dir_all(port_path.parent().unwrap()).unwrap();
+        // The staging name the PID-derived scheme used; `.weft/loomweave/` is
+        // inside the checkout, so a repository can commit this symlink.
+        let planted = port_path
+            .parent()
+            .unwrap()
+            .join(format!("ephemeral.port.{}.tmp", std::process::id()));
+        symlink(&victim, &planted).unwrap();
+
+        publish_port_at(&port_path, 4321).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        assert_eq!(std::fs::read_to_string(&port_path).unwrap(), "4321\n");
+        assert!(
+            std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn deterministic_port_is_stable_and_in_band() {

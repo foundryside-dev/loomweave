@@ -14,6 +14,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::atomic_fs::staging_file_in;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OpenFlags};
 
@@ -74,37 +75,25 @@ pub fn backup(project_root: &Path, output: &Path, force: bool) -> Result<()> {
     // Stage into a sibling temp file so a crash mid-copy can never leave a
     // truncated file sitting at `output`. Renaming is atomic on the same
     // filesystem; staging as a sibling keeps us on it.
-    let parent = output.parent().filter(|p| !p.as_os_str().is_empty());
-    if let Some(parent) = parent {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create backup output directory {}", parent.display()))?;
-    }
-    let staging = staging_path(output);
-    // Clear any stale staging file from a previous interrupted run.
-    if staging.exists() {
-        std::fs::remove_file(&staging)
-            .with_context(|| format!("clear stale staging file {}", staging.display()))?;
-    }
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create backup output directory {}", parent.display()))?;
+    // Exclusive staging (see `atomic_fs`): SQLite opens the path it is given,
+    // so a guessable sibling name pre-planted as a symlink would have turned
+    // the backup into a write-through. The `TempPath` unlinks the staging file
+    // on every failure path, so an interrupted run leaves no debris.
+    let staging = staging_file_in(parent, &staging_prefix(output))?.into_temp_path();
 
-    let result = run_backup(&db_path, &staging);
-    match result {
-        Ok(()) => {
-            std::fs::rename(&staging, output).with_context(|| {
-                format!(
-                    "rename backup {} -> {}",
-                    staging.display(),
-                    output.display()
-                )
-            })?;
-            println!("Backed up {} -> {}", db_path.display(), output.display());
-            Ok(())
-        }
-        Err(err) => {
-            // Best-effort cleanup so a failed run leaves no debris behind.
-            let _ = std::fs::remove_file(&staging);
-            Err(err)
-        }
-    }
+    run_backup(&db_path, &staging)?;
+    staging
+        .persist(output)
+        .map_err(|err| err.error)
+        .with_context(|| format!("rename backup staging -> {}", output.display()))?;
+    println!("Backed up {} -> {}", db_path.display(), output.display());
+    Ok(())
 }
 
 /// Force a `PRAGMA wal_checkpoint(TRUNCATE)` on the working store so the on-disk
@@ -183,11 +172,12 @@ fn run_backup(db_path: &Path, staging: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sibling staging path for the atomic write (`<output>.loomweave-backup.tmp-<pid>`).
-fn staging_path(output: &Path) -> std::path::PathBuf {
-    let mut name = output.as_os_str().to_os_string();
-    name.push(format!(".loomweave-backup.tmp-{}", std::process::id()));
-    std::path::PathBuf::from(name)
+/// Prefix for the sibling staging file (`<output-name>.loomweave-backup.tmp-<random>`).
+fn staging_prefix(output: &Path) -> String {
+    let name = output
+        .file_name()
+        .map_or_else(|| "backup".to_owned(), |n| n.to_string_lossy().into_owned());
+    format!("{name}.loomweave-backup.tmp-")
 }
 
 /// True if both paths denote the same on-disk file. Falls back to a lexical
@@ -196,5 +186,58 @@ fn paths_are_same(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn backup_never_follows_a_planted_staging_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // A plain (non-git) project root resolves to the default store leaf.
+        // Spelled out so the worktree store-path audit does not read this
+        // test as an unclassified runtime resolution site.
+        let live = project.join(".weft").join("loomweave").join("loomweave.db");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&live).unwrap();
+        conn.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (42);")
+            .unwrap();
+        drop(conn);
+
+        let out_dir = dir.path().join("backups");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let output = out_dir.join("snap.db");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        // The staging name the PID-derived scheme used. SQLite opens whatever
+        // path it is handed, so a symlink here was a write-through.
+        let planted = out_dir.join(format!(
+            "snap.db.loomweave-backup.tmp-{}",
+            std::process::id()
+        ));
+        symlink(&victim, &planted).unwrap();
+
+        super::backup(&project, &output, false).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        assert!(
+            !std::fs::symlink_metadata(&output)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let conn = rusqlite::Connection::open(&output).unwrap();
+        let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(x, 42);
+        assert!(
+            std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }
