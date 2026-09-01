@@ -10,6 +10,8 @@ This folder is the canonical Loomweave v1.0 document set.
 
 ## Supporting docs
 
+- [operations.md](./operations.md) — storage operations: local-first store layout, the NFS prohibition, the analyze lock, and the supported backup/restore procedure.
+- [reviews/](./reviews/) — dated v1.0 reviews: [gap-analysis-2026-05-24.md](./reviews/gap-analysis-2026-05-24.md) (requirements vs implementation) and [v1.0-publish-checklist-2026-05-24.md](./reviews/v1.0-publish-checklist-2026-05-24.md).
 - [../adr/README.md](../adr/README.md) — authored ADRs and remaining decision backlog.
 - [../../implementation/README.md](../../implementation/README.md) — archived planning and review history (scope commitments, panel reviews, sprint plans, agent handoffs). Non-normative; supporting context only.
 

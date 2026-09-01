@@ -589,7 +589,7 @@ fn promote(project_root: &Path, config_path: Option<&Path>, observation_id: &str
     let mcp_config = crate::analyze::load_mcp_config(&canonical_root, config_path);
     let client = FiligreeHttpClient::from_config_with_project_root(
         &mcp_config.integrations.filigree,
-        |name| std::env::var(name).ok(),
+        loomweave_core::dotenv::var,
         Some(&canonical_root),
     )
     .context("build Filigree client")?

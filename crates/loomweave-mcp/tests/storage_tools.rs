@@ -2426,6 +2426,53 @@ async fn summary_cold_miss_refuses_live_source_drift() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_cold_miss_refuses_catalogue_path_outside_project() {
+    let (project, db_path) = open_project();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        outside.path(),
+        fs::read(project.path().join("demo.py")).unwrap(),
+    )
+    .unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE entities SET source_file_path = ?1 WHERE id = 'python:function:demo.entry'",
+        params![outside.path().display().to_string()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (writer, handle) = Writer::spawn(db_path.clone(), 50, 256).unwrap();
+    let provider = Arc::new(AnySummaryProvider::new_output(
+        r#"{"purpose":"should not run"}"#,
+        120,
+        0.0,
+    ));
+    let state = state_for_summary(
+        project.path(),
+        &db_path,
+        &writer,
+        provider.clone(),
+        llm_config(),
+    );
+
+    let envelope = call_tool(
+        &state,
+        "summary",
+        json!({"id": "python:function:demo.entry"}),
+    )
+    .await;
+
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    assert_eq!(envelope["error"]["code"], "invalid-path");
+    assert!(provider.invocations().is_empty());
+
+    drop(state);
+    drop(writer);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summary_cache_hit_reports_stale_semantic_when_graph_counts_drift() {
     let (project, db_path) = open_project();
     let conn = Connection::open(&db_path).unwrap();

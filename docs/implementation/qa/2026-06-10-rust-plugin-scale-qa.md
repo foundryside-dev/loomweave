@@ -1,6 +1,6 @@
 # Rust Plugin Dogfood + Scale QA — Sprint 3 report (2026-06-10)
 
-Non-normative QA memo (plan: `docs/superpowers/plans/2026-06-10-rust-plugin-scale-qa.md`,
+Non-normative QA memo (plan: `docs/superpowers/plans/archive/2026-06-10-rust-plugin-scale-qa.md`,
 parent ticket `clarion-a2db86704e`). Sprint-2 edge kinds (`derives`, `references`)
 WERE merged before all runs (rc4 @ `48bdafd`); edge counts include them.
 

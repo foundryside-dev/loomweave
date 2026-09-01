@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Rust Plugin Gold Closeout — Sprint 4 plan (2026-06-11)
 
 Worktree `feat/rust-plugin-gold` off rc4 `d05cb1a`. Parent ticket `clarion-363a6ca7d3`

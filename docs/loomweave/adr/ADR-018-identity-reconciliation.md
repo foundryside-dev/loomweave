@@ -198,8 +198,8 @@ Wardline exports its REGISTRY as a declarative descriptor file (`wardline_regist
 
 ## References
 
-- [Loomweave v0.1 requirements — REQ-INTEG-WARDLINE-01, NFR-COMPAT-02](../v0.1/requirements.md) (lines 599, 889) — REGISTRY pin and skew behaviour.
-- [Loomweave v0.1 system design §2 (Direct REGISTRY import), §9 (state-file ingest), §9 (Entity resolve oracle)](../v0.1/system-design.md) — import pattern, ingest paths, HTTP oracle.
-- [Loomweave v0.1 detailed design §2 (Identity reconciliation across the suite)](../v0.1/detailed-design.md) (lines 553-571) — three-scheme translation table; ingest-path rules.
+- [Loomweave v0.1 requirements — REQ-INTEG-WARDLINE-01, NFR-COMPAT-02](../1.0/requirements.md) (lines 599, 889) — REGISTRY pin and skew behaviour.
+- [Loomweave v0.1 system design §2 (Direct REGISTRY import), §9 (state-file ingest), §9 (Entity resolve oracle)](../1.0/system-design.md) — import pattern, ingest paths, HTTP oracle.
+- [Loomweave v0.1 detailed design §2 (Identity reconciliation across the suite)](../1.0/detailed-design.md) (lines 553-571) — three-scheme translation table; ingest-path rules.
 - [Weft doctrine §5 (v0.1 asterisks), §6 (What Weft is NOT)](../../suite/weft.md) — initialization-coupling asterisk; "no identity reconciliation service" categorical.
 - [Panel doctrine synthesis](../../implementation/v0.1-reviews/panel-2026-04-17/11-doctrine-panel-synthesis.md) — the asterisks framing originated here.

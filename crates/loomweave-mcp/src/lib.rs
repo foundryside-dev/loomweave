@@ -41,9 +41,9 @@ use loomweave_storage::{
     WriterCmd, call_edges_from, call_edges_targeting, containing_module_id,
     duplicate_locator_collision, entity_briefing_block_reason, entity_by_id,
     import_edges_for_entity, inferred_edge_cache_key_id, module_reference_rollup,
-    reference_edges_for_entity, relation_edges_for_entity, resolve_entity_ref, sei_for_locator,
-    tags_for_entity, unresolved_call_sites_for_caller, unresolved_caller_count_for_target,
-    unresolved_callers_for_target,
+    normalize_source_path, reference_edges_for_entity, relation_edges_for_entity,
+    resolve_entity_ref, sei_for_locator, tags_for_entity, unresolved_call_sites_for_caller,
+    unresolved_caller_count_for_target, unresolved_callers_for_target,
 };
 
 use crate::config::{LlmConfig, SemanticSearchConfig};
@@ -3774,7 +3774,7 @@ fn read_llm_config_status(
 }
 
 fn llm_config_status_json(path: &Path, created_or_absent: bool, config: &McpConfig) -> Value {
-    let selection = select_provider_with_env(config, |name| std::env::var(name).ok());
+    let selection = select_provider_with_env(config, loomweave_core::dotenv::var);
     let (live, selection_error) = match &selection {
         Ok(
             ProviderSelection::OpenRouter { .. }
@@ -3841,8 +3841,7 @@ fn semantic_config_status_json(
 ) -> Value {
     let semantic = &config.semantic_search;
     let sidecar_count = semantic_sidecar_count(sidecar_path);
-    let has_key = std::env::var(&semantic.api_key_env)
-        .ok()
+    let has_key = loomweave_core::dotenv::var(&semantic.api_key_env)
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
     let provider_error = semantic_provider_error(semantic, has_key).map(Value::String);
@@ -4624,26 +4623,46 @@ fn summary_read_error(read: SummaryRead) -> Value {
 }
 
 #[derive(Debug)]
-struct SourceExcerptError {
-    entity_id: String,
-    stored_content_hash: String,
-    current_content_hash: String,
+enum SourceExcerptError {
+    ContentDrift {
+        entity_id: String,
+        stored_content_hash: String,
+        current_content_hash: String,
+    },
+    InvalidPath {
+        entity_id: String,
+    },
 }
 
 impl SourceExcerptError {
     fn message(&self) -> String {
-        format!(
-            "entity {} source content drifted: stored content_hash {} but current file hashes to {}; rerun `loomweave analyze` before requesting LLM output",
-            self.entity_id, self.stored_content_hash, self.current_content_hash
-        )
+        match self {
+            Self::ContentDrift {
+                entity_id,
+                stored_content_hash,
+                current_content_hash,
+            } => format!(
+                "entity {entity_id} source content drifted: stored content_hash {stored_content_hash} but current file hashes to {current_content_hash}; rerun `loomweave analyze` before requesting LLM output"
+            ),
+            Self::InvalidPath { entity_id } => format!(
+                "entity {entity_id} has a source path outside the project root; rerun `loomweave analyze` before requesting LLM output"
+            ),
+        }
     }
 
     fn to_envelope(&self) -> Value {
-        tool_error_envelope(McpErrorCode::ContentDrift, &self.message(), false)
+        tool_error_envelope(self.code(), &self.message(), false)
     }
 
     fn to_inferred_failure(&self) -> InferredDispatchFailure {
-        InferredDispatchFailure::new(McpErrorCode::ContentDrift, &self.message(), false)
+        InferredDispatchFailure::new(self.code(), &self.message(), false)
+    }
+
+    fn code(&self) -> McpErrorCode {
+        match self {
+            Self::ContentDrift { .. } => McpErrorCode::ContentDrift,
+            Self::InvalidPath { .. } => McpErrorCode::InvalidPath,
+        }
     }
 }
 
@@ -6150,10 +6169,20 @@ fn source_anchor_for_entity(
     .flatten()
 }
 
-fn verified_source_excerpt(entity: &EntityRow) -> Result<String, SourceExcerptError> {
+fn verified_source_excerpt(
+    project_root: &Path,
+    entity: &EntityRow,
+) -> Result<String, SourceExcerptError> {
     let Some(path) = entity.source_file_path.as_deref() else {
         return Ok(String::new());
     };
+    // Catalogue rows are untrusted and may be committed with the project. Jail
+    // every read at use time; canonicalization also rejects symlinks escaping
+    // the project root.
+    let path =
+        normalize_source_path(project_root, path).map_err(|_| SourceExcerptError::InvalidPath {
+            entity_id: entity.id.clone(),
+        })?;
     let Ok(bytes) = std::fs::read(path) else {
         return Ok(String::new());
     };
@@ -6163,7 +6192,7 @@ fn verified_source_excerpt(entity: &EntityRow) -> Result<String, SourceExcerptEr
         current_source_content_hash(entity, &bytes, source.as_deref()),
     ) && stored_content_hash != current_content_hash
     {
-        return Err(SourceExcerptError {
+        return Err(SourceExcerptError::ContentDrift {
             entity_id: entity.id.clone(),
             stored_content_hash: stored_content_hash.to_owned(),
             current_content_hash,

@@ -7,7 +7,7 @@
 - **Deliverables selected**: **Option G — Comprehensive**.
   - Rationale: user requested a fresh "root and branch" analysis after deleting the old analysis.
   - Note: the skill's interactive deliverable menu is documented here rather than asked live because the user explicitly named the comprehensive scope.
-- **Workspace**: `docs/implementation/arch-analysis-2026-05-20-2124/`.
+- **Workspace**: `docs/archive/arch-analysis-2026-05-20-2124/` (archived from `docs/implementation/`).
 - **Strategy**: **PARALLEL** subagent exploration over independent subsystems, then independent validation gates.
 - **Tier**: Medium-to-large. Source is below ultralarge thresholds, but RC1 adds release governance and federation surfaces that warrant quality/security/dependency passes.
 - **Time constraint**: None stated.

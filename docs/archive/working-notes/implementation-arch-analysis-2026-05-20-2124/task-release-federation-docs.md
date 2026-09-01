@@ -2,7 +2,7 @@
 
 ## Context
 
-- Workspace: `docs/implementation/arch-analysis-2026-05-20-2124/`
+- Workspace: `docs/archive/arch-analysis-2026-05-20-2124/`
 - Branch / commit: `RC1` at `286d92d`
 - Scope: `docs/clarion/1.0/`, `docs/clarion/adr/`, `docs/federation/`,
   `docs/operator/`, `.github/workflows/`, `scripts/`, `tests/e2e/`,

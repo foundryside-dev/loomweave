@@ -56,11 +56,11 @@ WHERE kind = 'in_subsystem';
 
 ## MCP Access
 
-Use `subsystem_members` to inspect the modules assigned to a subsystem:
+Use `subsystem_member_list` to inspect the modules assigned to a subsystem:
 
 ```json
 {
-  "name": "subsystem_members",
+  "name": "subsystem_member_list",
   "arguments": {
     "id": "core:subsystem:abc123def456"
   }
@@ -68,7 +68,7 @@ Use `subsystem_members` to inspect the modules assigned to a subsystem:
 ```
 
 The response includes subsystem properties and ordered member modules. Calling
-`summary` on a subsystem returns `available=false` with reason
+`entity_summary_get` on a subsystem returns `available=false` with reason
 `summary-scope-deferred`; subsystem summarization is deferred to v0.2 and does
 not call the LLM provider in v0.1.
 

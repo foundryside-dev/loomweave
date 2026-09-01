@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-18
 **For**: an agent picking this up cold
-**Predecessor context**: Sprint 2 closed GREEN; [arch-analysis 2026-05-20](../arch-analysis-2026-05-20-2124/04-final-report.md) supersedes the removed 2026-05-18 snapshot as the current RC1 code-geography reference; [Thread-1 publish-prep program](../../implementation/v0.1-publish/thread-1-pre-publish-blockers.md) runs in parallel to this and does not block.
+**Predecessor context**: Sprint 2 closed GREEN; [arch-analysis 2026-05-20](../../archive/arch-analysis-2026-05-20-2124/04-final-report.md) supersedes the removed 2026-05-18 snapshot as the current RC1 code-geography reference; [Thread-1 publish-prep program](../../implementation/v0.1-publish/thread-1-pre-publish-blockers.md) runs in parallel to this and does not block.
 
 ---
 
@@ -44,7 +44,7 @@ Two things, in order, with a human review gate between them.
    - `crates/loomweave-cli/src/analyze.rs` — where Phase 1 (entity ingest) and Phase 2 (graph completion if implemented) currently end. Find the seam Phase 3 plugs into. Note that the file is `#[allow(clippy::too_many_lines)]` and arch-analysis flagged it (H-1 closed); if you add to it, factor cleanly.
    - `crates/loomweave-mcp/src/lib.rs` — the 7 MCP tools. Specifically `neighborhood`, `find_entity`, `execution_paths_from` — these will become more useful with subsystems but may need shape changes. **Do not change MCP tool surfaces silently.** Surface every proposed change in the plan.
 8. **`docs/implementation/sprint-2/scope-amendment-2026-05.md`** — what was explicitly deferred. WP4 Phase 3 was deferred *with this work in mind*; you are pulling it forward from v0.2 to closing-of-v0.1.
-9. **`docs/implementation/arch-analysis-2026-05-20-2124/02-subsystem-catalog.md`** — current RC1 code geography. The `loomweave-storage` and `loomweave-cli` entries describe the writer-actor, query helpers, and analyze orchestrator in concrete terms; refresh line numbers against current `HEAD` before treating them as evidence.
+9. **`docs/archive/arch-analysis-2026-05-20-2124/02-subsystem-catalog.md`** — current RC1 code geography. The `loomweave-storage` and `loomweave-cli` entries describe the writer-actor, query helpers, and analyze orchestrator in concrete terms; refresh line numbers against current `HEAD` before treating them as evidence.
 
 ## Scope discipline — what's IN and what's OUT
 
@@ -178,9 +178,9 @@ The last bullet is the actual capability the work delivers. If it works in CI bu
 - [ADR-003 — Entity-ID scheme](../../loomweave/adr/ADR-003-entity-id-scheme.md)
 - [ADR-024 — Migration edit-in-place policy](../../loomweave/adr/ADR-024-guidance-schema-vocabulary.md)
 - [ADR-031 — Schema validation policy (CHECK constraints)](../../loomweave/adr/ADR-031-schema-validation-policy.md)
-- [REQ-CATALOG-05, REQ-ANALYZE-01, REQ-ANALYZE-05](../../loomweave/v0.1/requirements.md)
+- [REQ-CATALOG-05, REQ-ANALYZE-01, REQ-ANALYZE-05](../../loomweave/1.0/requirements.md)
 - [v0.1-plan.md WP4](../../implementation/v0.1-plan.md#wp4--core-only-pipeline-phases-03-7-8)
 - [Sprint-2 scope amendment — explicit Phase 3 deferral with retirement path](../../implementation/sprint-2/scope-amendment-2026-05.md)
-- [Arch-analysis 2026-05-20 — current RC1 code geography](../arch-analysis-2026-05-20-2124/04-final-report.md)
+- [Arch-analysis 2026-05-20 — current RC1 code geography](../../archive/arch-analysis-2026-05-20-2124/04-final-report.md)
 - [B.2 plan-doc shape — canonical example](../agent-plans/2026-05-05-b2-class-module-entities.md)
 - [Sprint-2 B.4* — the week-2 go/no-go gate pattern to mimic](../../implementation/sprint-2/scope-amendment-2026-05.md#5-the-week-2-gono-go-gate-load-bearing-risk)

@@ -334,24 +334,20 @@ pub fn install_session_start_hook(project_root: &Path) -> Result<bool> {
     let serialized =
         serde_json::to_string_pretty(&settings).context("serialize .claude/settings.json")?;
 
-    // Atomic write: stage into a sibling temp file in the same directory, then
-    // rename over the destination (same-filesystem atomic swap). This protects
-    // the user's hand-authored settings.json from truncation/corruption on a
-    // crash or concurrent install mid-write. Mirrors skill_pack::stage_and_swap.
-    let tmp = claude_dir.join(format!(".settings.json.tmp-{}", std::process::id()));
-    if let Err(err) = write_and_swap(&tmp, &settings_path, &serialized) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
+    // Atomic write: create an unpredictable sibling exclusively, then rename
+    // it over the destination (same-filesystem atomic swap). Exclusive creation
+    // prevents a repository-controlled symlink from redirecting the write.
+    write_and_swap(&claude_dir, &settings_path, &serialized)?;
     Ok(true)
 }
 
-fn write_and_swap(tmp: &Path, dest: &Path, serialized: &str) -> Result<()> {
-    fs::write(tmp, format!("{serialized}\n"))
-        .with_context(|| format!("write staging {}", tmp.display()))?;
-    fs::rename(tmp, dest)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
-    Ok(())
+fn write_and_swap(dir: &Path, dest: &Path, serialized: &str) -> Result<()> {
+    debug_assert_eq!(dest.parent(), Some(dir));
+    crate::atomic_fs::replace_file(
+        dest,
+        ".settings.json.tmp-",
+        format!("{serialized}\n").as_bytes(),
+    )
 }
 
 #[cfg(test)]
@@ -878,6 +874,36 @@ mod tests {
         assert_eq!(
             after, original,
             "a failed install must leave the user's settings.json byte-for-byte intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_does_not_follow_predictable_staging_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        fs::create_dir(&claude_dir).unwrap();
+        let outside = dir.path().join("outside.json");
+        fs::write(&outside, "outside must remain unchanged\n").unwrap();
+
+        // This was the staging name before randomized, exclusive temp-file
+        // creation. A malicious repository could commit such a symlink.
+        let attacker_link = claude_dir.join(format!(".settings.json.tmp-{}", std::process::id()));
+        symlink(&outside, &attacker_link).unwrap();
+
+        assert!(install_session_start_hook(dir.path()).unwrap());
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "outside must remain unchanged\n"
+        );
+        assert!(
+            !fs::symlink_metadata(claude_dir.join("settings.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "installed settings must be a regular file, not the attacker symlink"
         );
     }
 }

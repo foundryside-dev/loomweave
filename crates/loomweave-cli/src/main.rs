@@ -1,5 +1,6 @@
 mod analyze;
 mod analyze_lock;
+mod atomic_fs;
 mod cli;
 mod config;
 mod db;
@@ -28,10 +29,11 @@ use clap::Parser;
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
-    // Load .env before tracing setup for operator-facing commands so a
-    // .env-supplied RUST_LOG is in effect by the time the filter is built.
+    // Parse `.env` into the credential sidecar — never the process
+    // environment (`loomweave_core::dotenv`, ADR-062) — before tracing setup
+    // so a `.env`-supplied RUST_LOG is in effect by the time the filter is built.
     if should_load_dotenv(&cli.command) {
-        let _ = dotenvy::dotenv();
+        loomweave_core::dotenv::load_sidecar();
     }
     init_tracing();
     match cli.command {
@@ -173,24 +175,29 @@ fn main() -> Result<()> {
     }
 }
 
-/// Whether to load a repository-controlled `.env` for this command.
+/// Whether to consult a repository-controlled `.env` for this command.
 ///
-/// Most operator commands want `.env` loaded (e.g. a `.env`-supplied `RUST_LOG`,
-/// or a Filigree `token_env` consumed by `guidance promote` / `sarif import`).
-/// Two cases must NOT load it, because they would import repository-controlled
-/// values into a subprocess environment before those values have been vetted:
+/// `.env` is parsed into a credential sidecar (`loomweave_core::dotenv`,
+/// ADR-062) that only Loomweave's own config-named lookups read — provider
+/// keys, Filigree tokens, `RUST_LOG`. It never enters the process environment,
+/// so no child process inherits it and no launcher override
+/// (`LOOMWEAVE_*_MCP_COMMAND`, `$EDITOR`, `LD_PRELOAD`, …) can be supplied by
+/// it. Most operator commands want the sidecar (e.g. a `.env`-supplied
+/// `RUST_LOG`, or a Filigree `token_env` consumed by `guidance promote` /
+/// `sarif import`). The exclusions below are defence in depth for commands
+/// that must not read repository-supplied credentials at all:
 ///
 /// - `analyze` (and `worktree analyze`, which runs the identical pipeline):
 ///   project `.env` contents are scanned as source sidecars by the
-///   pre-ingest secret scanner and must not reach plugin subprocess
-///   environments before that gate runs.
+///   pre-ingest secret scanner and must not be consumed before that gate runs.
+/// - `hook`: the session-start hook may spawn a detached `analyze`; it reads
+///   no credential itself, so it has no business parsing the file.
 /// - `guidance create` / `guidance edit`: authoring spawns `$VISUAL`/`$EDITOR`
-///   (see `guidance::edit_in_editor`), so a repository `.env` supplying
-///   `VISUAL`/`EDITOR` — or `PATH`, etc. — would execute attacker-controlled
-///   code as the operator who merely opened an untrusted checkout. Only these
-///   two `guidance` subcommands spawn an editor; the rest (`promote`, `show`,
-///   `list`, `export`, `import`, `delete`) keep `.env` so a `.env`-supplied
-///   Filigree token still resolves.
+///   (see `guidance::edit_in_editor`); the sidecar cannot feed those any more,
+///   but an editor session is the wrong place to have repository credentials
+///   resolvable at all. Only these two `guidance` subcommands spawn an editor;
+///   the rest (`promote`, `show`, `list`, `export`, `import`, `delete`) keep
+///   the sidecar so a `.env`-supplied Filigree token still resolves.
 fn should_load_dotenv(command: &cli::Command) -> bool {
     !matches!(
         command,
@@ -198,6 +205,7 @@ fn should_load_dotenv(command: &cli::Command) -> bool {
             | cli::Command::Worktree {
                 command: cli::WorktreeCommand::Analyze { .. },
             }
+            | cli::Command::Hook { .. }
             | cli::Command::Guidance {
                 command: cli::GuidanceCommand::Create { .. } | cli::GuidanceCommand::Edit { .. },
             }
@@ -206,7 +214,11 @@ fn should_load_dotenv(command: &cli::Command) -> bool {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `RUST_LOG` may come from the credential sidecar (a `.env` in the cwd),
+    // which `try_from_default_env` cannot see.
+    let filter = loomweave_core::dotenv::var("RUST_LOG")
+        .and_then(|directives| EnvFilter::try_new(directives).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -238,6 +250,19 @@ mod tests {
             "analyze",
             "--",
             "some-worktree"
+        ]));
+    }
+
+    #[test]
+    fn session_start_hook_does_not_load_dotenv() {
+        // A stale session-start hook spawns analyze; repo values must not be
+        // inherited by that child before analyze's secret scan runs.
+        assert!(!loads(&[
+            "loomweave",
+            "hook",
+            "session-start",
+            "--path",
+            ".",
         ]));
     }
 

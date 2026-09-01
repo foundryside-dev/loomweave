@@ -263,14 +263,10 @@ pub fn install_mcp_entry(project_root: &Path) -> Result<bool> {
     }
 
     let serialized = serde_json::to_string_pretty(&root).context("serialize .mcp.json")?;
-    // Atomic write: stage a sibling temp file in the project root (same
+    // Atomic write: exclusive sibling staging in the project root (same
     // filesystem), then rename over the destination. Mirrors
     // hooks_settings::write_and_swap.
-    let tmp = project_root.join(format!(".mcp.json.tmp-{}", std::process::id()));
-    if let Err(err) = write_and_swap(&tmp, &path, &serialized) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
+    write_and_swap(&path, &serialized)?;
     Ok(true)
 }
 
@@ -396,12 +392,8 @@ fn write_text_if_changed(path: &Path, content: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn write_and_swap(tmp: &Path, dest: &Path, serialized: &str) -> Result<()> {
-    fs::write(tmp, format!("{serialized}\n"))
-        .with_context(|| format!("write staging {}", tmp.display()))?;
-    fs::rename(tmp, dest)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
-    Ok(())
+fn write_and_swap(dest: &Path, serialized: &str) -> Result<()> {
+    crate::atomic_fs::replace_file(dest, ".mcp.json.tmp-", format!("{serialized}\n").as_bytes())
 }
 
 #[cfg(test)]
@@ -411,6 +403,40 @@ mod tests {
     use serde_json::Value;
 
     use super::{McpState, install_mcp_entry, mcp_entry_state};
+
+    #[cfg(unix)]
+    #[test]
+    fn install_never_follows_a_planted_staging_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.json");
+        fs::write(&victim, "{\"keep\":true}\n").unwrap();
+        // The staging name the PID-derived scheme used, committed at the
+        // project root by a hostile repository.
+        let planted = dir
+            .path()
+            .join(format!(".mcp.json.tmp-{}", std::process::id()));
+        symlink(&victim, &planted).unwrap();
+
+        assert!(install_mcp_entry(dir.path()).unwrap());
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "{\"keep\":true}\n");
+        let written = dir.path().join(".mcp.json");
+        assert!(
+            !fs::symlink_metadata(&written)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let value: Value = serde_json::from_str(&fs::read_to_string(&written).unwrap()).unwrap();
+        assert!(value["mcpServers"]["loomweave"].is_object());
+        assert!(
+            fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn state_missing_then_present_around_install() {

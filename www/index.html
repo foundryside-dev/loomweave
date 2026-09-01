@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Loomweave — code-archaeology &amp; the suite's identity authority</title>
-<meta name="description" content="Loomweave turns a codebase into a queryable, identity-stable structural graph an agent reads instead of grepping — and mints the SEI every cross-tool binding in the Weft Federation keys on. Rust core, 42+ consult-mode MCP tools, local-first.">
+<meta name="description" content="Loomweave turns a codebase into a queryable, identity-stable structural graph an agent reads instead of grepping — and mints the SEI every cross-tool binding in the Weft Federation keys on. Rust core, 48 consult-mode MCP tools, local-first.">
 <!-- Preload brand + product faces before first paint (kills the substitute-font flash). -->
 <link rel="preload" href="fonts/SpaceGrotesk-Variable.ttf" as="font" type="font/ttf" crossorigin>
 <link rel="preload" href="fonts/JetBrainsMono-Variable.ttf" as="font" type="font/ttf" crossorigin>
@@ -42,7 +42,7 @@
   <section class="hero">
     <div class="eyebrow">
       <span class="dot dot-ready" aria-hidden="true"></span>
-      <span class="t-label">Rust core · 42+ MCP tools · local-first · v1.1.0</span>
+      <span class="t-label">Rust core · 48 MCP tools · local-first · v1.6.1</span>
     </div>
     <h1 class="hero-title">Read the codebase,<br>don&rsquo;t re-grep it.</h1>
     <p class="t-body hero-lede">
@@ -81,7 +81,7 @@
     <div class="hero-stats">
       <div class="stat">
         <span class="stat-label"><span class="stat-dot t-accent"></span>Consult-mode MCP tools</span>
-        <span class="stat-value">42+</span>
+        <span class="stat-value">48</span>
       </div>
       <div class="stat">
         <span class="stat-label"><span class="stat-dot t-ready"></span>Entity kinds extracted</span>
@@ -141,18 +141,18 @@
     <div class="code">
       <div class="code-head"><span class="code-lang">bash</span></div>
 <pre><span class="cm"># install the binary + the Python language plugin from the GitHub Release</span>
-TAG=v1.1.0
+TAG=v1.6.1
 curl -L -o loomweave.tar.gz \
   "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf loomweave.tar.gz
 install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
 pipx install \
-  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-plugin-python-1.1.0.tar.gz"
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.6.1.tar.gz"
 
 <span class="cm"># wire the agent, walk the corpus, serve the graph over MCP</span>
 loomweave install --path .   <span class="cm"># initialises .weft/loomweave/, wires the MCP client + skill + hook</span>
 loomweave analyze            <span class="cm"># extract entities + edges (no LLM credentials needed)</span>
-loomweave serve              <span class="cm"># expose the 42+-tool consult-mode MCP surface</span></pre>
+loomweave serve              <span class="cm"># expose the 48-tool consult-mode MCP surface</span></pre>
     </div>
 
     <h2 class="doc-h2">A traversal answer, honest about its blind spots</h2>
@@ -230,7 +230,7 @@ loomweave serve              <span class="cm"># expose the 42+-tool consult-mode
       </a>
       <a class="product-card thread-loomweave" href="tools.html">
         <span class="product-head"><span class="product-name">MCP tools</span></span>
-        <span class="product-domain">the 42+-tool consult surface</span>
+        <span class="product-domain">the 48-tool consult surface</span>
         <span class="product-what">The full MCP surface grouped by family: navigation, briefing, guidance/findings/federation context, analyze lifecycle, and faceted shortcuts.</span>
         <span class="product-link">Reference &rarr;</span>
       </a>

@@ -1019,9 +1019,9 @@ off via the criteria in §9.
 - [ADR-021 — Plugin authority hybrid](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md) — path-jail upstream of scanner.
 - [ADR-022 — Core/plugin ontology boundary](../../loomweave/adr/ADR-022-core-plugin-ontology.md) — secret detection as a core-owned algorithm.
 - [ADR-023 — Tooling baseline](../../loomweave/adr/ADR-023-tooling-baseline.md) — CI floor every task in this workstream must clear.
-- [Requirements — NFR-SEC-01, NFR-SEC-04, NFR-OPS-01, NFR-OPS-04](../../loomweave/v0.1/requirements.md) — requirement floor.
+- [Requirements — NFR-SEC-01, NFR-SEC-04, NFR-OPS-01, NFR-OPS-04](../../loomweave/1.0/requirements.md) — requirement floor.
 - [Thread 1 — Pre-publish blockers (program of work)](./thread-1-pre-publish-blockers.md) — the umbrella program.
 - [v0.1-plan.md — WP5 scope](../v0.1-plan.md#wp5--pre-ingest-secret-scanner) — original work-package definition.
 - [Sprint 2 scope amendment — WP5 deferral rationale](../sprint-2/scope-amendment-2026-05.md) — "production deployment against unknown corpora gates on this returning."
-- [Arch-analysis final report](../arch-analysis-2026-05-20-2124/04-final-report.md) — current RC1 architecture report; historical H-1 (`SoftFailed` coverage) coverage remains closed via `clarion-141ca7de30` and is a relevant precondition for Task 3.
+- [Arch-analysis final report](../../archive/arch-analysis-2026-05-20-2124/04-final-report.md) — current RC1 architecture report; historical H-1 (`SoftFailed` coverage) coverage remains closed via `clarion-141ca7de30` and is a relevant precondition for Task 3.
 - [`detect-secrets` baseline format](https://github.com/Yelp/detect-secrets/blob/master/README.md#baseline-file) — the format Task 2 matches.

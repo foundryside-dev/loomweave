@@ -1,6 +1,6 @@
 # Runtime Topology
 
-Loomweave stores project state in `.weft/loomweave/loomweave.db`. The current v0.1 CLI
+Loomweave stores project state in `.weft/loomweave/loomweave.db`. The current 1.x CLI
 uses SQLite WAL mode with a 5 second `busy_timeout` on writer and reader
 connections. `loomweave analyze` opens one writer actor for ingest. `loomweave
 serve` always opens a reader pool, and opens its own writer actor only when LLM
@@ -55,5 +55,5 @@ first, then copy or repair the store.
 
 ADR-011 describes a future shadow database mode for zero-stale reads during
 long analysis runs. The current CLI does not expose a `--shadow-db` flag, so
-operators should treat in-place analyze plus WAL as the only shipped v0.1
+operators should treat in-place analyze plus WAL as the only shipped 1.x
 runtime topology.

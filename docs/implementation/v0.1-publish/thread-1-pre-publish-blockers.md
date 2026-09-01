@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans`. Each workstream is independently dispatchable; sequencing is described in §1.
 
 **Status**: drafted 2026-05-18 — not yet broken into Filigree issues.
-**Predecessor context**: Sprint 2 closed GREEN ([`../sprint-2/signoffs.md`](../sprint-2/signoffs.md)); the 2026-05-20 RC1 codebase archaeology ([`../../arch-analysis-2026-05-20-2124/04-final-report.md`](../arch-analysis-2026-05-20-2124/04-final-report.md)) supersedes the removed 2026-05-18 snapshot as the current-state reference.
+**Predecessor context**: Sprint 2 closed GREEN ([`../sprint-2/signoffs.md`](../sprint-2/signoffs.md)); the 2026-05-20 RC1 codebase archaeology ([`../../../archive/arch-analysis-2026-05-20-2124/04-final-report.md`](../../archive/arch-analysis-2026-05-20-2124/04-final-report.md)) supersedes the removed 2026-05-18 snapshot as the current-state reference.
 **Goal**: take the amended-v0.1 MCP-MVP from "works on the elspeth-slice corpus on the author's box" to "publishable v0.1" — meaning *an outside operator can install it, point it at an arbitrary repo without leaking secrets, and find their way to first value in five minutes*.
 
 **Scope discipline**: this is *only* Thread 1 (pre-publish operational/security blockers). Two adjacent threads exist and are NOT in this program:
@@ -426,8 +426,8 @@ filigree close clarion-2d178ddda0 --reason="superseded by Publish-prep --force t
 - [ADR-007 — Summary cache key (briefing_blocked semantics)](../../loomweave/adr/ADR-007-summary-cache-key.md)
 - [ADR-021 — Plugin authority hybrid (path-jail upstream of scanner)](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md)
 - [ADR-023 — Tooling baseline (CI floor every PR must clear)](../../loomweave/adr/ADR-023-tooling-baseline.md)
-- [Requirements — NFR-SEC-01, NFR-SEC-04, NFR-OPS-01, NFR-OPS-04](../../loomweave/v0.1/requirements.md)
-- [System design — §10 Security, pre-ingest redaction paragraph](../../loomweave/v0.1/system-design.md)
+- [Requirements — NFR-SEC-01, NFR-SEC-04, NFR-OPS-01, NFR-OPS-04](../../loomweave/1.0/requirements.md)
+- [System design — §10 Security, pre-ingest redaction paragraph](../../loomweave/1.0/system-design.md)
 - [v0.1-plan.md — WP5 scope](../v0.1-plan.md#wp5--pre-ingest-secret-scanner)
 - [Sprint-2 scope amendment — explicit WP5 deferral rationale, "production deployment against unknown corpora gates on this returning"](../sprint-2/scope-amendment-2026-05.md)
-- [Arch analysis final report — current RC1 architecture report](../arch-analysis-2026-05-20-2124/04-final-report.md)
+- [Arch analysis final report — current RC1 architecture report](../../archive/arch-analysis-2026-05-20-2124/04-final-report.md)

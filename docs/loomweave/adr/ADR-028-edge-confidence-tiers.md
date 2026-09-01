@@ -211,5 +211,5 @@ Compute inferred edges for every unresolved site during `loomweave analyze`.
 ## References
 
 - [Sprint 2 scope-amendment memo](../../implementation/sprint-2/scope-amendment-2026-05.md) — the larger context: pyright integration, MVP MCP surface, where confidence tiers fit in the new sprint shape.
-- [`detailed-design.md` §"Python plugin specifics — call graph precision"](../v0.1/detailed-design.md#python-plugin-specifics-call-graph-precision) — the prior text this ADR formalises.
+- [`detailed-design.md` §"Python plugin specifics — call graph precision"](../1.0/detailed-design.md#python-plugin-specifics--call-graph-precision) — the prior text this ADR formalises.
 - [B.4* design doc — calls edges + pyright + confidence] — to be written as part of the resume; cites this ADR.

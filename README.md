@@ -14,10 +14,13 @@ and trust-topology tools.
 
 ## Status
 
-**Public release: v1.5.1. Local checkout: v1.6.0.** `v1.5.1` is the latest
-public GitHub release (crates.io and all three PyPI packages). This checkout
-and the local uv build are versioned `1.6.0`; `v1.6.0` is intentionally not
-tagged or published yet. The current source and public release line include:
+**Public release: v1.6.1. Local checkout: v1.6.1.** `v1.6.1` is the latest
+public GitHub release (crates.io and all three PyPI packages): a security
+patch that keeps a repository `.env` out of the process environment (ADR-062),
+stages every atomic write exclusively, isolates the Filigree MCP launcher, and
+jails LLM source excerpts to the project root. This checkout and the local uv
+build are versioned `1.6.1`. The current source and public release line
+include:
 
 - **Python and Rust first-party plugins.** The Python plugin extracts modules,
   classes, functions, calls, references, decorators, and inheritance edges. The
@@ -89,13 +92,13 @@ and live LLM spend. The core tool families are:
 
 ```bash
 # 1. Install from the current GitHub Release
-TAG=v1.4.0
+TAG=v1.6.1
 curl -L -o loomweave-x86_64-unknown-linux-gnu.tar.gz \
   "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf loomweave-x86_64-unknown-linux-gnu.tar.gz
 install loomweave-x86_64-unknown-linux-gnu/loomweave ~/.local/bin/
 pipx install \
-  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.4.0.tar.gz"
+  "https://github.com/foundryside-dev/loomweave/releases/download/${TAG}/loomweave_plugin_python-1.6.1.tar.gz"
 
 # 2. Initialise a project
 cd /path/to/your/python/repo
@@ -108,7 +111,7 @@ loomweave analyze
 loomweave serve
 ```
 
-This versioned `1.6.0` checkout can also be installed locally:
+This versioned `1.6.1` checkout can also be installed locally:
 
 ```bash
 # From this repository checkout
@@ -118,7 +121,7 @@ pipx install ./packaging/rust-plugin-dist
 ```
 
 The `loomweave` package metadata in this checkout depends on both
-`loomweave-plugin-python==1.6.0` and `loomweave-plugin-rust==1.6.0`; installing
+`loomweave-plugin-python==1.6.1` and `loomweave-plugin-rust==1.6.1`; installing
 that local package lands the CLI and both plugin executables in the same
 environment.
 

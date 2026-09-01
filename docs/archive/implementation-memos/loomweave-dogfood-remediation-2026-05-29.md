@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Loomweave dogfood — remediation plan (2026-05-29)
 
 Companion to [`loomweave-dogfood-eval-2026-05-29.md`](loomweave-dogfood-eval-2026-05-29.md).

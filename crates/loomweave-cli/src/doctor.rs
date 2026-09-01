@@ -1895,7 +1895,7 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     // static bind. A running serve publishes .weft/loomweave/ephemeral.port.
     let resolution =
         loomweave_federation::loomweave_url::resolve_loomweave_url_at(None, &port_path, |name| {
-            std::env::var(name).ok()
+            loomweave_core::dotenv::var(name)
         });
     if let Some(url) = resolution.resolved_url {
         if resolution.source == loomweave_federation::loomweave_url::SOURCE_EPHEMERAL_PORT
@@ -1980,12 +1980,11 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
             }));
     }
 
-    let identity_secret_present = http
-        .identity_token_env
-        .as_deref()
-        .is_some_and(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+    let identity_secret_present = http.identity_token_env.as_deref().is_some_and(|name| {
+        loomweave_core::dotenv::var(name).is_some_and(|value| !value.trim().is_empty())
+    });
     let bearer_secret_present =
-        std::env::var(&http.token_env).is_ok_and(|value| !value.trim().is_empty());
+        loomweave_core::dotenv::var(&http.token_env).is_some_and(|value| !value.trim().is_empty());
     let configured_mode = if http.identity_token_env.is_some() {
         "hmac"
     } else if bearer_secret_present {
@@ -2006,7 +2005,7 @@ fn check_http_authentication_json(project_root: &Path) -> DoctorJsonCheck {
         "secret_present": secret_present,
         "loopback": http.is_loopback_bind(),
     });
-    if let Err(err) = http.validate_auth_trust(|name| std::env::var(name).ok()) {
+    if let Err(err) = http.validate_auth_trust(loomweave_core::dotenv::var) {
         let check = DoctorJsonCheck::problem(
             ID,
             format!("HTTP authentication is configured but unusable: {err}"),
@@ -2248,7 +2247,7 @@ fn llm_posture(project_root: &Path) -> LlmPosture {
 
     let warnings = config.llm_warnings();
     let provider = config.llm.provider.as_str();
-    match select_provider_with_env(&config, |name| std::env::var(name).ok()) {
+    match select_provider_with_env(&config, loomweave_core::dotenv::var) {
         Err(err) => LlmPosture::Unusable(format!("live provider selected but unusable: {err}")),
         Ok(sel) => {
             let live = matches!(

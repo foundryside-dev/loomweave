@@ -783,7 +783,7 @@ Loomweave reads `wardline.exceptions.json` at analyse time; entities referenced 
 
 #### REQ-INTEG-WARDLINE-05 — SARIF baseline ingest for translator
 
-> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP10 SARIF translator). The translator surface (`loomweave sarif import`) itself is deferred — see [REQ-INTEG-FILIGREE-04](#req-integ-filigree-04--sarif-import-translator) — so the baseline-ingest path it feeds is moot until WP10 lands.
+> **Deferred to v1.1** per the [Sprint 2 scope amendment §4](../../implementation/sprint-2/scope-amendment-2026-05.md) (WP10 SARIF translator). The translator surface (`loomweave sarif import`) itself is deferred — see [REQ-FINDING-04](#req-finding-04--general-purpose-sarif--filigree-translator) — so the baseline-ingest path it feeds is moot until WP10 lands.
 
 Loomweave reads `wardline.sarif.baseline.json` (read-only) for the `loomweave sarif import` translator path — the 663-result baseline is the source for Wardline-to-Filigree finding flow in v0.1.
 
@@ -958,7 +958,7 @@ Loomweave runs entirely locally. The only required network egress is the LLM pro
 The `.weft/loomweave/` directory (including `loomweave.db` by default) is safe to commit to git. Textual DB export (`loomweave db export --textual`) and a merge helper (`loomweave db merge-helper`) handle multi-developer conflicts.
 
 **Rationale**: Shared analysis state benefits small teams (one developer pays the LLM cost; the team sees the briefings). Commit-by-default matches Filigree's and Wardline's storage patterns. Textual export makes git diffs meaningful.
-**Verification**: `git add .loomweave && git commit` succeeds on a populated store; two developers' simultaneous runs produce a DB that the merge helper resolves deterministically.
+**Verification**: `git add .weft/loomweave && git commit` succeeds on a populated store; two developers' simultaneous runs produce a DB that the merge helper resolves deterministically.
 **See**: System Design §4 (Storage, File layout).
 
 #### NFR-OPS-04 — Python plugin install via pipx

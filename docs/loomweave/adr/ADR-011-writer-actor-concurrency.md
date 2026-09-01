@@ -174,7 +174,7 @@ Already rejected in ADR-001 for the storage-engine selection. Re-cited here beca
 ## References
 
 - [Loomweave v0.1 design review §2.2](../../implementation/v0.1-reviews/pre-restructure/design-review.md) (lines 56-66) — original CRITICAL flag; writer-actor and shadow-DB options.
-- [Loomweave v0.1 detailed design §3 (Concurrency)](../v0.1/detailed-design.md) (lines 758-769) — the implementation detail this ADR formalises.
-- [Loomweave v0.1 requirements §NFR-RELIABILITY-02](../v0.1/requirements.md) (line 857) — WAL + writer-actor + checkpoint discipline as crash-safety requirement.
-- [Loomweave v0.1 system design §4 Storage](../v0.1/system-design.md) — SQLite rationale; WAL mode claim.
+- [Loomweave v0.1 detailed design §3 (Concurrency)](../1.0/detailed-design.md) (lines 758-769) — the implementation detail this ADR formalises.
+- [Loomweave v0.1 requirements §NFR-RELIABILITY-02](../1.0/requirements.md) (line 857) — WAL + writer-actor + checkpoint discipline as crash-safety requirement.
+- [Loomweave v0.1 system design §4 Storage](../1.0/system-design.md) — SQLite rationale; WAL mode claim.
 - [Loomweave v0.1 scope commitments — ADR sprint + validation](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) (lines 181-195, 249-251) — P0 promotion from P1 and the explicit follow-up validation task.

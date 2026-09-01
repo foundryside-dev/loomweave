@@ -1,6 +1,0 @@
-# Project-local Codex MCP configuration.
-# Codex does not read .mcp.json, so mirror this project's stdio MCP servers here.
-
-[mcp_servers.filigree]
-command = "/home/john/.local/bin/filigree-mcp"
-args = ["--project", "/home/john/loomweave"]

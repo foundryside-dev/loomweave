@@ -628,18 +628,11 @@ fn populate_after_mkdir(loomweave_dir: &Path, project_root: &Path) -> Result<()>
 pub(crate) fn write_gitignore(store_dir: &Path) -> Result<()> {
     fs::create_dir_all(store_dir).with_context(|| format!("mkdir {}", store_dir.display()))?;
     let target = store_dir.join(".gitignore");
-    let temp = store_dir.join(format!(".gitignore.loomweave.tmp-{}", std::process::id()));
-    if let Err(err) = fs::write(&temp, GITIGNORE_CONTENTS)
-        .with_context(|| format!("write {}", temp.display()))
-        .and_then(|()| {
-            fs::rename(&temp, &target)
-                .with_context(|| format!("rename {} -> {}", temp.display(), target.display()))
-        })
-    {
-        let _ = fs::remove_file(&temp);
-        return Err(err);
-    }
-    Ok(())
+    crate::atomic_fs::replace_file(
+        &target,
+        ".gitignore.loomweave.tmp-",
+        GITIGNORE_CONTENTS.as_bytes(),
+    )
 }
 
 fn initialise_db(path: &Path) -> Result<()> {
@@ -653,6 +646,35 @@ fn initialise_db(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{GITIGNORE_CONTENTS, InstallComponent, InstallPlan};
+
+    #[cfg(unix)]
+    #[test]
+    fn write_gitignore_never_follows_a_planted_staging_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(".weft").join("loomweave");
+        std::fs::create_dir_all(&store).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        // The staging name the PID-derived scheme used; a repository can
+        // commit this symlink under `.weft/loomweave/`.
+        let planted = store.join(format!(".gitignore.loomweave.tmp-{}", std::process::id()));
+        symlink(&victim, &planted).unwrap();
+
+        super::write_gitignore(&store).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        assert_eq!(
+            std::fs::read_to_string(store.join(".gitignore")).unwrap(),
+            GITIGNORE_CONTENTS
+        );
+        assert!(
+            std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn canonical_gitignore_excludes_the_isolated_worktree_namespace() {

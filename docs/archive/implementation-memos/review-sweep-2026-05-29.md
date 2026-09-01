@@ -1,3 +1,5 @@
+_Archived 2026-08-31: superseded/completed; retained for history._
+
 # Full-codebase review sweep — 2026-05-29
 
 A multi-agent code-review sweep over Loomweave's own source + tests, chunked into

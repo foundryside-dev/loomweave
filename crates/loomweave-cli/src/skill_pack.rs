@@ -165,22 +165,14 @@ pub fn skill_pack_state(project_root: &Path) -> SkillPackState {
 
 fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
     fs::create_dir_all(root).with_context(|| format!("mkdir {}", root.display()))?;
-    // Stage in a sibling temp dir so the final rename is same-filesystem.
-    let staging = root.join(format!(".loomweave-workflow.tmp-{}", std::process::id()));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .with_context(|| format!("clear stale staging {}", staging.display()))?;
-    }
-    fs::create_dir_all(&staging).with_context(|| format!("mkdir {}", staging.display()))?;
-
-    // Cleanup guard: if writing the staged files fails, remove the staging dir
-    // before bubbling the error so we don't leak a `.loomweave-workflow.tmp-*`
-    // sibling. Matches the partial-state-cleanup precedent on the `.weft/loomweave/`
-    // path in install.rs. The original error is preserved.
-    if let Err(err) = write_staged_pack(&staging, fingerprint) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(err);
-    }
+    // Stage in an exclusive, unpredictably named sibling dir (see `atomic_fs`)
+    // so the final rename is same-filesystem and a pre-planted entry at a
+    // guessable name is never reused. The `TempDir` removes the staging tree
+    // on every early-return path, so a failed write never leaks a
+    // `.loomweave-workflow.tmp-*` sibling.
+    let staging_dir = crate::atomic_fs::staging_dir_in(root, ".loomweave-workflow.tmp-")?;
+    let staging = staging_dir.path().to_path_buf();
+    write_staged_pack(&staging, fingerprint)?;
 
     // Crash-safe swap: move the existing pack aside, rename the staged pack
     // into place, then drop the backup. On failure, restore the backup so the
@@ -191,12 +183,12 @@ fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
     // backup, so the previously-installed pack is always recoverable; we never
     // delete `dest` ahead of a rename that might not happen.
     let had_existing = dest.exists();
-    let backup = root.join(format!(".loomweave-workflow.bak-{}", std::process::id()));
+    // The backup slot is an exclusive empty directory: `rename(2)` replaces an
+    // empty directory atomically, and a planted symlink at a guessable name
+    // can neither be followed nor swapped into place.
+    let backup_dir = crate::atomic_fs::staging_dir_in(root, ".loomweave-workflow.bak-")?;
+    let backup = backup_dir.path().to_path_buf();
     if had_existing {
-        if backup.exists() {
-            fs::remove_dir_all(&backup)
-                .with_context(|| format!("clear stale backup {}", backup.display()))?;
-        }
         fs::rename(dest, &backup).with_context(|| {
             format!(
                 "back up existing {} -> {}",
@@ -207,17 +199,18 @@ fn stage_and_swap(root: &Path, dest: &Path, fingerprint: &str) -> Result<()> {
     }
     match fs::rename(&staging, dest) {
         Ok(()) => {
-            if had_existing {
-                let _ = fs::remove_dir_all(&backup);
-            }
+            // The staged tree now lives at `dest`; detach the guard so its
+            // drop does not chase the moved path. `backup_dir` drops here and
+            // removes the superseded pack.
+            let _ = staging_dir.keep();
             Ok(())
         }
         Err(err) => {
-            // Restore the previous pack so orientation is never left broken.
+            // Restore the previous pack so orientation is never left broken;
+            // `staging_dir` / `backup_dir` drop and clear whatever is left.
             if had_existing {
                 let _ = fs::rename(&backup, dest);
             }
-            let _ = fs::remove_dir_all(&staging);
             Err(anyhow::Error::new(err))
                 .with_context(|| format!("swap staged pack into {}", dest.display()))
         }

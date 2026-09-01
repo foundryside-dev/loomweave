@@ -182,7 +182,7 @@ A `weft-findings` package that both products import; the library owns emission t
 ## References
 
 - [Weft doctrine §5 (v0.1 asterisks, asterisk 1)](../../suite/weft.md) — pipeline-coupling asterisk for (Wardline, Filigree) with this ADR as the retirement condition.
-- [Loomweave v0.1 detailed design §9 (Wardline prerequisites) item 3](../v0.1/detailed-design.md) (line 1361) — Option A / Option B enumeration.
+- [Loomweave v0.1 detailed design §9 (Wardline prerequisites) item 3](../1.0/detailed-design.md) (line 1361) — Option A / Option B enumeration.
 - [Loomweave v0.1 scope commitments](../../implementation/v0.1-scope-plans/v0.1-scope-commitments.md) (lines 72, 190, 202) — default deferral; spike promotion condition.
 - [Loomweave v0.1 integration reconnaissance §4.3](../../implementation/v0.1-reviews/pre-restructure/integration-recon.md) (line 339) — "Wardline has zero HTTP client code"; empirical basis for the v0.2 deferral default.
 - [Panel doctrine synthesis](../../implementation/v0.1-reviews/panel-2026-04-17/11-doctrine-panel-synthesis.md) — SARIF triangle framing; asterisk requirement.

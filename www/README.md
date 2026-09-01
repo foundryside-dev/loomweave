@@ -5,7 +5,12 @@ Weft Federation's SEI identity authority. A faithful application of the
 **Weft Design System** to a multi-page product site — terminal-grade,
 warm-espresso "Loom" theme, JetBrains Mono as the product face with Space
 Grotesk reserved for brand moments. Hand-rolled HTML/CSS/JS, **no build step, no
-runtime dependencies**. GitHub-Pages-deployable as-is at `loomweave.foundryside.dev`.
+runtime dependencies**.
+
+**Not currently deployed.** `loomweave.foundryside.dev` is served from the Astro
+site in `site/` by `.github/workflows/deploy-site.yml`; the legacy `docs.yml`
+gh-pages deploy of this directory was retired in commit `3d2749b`. These files
+are maintained as source only.
 
 ## Files
 
@@ -14,14 +19,14 @@ runtime dependencies**. GitHub-Pages-deployable as-is at `loomweave.foundryside.
 | `index.html` | Landing page: hero (defining line + SEI axiom + 4-stat strip), "what Loomweave owns", 30-second quick start (with the `scope_excludes` honesty note), the federation role section, and cards into the other pages. |
 | `getting-started.html` | install → init → analyze → serve → optional summaries, the `.mcp.json` wiring, and a troubleshooting table. |
 | `concepts.html` | The entity model (locator vs. SEI identity), kinds, the edge graph, subsystems, the consult loop, `scope_excludes`, and enrich-only design. |
-| `tools.html` | The ~42-tool MCP consult surface, grouped by family. |
+| `tools.html` | The 48-tool MCP consult surface, grouped by family. |
 | `cli.html` | The `loomweave` command set with every flag. |
 | `colors_and_type.css` | **Token + type source of truth — copied VERBATIM from the design system. Never edit it here** (see below). |
 | `styles.css` | Site layout + components, layered on the tokens. Carries the single accent remap and all net-new vocabulary. |
 | `main.js` | Progressive enhancement only: copy-to-clipboard on code blocks. The site is fully content-complete with JS off. |
 | `fonts/` | JetBrains Mono (upright + italic) and Space Grotesk variable TTFs + OFL licenses. Bundled locally — fully offline, no CDN. |
 | `assets/marks/` | The federation glyph set as standalone SVGs. The Loomweave 3-spoke node mark is also inlined in each page so it inherits `currentColor`. |
-| `CNAME` | `loomweave.foundryside.dev` (GitHub Pages custom domain). |
+| `CNAME` | `loomweave.foundryside.dev` (GitHub Pages custom domain). Inert while this directory is undeployed. |
 | `.nojekyll` | Serve files verbatim on GitHub Pages (no Jekyll processing). |
 
 ## Preview locally
@@ -36,7 +41,7 @@ preloaded fonts resolve under a normal origin.
 ## The verbatim-token-copy discipline
 
 `colors_and_type.css` and `fonts/` are **copied unchanged** from the Weft Design
-System (`~/weft/www/`). They are the suite-wide token + type source of truth.
+System (`~/weft/www/`; public mirror: https://github.com/foundryside-dev/weft). They are the suite-wide token + type source of truth.
 
 - **Never edit `colors_and_type.css` here.** On a design-system update, **re-copy**
   it from the source rather than hand-patching it.
@@ -71,10 +76,11 @@ stale, it was corrected:
   landed; the old "clarion" notes were dropped).
 - **Store path:** `.weft/loomweave/` (e.g. `.weft/loomweave/loomweave.db`) — the
   old docs said `.loomweave/`.
-- **Version line:** normalised to `1.1.0` (`TAG=v1.1.0`, wheel
-  `loomweave-plugin-python-1.1.0.tar.gz`) — the old docs drifted between v1.2.0
-  and v1.0.0.
-- **MCP surface:** described as "~40 consult-mode MCP tools".
+- **Version line:** tracks the latest *published* tag (`TAG=v<version>` and the
+  PEP 625 sdist name `loomweave_plugin_python-<version>.tar.gz`); it must be
+  re-checked against the GitHub Releases page on every release.
+- **MCP surface:** 48 consult-mode MCP tools (pinned by an assertion in
+  `crates/loomweave-mcp/src/lib.rs`).
 - **MCP tool names:** the live `entity_*` names (e.g. `entity_callers_list`,
   `entity_neighborhood_get`, `entity_orientation_pack_get`), not the older
   shorthand (`callers_of`, `neighborhood`).

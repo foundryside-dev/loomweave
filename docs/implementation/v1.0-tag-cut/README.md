@@ -21,7 +21,7 @@ tag-cut program.
 The gap register is the integrated output of seven review passes:
 
 1. The 2026-05-20 RC1 architecture archaeology at
-   [`../arch-analysis-2026-05-20-2124/`](../arch-analysis-2026-05-20-2124/),
+   [`../../archive/arch-analysis-2026-05-20-2124/`](../../archive/arch-analysis-2026-05-20-2124/),
    which originated risks R1–R6.
 2. Six parallel subagent deep-dives executed 2026-05-22:
    - Architecture critique of the five flagged blast-radius files.

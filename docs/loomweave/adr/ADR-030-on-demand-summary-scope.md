@@ -208,5 +208,5 @@ Add edge-vs-summary as a cache-key component; share one cache implementation.
 ## References
 
 - [Sprint 2 scope-amendment memo](../../implementation/sprint-2/scope-amendment-2026-05.md) — the larger context: MVP MCP surface, what stays in v0.1, what slips to v0.2.
-- [`system-design.md` §6 "Analysis pipeline"](../v0.1/system-design.md#6-analysis-pipeline) — the v0.2-target hierarchical-aggregation pipeline; preserved as the architectural endpoint, not built in v0.1.
-- [`detailed-design.md` §4 "Policy engine and caching"](../v0.1/detailed-design.md#4-policy-engine-and-caching) — the cache implementation reference.
+- [`system-design.md` §6 "Analysis pipeline"](../1.0/system-design.md#6-analysis-pipeline) — the v0.2-target hierarchical-aggregation pipeline; preserved as the architectural endpoint, not built in v0.1.
+- [`detailed-design.md` §4 "Policy engine and caching"](../1.0/detailed-design.md#4-policy-engine--config--caching-internals) — the cache implementation reference.

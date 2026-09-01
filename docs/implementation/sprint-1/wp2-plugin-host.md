@@ -1,7 +1,7 @@
 # WP2 — Plugin Host and Hybrid Authority (Sprint 1)
 
 **Status**: DRAFT — blocked-by WP1
-**Anchoring design**: [system-design.md §2 (Core/Plugin Architecture)](../../loomweave/v0.1/system-design.md#2-core--plugin-architecture), [detailed-design.md §1 (Plugin implementation detail)](../../loomweave/v0.1/detailed-design.md#1-plugin-implementation-detail)
+**Anchoring design**: [system-design.md §2 (Core/Plugin Architecture)](../../loomweave/1.0/system-design.md#2-core--plugin-architecture), [detailed-design.md §1 (Plugin implementation detail)](../../loomweave/1.0/detailed-design.md#1-plugin-implementation-detail)
 **Accepted ADRs**: [ADR-002](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md), [ADR-021](../../loomweave/adr/ADR-021-plugin-authority-hybrid.md), [ADR-022](../../loomweave/adr/ADR-022-core-plugin-ontology.md)
 **Predecessor**: [WP1](./wp1-scaffold.md).
 **Blocks**: WP3.
@@ -55,7 +55,7 @@ enforcement points are what lock L6 and determine the plugin API contract.
 
 **What locks**: the over-the-wire protocol between core and any plugin, per
 [ADR-002](../../loomweave/adr/ADR-002-plugin-transport-json-rpc.md) and
-[detailed-design.md §1](../../loomweave/v0.1/detailed-design.md#1-plugin-implementation-detail).
+[detailed-design.md §1](../../loomweave/1.0/detailed-design.md#1-plugin-implementation-detail).
 
 **Sprint 1 method set** (minimum viable for walking skeleton):
 
