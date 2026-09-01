@@ -369,8 +369,8 @@ impl ServerState {
         read: InferredRead,
         llm: &InferenceLlmState,
     ) -> Result<InferredDispatchStats, InferredDispatchFailure> {
-        let caller_source_excerpt =
-            verified_source_excerpt(&read.caller).map_err(|err| err.to_inferred_failure())?;
+        let caller_source_excerpt = verified_source_excerpt(&self.project_root, &read.caller)
+            .map_err(|err| err.to_inferred_failure())?;
         let prompt = build_inferred_calls_prompt(&InferredCallsPromptInput {
             caller_entity_id: read.caller.id.clone(),
             caller_source_excerpt,
@@ -593,7 +593,7 @@ impl ServerState {
         now: String,
     ) -> Value {
         let model_id = self.summary_model_id();
-        let source_excerpt = match verified_source_excerpt(&ready.entity) {
+        let source_excerpt = match verified_source_excerpt(&self.project_root, &ready.entity) {
             Ok(excerpt) => excerpt,
             Err(err) => return err.to_envelope(),
         };

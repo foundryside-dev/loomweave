@@ -168,7 +168,7 @@ impl ServerState {
         let estimated_input_tokens = if cache_status == "hit" {
             None
         } else {
-            verified_source_excerpt(&ready.entity)
+            verified_source_excerpt(&self.project_root, &ready.entity)
                 .ok()
                 .map(|source_excerpt| {
                     let prompt = build_leaf_summary_prompt(&LeafSummaryPromptInput {
