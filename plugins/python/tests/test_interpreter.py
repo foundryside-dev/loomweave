@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
+import subprocess
 from typing import TYPE_CHECKING
 
+import pytest
+
+from loomweave_plugin_python import interpreter as interpreter_module
 from loomweave_plugin_python.interpreter import (
     INTERPRETER_OVERRIDE_ENV,
     ProjectInterpreter,
@@ -14,8 +19,6 @@ from loomweave_plugin_python.interpreter import (
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def _make_python(path: Path) -> Path:
@@ -191,3 +194,76 @@ def test_override_with_a_trailing_separator_matches_the_rust_host(tmp_path: Path
 
     assert found == ProjectInterpreter(path=str(real_python), source="override")
     assert found.pinned
+
+
+def _git(root: Path, *args: str) -> None:
+    # GIT_CONFIG_GLOBAL=/dev/null + GIT_CONFIG_NOSYSTEM=1 on top of the
+    # author/committer identity, so a developer's own global git config
+    # cannot alter these fixtures.
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    subprocess.run(  # noqa: S603 — fixture builder; argv comes from this test module
+        ["git", *args],  # noqa: S607 — the fixture builder deliberately uses PATH's git
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_a_repository_tracked_dotvenv_is_skipped_and_the_ladder_continues(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(interpreter_module, "_tracked_dotvenv_warned", False)
+    _git(tmp_path, "init", "-q")
+    _make_python(tmp_path / ".venv" / "bin" / "python")
+    _git(tmp_path, "add", "-f", ".venv/bin/python")
+    _git(tmp_path, "commit", "-q", "-m", "hostile")
+    venv = _make_python(tmp_path / "operator-venv" / "bin" / "python")
+
+    chosen = discover_project_interpreter(
+        tmp_path, {"VIRTUAL_ENV": str(tmp_path / "operator-venv")}
+    )
+
+    assert chosen.source == "virtual_env"
+    assert chosen.path == str(venv)
+    assert "skipped .venv/bin/python" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_an_untracked_dotvenv_in_a_repository_is_still_chosen(tmp_path: Path) -> None:
+    _git(tmp_path, "init", "-q")
+    venv = _make_python(tmp_path / ".venv" / "bin" / "python")
+
+    chosen = discover_project_interpreter(tmp_path, {})
+
+    assert chosen.source == "dotvenv"
+    assert chosen.path == str(venv)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_a_tracked_symlink_dotvenv_is_skipped(tmp_path: Path) -> None:
+    _git(tmp_path, "init", "-q")
+    _make_python(tmp_path / "payload" / "bin" / "python")
+    (tmp_path / ".venv").symlink_to(tmp_path / "payload")
+    _git(tmp_path, "add", "-f", ".venv")
+    _git(tmp_path, "commit", "-q", "-m", "hostile")
+
+    assert discover_project_interpreter(tmp_path, {}).source != "dotvenv"
+
+
+def test_outside_a_repository_the_dotvenv_rung_is_unchanged(tmp_path: Path) -> None:
+    venv = _make_python(tmp_path / ".venv" / "bin" / "python")
+
+    chosen = discover_project_interpreter(tmp_path, {})
+
+    assert chosen.source == "dotvenv"
+    assert chosen.path == str(venv)

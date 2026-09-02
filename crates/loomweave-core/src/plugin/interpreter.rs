@@ -15,6 +15,15 @@
 //! The order is a CROSS-LANGUAGE CONTRACT with
 //! `plugins/python/src/loomweave_plugin_python/interpreter.py`. Change both or
 //! neither.
+//!
+//! Rung 2 (`<project_root>/.venv/bin/python`) applies only when that path is
+//! **not repository-tracked**: [`crate::hardened_git::tracked_state`] must
+//! answer `untracked` or `not_a_git_work_tree` (`tracked` and the fail-closed
+//! `unknown` both skip the rung, logged once per process). pyright executes
+//! `python.pythonPath`, so a committed `.venv/bin/python` — or a committed
+//! symlink at `.venv` to committed content — would otherwise be code
+//! execution as the operator on the first `analyze` of an untrusted corpus.
+//! See ADR-063 and the ADR-058 amendment (2026-09-02).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -210,10 +219,15 @@ pub fn discover_project_interpreter(
         );
     }
     if let Some(path) = usable(&project_root.join(".venv/bin/python")) {
-        return ProjectInterpreter {
-            path: Some(path),
-            source: InterpreterSource::DotVenv,
-        };
+        let state = crate::hardened_git::tracked_state(project_root, Path::new(".venv/bin/python"));
+        if state.treat_as_tracked() {
+            warn_tracked_dotvenv_once(project_root, &state);
+        } else {
+            return ProjectInterpreter {
+                path: Some(path),
+                source: InterpreterSource::DotVenv,
+            };
+        }
     }
     for (var, source) in [
         ("VIRTUAL_ENV", InterpreterSource::VirtualEnv),
@@ -243,6 +257,23 @@ pub fn discover_project_interpreter(
         path: None,
         source: InterpreterSource::None,
     }
+}
+
+/// Rung 2 is skipped when `.venv/bin/python` is repository content (ADR-063;
+/// ADR-058 amendment 2026-09-02): pyright executes `python.pythonPath`, so a
+/// committed executable there is code execution as the operator. Logged once
+/// per process so the operator sees why resolution degraded (ADR-057 style).
+fn warn_tracked_dotvenv_once(project_root: &Path, state: &crate::hardened_git::TrackedState) {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            project_root = %project_root.display(),
+            tracked_state = state.label(),
+            "skipped .venv/bin/python (rung 2): it is tracked by the repository (or its tracked \
+             state could not be determined); an operator venv is untracked. Resolution continues \
+             with VIRTUAL_ENV/CONDA_PREFIX/PATH."
+        );
+    });
 }
 
 /// The resolver-environment fingerprint a plugin's index depends on: `Some`
@@ -598,5 +629,92 @@ mod tests {
         fs::set_permissions(&py, fs::Permissions::from_mode(0o644)).unwrap();
         let found = discover_project_interpreter(dir.path(), &env(&map));
         assert_eq!(found.path.unwrap().file_name().unwrap(), "python3");
+    }
+
+    /// `GIT_CONFIG_GLOBAL=/dev/null` + `GIT_CONFIG_NOSYSTEM=1` on top of the
+    /// author/committer identity, so a developer's own global git config
+    /// cannot alter these fixtures (review finding on Task 3's builders,
+    /// applied here too).
+    fn git(root: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    #[test]
+    fn a_repository_tracked_dotvenv_is_skipped_and_the_ladder_continues() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q"]);
+        make_python(&root.join(".venv/bin/python"));
+        git(&root, &["add", "-f", ".venv/bin/python"]);
+        git(&root, &["commit", "-q", "-m", "hostile"]);
+        let venv = make_python(&root.join("operator-venv/bin/python"));
+        let vars = HashMap::from([(
+            "VIRTUAL_ENV",
+            root.join("operator-venv").display().to_string(),
+        )]);
+        let chosen = discover_project_interpreter(&root, &env(&vars));
+        assert_eq!(chosen.source, InterpreterSource::VirtualEnv);
+        assert_eq!(chosen.path.as_deref(), Some(venv.as_path()));
+    }
+
+    #[test]
+    fn an_untracked_dotvenv_in_a_repository_is_still_chosen() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q"]);
+        let venv = make_python(&root.join(".venv/bin/python"));
+        let chosen = discover_project_interpreter(&root, &env(&HashMap::new()));
+        assert_eq!(chosen.source, InterpreterSource::DotVenv);
+        assert_eq!(chosen.path.as_deref(), Some(venv.as_path()));
+    }
+
+    #[test]
+    fn a_tracked_symlink_dotvenv_is_skipped() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q"]);
+        make_python(&root.join("payload/bin/python"));
+        std::os::unix::fs::symlink(root.join("payload"), root.join(".venv")).unwrap();
+        git(&root, &["add", "-f", ".venv"]);
+        git(&root, &["commit", "-q", "-m", "hostile"]);
+        let chosen = discover_project_interpreter(&root, &env(&HashMap::new()));
+        assert_ne!(chosen.source, InterpreterSource::DotVenv);
+    }
+
+    #[test]
+    fn outside_a_repository_the_dotvenv_rung_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let venv = make_python(&root.join(".venv/bin/python"));
+        let chosen = discover_project_interpreter(&root, &env(&HashMap::new()));
+        assert_eq!(chosen.source, InterpreterSource::DotVenv);
+        assert_eq!(chosen.path.as_deref(), Some(venv.as_path()));
     }
 }

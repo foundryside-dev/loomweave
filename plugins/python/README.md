@@ -48,7 +48,7 @@ passes `os.access(path, os.X_OK)`:
 | Rung | Source | Pinned? |
 |---|---|---|
 | 1 | `LOOMWEAVE_PYTHON_INTERPRETER` env var names an executable file | yes |
-| 2 | `<project_root>/.venv/bin/python` | yes |
+| 2 | `<project_root>/.venv/bin/python` — skipped when the file is tracked by the repository | yes |
 | 3 | `$VIRTUAL_ENV/bin/python` | yes |
 | 4 | `$CONDA_PREFIX/bin/python` | yes |
 | 5 | first `python` / `python3` on `PATH` | no |

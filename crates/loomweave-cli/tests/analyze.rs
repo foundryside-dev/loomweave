@@ -5930,11 +5930,35 @@ fn analyze_interpreter_change_forces_full_reanalysis() {
         .arg(project_dir.path())
         .assert()
         .success();
-    let plugin_only_path =
-        std::env::join_paths(std::iter::once(plugin_dir.path().to_path_buf())).unwrap();
+    // `tracked_state` (ADR-063), which rung 2 now consults, spawns `git` via
+    // the REAL process PATH (`hardened_git::apply_operator_env_passthrough`
+    // reads `std::env::var_os` directly — deliberately not the injectable env
+    // closure `discover_project_interpreter` itself takes, because the module
+    // hardens against a CORPUS-controlled environment, not a test harness).
+    // This test narrows `PATH` to control which `python`/`python3` stub
+    // wins, which would otherwise starve `git` of a resolvable path: every
+    // `.venv/bin/python` probe would read `Unknown` (fail-closed = tracked),
+    // silently skipping rung 2 for reasons unrelated to what this test
+    // exercises. Expose ONLY `git`, resolved from the ambient PATH via a
+    // symlink, so no ambient `python`/`python3` leaks into the PATH-rung
+    // assertions below.
+    let git_only_dir = tempfile::tempdir().unwrap();
+    let real_path = std::env::var_os("PATH").expect("PATH must be set to resolve `git`");
+    let git_bin = std::env::split_paths(&real_path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("git must be on the ambient PATH for this test");
+    std::os::unix::fs::symlink(&git_bin, git_only_dir.path().join("git")).unwrap();
+
+    let plugin_only_path = std::env::join_paths([
+        plugin_dir.path().to_path_buf(),
+        git_only_dir.path().to_path_buf(),
+    ])
+    .unwrap();
     let plugin_and_stub_path = std::env::join_paths([
         plugin_dir.path().to_path_buf(),
         path_stub_dir.path().to_path_buf(),
+        git_only_dir.path().to_path_buf(),
     ])
     .unwrap();
 
