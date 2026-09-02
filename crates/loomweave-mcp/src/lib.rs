@@ -1316,6 +1316,13 @@ pub struct ServerState {
     warpline_client: Option<Arc<dyn crate::warpline::WarplineLookup>>,
     diagnostics: Option<DiagnosticsContext>,
     tool_policy: McpToolPolicy,
+    /// Ownership verdict for the `loomweave.yaml` this session loaded
+    /// (ADR-063), captured by `serve` at construction so read surfaces can
+    /// report WHY a configured provider or integration is inert. Defaults to
+    /// `ConfigTrust::OperatorOwned` — the honest reading for a state built
+    /// without a config file (tests, storage-only servers): no repository
+    /// content shaped it.
+    config_trust: loomweave_federation::config::ConfigTrust,
     /// Supervised `loomweave analyze` runs launched via `analyze_start`.
     analyze_runs: crate::analyze_runs::RunRegistry,
     active_requests: Arc<AsyncMutex<BTreeSet<String>>>,
@@ -1394,6 +1401,7 @@ impl ServerState {
             warpline_client: None,
             diagnostics: None,
             tool_policy: McpToolPolicy::default(),
+            config_trust: loomweave_federation::config::ConfigTrust::OperatorOwned,
             analyze_runs: Arc::new(Mutex::new(HashMap::new())),
             active_requests: Arc::new(AsyncMutex::new(BTreeSet::new())),
             cancelled_requests: Arc::new(AsyncMutex::new(BTreeSet::new())),
@@ -1593,6 +1601,22 @@ impl ServerState {
     pub fn with_diagnostics(mut self, diagnostics: DiagnosticsContext) -> Self {
         self.diagnostics = Some(diagnostics);
         self
+    }
+
+    /// Record the ADR-063 ownership verdict for the loaded `loomweave.yaml`.
+    #[must_use]
+    pub fn with_config_trust(
+        mut self,
+        config_trust: loomweave_federation::config::ConfigTrust,
+    ) -> Self {
+        self.config_trust = config_trust;
+        self
+    }
+
+    /// The ADR-063 ownership verdict for the loaded `loomweave.yaml`.
+    #[must_use]
+    pub fn config_trust(&self) -> &loomweave_federation::config::ConfigTrust {
+        &self.config_trust
     }
 
     async fn tool_llm_config_get(

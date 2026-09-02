@@ -313,3 +313,63 @@ fn config_semantic_status_reports_sidecar_absent_without_secret() {
         "{stdout}"
     );
 }
+
+/// ADR-063: a `loomweave.yaml` the repository tracks is corpus content.
+/// `config check` names the verdict and the remedy before anything else, and
+/// `config llm set` refuses to write into it at all.
+#[test]
+fn config_check_reports_a_tracked_config_and_llm_set_refuses_it() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("loomweave.yaml"),
+        "version: 1\nllm_policy:\n  enabled: true\n  provider: codex_cli\n  allow_live_provider: true\n",
+    )
+    .unwrap();
+    for args in [vec!["init", "-q"], vec!["add", "-f", "loomweave.yaml"]] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    let (code, stdout, stderr) = config(dir.path(), &["check"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("config trust: repository_tracked"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("llm_policy"), "{stdout}");
+    assert!(
+        stdout.contains("git rm --cached loomweave.yaml"),
+        "{stdout}"
+    );
+    // The stripped llm_policy must actually take effect, not just be announced.
+    assert!(stdout.contains("LLM enabled:           false"), "{stdout}");
+
+    let (set_code, set_stdout, set_stderr) = config(dir.path(), &["llm", "set", "--enable"]);
+    assert_ne!(set_code, 0, "stdout: {set_stdout}");
+    assert!(
+        set_stderr.contains("tracked by the repository"),
+        "stderr: {set_stderr}"
+    );
+    // The refusal must leave the file byte-identical.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("loomweave.yaml")).unwrap(),
+        "version: 1\nllm_policy:\n  enabled: true\n  provider: codex_cli\n  allow_live_provider: true\n",
+    );
+}

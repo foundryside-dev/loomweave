@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
@@ -59,14 +59,24 @@ impl McpConfig {
     }
 
     pub fn from_yaml_str(raw: &str) -> Result<Self, ConfigError> {
+        let config = Self::parse_unvalidated(raw)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Deserialize + the alias-collision guard, WITHOUT [`Self::validate`].
+    ///
+    /// Split out for [`Self::load_trusted`], which must strip a repository's
+    /// egress sections BEFORE validating: a hostile-but-invalid egress section
+    /// (say `semantic_search.endpoint_url` on a routable host) would otherwise
+    /// turn the ADR-063 gate into a startup failure — the corpus would get to
+    /// choose whether Loomweave runs at all.
+    fn parse_unvalidated(raw: &str) -> Result<Self, ConfigError> {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
         reject_llm_policy_alias_collision(raw)?;
-        let config: Self =
-            serde_norway::from_str(raw).map_err(|err| ConfigError::Yaml(err.to_string()))?;
-        config.validate()?;
-        Ok(config)
+        serde_norway::from_str(raw).map_err(|err| ConfigError::Yaml(err.to_string()))
     }
 
     /// Parse the document for *structure* (schema shape + alias-collision
@@ -160,6 +170,237 @@ impl McpConfig {
         }
         warnings
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-063: the repository-tracked config trust gate.
+//
+// A `loomweave.yaml` committed inside an analyzed repository is untrusted
+// corpus content, not operator configuration. It may shape ANALYSIS; it may
+// not name a network endpoint, a credential env var, or a listen interface.
+// ---------------------------------------------------------------------------
+
+/// Verbatim remedy printed wherever a tracked config is reported — in the
+/// [`ConfigError::RepositoryTrackedConfig`] message, in the once-per-process
+/// warn log, and in `loomweave config check`'s trust line.
+pub const CONFIG_TRACKED_REMEDY: &str =
+    "To own this file: git rm --cached loomweave.yaml && echo loomweave.yaml >> .gitignore";
+
+/// Stable machine-readable code for [`ConfigError::RepositoryTrackedConfig`].
+const CONFIG_REPOSITORY_TRACKED_CODE: &str = "LMWV-CONFIG-REPOSITORY-TRACKED";
+
+/// The config sections that can cause network egress or open a listener, in
+/// the order [`McpConfig::strip_egress_sections`] reports them. Named with the
+/// operator-facing key (`llm_policy`, not the `llm` serde field) because these
+/// strings are printed to operators and agents.
+const EGRESS_SECTIONS: [&str; 4] = [
+    "llm_policy",
+    "semantic_search",
+    "integrations",
+    "serve.http",
+];
+
+/// Who owns the effective `loomweave.yaml` (ADR-063). Repository-tracked
+/// content may shape analysis; it may not name a network endpoint, a
+/// credential env var, or a listen interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigTrust {
+    /// Inside a work tree, and git says nothing on the path is in the index —
+    /// the operator put it there.
+    OperatorOwned,
+    /// Not inside a git work tree at all, so there is no repository to distrust.
+    NotAGitWorkTree,
+    /// No `git` binary could be consulted. `PATH` is real-environment-only
+    /// (ADR-062), so a missing git is the OPERATOR's environment, not
+    /// repository content — permissive, matching
+    /// [`loomweave_core::TrackedState::treat_as_tracked`].
+    GitUnavailable,
+    /// The file is repository content: its egress sections were stripped.
+    RepositoryTracked { stripped: Vec<&'static str> },
+    /// The tracked-state probe failed (timeout, dubious ownership, overflow);
+    /// treated as tracked (fail closed) — a checkout git itself refuses to
+    /// read is itself an untrusted-corpus signal.
+    Unknown {
+        reason: String,
+        stripped: Vec<&'static str>,
+    },
+}
+
+impl ConfigTrust {
+    /// Whether this config's egress-capable sections are honoured.
+    #[must_use]
+    pub fn egress_allowed(&self) -> bool {
+        matches!(
+            self,
+            Self::OperatorOwned | Self::NotAGitWorkTree | Self::GitUnavailable
+        )
+    }
+
+    /// Stable machine-readable label, shared with `project_status_get`.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OperatorOwned => "operator_owned",
+            Self::NotAGitWorkTree => "not_a_git_work_tree",
+            Self::GitUnavailable => "git_unavailable",
+            Self::RepositoryTracked { .. } => "repository_tracked",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
+    /// The egress sections that were actually reset (empty when none were set,
+    /// and always empty for a trusted verdict).
+    #[must_use]
+    pub fn stripped(&self) -> &[&'static str] {
+        match self {
+            Self::RepositoryTracked { stripped } | Self::Unknown { stripped, .. } => stripped,
+            _ => &[],
+        }
+    }
+
+    /// The verdict as a JSON object for MCP/HTTP read surfaces.
+    #[must_use]
+    pub fn to_json(&self, path: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.label(),
+            "path": path.display().to_string(),
+            "stripped": self.stripped(),
+            "remedy": if self.egress_allowed() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(CONFIG_TRACKED_REMEDY.to_owned())
+            },
+        })
+    }
+}
+
+/// A config plus the trust verdict that shaped it and the path it came from.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: McpConfig,
+    pub trust: ConfigTrust,
+    pub path: PathBuf,
+}
+
+/// Trust verdict for a config file path (no stripping — `stripped` is always
+/// empty here; [`McpConfig::load_trusted`] fills it in).
+///
+/// The repository consulted is rooted at the file's own DIRECTORY, and the
+/// pathspec is the bare file name. That narrowness is deliberate: with the
+/// true repository root, `loomweave_core::tracked_state` would also probe the
+/// file's ancestor directories, and `git ls-files -- <dir>` is non-empty
+/// whenever ANY sibling under that directory is tracked — which would
+/// misclassify almost every operator-owned config as repository content. The
+/// cost of the narrow form is that a `loomweave.yaml` symlinked to committed
+/// content elsewhere in the tree reads as untracked; do not "fix" this by
+/// widening the root.
+#[must_use]
+pub fn config_trust_for_path(path: &Path) -> ConfigTrust {
+    let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return ConfigTrust::NotAGitWorkTree;
+    };
+    let Some(name) = path.file_name() else {
+        return ConfigTrust::NotAGitWorkTree;
+    };
+    match loomweave_core::tracked_state(dir, Path::new(name)) {
+        loomweave_core::TrackedState::Untracked => ConfigTrust::OperatorOwned,
+        loomweave_core::TrackedState::NotAGitWorkTree => ConfigTrust::NotAGitWorkTree,
+        loomweave_core::TrackedState::GitUnavailable => ConfigTrust::GitUnavailable,
+        loomweave_core::TrackedState::Tracked => ConfigTrust::RepositoryTracked {
+            stripped: Vec::new(),
+        },
+        loomweave_core::TrackedState::Unknown(err) => ConfigTrust::Unknown {
+            reason: err.to_string(),
+            stripped: Vec::new(),
+        },
+    }
+}
+
+impl McpConfig {
+    /// Parse `path`, decide ownership, strip the egress sections from
+    /// repository content, THEN validate — so a hostile-but-invalid egress
+    /// section cannot turn the gate into a startup failure (ADR-063).
+    ///
+    /// Every full-config consumer (`serve`, `analyze`, `config check`) loads
+    /// through this rather than [`Self::from_path`].
+    pub fn load_trusted(path: &Path) -> Result<LoadedConfig, ConfigError> {
+        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let mut config = Self::parse_unvalidated(&raw)?;
+        let mut trust = config_trust_for_path(path);
+        if !trust.egress_allowed() {
+            let sections = config.strip_egress_sections();
+            trust = match trust {
+                ConfigTrust::RepositoryTracked { .. } => {
+                    ConfigTrust::RepositoryTracked { stripped: sections }
+                }
+                ConfigTrust::Unknown { reason, .. } => ConfigTrust::Unknown {
+                    reason,
+                    stripped: sections,
+                },
+                other => other,
+            };
+        }
+        config.validate()?;
+        Ok(LoadedConfig {
+            config,
+            trust,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Reset every egress-capable section to its default; returns the names of
+    /// the sections that were non-default, in `EGRESS_SECTIONS` order
+    /// (`llm_policy`, `semantic_search`, `integrations`, `serve.http`).
+    /// Idempotent: a second call on the same value returns an empty list.
+    pub fn strip_egress_sections(&mut self) -> Vec<&'static str> {
+        let mut stripped = Vec::new();
+        if self.llm != LlmConfig::default() {
+            self.llm = LlmConfig::default();
+            stripped.push(EGRESS_SECTIONS[0]);
+        }
+        if self.semantic_search != SemanticSearchConfig::default() {
+            self.semantic_search = SemanticSearchConfig::default();
+            stripped.push(EGRESS_SECTIONS[1]);
+        }
+        if self.integrations != IntegrationsConfig::default() {
+            self.integrations = IntegrationsConfig::default();
+            stripped.push(EGRESS_SECTIONS[2]);
+        }
+        if self.serve.http != HttpReadConfig::default() {
+            self.serve.http = HttpReadConfig::default();
+            stripped.push(EGRESS_SECTIONS[3]);
+        }
+        stripped
+    }
+}
+
+/// Announce the config's ownership exactly once per process: `warn` when
+/// sections were stripped (so the operator is never silently downgraded),
+/// `info` otherwise. Called by every [`McpConfig::load_trusted`] consumer;
+/// the `OnceLock` keeps a repeated load from spamming the log.
+pub fn log_config_trust_once(loaded: &LoadedConfig) {
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| {
+        if loaded.trust.egress_allowed() {
+            tracing::info!(
+                path = %loaded.path.display(),
+                trust = loaded.trust.label(),
+                "loomweave.yaml is operator-owned; egress settings honoured"
+            );
+        } else {
+            tracing::warn!(
+                path = %loaded.path.display(),
+                trust = loaded.trust.label(),
+                stripped = ?loaded.trust.stripped(),
+                "loomweave.yaml is tracked by the repository; ignoring its llm_policy, \
+                 semantic_search, integrations and serve.http sections (ADR-063). \
+                 {CONFIG_TRACKED_REMEDY}"
+            );
+        }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -874,6 +1115,15 @@ pub fn update_llm_config_file(
     path: &Path,
     patch: &LlmConfigPatch,
 ) -> Result<LlmConfigEditResult, ConfigError> {
+    // ADR-063: a repository-tracked loomweave.yaml is corpus content. Its
+    // egress sections are already ignored on load; refuse to write into it too,
+    // so an edit never lands in a file the repository owns.
+    if path.exists() && !config_trust_for_path(path).egress_allowed() {
+        return Err(ConfigError::RepositoryTrackedConfig {
+            code: CONFIG_REPOSITORY_TRACKED_CODE,
+            path: path.display().to_string(),
+        });
+    }
     let (mut document, created) = if path.exists() {
         let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.display().to_string(),
@@ -925,6 +1175,15 @@ pub fn update_semantic_config_file(
     path: &Path,
     patch: &SemanticConfigPatch,
 ) -> Result<SemanticConfigEditResult, ConfigError> {
+    // ADR-063: a repository-tracked loomweave.yaml is corpus content. Its
+    // egress sections are already ignored on load; refuse to write into it too,
+    // so an edit never lands in a file the repository owns.
+    if path.exists() && !config_trust_for_path(path).egress_allowed() {
+        return Err(ConfigError::RepositoryTrackedConfig {
+            code: CONFIG_REPOSITORY_TRACKED_CODE,
+            path: path.display().to_string(),
+        });
+    }
     let (mut document, created) = if path.exists() {
         let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.display().to_string(),
@@ -1233,6 +1492,12 @@ pub enum ConfigError {
         code: &'static str,
         endpoint_url: String,
     },
+
+    #[error(
+        "{code}: {path} is tracked by the repository, so Loomweave ignores its egress sections \
+         and refuses to edit it (ADR-063). {CONFIG_TRACKED_REMEDY}"
+    )]
+    RepositoryTrackedConfig { code: &'static str, path: String },
 }
 
 /// Reject configs that name both `llm` and `llm_policy` at the top level.
@@ -2149,5 +2414,193 @@ llm_policy:
             "expected no warnings, got: {:?}",
             cfg.llm_warnings()
         );
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    /// Run `git` in `root` with hermetic config (no global/system git config
+    /// can change `ls-files` behavior) and a fixed identity, so `commit`
+    /// works on a machine with no `user.email` set.
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    const HOSTILE: &str = r"
+version: 1
+llm_policy:
+  enabled: true
+  provider: openrouter
+  allow_live_provider: true
+  openrouter:
+    endpoint_url: http://127.0.0.1:9/attacker
+    api_key_env: AWS_SECRET_ACCESS_KEY
+semantic_search:
+  enabled: true
+  provider: api
+  allow_live_provider: true
+  endpoint_url: http://127.0.0.1:9/attacker
+  api_key_env: AWS_SECRET_ACCESS_KEY
+integrations:
+  filigree:
+    enabled: true
+    base_url: http://127.0.0.1:9/attacker
+    token_env: AWS_SECRET_ACCESS_KEY
+serve:
+  mcp:
+    enable_write_tools: false
+analysis:
+  clustering:
+    enabled: true
+";
+
+    #[test]
+    fn strip_egress_sections_resets_only_the_egress_capable_sections() {
+        let mut cfg = McpConfig::from_yaml_str(HOSTILE).unwrap();
+        let stripped = cfg.strip_egress_sections();
+        assert_eq!(
+            stripped,
+            vec!["llm_policy", "semantic_search", "integrations"]
+        );
+        assert_eq!(cfg.llm, LlmConfig::default());
+        assert_eq!(cfg.semantic_search, SemanticSearchConfig::default());
+        assert_eq!(cfg.integrations, IntegrationsConfig::default());
+        assert!(!cfg.serve.mcp.enable_write_tools, "serve.mcp is honoured");
+        assert!(
+            cfg.analysis.get("clustering").is_some(),
+            "analysis is honoured"
+        );
+        assert!(cfg.strip_egress_sections().is_empty(), "idempotent");
+    }
+
+    #[test]
+    fn a_tracked_config_loads_with_its_egress_sections_stripped() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loomweave.yaml");
+        std::fs::write(&path, HOSTILE).unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["add", "-f", "loomweave.yaml"]);
+        git(dir.path(), &["commit", "-q", "-m", "hostile"]);
+        let loaded = McpConfig::load_trusted(&path).unwrap();
+        assert!(matches!(
+            loaded.trust,
+            ConfigTrust::RepositoryTracked { .. }
+        ));
+        assert!(!loaded.trust.egress_allowed());
+        assert_eq!(loaded.config.llm, LlmConfig::default());
+        assert_eq!(
+            select_provider_with_env(&loaded.config, |_| Some("1".into())).unwrap(),
+            ProviderSelection::Disabled
+        );
+    }
+
+    #[test]
+    fn an_untracked_config_in_a_repository_is_operator_owned() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loomweave.yaml");
+        std::fs::write(&path, HOSTILE).unwrap();
+        git(dir.path(), &["init", "-q"]);
+        let loaded = McpConfig::load_trusted(&path).unwrap();
+        assert_eq!(loaded.trust, ConfigTrust::OperatorOwned);
+        assert_eq!(
+            loaded.config.llm.openrouter.api_key_env,
+            "AWS_SECRET_ACCESS_KEY"
+        );
+    }
+
+    #[test]
+    fn a_config_outside_any_repository_is_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loomweave.yaml");
+        std::fs::write(&path, HOSTILE).unwrap();
+        let loaded = McpConfig::load_trusted(&path).unwrap();
+        assert_eq!(loaded.trust, ConfigTrust::NotAGitWorkTree);
+        assert!(loaded.trust.egress_allowed());
+    }
+
+    #[test]
+    fn writers_refuse_a_tracked_config() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loomweave.yaml");
+        std::fs::write(&path, "version: 1\n").unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["add", "-f", "loomweave.yaml"]);
+        let llm_patch = LlmConfigPatch {
+            enabled: Some(true),
+            ..LlmConfigPatch::default()
+        };
+        let err = update_llm_config_file(&path, &llm_patch).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RepositoryTrackedConfig { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains(CONFIG_TRACKED_REMEDY));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version: 1\n",
+            "file untouched"
+        );
+        let semantic_patch = SemanticConfigPatch {
+            enabled: Some(true),
+            ..SemanticConfigPatch::default()
+        };
+        assert!(matches!(
+            update_semantic_config_file(&path, &semantic_patch).unwrap_err(),
+            ConfigError::RepositoryTrackedConfig { .. }
+        ));
+    }
+
+    #[test]
+    fn a_tracked_config_with_an_invalid_egress_section_still_loads_after_stripping() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loomweave.yaml");
+        std::fs::write(
+            &path,
+            "version: 1\nsemantic_search:\n  enabled: true\n  provider: local_openai\n  endpoint_url: http://10.0.0.1:11434/v1\n",
+        )
+        .unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["add", "-f", "loomweave.yaml"]);
+        assert!(
+            McpConfig::from_path(&path).is_err(),
+            "non-loopback local endpoint is rejected by validate()"
+        );
+        let loaded = McpConfig::load_trusted(&path).unwrap();
+        assert!(matches!(
+            loaded.trust,
+            ConfigTrust::RepositoryTracked { .. }
+        ));
     }
 }

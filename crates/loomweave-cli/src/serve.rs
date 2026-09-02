@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use loomweave_federation::config::{
-    LlmConfig, McpConfig, ProviderSelection, SemanticProviderKind, SemanticSearchConfig,
-    select_provider_with_env,
+    ConfigTrust, LlmConfig, McpConfig, ProviderSelection, SemanticProviderKind,
+    SemanticSearchConfig, log_config_trust_once, select_provider_with_env,
 };
 use loomweave_federation::filigree::FiligreeHttpClient;
 use loomweave_federation::warpline::WarplineMcpClient;
@@ -483,11 +483,19 @@ fn run_server(
         .context("load Loomweave project instance ID")?;
     let default_config_path = worktree_ctx.config_path();
     let config_path = config_path.unwrap_or(&default_config_path);
-    let config = if config_path.exists() {
-        McpConfig::from_path(config_path)
-            .with_context(|| format!("load MCP config {}", config_path.display()))?
+    // ADR-063: a repository-tracked loomweave.yaml is corpus content; its
+    // egress sections (llm_policy / semantic_search / integrations /
+    // serve.http) are stripped before validation, and the verdict is announced
+    // once and threaded into the server state for the read surfaces.
+    let (config, config_trust) = if config_path.exists() {
+        let loaded = McpConfig::load_trusted(config_path)
+            .with_context(|| format!("load MCP config {}", config_path.display()))?;
+        log_config_trust_once(&loaded);
+        (loaded.config, loaded.trust)
     } else {
-        McpConfig::default()
+        // Absent: the built-in defaults are in effect and no repository content
+        // shaped them.
+        (McpConfig::default(), ConfigTrust::OperatorOwned)
     };
     let provider_selection = select_provider_with_env(&config, loomweave_core::dotenv::var)?;
     let llm_diagnostics = llm_diagnostics(&provider_selection, &config.llm);
@@ -619,6 +627,7 @@ fn run_server(
         loomweave_mcp::McpToolPolicy {
             enable_write_tools: config.serve.mcp.enable_write_tools,
         },
+        config_trust,
         // review #12: forward serve's resolved config to analyze_start, but only
         // when it exists on disk (the McpConfig::default() fallback has no file).
         config_path.exists().then(|| config_path.to_path_buf()),
@@ -692,6 +701,7 @@ fn spawn_mcp_stdio(
     warpline_client: Option<WarplineMcpClient>,
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
+    config_trust: ConfigTrust,
     analyze_config_path: Option<PathBuf>,
     worktree_gate: Option<WorktreeServeGate>,
     store_paths: loomweave_core::worktree::StorePaths,
@@ -711,6 +721,7 @@ fn spawn_mcp_stdio(
                 warpline_client,
                 diagnostics,
                 tool_policy,
+                config_trust,
                 analyze_config_path,
                 worktree_gate,
                 store_paths,
@@ -733,6 +744,7 @@ fn run_mcp_stdio(
     warpline_client: Option<WarplineMcpClient>,
     diagnostics: loomweave_mcp::DiagnosticsContext,
     tool_policy: loomweave_mcp::McpToolPolicy,
+    config_trust: ConfigTrust,
     analyze_config_path: Option<PathBuf>,
     worktree_gate: Option<WorktreeServeGate>,
     store_paths: loomweave_core::worktree::StorePaths,
@@ -753,8 +765,9 @@ fn run_mcp_stdio(
     // `effective_*` accessors need for a gated (linked-worktree) session
     // (worktree-index Task 7) — not just the db path.
     let worktree_gate = worktree_gate.map(|gate| (store_paths, gate));
-    let mut state =
-        loomweave_mcp::ServerState::new(project_root, readers).with_tool_policy(tool_policy);
+    let mut state = loomweave_mcp::ServerState::new(project_root, readers)
+        .with_tool_policy(tool_policy)
+        .with_config_trust(config_trust);
     if let Some((store_paths, gate)) = worktree_gate {
         state =
             state.with_worktree_gate(store_paths, gate.fallback_argv, gate.bootstrap_spawn_failed);
