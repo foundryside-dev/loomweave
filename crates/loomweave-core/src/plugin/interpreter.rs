@@ -18,12 +18,15 @@
 //!
 //! Rung 2 (`<project_root>/.venv/bin/python`) applies only when that path is
 //! **not repository-tracked**: [`crate::hardened_git::tracked_state`] must
-//! answer `untracked` or `not_a_git_work_tree` (`tracked` and the fail-closed
-//! `unknown` both skip the rung, logged once per process). pyright executes
-//! `python.pythonPath`, so a committed `.venv/bin/python` — or a committed
-//! symlink at `.venv` to committed content — would otherwise be code
-//! execution as the operator on the first `analyze` of an untrusted corpus.
-//! See ADR-063 and the ADR-058 amendment (2026-09-02).
+//! answer `untracked`, `not_a_git_work_tree`, or `git_unavailable` (`tracked`
+//! and the fail-closed `unknown` both skip the rung, logged once per
+//! process). A missing `git` binary is the operator's environment, not
+//! repository content, so `git_unavailable` is permissive and does NOT skip
+//! the rung. pyright executes `python.pythonPath`, so a committed
+//! `.venv/bin/python` — or a committed symlink at `.venv` to committed
+//! content — would otherwise be code execution as the operator on the first
+//! `analyze` of an untrusted corpus. See ADR-063 and the ADR-058 amendment
+//! (2026-09-02).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

@@ -1,6 +1,6 @@
 # ADR-058: Project Interpreter Discovery for Pyright
 
-**Status**: Accepted; rung 2 gated on repository-tracked state amended 2026-09-02 (see Amendment below)
+**Status**: Accepted — amended 2026-09-02 (see Amendment below)
 **Date**: 2026-08-29
 **Deciders**: john
 **Related**: [ADR-021](./ADR-021-plugin-authority-hybrid.md), [ADR-035](./ADR-035-operational-tuning-discipline.md), [ADR-050](./ADR-050-plugin-lifecycle-deadlines.md), [ADR-057](./ADR-057-pyright-restart-attribution.md)
@@ -262,20 +262,32 @@ same ticket, not part of the interpreter-discovery mechanism itself.
 
 **Change.** Rung 2 (`<project_root>/.venv/bin/python`, source `dotvenv`) is
 accepted only when the path is **not repository content**: `tracked_state`
-(ADR-063) must answer `untracked` or `not_a_git_work_tree`. On `tracked` or
-`unknown` (fail closed) the rung is skipped exactly as if the file were absent,
-and discovery continues with `VIRTUAL_ENV` → `CONDA_PREFIX` → `PATH` → none.
-Both sides of the cross-language contract (`interpreter.rs`, `interpreter.py`)
-apply the same predicate and log the skip once per process.
+(ADR-063) must answer `untracked`, `not_a_git_work_tree`, or
+`git_unavailable`. On `tracked` or the fail-closed `unknown` the rung is
+skipped exactly as if the file were absent, and discovery continues with
+`VIRTUAL_ENV` → `CONDA_PREFIX` → `PATH` → none. `git_unavailable` (no `git`
+binary resolvable at all) is deliberately NOT fail-closed: a missing `git` is
+the operator's environment, not repository content — `PATH` is
+real-environment-only (ADR-062) — so the rung is accepted as if `git` had
+answered `untracked`. Both sides of the cross-language contract
+(`interpreter.rs`, `interpreter.py`) apply the same predicate and log the
+skip once per process.
 
 **Why.** pyright executes `python.pythonPath`. A repository that commits an
 executable at `.venv/bin/python` — or a symlink at `.venv` to committed
 content — gets code execution as the operator on the first `analyze`,
 including the hook-spawned background one (Codex #142, closed; clarion-9b3cf287b7).
-An operator-created venv is always untracked, so no legitimate rung-2 hit is
-lost. `pyrightconfig.json` `venvPath`/`venv` are not gated: verified against the
-pinned pyright bundle, those keys only shape site-packages globbing and never
-execute a program.
+An operator-created venv is always untracked, so no rung-2 hit is lost to the
+`tracked` verdict. The fail-closed `unknown` verdict can lose a legitimate
+hit — an `ls-files` probe that times out, or a checkout owned by another uid
+that git refuses as `dubious ownership` under the hardened environment (the
+operator's `safe.directory` is deliberately not consulted; foreign ownership
+is itself an untrusted-corpus signal). A missing `git` binary is the
+operator's environment, not repository content, and reads `git_unavailable`,
+which keeps the rung. Every skip is surfaced by the once-per-process warning
+and by the existing `interpreter_unpinned` token. `pyrightconfig.json`
+`venvPath`/`venv` are not gated: verified against the pinned pyright bundle,
+those keys only shape site-packages globbing and never execute a program.
 
 **What this does not change.** Rungs 1 and 3–6, the `access(2)` executability
 ruling, lexical normalisation, the fingerprint, the host-export guards, and the

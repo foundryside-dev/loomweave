@@ -82,6 +82,20 @@ def test_treat_as_tracked_fails_closed() -> None:
     assert treat_as_tracked("unknown")
     assert not treat_as_tracked("untracked")
     assert not treat_as_tracked("not_a_git_work_tree")
+    # A missing `git` binary is the operator's environment, not repository
+    # content, so it must NOT fail closed.
+    assert not treat_as_tracked("git_unavailable")
+
+
+def test_missing_git_binary_reports_git_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert tracked_state(repo, Path("x")) == "git_unavailable"
 
 
 def test_hung_git_reports_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

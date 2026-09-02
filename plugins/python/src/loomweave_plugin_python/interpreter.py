@@ -16,13 +16,15 @@ incremental skip on it). Change both or neither.
 
 The ``.venv``/``dotvenv`` rung applies only when
 ``<project_root>/.venv/bin/python`` is **not repository-tracked**:
-``git_trust.tracked_state`` must answer ``untracked`` or
-``not_a_git_work_tree`` (``tracked`` and the fail-closed ``unknown`` both skip
-the rung, logged once per process). pyright executes ``python.pythonPath``, so
-a committed ``.venv/bin/python`` -- or a committed symlink at ``.venv`` to
-committed content -- would otherwise be code execution as the operator on the
-first ``analyze`` of an untrusted corpus. See ADR-063 and the ADR-058
-amendment (2026-09-02).
+``git_trust.tracked_state`` must answer ``untracked``,
+``not_a_git_work_tree``, or ``git_unavailable`` (``tracked`` and the
+fail-closed ``unknown`` both skip the rung, logged once per process). A
+missing ``git`` binary is the operator's environment, not repository content,
+so ``git_unavailable`` is permissive and does NOT skip the rung. pyright
+executes ``python.pythonPath``, so a committed ``.venv/bin/python`` -- or a
+committed symlink at ``.venv`` to committed content -- would otherwise be
+code execution as the operator on the first ``analyze`` of an untrusted
+corpus. See ADR-063 and the ADR-058 amendment (2026-09-02).
 
 Paths are returned as absolute and lexically normalised (``Path.absolute`` +
 ``os.path.normpath``): ``.``/``..`` collapsed, symlinks preserved. A venv's

@@ -3,8 +3,10 @@
 CROSS-LANGUAGE CONTRACT with ``crates/loomweave-core/src/hardened_git.rs``
 ``tracked_state``: same pathspec construction (the path, its ancestors, and —
 when it resolves inside the repository — the canonical target and its
-ancestors), same tri-state, same fail-closed reading. Conformance vectors:
-``fixtures/git_tracked_paths.json``. Change both or neither.
+ancestors), same five labels (``tracked``, ``untracked``,
+``not_a_git_work_tree``, ``git_unavailable``, ``unknown``), same fail-closed
+reading. Conformance vectors: ``fixtures/git_tracked_paths.json``. Change both
+or neither.
 
 The git invocation mirrors the Rust hardened builder: cleared environment plus
 ``PATH``, pinned ``C`` locale, operator/system config nulled, optional locks
@@ -24,7 +26,7 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from pathlib import Path
 
-TrackedState = Literal["tracked", "untracked", "not_a_git_work_tree", "unknown"]
+TrackedState = Literal["tracked", "untracked", "not_a_git_work_tree", "git_unavailable", "unknown"]
 
 _STDERR_TAIL = 64 * 1024
 _READ_CHUNK = 8192
@@ -34,7 +36,13 @@ _NOT_A_REPOSITORY_EXIT = 128
 
 
 def treat_as_tracked(state: TrackedState) -> bool:
-    """Fail-closed reading for trust decisions."""
+    """Fail-closed reading for trust decisions.
+
+    ``git_unavailable`` is the one exception to fail-closed: a missing
+    ``git`` binary is the operator's environment, not repository content
+    (``PATH`` is real-environment-only, ADR-062), so it must NOT be treated
+    as tracked.
+    """
     return state in ("tracked", "unknown")
 
 
@@ -117,6 +125,12 @@ def tracked_state(repo_root: Path, path: Path, *, timeout_seconds: float = 30.0)
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+    except FileNotFoundError:
+        # No `git` binary on PATH: the operator's environment, not
+        # repository content — permissive, not fail-closed (mirrors
+        # `TrackedState::GitUnavailable` / `ErrorKind::NotFound` in the Rust
+        # twin).
+        return "git_unavailable"
     except OSError:
         return "unknown"
     return _classify(proc, time.monotonic() + timeout_seconds)

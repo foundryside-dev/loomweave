@@ -239,6 +239,25 @@ def test_a_repository_tracked_dotvenv_is_skipped_and_the_ladder_continues(
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_the_tracked_dotvenv_warning_is_logged_once_per_process(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(interpreter_module, "_tracked_dotvenv_warned", False)
+    _git(tmp_path, "init", "-q")
+    _make_python(tmp_path / ".venv" / "bin" / "python")
+    _git(tmp_path, "add", "-f", ".venv/bin/python")
+    _git(tmp_path, "commit", "-q", "-m", "hostile")
+    _make_python(tmp_path / "operator-venv" / "bin" / "python")
+    env = {"VIRTUAL_ENV": str(tmp_path / "operator-venv")}
+
+    discover_project_interpreter(tmp_path, env)
+    capsys.readouterr()  # drain the first call's warning
+    discover_project_interpreter(tmp_path, env)
+
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
 def test_an_untracked_dotvenv_in_a_repository_is_still_chosen(tmp_path: Path) -> None:
     _git(tmp_path, "init", "-q")
     venv = _make_python(tmp_path / ".venv" / "bin" / "python")

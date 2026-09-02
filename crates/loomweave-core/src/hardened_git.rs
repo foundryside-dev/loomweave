@@ -577,6 +577,11 @@ pub fn list_untracked_files(repo_root: &Path) -> Option<Vec<String>> {
 /// canonical target or any ancestor of that, has an entry in the git index.
 /// This catches a committed file, a committed symlink at any level, a
 /// directory with committed contents, and a symlink to committed content.
+///
+/// Cross-language contract: the Python twin
+/// (`plugins/python/src/loomweave_plugin_python/git_trust.py`) returns the
+/// same five labels — `tracked`, `untracked`, `not_a_git_work_tree`,
+/// `git_unavailable`, `unknown`.
 #[derive(Debug)]
 pub enum TrackedState {
     /// The path is repository content.
@@ -585,8 +590,17 @@ pub enum TrackedState {
     Untracked,
     /// `repo_root` is not inside a git work tree.
     NotAGitWorkTree,
-    /// The probe failed (timeout, overflow, git missing…). Consumers on the
-    /// trust boundary treat this as `Tracked` (fail closed).
+    /// No `git` binary could be found to run the probe. This is the
+    /// OPERATOR's environment, not repository content — `PATH` is
+    /// real-environment-only (ADR-062) — so it is permissive: no git to
+    /// consult, the operator owns the tree.
+    GitUnavailable,
+    /// The probe failed for any other reason (timeout, stdout overflow, a
+    /// non-zero exit that isn't "not a git repository" — including git's
+    /// "dubious ownership" refusal for a checkout owned by another uid — or
+    /// any other I/O failure). Consumers on the trust boundary treat this as
+    /// `Tracked` (fail closed): a checkout git itself refuses to read is
+    /// itself an untrusted-corpus signal.
     Unknown(GitProbeError),
 }
 
@@ -599,14 +613,36 @@ impl TrackedState {
             Self::Tracked => "tracked",
             Self::Untracked => "untracked",
             Self::NotAGitWorkTree => "not_a_git_work_tree",
+            Self::GitUnavailable => "git_unavailable",
             Self::Unknown(_) => "unknown",
         }
     }
 
-    /// Fail-closed reading for trust decisions.
+    /// Fail-closed reading for trust decisions. `GitUnavailable` is the one
+    /// exception to the fail-closed default: a missing `git` binary is the
+    /// operator's environment, not repository content, so it must NOT be
+    /// treated as tracked.
     #[must_use]
     pub fn treat_as_tracked(&self) -> bool {
         matches!(self, Self::Tracked | Self::Unknown(_))
+    }
+}
+
+/// Classify a completed (or failed) bounded git probe into a [`TrackedState`].
+/// Factored out of [`tracked_state`] so each arm is unit-testable directly,
+/// without spawning a real `git` subprocess for every case.
+fn classify_probe(result: Result<GitProbeOutput, GitProbeError>) -> TrackedState {
+    match result {
+        Ok(out) if out.stdout.is_empty() => TrackedState::Untracked,
+        Ok(_) => TrackedState::Tracked,
+        Err(GitProbeError::Spawn(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            TrackedState::GitUnavailable
+        }
+        Err(GitProbeError::NonZeroExit {
+            code: Some(128),
+            ref stderr_tail,
+        }) if stderr_tail.contains("not a git repository") => TrackedState::NotAGitWorkTree,
+        Err(err) => TrackedState::Unknown(err),
     }
 }
 
@@ -647,15 +683,7 @@ pub fn tracked_state(repo_root: &Path, path: &Path) -> TrackedState {
     for spec in &specs {
         command.arg(spec);
     }
-    match run_git_probe_default(command) {
-        Ok(out) if out.stdout.is_empty() => TrackedState::Untracked,
-        Ok(_) => TrackedState::Tracked,
-        Err(GitProbeError::NonZeroExit {
-            code: Some(128),
-            stderr_tail,
-        }) if stderr_tail.contains("not a git repository") => TrackedState::NotAGitWorkTree,
-        Err(err) => TrackedState::Unknown(err),
-    }
+    classify_probe(run_git_probe_default(command))
 }
 
 /// Push `path` relative to `root`, then each ancestor down to (excluding) the
@@ -1073,6 +1101,7 @@ mod tests {
         assert_eq!(TrackedState::Tracked.label(), "tracked");
         assert_eq!(TrackedState::Untracked.label(), "untracked");
         assert_eq!(TrackedState::NotAGitWorkTree.label(), "not_a_git_work_tree");
+        assert_eq!(TrackedState::GitUnavailable.label(), "git_unavailable");
         assert_eq!(unknown.label(), "unknown");
 
         // Fail closed: only a proven-absent index entry buys trust.
@@ -1080,5 +1109,87 @@ mod tests {
         assert!(unknown.treat_as_tracked());
         assert!(!TrackedState::Untracked.treat_as_tracked());
         assert!(!TrackedState::NotAGitWorkTree.treat_as_tracked());
+        // The one exception to fail-closed: a missing `git` binary is the
+        // operator's environment, not repository content.
+        assert!(!TrackedState::GitUnavailable.treat_as_tracked());
+    }
+
+    #[cfg(unix)]
+    fn success_probe_output(stdout: &[u8]) -> GitProbeOutput {
+        use std::os::unix::process::ExitStatusExt;
+        GitProbeOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: stdout.to_vec(),
+            stderr_tail: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_probe_covers_every_branch() {
+        // Ok arms.
+        assert!(matches!(
+            classify_probe(Ok(success_probe_output(b""))),
+            TrackedState::Untracked
+        ));
+        assert!(matches!(
+            classify_probe(Ok(success_probe_output(b"some/tracked/path\0"))),
+            TrackedState::Tracked
+        ));
+
+        // `git` binary missing: the operator's environment, not repository
+        // content — permissive, not fail-closed.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            )))),
+            TrackedState::GitUnavailable
+        ));
+
+        // A spawn failure for any OTHER reason stays fail-closed.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied",
+            )))),
+            TrackedState::Unknown(GitProbeError::Spawn(_))
+        ));
+
+        // Timeout stays fail-closed.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::Timeout {
+                after: Duration::from_secs(30),
+            })),
+            TrackedState::Unknown(GitProbeError::Timeout { .. })
+        ));
+
+        // "not a git repository" is the one NonZeroExit reason that is NOT a
+        // trust-boundary concern: there is simply no repository here.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::NonZeroExit {
+                code: Some(128),
+                stderr_tail: "fatal: not a git repository (or any of the parent directories): \
+                              .git"
+                    .to_owned(),
+            })),
+            TrackedState::NotAGitWorkTree
+        ));
+
+        // "dubious ownership" is itself an untrusted-corpus signal (a
+        // checkout owned by another uid) and stays fail-closed; the
+        // operator's `safe.directory` allowlist is deliberately not
+        // consulted by the hardened command.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::NonZeroExit {
+                code: Some(128),
+                stderr_tail: "fatal: detected dubious ownership in repository at '/corpus'"
+                    .to_owned(),
+            })),
+            TrackedState::Unknown(GitProbeError::NonZeroExit {
+                code: Some(128),
+                ..
+            })
+        ));
     }
 }
