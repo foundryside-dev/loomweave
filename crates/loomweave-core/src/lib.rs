@@ -23,8 +23,9 @@ pub use classifier_coverage::{
 pub use entity_id::{EntityId, EntityIdError, entity_id};
 pub use errors::{HttpErrorCode, McpErrorCode};
 pub use hardened_git::{
-    GIT_PROBE_STDERR_TAIL_BYTES, GitProbeError, GitProbeLimits, GitProbeOutput,
+    GIT_PROBE_STDERR_TAIL_BYTES, GitProbeError, GitProbeLimits, GitProbeOutput, TrackedState,
     hardened_git_command, list_untracked_files, run_git_probe, run_git_probe_default,
+    tracked_state,
 };
 pub use plugin::process_tree::{descendant_pids, kill_process_tree};
 pub use plugin::{

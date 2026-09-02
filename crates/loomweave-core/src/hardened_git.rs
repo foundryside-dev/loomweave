@@ -63,7 +63,7 @@
 //! `--cached` call sites carry the actual safety.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -572,6 +572,110 @@ pub fn list_untracked_files(repo_root: &Path) -> Option<Vec<String>> {
     )
 }
 
+/// Whether `path` is repository content (ADR-063). Tracked means: the path,
+/// any ancestor of it, or — when it resolves inside the repository — its
+/// canonical target or any ancestor of that, has an entry in the git index.
+/// This catches a committed file, a committed symlink at any level, a
+/// directory with committed contents, and a symlink to committed content.
+#[derive(Debug)]
+pub enum TrackedState {
+    /// The path is repository content.
+    Tracked,
+    /// The path is inside a work tree, and nothing on it is in the index.
+    Untracked,
+    /// `repo_root` is not inside a git work tree.
+    NotAGitWorkTree,
+    /// The probe failed (timeout, overflow, git missing…). Consumers on the
+    /// trust boundary treat this as `Tracked` (fail closed).
+    Unknown(GitProbeError),
+}
+
+impl TrackedState {
+    /// Stable machine-readable label; also the wire vocabulary shared with the
+    /// Python twin (`plugins/python/src/loomweave_plugin_python/git_trust.py`).
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Tracked => "tracked",
+            Self::Untracked => "untracked",
+            Self::NotAGitWorkTree => "not_a_git_work_tree",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// Fail-closed reading for trust decisions.
+    #[must_use]
+    pub fn treat_as_tracked(&self) -> bool {
+        matches!(self, Self::Tracked | Self::Unknown(_))
+    }
+}
+
+/// Ask git whether `path` (absolute, or relative to `repo_root`) is tracked.
+/// One `git ls-files -z -- <specs…>` through the bounded runner; any output
+/// means tracked. Never hashes working-tree content, so no repo-controlled
+/// `filter` driver can run (see the module docs).
+///
+/// `--literal-pathspecs` is set because the specs are *paths*, not patterns:
+/// the canonical branch feeds git a path derived from a corpus-controlled
+/// symlink target, and a component containing `*`, `?`, `[…]` or a leading `:`
+/// would otherwise be read as a glob or as pathspec magic and answer about
+/// some other path.
+///
+/// Cross-language contract: the Python twin
+/// (`plugins/python/src/loomweave_plugin_python/git_trust.py`) builds the same
+/// pathspecs and returns the same labels; the shared vectors are
+/// `fixtures/git_tracked_paths.json`. Change both or neither.
+#[must_use]
+pub fn tracked_state(repo_root: &Path, path: &Path) -> TrackedState {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    let mut specs: Vec<PathBuf> = Vec::new();
+    push_self_and_ancestors(&mut specs, &absolute, repo_root);
+    if let (Ok(canonical), Ok(canonical_root)) = (absolute.canonicalize(), repo_root.canonicalize())
+    {
+        push_self_and_ancestors(&mut specs, &canonical, &canonical_root);
+    }
+    if specs.is_empty() {
+        // Entirely outside the repository (and not resolving into it).
+        return TrackedState::Untracked;
+    }
+    let mut command = hardened_git_command(repo_root);
+    command.args(["--literal-pathspecs", "ls-files", "-z", "--"]);
+    for spec in &specs {
+        command.arg(spec);
+    }
+    match run_git_probe_default(command) {
+        Ok(out) if out.stdout.is_empty() => TrackedState::Untracked,
+        Ok(_) => TrackedState::Tracked,
+        Err(GitProbeError::NonZeroExit {
+            code: Some(128),
+            stderr_tail,
+        }) if stderr_tail.contains("not a git repository") => TrackedState::NotAGitWorkTree,
+        Err(err) => TrackedState::Unknown(err),
+    }
+}
+
+/// Push `path` relative to `root`, then each ancestor down to (excluding) the
+/// root. Paths outside `root` contribute nothing.
+fn push_self_and_ancestors(specs: &mut Vec<PathBuf>, path: &Path, root: &Path) {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return;
+    };
+    let mut cursor = Some(rel);
+    while let Some(current) = cursor {
+        if current.as_os_str().is_empty() {
+            break;
+        }
+        if !specs.iter().any(|spec| spec == current) {
+            specs.push(current.to_path_buf());
+        }
+        cursor = current.parent();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,5 +1063,22 @@ mod tests {
             None,
             "a non-UTF-8 untracked path must read as unknown, never a partial list"
         );
+    }
+
+    #[test]
+    fn tracked_state_labels_and_fail_closed_reading() {
+        let unknown = TrackedState::Unknown(GitProbeError::Timeout {
+            after: Duration::from_secs(1),
+        });
+        assert_eq!(TrackedState::Tracked.label(), "tracked");
+        assert_eq!(TrackedState::Untracked.label(), "untracked");
+        assert_eq!(TrackedState::NotAGitWorkTree.label(), "not_a_git_work_tree");
+        assert_eq!(unknown.label(), "unknown");
+
+        // Fail closed: only a proven-absent index entry buys trust.
+        assert!(TrackedState::Tracked.treat_as_tracked());
+        assert!(unknown.treat_as_tracked());
+        assert!(!TrackedState::Untracked.treat_as_tracked());
+        assert!(!TrackedState::NotAGitWorkTree.treat_as_tracked());
     }
 }
