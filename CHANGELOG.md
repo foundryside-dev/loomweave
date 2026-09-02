@@ -12,7 +12,78 @@ only when an incompatible change is made to that surface. See
 
 ## [Unreleased]
 
-Nothing yet.
+### Security
+
+- **A repository-tracked `loomweave.yaml` no longer directs egress**
+  (clarion-dee44f1a66, [ADR-063](docs/loomweave/adr/ADR-063-repository-content-is-not-operator-intent.md)).
+  `loomweave.yaml` sits at the project root, inside the very tree Loomweave
+  analyses, and it names network endpoints (`llm_policy`, `semantic_search`,
+  `integrations.filigree`) plus the **name** of the environment variable whose
+  value is sent as a bearer token — with `allow_live_provider` in the same
+  file. A checkout that committed one could therefore exfiltrate any operator
+  environment variable, plus source-derived text, on the first `analyze` —
+  including the background one the session hook spawns. When the effective
+  config is tracked by the repository that contains it (or its tracked state
+  cannot be determined), its `llm_policy`, `semantic_search`, `integrations`
+  and `serve.http` sections are now replaced with their defaults before
+  anything reads them; `version`, `analysis` and `serve.mcp` are still
+  honoured. `llm_config_set` / `semantic_config_set` and `config llm set` /
+  `config semantic set` refuse a tracked target rather than writing a config
+  that would be silently inert.
+- **A repository-tracked `.venv/bin/python` is no longer executed**
+  (clarion-9b3cf287b7, [ADR-058](docs/loomweave/adr/ADR-058-project-interpreter-discovery.md)
+  amendment). Rung 2 of interpreter discovery hands that path to pyright, which
+  runs it — so a committed binary there was code execution as the operator. The
+  rung is now taken only when the path is untracked (or there is no repository
+  / no git to ask); otherwise resolution falls through to `VIRTUAL_ENV` /
+  `CONDA_PREFIX` / `PATH` exactly as if the file were absent.
+- **Every git probe against the analysed repository is bounded**
+  (clarion-9202f4acec). All corpus-facing probes now run through a shared
+  runner with a 30 s deadline and a 32 MiB stdout cap, draining both pipes on
+  dedicated threads, killing the whole process tree on expiry, and always
+  reaping the child — a hostile or pathological repository can no longer wedge
+  `serve`, the session hook, or `analyze`. Probe output is decoded strictly
+  rather than lossily, and `doctor`'s git-tracked-db check gained an `unknown`
+  state so a failed probe is never reported as the healthy verdict.
+
+### Fixed
+
+- **`install --hooks` honours your GLOBAL `core.hooksPath` again**
+  (clarion-9202f4acec). Routing the hook-directory probe onto the hardened git
+  builder nulled `GIT_CONFIG_GLOBAL`, so `git rev-parse --git-path hooks`
+  answered `.git/hooks` even when `~/.gitconfig` pointed elsewhere — the
+  managed block landed where git would never run it, and `doctor` reported the
+  hooks present. `hooks_dir` now resolves in git's own precedence order — the
+  repository's `.git/config` (operator/tool state, never committed content),
+  then your global `~/.gitconfig` via a second, deliberately unhardened probe
+  (`git config --global --get`, which cannot reach repository config), then the
+  hardened `--git-path hooks` default. A relative value resolves against the
+  worktree top level, as git itself does.
+- A path that resolves to the repository **root** is no longer reported
+  untracked without asking git: the root of a repository holding any tracked
+  content is repository content, and only an empty repository answers
+  `untracked` there.
+
+### Changed
+
+- A `loomweave.yaml` that your repository tracks now has its `llm_policy`,
+  `semantic_search`, `integrations` and `serve.http` sections **ignored**. If
+  you were using a committed config as a team default, run
+  `git rm --cached loomweave.yaml && echo loomweave.yaml >> .gitignore` (or
+  `loomweave doctor --fix`). The new `doctor` check `config.trust` fails the
+  gate until you do; `loomweave config check`, `loomweave install`, and the
+  `project_status_get` / `llm_config_get` MCP tools report the same verdict.
+- `loomweave doctor`'s `db.tracked` check can now report `unknown` (a warning,
+  not a pass) when the git probe cannot answer.
+- The `config.trust` verdict now carries the remedy that fits it. `unknown`
+  (git refused the checkout — commonly "dubious ownership") tells you to fix
+  ownership rather than to untrack a file git never said was tracked, and
+  `git_unavailable` tells you to install git. The MCP config writers answer an
+  `unknown` verdict with the new `LMWV-CONFIG-TRUST-UNKNOWN` code, in the same
+  invalid-params class as the tracked refusal.
+- `loomweave analyze`'s no-indexed-changes fast path is skipped for a
+  repository whose commit range contains a non-UTF-8 path; the run falls back
+  to a full analyze rather than trusting a lossily-decoded probe.
 
 ## [1.6.1] — 2026-09-02
 

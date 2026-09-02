@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use loomweave_core::hardened_git::hardened_git_command;
+use loomweave_core::hardened_git::{hardened_git_command, run_git_probe_default};
 
 /// `<name-or-path>` could not be resolved to exactly one worktree path.
 #[derive(Debug, thiserror::Error)]
@@ -111,16 +111,16 @@ pub fn resolve_target(cwd: &Path, name_or_path: &str) -> Result<PathBuf, Resolve
 /// every such failure falls back to filesystem-path interpretation in
 /// [`resolve_target`], never a hard error here.
 fn find_registered_worktrees(cwd: &Path, name: &str) -> Vec<PathBuf> {
-    let Ok(output) = hardened_git_command(cwd)
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .output()
-    else {
+    // Bounded (clarion-9202f4acec): a corpus-controlled repository must not be
+    // able to hang or flood this convenience lookup. Every failure — spawn,
+    // non-zero exit, deadline, stdout cap, non-UTF-8 — folds to "no match",
+    // which is the fall-back-to-a-path behaviour documented above.
+    let mut command = hardened_git_command(cwd);
+    command.args(["worktree", "list", "--porcelain", "-z"]);
+    let Ok(output) = run_git_probe_default(command) else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let Ok(text) = std::str::from_utf8(&output.stdout) else {
+    let Ok(text) = output.stdout_utf8() else {
         return Vec::new();
     };
     let mut matches = Vec::new();

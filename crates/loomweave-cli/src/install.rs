@@ -25,6 +25,7 @@ use loomweave_storage::{pragma, schema};
 // and `loomweave config example` emit byte-identical content from a single
 // source of truth (it can never drift from what install writes).
 use crate::config::LOOMWEAVE_YAML_STUB;
+use loomweave_federation::config::CONFIG_TRACKED_REMEDY;
 
 /// Canonical contents of `.weft/loomweave/.gitignore`. The single source of
 /// truth: [`write_gitignore`] writes it verbatim on install, and
@@ -322,6 +323,10 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
             "{} already initialised; skipping .weft/loomweave/ init (pass --force to recreate).",
             loomweave_dir.display()
         );
+        // Deliberately printed on the SKIP path too: the operator whose
+        // `.weft/loomweave/` already exists is exactly the one who may have
+        // committed `loomweave.yaml` before this gate existed.
+        advise_config_ownership(project_root);
         return Ok(());
     }
 
@@ -366,7 +371,54 @@ fn initialise_project(project_root: &Path, force: bool) -> Result<()> {
         "loomweave install complete"
     );
     println!("Initialised {}", loomweave_dir.display());
+    advise_config_ownership(project_root);
     Ok(())
+}
+
+/// Whether the project root's `.gitignore` already has a line naming
+/// `loomweave.yaml`. Root file only — `install` advises, it never searches.
+fn root_gitignore_covers_config(project_root: &Path) -> bool {
+    fs::read_to_string(project_root.join(".gitignore"))
+        .is_ok_and(|body| body.lines().any(|line| line.trim() == "loomweave.yaml"))
+}
+
+/// ADR-063 ownership advisory for `loomweave.yaml`.
+///
+/// `install` writes the config stub at the project root, inside the very
+/// repository Loomweave is about to analyse. Say which side of the trust
+/// boundary the file is on before the operator puts credentials in it.
+///
+/// Advisory ONLY. `install` does not edit `.gitignore` (that file belongs to
+/// the repository, not to Loomweave — the config-repair cede discipline), and
+/// nothing here gates the run.
+fn advise_config_ownership(project_root: &Path) {
+    if !project_root.join("loomweave.yaml").exists() {
+        return;
+    }
+    match loomweave_core::tracked_state(project_root, Path::new("loomweave.yaml")) {
+        loomweave_core::TrackedState::Tracked => {
+            println!(
+                "warning: loomweave.yaml is tracked by this repository; Loomweave ignores its \
+                 egress sections (ADR-063). {CONFIG_TRACKED_REMEDY}"
+            );
+        }
+        // Inside a work tree and not tracked — the healthy case. Nudge only
+        // while nothing stops the next `git add -A` from committing it.
+        loomweave_core::TrackedState::Untracked => {
+            if !root_gitignore_covers_config(project_root) {
+                println!(
+                    "note: loomweave.yaml is operator-owned; add it to .gitignore so it is never \
+                     committed (ADR-063)."
+                );
+            }
+        }
+        // Not a git work tree, no git binary to ask, or an unanswerable probe:
+        // there is no repository to warn about, and a false alarm here would be
+        // pure noise on every `install` outside a checkout.
+        loomweave_core::TrackedState::NotAGitWorkTree
+        | loomweave_core::TrackedState::GitUnavailable
+        | loomweave_core::TrackedState::Unknown(_) => {}
+    }
 }
 
 /// Refuse `--force`'s recursive delete unless `loomweave_dir` is a Loomweave-owned

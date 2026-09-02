@@ -22,7 +22,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use loomweave_core::hardened_git_command;
+use loomweave_core::{hardened_git_command, run_git_probe_default};
 use rusqlite::{Connection, OpenFlags};
 
 /// Non-source inputs whose change must run the full pipeline.
@@ -48,19 +48,19 @@ pub(crate) fn no_indexed_changes(project_root: &Path, db_path: &Path) -> Option<
     )
     .ok()?;
     let drift = loomweave_mcp::commit_only_drift(&conn, project_root)?;
-    let output = hardened_git_command(project_root)
-        .args([
-            "diff",
-            "--name-only",
-            "-z",
-            &format!("{}..{}", drift.analyzed_commit, drift.head_commit),
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut command = hardened_git_command(project_root);
+    command.args([
+        "diff",
+        "--name-only",
+        "-z",
+        &format!("{}..{}", drift.analyzed_commit, drift.head_commit),
+    ]);
+    // Bounded (clarion-9202f4acec). `None` means "cannot decide" — the fast
+    // path is not taken and the full walk runs, which is the same conservative
+    // answer a non-success exit already produced. A non-UTF-8 path list joins
+    // that set rather than being lossily decoded into a scope decision.
+    let output = run_git_probe_default(command).ok()?;
+    let stdout = output.stdout_utf8().ok()?;
     let paths: Vec<&str> = stdout.split('\0').filter(|p| !p.is_empty()).collect();
     if paths_touch_indexed_scope(paths.iter().copied(), &drift.ingested_extensions) {
         return None;

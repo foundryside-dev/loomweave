@@ -30,8 +30,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc};
 
 use loomweave_core::plugin::{ContentLengthCeiling, Frame, TransportError};
 use loomweave_federation::config::{
-    LlmConfigPatch, LlmProviderKind, McpConfig, ProviderSelection, SemanticConfigPatch,
-    SemanticProviderKind, select_provider_with_env, update_llm_config_file,
+    ConfigError, ConfigTrust, LlmConfigPatch, LlmProviderKind, McpConfig, ProviderSelection,
+    SemanticConfigPatch, SemanticProviderKind, select_provider_with_env, update_llm_config_file,
     update_semantic_config_file,
 };
 use loomweave_storage::{
@@ -1316,6 +1316,13 @@ pub struct ServerState {
     warpline_client: Option<Arc<dyn crate::warpline::WarplineLookup>>,
     diagnostics: Option<DiagnosticsContext>,
     tool_policy: McpToolPolicy,
+    /// Ownership verdict for the `loomweave.yaml` this session loaded
+    /// (ADR-063), captured by `serve` at construction so read surfaces can
+    /// report WHY a configured provider or integration is inert. Defaults to
+    /// `ConfigTrust::OperatorOwned` — the honest reading for a state built
+    /// without a config file (tests, storage-only servers): no repository
+    /// content shaped it.
+    config_trust: loomweave_federation::config::ConfigTrust,
     /// Supervised `loomweave analyze` runs launched via `analyze_start`.
     analyze_runs: crate::analyze_runs::RunRegistry,
     active_requests: Arc<AsyncMutex<BTreeSet<String>>>,
@@ -1394,6 +1401,7 @@ impl ServerState {
             warpline_client: None,
             diagnostics: None,
             tool_policy: McpToolPolicy::default(),
+            config_trust: loomweave_federation::config::ConfigTrust::OperatorOwned,
             analyze_runs: Arc::new(Mutex::new(HashMap::new())),
             active_requests: Arc::new(AsyncMutex::new(BTreeSet::new())),
             cancelled_requests: Arc::new(AsyncMutex::new(BTreeSet::new())),
@@ -1595,6 +1603,22 @@ impl ServerState {
         self
     }
 
+    /// Record the ADR-063 ownership verdict for the loaded `loomweave.yaml`.
+    #[must_use]
+    pub fn with_config_trust(
+        mut self,
+        config_trust: loomweave_federation::config::ConfigTrust,
+    ) -> Self {
+        self.config_trust = config_trust;
+        self
+    }
+
+    /// The ADR-063 ownership verdict for the loaded `loomweave.yaml`.
+    #[must_use]
+    pub fn config_trust(&self) -> &loomweave_federation::config::ConfigTrust {
+        &self.config_trust
+    }
+
     async fn tool_llm_config_get(
         &self,
         _arguments: &serde_json::Map<String, Value>,
@@ -1634,10 +1658,15 @@ impl ServerState {
         let active_write_tools = self.tool_policy.enable_write_tools;
         let write = tokio::task::spawn_blocking(move || {
             let result = update_llm_config_file(&path, &patch)?;
-            Ok::<_, loomweave_federation::config::ConfigError>(llm_config_status_json(
+            // The write only reaches here on a target `update_llm_config_file`
+            // judged operator-owned, so re-probing costs one bounded `git
+            // ls-files` on a rare path and keeps the written-back envelope
+            // shaped exactly like the read one.
+            let trust = loomweave_federation::config::config_trust_for_path(&path);
+            Ok::<_, loomweave_federation::config::ConfigError>(stamp_config_trust(
+                llm_config_status_json(&path, result.created, &result.config),
+                &trust,
                 &path,
-                result.created,
-                &result.config,
             ))
         })
         .await;
@@ -1647,6 +1676,17 @@ impl ServerState {
                 active_write_tools,
                 true,
             ))),
+            // ADR-063: a target Loomweave does not own is a caller-side fault
+            // (the file is corpus content Loomweave refuses to edit), not a
+            // storage failure. Answer in the invalid-params class so an agent
+            // does not read it as retryable; each error's own Display carries
+            // the remedy that fits its arm. `ConfigTrustUnknown` is the same
+            // class as the tracked refusal — it is the fail-closed reading of
+            // the same gate, not a different kind of failure.
+            Ok(Err(
+                err @ (ConfigError::RepositoryTrackedConfig { .. }
+                | ConfigError::ConfigTrustUnknown { .. }),
+            )) => Err(ParamError::new(&err.to_string())),
             Ok(Err(err)) => Ok(tool_error_envelope(
                 McpErrorCode::StorageError,
                 &err.to_string(),
@@ -1705,11 +1745,11 @@ impl ServerState {
         let active_write_tools = self.tool_policy.enable_write_tools;
         let write = tokio::task::spawn_blocking(move || {
             let result = update_semantic_config_file(&path, &patch)?;
-            Ok::<_, loomweave_federation::config::ConfigError>(semantic_config_status_json(
+            let trust = loomweave_federation::config::config_trust_for_path(&path);
+            Ok::<_, loomweave_federation::config::ConfigError>(stamp_config_trust(
+                semantic_config_status_json(&path, &sidecar_path, result.created, &result.config),
+                &trust,
                 &path,
-                &sidecar_path,
-                result.created,
-                &result.config,
             ))
         })
         .await;
@@ -1719,6 +1759,11 @@ impl ServerState {
                 active_write_tools,
                 true,
             ))),
+            // ADR-063, as in `tool_llm_config_set`: caller-side fault, not storage.
+            Ok(Err(
+                err @ (ConfigError::RepositoryTrackedConfig { .. }
+                | ConfigError::ConfigTrustUnknown { .. }),
+            )) => Err(ParamError::new(&err.to_string())),
             Ok(Err(err)) => Ok(tool_error_envelope(
                 McpErrorCode::StorageError,
                 &err.to_string(),
@@ -3762,14 +3807,44 @@ fn semantic_config_patch_is_empty(patch: &SemanticConfigPatch) -> bool {
         && patch.session_token_ceiling.is_none()
 }
 
+/// Stamp the ADR-063 ownership verdict onto a config-status object.
+///
+/// Output-only (no tool schema or description changes — `tools/list` is metered
+/// against a byte budget). The verdict travels with the status so an agent
+/// reading "provider disabled" can see in the same envelope whether the
+/// repository, rather than the operator's config, is why.
+fn stamp_config_trust(mut status: Value, trust: &ConfigTrust, path: &Path) -> Value {
+    status["config_trust"] = trust.to_json(path);
+    status
+}
+
+/// ADR-063: read through [`McpConfig::load_trusted`], never `from_path`, so the
+/// DISPLAYED provider state is the one actually in effect — a repository-tracked
+/// config's `llm_policy` is stripped before it is rendered, and the surface can
+/// never advertise egress the gate has already disabled.
+///
+/// The verdict reported here comes from THIS load rather than from
+/// `ServerState::config_trust` (the start-up verdict). One load produces both
+/// the config values and the label, so the two can never disagree with each
+/// other inside a single envelope.
 fn read_llm_config_status(
     path: &Path,
 ) -> std::result::Result<Value, loomweave_federation::config::ConfigError> {
     if path.exists() {
-        let config = McpConfig::from_path(path)?;
-        Ok(llm_config_status_json(path, false, &config))
+        let loaded = McpConfig::load_trusted(path)?;
+        Ok(stamp_config_trust(
+            llm_config_status_json(path, false, &loaded.config),
+            &loaded.trust,
+            path,
+        ))
     } else {
-        Ok(llm_config_status_json(path, true, &McpConfig::default()))
+        // No file: the built-in defaults are in effect and no repository
+        // content shaped them (matching `serve`'s absent-config verdict).
+        Ok(stamp_config_trust(
+            llm_config_status_json(path, true, &McpConfig::default()),
+            &ConfigTrust::OperatorOwned,
+            path,
+        ))
     }
 }
 
@@ -3805,24 +3880,25 @@ fn llm_config_status_json(path: &Path, created_or_absent: bool, config: &McpConf
     })
 }
 
+/// Semantic twin of [`read_llm_config_status`] — same ADR-063 rule, same
+/// reason: the two config surfaces must not disagree about whether the
+/// repository owns the file.
 fn read_semantic_config_status(
     path: &Path,
     sidecar_path: &Path,
 ) -> std::result::Result<Value, loomweave_federation::config::ConfigError> {
     if path.exists() {
-        let config = McpConfig::from_path(path)?;
-        Ok(semantic_config_status_json(
+        let loaded = McpConfig::load_trusted(path)?;
+        Ok(stamp_config_trust(
+            semantic_config_status_json(path, sidecar_path, false, &loaded.config),
+            &loaded.trust,
             path,
-            sidecar_path,
-            false,
-            &config,
         ))
     } else {
-        Ok(semantic_config_status_json(
+        Ok(stamp_config_trust(
+            semantic_config_status_json(path, sidecar_path, true, &McpConfig::default()),
+            &ConfigTrust::OperatorOwned,
             path,
-            sidecar_path,
-            true,
-            &McpConfig::default(),
         ))
     }
 }
@@ -7815,6 +7891,120 @@ mod tests {
         );
         assert_eq!(saved.llm.codex_cli.model.as_deref(), Some("gpt-5-codex"));
         assert!(saved.serve.mcp.enable_write_tools);
+    }
+
+    /// Hermetic git in a fixture repo: no global/system config, explicit
+    /// identity. Returns `false` when git is not installed so the ADR-063
+    /// tests below skip cleanly instead of failing on the environment.
+    fn fixture_git(dir: &std::path::Path, args: &[&str]) -> bool {
+        let Ok(output) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+        else {
+            return false;
+        };
+        assert!(
+            output.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// ADR-063 (clarion-dee44f1a66): a `loomweave.yaml` the repository tracks is
+    /// corpus content. `llm_config_set` must refuse it in the invalid-params
+    /// class (not as a retryable storage error), carry the remedy, and leave the
+    /// file byte-identical — a bootstrap from a read-only session must never
+    /// hand the operator a config that is silently inert. The read surface must
+    /// say why in the same breath.
+    #[tokio::test]
+    async fn llm_config_set_refuses_a_repository_tracked_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loomweave.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db).unwrap();
+            pragma::apply_write_pragmas(&conn).unwrap();
+            schema::apply_migrations(&mut conn).unwrap();
+        }
+        let config_path = dir.path().join("loomweave.yaml");
+        let original = "version: 1\nllm_policy:\n  enabled: false\n";
+        std::fs::write(&config_path, original).unwrap();
+        if !fixture_git(dir.path(), &["init", "-q", "-b", "main"]) {
+            eprintln!("skipping: no git available");
+            return;
+        }
+        fixture_git(dir.path(), &["add", "-f", "--", "loomweave.yaml"]);
+        fixture_git(dir.path(), &["commit", "-qm", "commit the config"]);
+
+        let readers = ReaderPool::open(&db, 4).unwrap();
+        let state = ServerState::new(dir.path().to_path_buf(), readers)
+            .with_tool_policy(McpToolPolicy::read_only());
+
+        let response = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "llm-config-set-tracked",
+                "method": "tools/call",
+                "params": {
+                    "name": "llm_config_set",
+                    "arguments": {"enabled": true, "allow_live_provider": true}
+                }
+            }))
+            .await
+            .expect("tools/call response");
+
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "a tracked target is a caller-side fault, not a storage error: {response}"
+        );
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("tracked by the repository"),
+            "the refusal must name the reason: {response}"
+        );
+        assert!(
+            message.contains(loomweave_federation::config::CONFIG_TRACKED_REMEDY),
+            "the refusal must carry the verbatim remedy: {response}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            original,
+            "a refused write must not touch the file"
+        );
+
+        // The read surface agrees: stripped posture plus the verdict that
+        // explains it, in one envelope.
+        let read = state
+            .handle_json_rpc(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "llm-config-get-tracked",
+                "method": "tools/call",
+                "params": {"name": "llm_config_get", "arguments": {}}
+            }))
+            .await
+            .expect("tools/call response");
+        let text = read["result"]["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true, "{envelope}");
+        assert_eq!(
+            envelope["result"]["config_trust"]["state"], "repository_tracked",
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["result"]["config_trust"]["remedy"],
+            loomweave_federation::config::CONFIG_TRACKED_REMEDY,
+            "{envelope}"
+        );
     }
 
     #[tokio::test]

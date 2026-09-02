@@ -62,9 +62,14 @@
 //! and the in-tree-attribute belt-and-suspenders is simply inactive — again, the
 //! `--cached` call sites carry the actual safety.
 
-use std::path::Path;
-use std::process::Command;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// The well-known empty tree object (SHA-1). Reading gitattributes from this
 /// tree assigns no attribute to any path, so no `filter`/diff/textconv driver is
@@ -102,14 +107,18 @@ fn attr_source_supported() -> bool {
         let mut command = Command::new("git");
         command.env_clear();
         apply_operator_env_passthrough(&mut command, |name| std::env::var_os(name));
-        command
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| parse_git_version(&s))
-            .is_some_and(|v| v >= (2, 40))
+        command.arg("--version");
+        run_git_probe(
+            command,
+            &GitProbeLimits {
+                deadline: Duration::from_secs(5),
+                max_stdout_bytes: 4096,
+            },
+        )
+        .ok()
+        .and_then(|o| o.stdout_utf8().ok().map(str::to_owned))
+        .and_then(|s| parse_git_version(&s))
+        .is_some_and(|v| v >= (2, 40))
     })
 }
 
@@ -147,17 +156,88 @@ const NULL_DEVICE: &str = "NUL";
 #[cfg(not(windows))]
 const NULL_DEVICE: &str = "/dev/null";
 
+/// The ONE sanctioned git spawn in Loomweave that does not harden itself
+/// against corpus content — because it cannot reach any. Returns
+/// `git config --global --get`; the caller appends the key.
+///
+/// `--global` reads the operator's global config file and **nothing else**: not
+/// the repository's `.git/config`, not `.gitattributes`, not the worktree. So
+/// the config-and-attribute vectors [`hardened_git_command`] exists to
+/// neutralize have no path into this probe, and `config --get` executes no
+/// program of its own.
+///
+/// It exists because the hardening is, for one narrow question, *too* strong.
+/// [`hardened_git_command`] nulls `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so a
+/// probe built on it answers as if the operator's `~/.gitconfig` did not exist.
+/// That is exactly right for "what does this repository contain" and exactly
+/// wrong for "what has the operator configured": under ADR-063 the operator's
+/// global git config IS operator intent, and silently ignoring it makes
+/// Loomweave act on a setting the operator never chose. The concrete case is
+/// `core.hooksPath` (see `loomweave-cli`'s `git_hooks::hooks_dir`): read through
+/// the hardened probe, a global `core.hooksPath` vanishes and
+/// `install --hooks` writes hooks into `.git/hooks`, where git will never run
+/// them.
+///
+/// The environment is still cleared and rebuilt — no repository selector may
+/// survive — but three more operator-owned variables are forwarded, because
+/// they are how an operator says *where their global config is*:
+///
+/// * `HOME` — the default location of `~/.gitconfig`.
+/// * `XDG_CONFIG_HOME` — the alternative location (`$XDG_CONFIG_HOME/git/config`).
+/// * `GIT_CONFIG_GLOBAL` — an explicit redirect, how containers and CI point
+///   git at an operator config file. Forwarded VERBATIM and never nulled; that
+///   is the whole point of this builder.
+///
+/// `GIT_CONFIG_SYSTEM` is deliberately not forwarded and `GIT_CONFIG_NOSYSTEM`
+/// deliberately not set: `--global` consults neither, so both would be noise.
+///
+/// Spawn it with [`run_git_probe`] / [`run_git_probe_default`], like every
+/// other git spawn here.
+#[must_use]
+pub fn operator_global_git_config_command() -> Command {
+    operator_global_git_config_command_with(|name| std::env::var_os(name))
+}
+
+/// [`operator_global_git_config_command`] with `getenv` injected, so a test can
+/// pin the environment contract without mutating the process environment.
+fn operator_global_git_config_command_with(
+    getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Command {
+    let mut command = Command::new("git");
+    command.env_clear();
+    apply_operator_env_passthrough(&mut command, &getenv);
+    for name in ["HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"] {
+        if let Some(value) = getenv(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        // Machine-parsed output: pin the locale.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        // `--global` is baked in, not left to the caller: it is the whole
+        // reason this unhardened spawn is safe.
+        .args(["config", "--global", "--get"]);
+    command
+}
+
 /// Build a `git` [`Command`] hardened for read-only probes against an untrusted
 /// repository at `repo_root` (sets `git -C <repo_root>`). The caller appends the
 /// subcommand and its arguments, e.g.:
 ///
 /// ```no_run
 /// # use std::path::Path;
-/// # use loomweave_core::hardened_git_command;
-/// let out = hardened_git_command(Path::new("/corpus"))
-///     .args(["rev-parse", "HEAD"])
-///     .output();
+/// # use loomweave_core::{hardened_git_command, run_git_probe_default};
+/// let mut command = hardened_git_command(Path::new("/corpus"));
+/// command.args(["rev-parse", "HEAD"]);
+/// let out = run_git_probe_default(command);
 /// ```
+///
+/// Spawn the built command with [`run_git_probe`] / [`run_git_probe_default`],
+/// never `Command::output()`: a corpus-controlled repository can make git emit
+/// unbounded output or block forever, and `output()` has neither a byte cap nor
+/// a deadline.
 ///
 /// **Callers must not hash working-tree content** on an untrusted corpus (use
 /// `diff --cached`, not `status` or a worktree `diff`) — see the module docs for
@@ -217,6 +297,313 @@ pub fn hardened_git_command(repo_root: &Path) -> Command {
     command
 }
 
+/// Bytes of stderr retained (the tail) by [`run_git_probe`]. stderr is
+/// diagnostic: overflow drops the oldest bytes and never fails the probe.
+pub const GIT_PROBE_STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+/// How long [`run_git_probe`] still spends joining its drain threads once the
+/// deadline is already spent. Without it, every error path would detach its
+/// readers by construction (the budget is exhausted the moment the deadline
+/// fires) — the leak this runner exists to avoid.
+const READER_JOIN_GRACE: Duration = Duration::from_secs(1);
+
+/// Poll interval while waiting for the child to exit.
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Poll interval while waiting for a drain thread to finish.
+const READER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Wall-clock and stdout ceilings for one git probe against the corpus.
+#[derive(Debug, Clone, Copy)]
+pub struct GitProbeLimits {
+    /// Kill the process tree and fail the probe when exceeded.
+    pub deadline: Duration,
+    /// Kill the process tree and fail the probe when stdout exceeds this.
+    pub max_stdout_bytes: usize,
+}
+
+impl Default for GitProbeLimits {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_secs(30),
+            max_stdout_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+/// A completed, bounded probe.
+#[derive(Debug)]
+pub struct GitProbeOutput {
+    /// The child's exit status (always successful — a non-zero exit is
+    /// reported as [`GitProbeError::NonZeroExit`] instead).
+    pub status: ExitStatus,
+    /// Everything the child wrote to stdout, at most
+    /// [`GitProbeLimits::max_stdout_bytes`].
+    pub stdout: Vec<u8>,
+    /// The last [`GIT_PROBE_STDERR_TAIL_BYTES`] bytes of stderr.
+    pub stderr_tail: Vec<u8>,
+}
+
+impl GitProbeOutput {
+    /// Strict UTF-8 view of stdout. Machine-parsed git output is ASCII/UTF-8
+    /// under `LC_ALL=C`; anything else is malformed and fails the probe.
+    pub fn stdout_utf8(&self) -> Result<&str, GitProbeError> {
+        std::str::from_utf8(&self.stdout).map_err(|_| GitProbeError::NonUtf8)
+    }
+
+    /// The retained stderr tail, decoded lossily for diagnostics only.
+    #[must_use]
+    pub fn stderr_tail_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.stderr_tail).into_owned()
+    }
+}
+
+/// Why a bounded git probe produced no usable output.
+#[derive(Debug, thiserror::Error)]
+pub enum GitProbeError {
+    /// `git` could not be started (not on `PATH`, not executable, …).
+    #[error("spawn git: {0}")]
+    Spawn(#[source] std::io::Error),
+    /// The child outlived its deadline; its process tree was killed.
+    #[error("git probe exceeded its {after:?} deadline and was killed")]
+    Timeout {
+        /// The deadline that was exceeded.
+        after: Duration,
+    },
+    /// The child wrote more than the stdout cap; its process tree was killed.
+    #[error("git probe stdout exceeded {limit} bytes and was killed")]
+    StdoutOverflow {
+        /// The cap that was exceeded.
+        limit: usize,
+    },
+    /// The child ran to completion but exited non-zero.
+    #[error("git exited with {code:?}: {stderr_tail}")]
+    NonZeroExit {
+        /// The child's exit code, `None` when it died from a signal.
+        code: Option<i32>,
+        /// The retained stderr tail, decoded lossily.
+        stderr_tail: String,
+    },
+    /// stdout was not valid UTF-8 (see [`GitProbeOutput::stdout_utf8`]).
+    #[error("git probe stdout is not valid UTF-8")]
+    NonUtf8,
+    /// Reading a pipe, waiting on the child, or joining a drain thread failed.
+    #[error("git probe I/O: {0}")]
+    Io(#[source] std::io::Error),
+}
+
+impl GitProbeError {
+    /// The child's exit code, only for [`GitProbeError::NonZeroExit`].
+    #[must_use]
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::NonZeroExit { code, .. } => *code,
+            _ => None,
+        }
+    }
+}
+
+/// Run `command` with stdin null, stdout and stderr piped and drained
+/// concurrently, a hard stdout byte cap, and a wall-clock deadline. On cap or
+/// deadline the whole process tree is killed and the child reaped; the drain
+/// threads are then joined before returning. Never use `Command::output()` on a
+/// corpus path — its length is only checkable after unbounded allocation, and
+/// it waits forever.
+///
+/// stderr is diagnostic, not data: only its last
+/// [`GIT_PROBE_STDERR_TAIL_BYTES`] bytes are kept, and its volume never fails
+/// the probe.
+///
+/// Residual: a grandchild that inherited the pipes can outlive the killed tree
+/// and hold them open. Joining the drain threads is therefore bounded too — by
+/// whatever is left of the deadline, but never less than a one-second grace, so
+/// an already-expired probe still reaps its readers. Only if that bound is
+/// also exhausted does the probe return [`GitProbeError::Timeout`] and detach
+/// the threads (they exit on their own at EOF).
+pub fn run_git_probe(
+    mut command: Command,
+    limits: &GitProbeLimits,
+) -> Result<GitProbeOutput, GitProbeError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(GitProbeError::Spawn)?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        // Unreachable: both were just piped. Fail rather than panic — this is a
+        // hardening primitive on the untrusted-corpus path.
+        reap_killed(&mut child);
+        return Err(GitProbeError::Io(std::io::Error::other(
+            "git probe pipes were not created",
+        )));
+    };
+    let overflow = Arc::new(AtomicBool::new(false));
+    let cap = limits.max_stdout_bytes;
+    let stdout_reader = {
+        let overflow = Arc::clone(&overflow);
+        thread::spawn(move || read_capped(stdout, cap, &overflow))
+    };
+    let stderr_reader = thread::spawn(move || read_tail(stderr, GIT_PROBE_STDERR_TAIL_BYTES));
+
+    let started = Instant::now();
+    let status = loop {
+        if overflow.load(Ordering::Acquire) {
+            reap_killed(&mut child);
+            reap_readers(stdout_reader, stderr_reader, started, limits.deadline);
+            return Err(GitProbeError::StdoutOverflow { limit: cap });
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => {
+                reap_killed(&mut child);
+                reap_readers(stdout_reader, stderr_reader, started, limits.deadline);
+                return Err(GitProbeError::Io(err));
+            }
+        }
+        if started.elapsed() >= limits.deadline {
+            tracing::debug!(
+                deadline = ?limits.deadline,
+                "git probe exceeded its deadline; killing the process tree"
+            );
+            reap_killed(&mut child);
+            reap_readers(stdout_reader, stderr_reader, started, limits.deadline);
+            return Err(GitProbeError::Timeout {
+                after: limits.deadline,
+            });
+        }
+        thread::sleep(CHILD_POLL_INTERVAL);
+    };
+
+    let until = reader_join_deadline(started, limits.deadline);
+    let stdout = join_within(stdout_reader, until).ok_or(GitProbeError::Timeout {
+        after: limits.deadline,
+    })?;
+    // The child can also exit on its own after overflowing a cap smaller than
+    // the pipe buffer, so the flag is re-checked on the success path — before
+    // the reader's own error, because a cap breach outranks a read error.
+    if overflow.load(Ordering::Acquire) {
+        let _ = join_within(stderr_reader, until);
+        return Err(GitProbeError::StdoutOverflow { limit: cap });
+    }
+    let stdout = stdout.map_err(GitProbeError::Io)?;
+    let stderr_tail = join_within(stderr_reader, until)
+        .ok_or(GitProbeError::Timeout {
+            after: limits.deadline,
+        })?
+        .unwrap_or_default();
+    if !status.success() {
+        return Err(GitProbeError::NonZeroExit {
+            code: status.code(),
+            stderr_tail: String::from_utf8_lossy(&stderr_tail).into_owned(),
+        });
+    }
+    Ok(GitProbeOutput {
+        status,
+        stdout,
+        stderr_tail,
+    })
+}
+
+/// [`run_git_probe`] with [`GitProbeLimits::default`] (30 s, 32 MiB).
+pub fn run_git_probe_default(command: Command) -> Result<GitProbeOutput, GitProbeError> {
+    run_git_probe(command, &GitProbeLimits::default())
+}
+
+/// Read until EOF or until the next chunk would exceed `cap`; on overflow set
+/// the flag and stop reading (the writer then blocks until it is killed).
+fn read_capped(
+    mut reader: impl Read,
+    cap: usize,
+    overflow: &AtomicBool,
+) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(buf),
+            Ok(n) => {
+                if buf.len() + n > cap {
+                    overflow.store(true, Ordering::Release);
+                    return Ok(buf);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Ring-buffer drain: keep only the last `tail` bytes. Mirrors the plugin
+/// host's `drain_stderr_into_ring` (host.rs) semantics.
+fn read_tail(mut reader: impl Read, tail: usize) -> std::io::Result<Vec<u8>> {
+    let mut ring = std::collections::VecDeque::with_capacity(tail.min(8192));
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(ring.into_iter().collect()),
+            Ok(n) => {
+                ring.extend(chunk[..n].iter().copied());
+                while ring.len() > tail {
+                    ring.pop_front();
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Kill the whole tree and reap the child (a dropped `Child` is never waited on
+/// on Unix — see host.rs — so an early return would leave a zombie).
+fn reap_killed(child: &mut Child) {
+    let _ = crate::plugin::process_tree::kill_process_tree(child);
+    let _ = child.wait();
+}
+
+/// The instant by which the drain threads must have finished: whatever is left
+/// of the deadline, but never less than [`READER_JOIN_GRACE`] from now.
+fn reader_join_deadline(started: Instant, deadline: Duration) -> Instant {
+    let grace = Instant::now() + READER_JOIN_GRACE;
+    started
+        .checked_add(deadline)
+        .map_or(grace, |by| by.max(grace))
+}
+
+/// Join a drain thread, or give up at `until` and detach it (something still
+/// holds the pipe open — see the residual in [`run_git_probe`]).
+fn join_within(
+    handle: JoinHandle<std::io::Result<Vec<u8>>>,
+    until: Instant,
+) -> Option<std::io::Result<Vec<u8>>> {
+    while !handle.is_finished() {
+        if Instant::now() >= until {
+            tracing::debug!("git probe drain thread outlived the killed process tree; detaching");
+            return None;
+        }
+        thread::sleep(READER_POLL_INTERVAL);
+    }
+    Some(
+        handle
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("git probe reader panicked"))),
+    )
+}
+
+/// Best-effort join of both drain threads on an error path; their output is
+/// already known to be unusable, so only the reaping matters.
+fn reap_readers(
+    stdout_reader: JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_reader: JoinHandle<std::io::Result<Vec<u8>>>,
+    started: Instant,
+    deadline: Duration,
+) {
+    let until = reader_join_deadline(started, deadline);
+    let _ = join_within(stdout_reader, until);
+    let _ = join_within(stderr_reader, until);
+}
+
 /// List untracked, non-ignored files in `repo_root`, hardened for an untrusted
 /// corpus (clarion-d9cf8bcfa9; ADR-045).
 ///
@@ -234,22 +621,183 @@ pub fn hardened_git_command(repo_root: &Path) -> Command {
 /// corpus git probes: returns `None` when git is unavailable, `repo_root` is not
 /// a work tree, or the command fails — never an error. An empty `Vec` means "a
 /// git repo with no untracked files".
+///
+/// Bounded by [`GitProbeLimits::default`]; a timeout, overflow, or non-UTF-8
+/// listing returns `None` (unknown), never a partial list.
 #[must_use]
 pub fn list_untracked_files(repo_root: &Path) -> Option<Vec<String>> {
-    let out = hardened_git_command(repo_root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
+    let mut command = hardened_git_command(repo_root);
+    command.args(["ls-files", "--others", "--exclude-standard", "-z"]);
+    let out = run_git_probe_default(command).ok()?;
+    let text = out.stdout_utf8().ok()?;
     Some(
-        out.stdout
-            .split(|&b| b == 0)
+        text.split('\0')
             .filter(|segment| !segment.is_empty())
-            .map(|segment| String::from_utf8_lossy(segment).into_owned())
+            .map(str::to_owned)
             .collect(),
     )
+}
+
+/// Whether `path` is repository content (ADR-063). Tracked means: the path,
+/// any ancestor of it, or — when it resolves inside the repository — its
+/// canonical target or any ancestor of that, has an entry in the git index.
+/// This catches a committed file, a committed symlink at any level, a
+/// directory with committed contents, and a symlink to committed content.
+///
+/// Cross-language contract: the Python twin
+/// (`plugins/python/src/loomweave_plugin_python/git_trust.py`) returns the
+/// same five labels — `tracked`, `untracked`, `not_a_git_work_tree`,
+/// `git_unavailable`, `unknown`.
+#[derive(Debug)]
+pub enum TrackedState {
+    /// The path is repository content.
+    Tracked,
+    /// The path is inside a work tree, and nothing on it is in the index.
+    Untracked,
+    /// `repo_root` is not inside a git work tree.
+    NotAGitWorkTree,
+    /// No `git` binary could be found to run the probe. This is the
+    /// OPERATOR's environment, not repository content — `PATH` is
+    /// real-environment-only (ADR-062) — so it is permissive: no git to
+    /// consult, the operator owns the tree.
+    GitUnavailable,
+    /// The probe failed for any other reason (timeout, stdout overflow, a
+    /// non-zero exit that isn't "not a git repository" — including git's
+    /// "dubious ownership" refusal for a checkout owned by another uid — or
+    /// any other I/O failure). Consumers on the trust boundary treat this as
+    /// `Tracked` (fail closed): a checkout git itself refuses to read is
+    /// itself an untrusted-corpus signal.
+    Unknown(GitProbeError),
+}
+
+impl TrackedState {
+    /// Stable machine-readable label; also the wire vocabulary shared with the
+    /// Python twin (`plugins/python/src/loomweave_plugin_python/git_trust.py`).
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Tracked => "tracked",
+            Self::Untracked => "untracked",
+            Self::NotAGitWorkTree => "not_a_git_work_tree",
+            Self::GitUnavailable => "git_unavailable",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// Fail-closed reading for trust decisions. `GitUnavailable` is the one
+    /// exception to the fail-closed default: a missing `git` binary is the
+    /// operator's environment, not repository content, so it must NOT be
+    /// treated as tracked.
+    #[must_use]
+    pub fn treat_as_tracked(&self) -> bool {
+        matches!(self, Self::Tracked | Self::Unknown(_))
+    }
+}
+
+/// Classify a completed (or failed) bounded git probe into a [`TrackedState`].
+/// Factored out of [`tracked_state`] so each arm is unit-testable directly,
+/// without spawning a real `git` subprocess for every case.
+///
+/// Accepted inconsistency: only `Spawn(NotFound)` reads `GitUnavailable`. A
+/// `Spawn(PermissionDenied)` — a `git` on the operator's `PATH` that is not
+/// executable — is just as much the operator's environment rather than
+/// repository content, yet it reads `Unknown` and therefore fails closed. It is
+/// left that way on purpose: `NotFound` is unambiguous ("there is no git"),
+/// while the other spawn failures are a long tail whose causes are not all
+/// operator-side, and widening the permissive arm to cover them would trade a
+/// rare false-positive for a class of false-negatives on the trust boundary.
+fn classify_probe(result: Result<GitProbeOutput, GitProbeError>) -> TrackedState {
+    match result {
+        Ok(out) if out.stdout.is_empty() => TrackedState::Untracked,
+        Ok(_) => TrackedState::Tracked,
+        Err(GitProbeError::Spawn(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            TrackedState::GitUnavailable
+        }
+        Err(GitProbeError::NonZeroExit {
+            code: Some(128),
+            ref stderr_tail,
+        }) if stderr_tail.contains("not a git repository") => TrackedState::NotAGitWorkTree,
+        Err(err) => TrackedState::Unknown(err),
+    }
+}
+
+/// Ask git whether `path` (absolute, or relative to `repo_root`) is tracked.
+/// One `git ls-files -z -- <specs…>` through the bounded runner; any output
+/// means tracked. Never hashes working-tree content, so no repo-controlled
+/// `filter` driver can run (see the module docs).
+///
+/// A `path` that resolves to the repository ROOT itself is probed as `.`, not
+/// short-circuited to `Untracked`: the root of a repository holding any tracked
+/// content is itself repository content, and only an empty repository answers
+/// `Untracked` there. Only a path entirely outside the root (and not resolving
+/// into it) answers `Untracked` without asking git.
+///
+/// `--literal-pathspecs` is set because the specs are *paths*, not patterns:
+/// the canonical branch feeds git a path derived from a corpus-controlled
+/// symlink target, and a component containing `*`, `?`, `[…]` or a leading `:`
+/// would otherwise be read as a glob or as pathspec magic and answer about
+/// some other path.
+///
+/// Cross-language contract: the Python twin
+/// (`plugins/python/src/loomweave_plugin_python/git_trust.py`) builds the same
+/// pathspecs and returns the same labels; the shared vectors are
+/// `fixtures/git_tracked_paths.json`. Change both or neither.
+#[must_use]
+pub fn tracked_state(repo_root: &Path, path: &Path) -> TrackedState {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    let mut specs: Vec<PathBuf> = Vec::new();
+    let mut inside = push_self_and_ancestors(&mut specs, &absolute, repo_root);
+    if let (Ok(canonical), Ok(canonical_root)) = (absolute.canonicalize(), repo_root.canonicalize())
+    {
+        inside |= push_self_and_ancestors(&mut specs, &canonical, &canonical_root);
+    }
+    if specs.is_empty() {
+        if !inside {
+            // Entirely outside the repository (and not resolving into it).
+            return TrackedState::Untracked;
+        }
+        // The path IS the repository root (`""`, `"."`, or a symlink resolving
+        // onto it). An empty pathspec set would answer `Untracked` without ever
+        // asking git, which is permissive on the trust boundary — the root of a
+        // repository with any tracked content is repository content. Probe `.`
+        // so git answers: non-empty for any tracked file, empty for an empty
+        // repository.
+        specs.push(PathBuf::from("."));
+    }
+    let mut command = hardened_git_command(repo_root);
+    command.args(["--literal-pathspecs", "ls-files", "-z", "--"]);
+    for spec in &specs {
+        command.arg(spec);
+    }
+    classify_probe(run_git_probe_default(command))
+}
+
+/// Push `path` relative to `root`, then each ancestor down to (excluding) the
+/// root. Paths outside `root` contribute nothing.
+///
+/// Returns whether `path` is *inside* `root` at all — which is NOT the same as
+/// "pushed something": the root itself is inside and pushes nothing, and the
+/// caller must tell that case apart from a path that lies outside entirely
+/// (the first must still be asked about, the second must not).
+fn push_self_and_ancestors(specs: &mut Vec<PathBuf>, path: &Path, root: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut cursor = Some(rel);
+    while let Some(current) = cursor {
+        if current.as_os_str().is_empty() {
+            break;
+        }
+        if !specs.iter().any(|spec| spec == current) {
+            specs.push(current.to_path_buf());
+        }
+        cursor = current.parent();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -489,5 +1037,347 @@ mod tests {
             "ls-files --others must NOT hash working-tree content, so the corpus \
              clean filter must never run (no PWNED marker)"
         );
+    }
+
+    /// Write an executable `#!/bin/sh` stub named `name` in `dir`, so a probe
+    /// can be driven against a child whose behaviour (hang, flood, exit code)
+    /// is chosen by the test rather than by the host's real `git`.
+    #[cfg(unix)]
+    fn stub(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_deadline_kills_a_hung_child_and_reports_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = stub(dir.path(), "git", "sleep 30");
+        let started = std::time::Instant::now();
+        let err = run_git_probe(
+            Command::new(exe),
+            &GitProbeLimits {
+                deadline: Duration::from_millis(200),
+                max_stdout_bytes: 1024,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, GitProbeError::Timeout { .. }), "{err:?}");
+        // Returning at all proves the kill landed: `reap_killed` waits on the
+        // child *before* the error is returned, so a `sleep 30` that survived
+        // the signal would hold this call for the full 30 s.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "child was not killed promptly"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_stdout_cap_kills_a_flooding_child_and_reports_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = stub(dir.path(), "git", "head -c 4000000 /dev/zero; sleep 30");
+        let started = std::time::Instant::now();
+        let err = run_git_probe(
+            Command::new(exe),
+            &GitProbeLimits {
+                deadline: Duration::from_secs(20),
+                max_stdout_bytes: 4096,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GitProbeError::StdoutOverflow { limit: 4096 }),
+            "{err:?}"
+        );
+        // Same proof as the deadline test: the trailing `sleep 30` would hold
+        // `reap_killed`'s wait for 30 s if the tree kill had not landed.
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_reports_non_zero_exit_with_the_stderr_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = stub(dir.path(), "git", "echo boom >&2; exit 3");
+        let err = run_git_probe_default(Command::new(exe)).unwrap_err();
+        match err {
+            GitProbeError::NonZeroExit { code, stderr_tail } => {
+                assert_eq!(code, Some(3));
+                assert!(stderr_tail.contains("boom"), "{stderr_tail}");
+            }
+            other => panic!("expected NonZeroExit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_keeps_only_the_stderr_tail_and_never_fails_on_stderr_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = stub(
+            dir.path(),
+            "git",
+            "head -c 300000 /dev/zero | tr '\\0' 'a' >&2; echo END >&2; echo ok",
+        );
+        let out = run_git_probe_default(Command::new(exe)).unwrap();
+        assert_eq!(out.stdout_utf8().unwrap().trim(), "ok");
+        assert!(out.stderr_tail.len() <= GIT_PROBE_STDERR_TAIL_BYTES);
+        assert!(out.stderr_tail_lossy().ends_with("END\n"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_stdout_utf8_is_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = stub(dir.path(), "git", "printf '\\377\\376'");
+        let out = run_git_probe_default(Command::new(exe)).unwrap();
+        assert!(matches!(out.stdout_utf8(), Err(GitProbeError::NonUtf8)));
+        assert_eq!(out.stdout, vec![0xff, 0xfe]);
+    }
+
+    #[test]
+    fn probe_runs_real_git_through_the_hardened_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut cmd = hardened_git_command(dir.path());
+        cmd.args(["rev-parse", "--is-inside-work-tree"]);
+        let out = run_git_probe_default(cmd).unwrap();
+        assert_eq!(out.stdout_utf8().unwrap().trim(), "true");
+    }
+
+    /// The strict decode is a deliberate behaviour change (this task): a
+    /// corpus path that is not UTF-8 now reads as "unknown" rather than as a
+    /// lossily-mangled entry in an otherwise trusted list.
+    #[test]
+    #[cfg(unix)]
+    fn list_untracked_files_reports_unknown_for_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let Ok(init) = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+        else {
+            return;
+        };
+        if !init.success() {
+            return;
+        }
+        std::fs::write(
+            repo.join(std::ffi::OsStr::from_bytes(b"bad\xff.py")),
+            "x = 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            list_untracked_files(repo),
+            None,
+            "a non-UTF-8 untracked path must read as unknown, never a partial list"
+        );
+    }
+
+    #[test]
+    fn tracked_state_labels_and_fail_closed_reading() {
+        let unknown = TrackedState::Unknown(GitProbeError::Timeout {
+            after: Duration::from_secs(1),
+        });
+        assert_eq!(TrackedState::Tracked.label(), "tracked");
+        assert_eq!(TrackedState::Untracked.label(), "untracked");
+        assert_eq!(TrackedState::NotAGitWorkTree.label(), "not_a_git_work_tree");
+        assert_eq!(TrackedState::GitUnavailable.label(), "git_unavailable");
+        assert_eq!(unknown.label(), "unknown");
+
+        // Fail closed: only a proven-absent index entry buys trust.
+        assert!(TrackedState::Tracked.treat_as_tracked());
+        assert!(unknown.treat_as_tracked());
+        assert!(!TrackedState::Untracked.treat_as_tracked());
+        assert!(!TrackedState::NotAGitWorkTree.treat_as_tracked());
+        // The one exception to fail-closed: a missing `git` binary is the
+        // operator's environment, not repository content.
+        assert!(!TrackedState::GitUnavailable.treat_as_tracked());
+    }
+
+    #[cfg(unix)]
+    fn success_probe_output(stdout: &[u8]) -> GitProbeOutput {
+        use std::os::unix::process::ExitStatusExt;
+        GitProbeOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: stdout.to_vec(),
+            stderr_tail: Vec::new(),
+        }
+    }
+
+    /// The operator-global probe's contract is the MIRROR of the hardened
+    /// builder's: `GIT_CONFIG_GLOBAL` must reach the child intact rather than
+    /// being nulled, or the probe answers about a global config file that is
+    /// not the operator's. Assert on "not nulled + forwarded verbatim", not on
+    /// "absent": absent is the correct state only when the operator has not
+    /// redirected their global config, and the second half pins that too.
+    #[test]
+    fn operator_global_probe_never_nulls_the_operators_global_config() {
+        let redirected = operator_global_git_config_command_with(|name| match name {
+            "PATH" => Some("/usr/bin".into()),
+            "HOME" => Some("/home/op".into()),
+            "XDG_CONFIG_HOME" => Some("/home/op/.config".into()),
+            "GIT_CONFIG_GLOBAL" => Some("/home/op/ci-gitconfig".into()),
+            _ => None,
+        });
+
+        let args: Vec<String> = redirected
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["config", "--global", "--get"],
+            "`--global` is what makes this unhardened spawn safe; it must be baked in"
+        );
+
+        let envs: Vec<(String, Option<String>)> = redirected
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&(
+                "GIT_CONFIG_GLOBAL".to_owned(),
+                Some("/home/op/ci-gitconfig".to_owned())
+            )),
+            "the operator's redirect must be forwarded verbatim: {envs:?}"
+        );
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, v)| k == "GIT_CONFIG_GLOBAL" && v.as_deref() == Some(NULL_DEVICE)),
+            "nulling the global config is exactly the bug this builder exists to avoid: {envs:?}"
+        );
+        // `--global` reads neither of these, so setting them would be noise
+        // that implies a protection this probe does not need.
+        assert!(
+            !envs.iter().any(|(k, _)| k == "GIT_CONFIG_SYSTEM"),
+            "{envs:?}"
+        );
+        assert!(
+            !envs.iter().any(|(k, _)| k == "GIT_CONFIG_NOSYSTEM"),
+            "{envs:?}"
+        );
+        // The two variables that locate `~/.gitconfig` when there is no redirect.
+        assert!(envs.contains(&("HOME".to_owned(), Some("/home/op".to_owned()))));
+        assert!(envs.contains(&(
+            "XDG_CONFIG_HOME".to_owned(),
+            Some("/home/op/.config".to_owned())
+        )));
+        // Still a cleared, rebuilt environment: no repository selector survives.
+        let mut keys: Vec<&str> = envs.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "GIT_CONFIG_GLOBAL",
+                "GIT_OPTIONAL_LOCKS",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "PATH",
+                "XDG_CONFIG_HOME",
+            ],
+            "the child sees exactly this key set and nothing else"
+        );
+
+        // An operator who has NOT redirected their global config must not have
+        // one invented for them — git falls back to `$HOME/.gitconfig`.
+        let plain = operator_global_git_config_command_with(|name| {
+            (name == "HOME").then(|| "/home/op".into())
+        });
+        assert!(
+            !plain.get_envs().any(|(k, _)| k == "GIT_CONFIG_GLOBAL"),
+            "an unset GIT_CONFIG_GLOBAL must stay unset, never nulled"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_probe_covers_every_branch() {
+        // Ok arms.
+        assert!(matches!(
+            classify_probe(Ok(success_probe_output(b""))),
+            TrackedState::Untracked
+        ));
+        assert!(matches!(
+            classify_probe(Ok(success_probe_output(b"some/tracked/path\0"))),
+            TrackedState::Tracked
+        ));
+
+        // `git` binary missing: the operator's environment, not repository
+        // content — permissive, not fail-closed.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            )))),
+            TrackedState::GitUnavailable
+        ));
+
+        // A spawn failure for any OTHER reason stays fail-closed.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied",
+            )))),
+            TrackedState::Unknown(GitProbeError::Spawn(_))
+        ));
+
+        // Timeout stays fail-closed.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::Timeout {
+                after: Duration::from_secs(30),
+            })),
+            TrackedState::Unknown(GitProbeError::Timeout { .. })
+        ));
+
+        // "not a git repository" is the one NonZeroExit reason that is NOT a
+        // trust-boundary concern: there is simply no repository here.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::NonZeroExit {
+                code: Some(128),
+                stderr_tail: "fatal: not a git repository (or any of the parent directories): \
+                              .git"
+                    .to_owned(),
+            })),
+            TrackedState::NotAGitWorkTree
+        ));
+
+        // "dubious ownership" is itself an untrusted-corpus signal (a
+        // checkout owned by another uid) and stays fail-closed; the
+        // operator's `safe.directory` allowlist is deliberately not
+        // consulted by the hardened command.
+        assert!(matches!(
+            classify_probe(Err(GitProbeError::NonZeroExit {
+                code: Some(128),
+                stderr_tail: "fatal: detected dubious ownership in repository at '/corpus'"
+                    .to_owned(),
+            })),
+            TrackedState::Unknown(GitProbeError::NonZeroExit {
+                code: Some(128),
+                ..
+            })
+        ));
     }
 }

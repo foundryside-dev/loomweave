@@ -425,6 +425,14 @@ impl ServerState {
             "llm": self.llm_diagnostics_json(),
             "filigree": self.filigree_diagnostics_json(),
             "loomweave_read_api": self.loomweave_read_api_json(),
+            // ADR-063: who owns the effective `loomweave.yaml`. Reported from
+            // the START-UP verdict (`ServerState::config_trust`, threaded from
+            // `serve`'s `load_trusted`) — that is the verdict which actually
+            // shaped this process's LLM/Filigree/HTTP posture, and it is the
+            // only source this surface has. Deliberately NOT nulled while
+            // building: "why are summaries off" is exactly the question an
+            // agent asks during a build.
+            "config_trust": self.config_trust().to_json(&self.config_file_path()),
         });
         if building {
             null_corpus_derived_fields_while_building(&mut result);

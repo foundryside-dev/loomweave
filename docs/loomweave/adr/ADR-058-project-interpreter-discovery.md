@@ -1,6 +1,6 @@
 # ADR-058: Project Interpreter Discovery for Pyright
 
-**Status**: Accepted
+**Status**: Accepted — amended 2026-09-02 (see Amendment below)
 **Date**: 2026-08-29
 **Deciders**: john
 **Related**: [ADR-021](./ADR-021-plugin-authority-hybrid.md), [ADR-035](./ADR-035-operational-tuning-discipline.md), [ADR-050](./ADR-050-plugin-lifecycle-deadlines.md), [ADR-057](./ADR-057-pyright-restart-attribution.md)
@@ -42,7 +42,7 @@ files each say must not be changed on one side alone:
 | Rung | Source | `ProjectInterpreter.source` | Pinned? |
 |---|---|---|---|
 | 1 | `LOOMWEAVE_PYTHON_INTERPRETER` env var names an executable file | `override` | yes |
-| 2 | `<project_root>/.venv/bin/python` | `dotvenv` | yes |
+| 2 | `<project_root>/.venv/bin/python` — only when not repository-tracked (Amendment 2026-09-02) | `dotvenv` | yes |
 | 3 | `$VIRTUAL_ENV/bin/python` | `virtual_env` | yes |
 | 4 | `$CONDA_PREFIX/bin/python` | `conda` | yes |
 | 5 | first `python` / `python3` on `PATH` | `path` | no |
@@ -257,3 +257,42 @@ same ticket, not part of the interpreter-discovery mechanism itself.
   single literal (`INTERPRETER_OVERRIDE_ENV` / `PYTHON_INTERPRETER_ENV`) as
   the one place the cross-language contract can drift if renamed on only one
   side.
+
+## Amendment (2026-09-02) — rung-2 trust condition
+
+**Change.** Rung 2 (`<project_root>/.venv/bin/python`, source `dotvenv`) is
+accepted only when the path is **not repository content**: `tracked_state`
+(ADR-063) must answer `untracked`, `not_a_git_work_tree`, or
+`git_unavailable`. On `tracked` or the fail-closed `unknown` the rung is
+skipped exactly as if the file were absent, and discovery continues with
+`VIRTUAL_ENV` → `CONDA_PREFIX` → `PATH` → none. `git_unavailable` (no `git`
+binary resolvable at all) is deliberately NOT fail-closed: a missing `git` is
+the operator's environment, not repository content — `PATH` is
+real-environment-only (ADR-062) — so the rung is accepted as if `git` had
+answered `untracked`. Both sides of the cross-language contract
+(`interpreter.rs`, `interpreter.py`) apply the same predicate and log the
+skip once per process.
+
+**Why.** pyright executes `python.pythonPath`. A repository that commits an
+executable at `.venv/bin/python` — or a symlink at `.venv` to committed
+content — gets code execution as the operator on the first `analyze`,
+including the hook-spawned background one (Codex #142, closed; clarion-9b3cf287b7).
+An operator-created venv is always untracked, so no rung-2 hit is lost to the
+`tracked` verdict. The fail-closed `unknown` verdict can lose a legitimate
+hit — an `ls-files` probe that times out, or a checkout owned by another uid
+that git refuses as `dubious ownership` under the hardened environment (the
+operator's `safe.directory` is deliberately not consulted; foreign ownership
+is itself an untrusted-corpus signal). A missing `git` binary is the
+operator's environment, not repository content, and reads `git_unavailable`,
+which keeps the rung. Every skip is surfaced by the once-per-process warning
+and by the existing `interpreter_unpinned` token. `pyrightconfig.json`
+`venvPath`/`venv` are not gated: verified against the pinned pyright bundle,
+those keys only shape site-packages globbing and never execute a program.
+
+**What this does not change.** Rungs 1 and 3–6, the `access(2)` executability
+ruling, lexical normalisation, the fingerprint, the host-export guards, and the
+`interpreter_unpinned` semantics are untouched. A skipped rung 2 that lands on
+rung 5/6 is surfaced by the once-per-process warning and by the existing
+`interpreter_unpinned` token — there is no `doctor` check for a skipped rung.
+Note that `git rm --cached .venv` is the wrong fix: the operator should create
+their own venv; the committed one is the repository's business.

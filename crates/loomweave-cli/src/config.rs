@@ -4,9 +4,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use loomweave_analysis::ClusterAlgorithm;
 use loomweave_federation::config::{
-    LlmConfigEditResult, LlmConfigPatch, LlmProviderKind, McpConfig, ProviderSelection,
-    SemanticConfigEditResult, SemanticConfigPatch, SemanticProviderKind, select_provider_with_env,
-    update_llm_config_file, update_semantic_config_file,
+    ConfigTrust, LlmConfigEditResult, LlmConfigPatch, LlmProviderKind, McpConfig,
+    ProviderSelection, SemanticConfigEditResult, SemanticConfigPatch, SemanticProviderKind,
+    select_provider_with_env, update_llm_config_file, update_semantic_config_file,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -390,19 +390,49 @@ fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
         None => resolve_default_config_path(path)?,
     };
     let config_path = config_path.as_path();
-    let (config, source) = if config_path.exists() {
-        let config = McpConfig::from_path(config_path)
+    // ADR-063: report ownership FIRST, so an operator reading "LLM enabled:
+    // false" below sees immediately whether the repository, not their config,
+    // is why.
+    let (config, source, trust) = if config_path.exists() {
+        let loaded = McpConfig::load_trusted(config_path)
             .with_context(|| format!("parse {}", config_path.display()))?;
-        (config, config_path.display().to_string())
+        (
+            loaded.config,
+            config_path.display().to_string(),
+            loaded.trust,
+        )
     } else {
         (
             McpConfig::default(),
             "(absent — built-in defaults in effect)".to_owned(),
+            ConfigTrust::OperatorOwned,
         )
     };
 
     let selection = select_provider_with_env(&config, loomweave_core::dotenv::var);
 
+    println!(
+        "config trust: {} ({})",
+        trust.label(),
+        config_path.display()
+    );
+    if !trust.egress_allowed() {
+        // Label from the verdict itself: an `unknown` verdict strips the same
+        // sections but is NOT evidence the repository tracks the file, and
+        // saying "repository-tracked" there would misreport what git answered.
+        println!(
+            "  ignored ({}): {}",
+            trust.label(),
+            if trust.stripped().is_empty() {
+                "none set".to_owned()
+            } else {
+                trust.stripped().join(", ")
+            }
+        );
+    }
+    if let Some(remedy) = trust.remedy() {
+        println!("  {remedy}");
+    }
     println!("loomweave.yaml:        {source}");
     println!("LLM enabled:           {}", config.llm.enabled);
     println!("Provider (configured): {}", config.llm.provider.as_str());
@@ -461,16 +491,47 @@ fn run_semantic_status(path: &Path, explicit_config: Option<&Path>) -> Result<()
         None => resolve_default_config_path(path)?,
     };
     let config_path = config_path.as_path();
-    let (config, source) = if config_path.exists() {
-        let config = McpConfig::from_path(config_path)
+    // ADR-063: `load_trusted`, and report the verdict FIRST — same rule and same
+    // rendering as `run_check`, so an operator reading "semantic search enabled:
+    // false" here sees immediately whether the repository, not their config, is
+    // why.
+    let (config, source, trust) = if config_path.exists() {
+        let loaded = McpConfig::load_trusted(config_path)
             .with_context(|| format!("parse {}", config_path.display()))?;
-        (config, config_path.display().to_string())
+        (
+            loaded.config,
+            config_path.display().to_string(),
+            loaded.trust,
+        )
     } else {
         (
             McpConfig::default(),
             "(absent — built-in defaults in effect)".to_owned(),
+            ConfigTrust::OperatorOwned,
         )
     };
+    println!(
+        "config trust: {} ({})",
+        trust.label(),
+        config_path.display()
+    );
+    if !trust.egress_allowed() {
+        // Label from the verdict itself: an `unknown` verdict strips the same
+        // sections but is NOT evidence the repository tracks the file, and
+        // saying "repository-tracked" there would misreport what git answered.
+        println!(
+            "  ignored ({}): {}",
+            trust.label(),
+            if trust.stripped().is_empty() {
+                "none set".to_owned()
+            } else {
+                trust.stripped().join(", ")
+            }
+        );
+    }
+    if let Some(remedy) = trust.remedy() {
+        println!("  {remedy}");
+    }
     println!("loomweave.yaml:         {source}");
     print_semantic_status_fields(&resolve_effective_embeddings_path(path), &config);
     Ok(())

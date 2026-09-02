@@ -14,6 +14,18 @@ The order below is a CROSS-LANGUAGE CONTRACT with
 discovery, exports the winner as ``LOOMWEAVE_PYTHON_INTERPRETER``, and keys the
 incremental skip on it). Change both or neither.
 
+The ``.venv``/``dotvenv`` rung applies only when
+``<project_root>/.venv/bin/python`` is **not repository-tracked**:
+``git_trust.tracked_state`` must answer ``untracked``,
+``not_a_git_work_tree``, or ``git_unavailable`` (``tracked`` and the
+fail-closed ``unknown`` both skip the rung, logged once per process). A
+missing ``git`` binary is the operator's environment, not repository content,
+so ``git_unavailable`` is permissive and does NOT skip the rung. pyright
+executes ``python.pythonPath``, so a committed ``.venv/bin/python`` -- or a
+committed symlink at ``.venv`` to committed content -- would otherwise be
+code execution as the operator on the first ``analyze`` of an untrusted
+corpus. See ADR-063 and the ADR-058 amendment (2026-09-02).
+
 Paths are returned as absolute and lexically normalised (``Path.absolute`` +
 ``os.path.normpath``): ``.``/``..`` collapsed, symlinks preserved. A venv's
 ``bin/python`` is typically a symlink to the base interpreter; handing pyright
@@ -29,6 +41,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
+
+from .git_trust import TrackedState, tracked_state, treat_as_tracked
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -52,6 +66,21 @@ _PREFIX_SOURCES: Final[tuple[tuple[str, InterpreterSource], ...]] = (
 _PINNED_SOURCES: Final[frozenset[InterpreterSource]] = frozenset(
     {"override", "dotvenv", "virtual_env", "conda"},
 )
+
+_tracked_dotvenv_warned = False
+
+
+def _warn_tracked_dotvenv_once(project_root: Path, state: TrackedState) -> None:
+    """Rung 2 skipped (ADR-063; ADR-058 amendment 2026-09-02) — announce once."""
+    global _tracked_dotvenv_warned  # noqa: PLW0603 — process-wide once-latch, mirrors the Rust OnceLock
+    if _tracked_dotvenv_warned:
+        return
+    _tracked_dotvenv_warned = True
+    sys.stderr.write(
+        f"loomweave-plugin-python: skipped .venv/bin/python (rung 2) under {project_root}: it is "
+        f"tracked by the repository (state={state}); an operator venv is untracked. Resolution "
+        "continues with VIRTUAL_ENV/CONDA_PREFIX/PATH.\n"
+    )
 
 
 @dataclass(frozen=True)
@@ -87,8 +116,13 @@ def discover_project_interpreter(
             f"loomweave-plugin-python: {INTERPRETER_OVERRIDE_ENV}={override!r} is not an "
             "executable file; ignoring the override and discovering the interpreter\n",
         )
-    if (hit := _usable(Path(project_root) / ".venv" / "bin" / "python")) is not None:
-        return ProjectInterpreter(path=str(hit), source="dotvenv")
+    dotvenv = Path(project_root) / ".venv" / "bin" / "python"
+    if (hit := _usable(dotvenv)) is not None:
+        state = tracked_state(Path(project_root), Path(".venv/bin/python"))
+        if treat_as_tracked(state):
+            _warn_tracked_dotvenv_once(Path(project_root), state)
+        else:
+            return ProjectInterpreter(path=str(hit), source="dotvenv")
     for var, source in _PREFIX_SOURCES:
         prefix = env.get(var)
         if prefix and (hit := _usable(Path(prefix) / "bin" / "python")) is not None:

@@ -41,7 +41,9 @@ use loomweave_storage::{
     sei::{BindingStatus, LineageEvent},
 };
 
-use loomweave_federation::config::{FiligreeConfig, McpConfig, SemanticSearchConfig};
+use loomweave_federation::config::{
+    FiligreeConfig, McpConfig, SemanticSearchConfig, log_config_trust_once,
+};
 use loomweave_federation::filigree::FiligreeHttpClient;
 use loomweave_federation::filigree_url::resolve_filigree_url_with_roots;
 use loomweave_federation::scan_results::{
@@ -5061,19 +5063,30 @@ fn source_walk_finding_record(
 /// `loomweave serve` reads. A missing or unparseable file falls back to the
 /// default (Filigree disabled), so a config problem never fails the run — it
 /// just means no emission.
+///
+/// Loads through `load_trusted` (ADR-063): when the file is repository content,
+/// `integrations` is one of the stripped egress sections, so a corpus-committed
+/// `loomweave.yaml` cannot point finding emission at an attacker endpoint or
+/// name which operator env var is sent as its bearer token.
 pub(crate) fn load_mcp_config(project_root: &Path, config_path: Option<&Path>) -> McpConfig {
     let path = config_path.map_or_else(|| project_root.join("loomweave.yaml"), Path::to_path_buf);
     if !path.exists() {
         return McpConfig::default();
     }
-    McpConfig::from_path(&path).unwrap_or_else(|err| {
-        tracing::warn!(
-            path = %path.display(),
-            error = %err,
-            "load MCP config for finding emission failed; emission disabled",
-        );
-        McpConfig::default()
-    })
+    match McpConfig::load_trusted(&path) {
+        Ok(loaded) => {
+            log_config_trust_once(&loaded);
+            loaded.config
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "load MCP config for finding emission failed; emission disabled",
+            );
+            McpConfig::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

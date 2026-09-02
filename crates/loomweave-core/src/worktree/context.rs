@@ -42,7 +42,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::hardened_git::hardened_git_command;
+use crate::hardened_git::{hardened_git_command, run_git_probe_default};
 use crate::store::store_dir_resolution;
 use crate::worktree::paths::StorePaths;
 
@@ -115,12 +115,10 @@ pub enum WorktreeContextError {
     /// administrative identity as a UTF-8 string, so a non-UTF-8 source
     /// root, primary root, Git administrative directory, or derived
     /// admin-identity fragment is rejected here, before any store directory
-    /// is created or any git output is trusted further. This is a deliberate
-    /// departure from [`crate::hardened_git::list_untracked_files`]'s lossy
-    /// decode: that function's output is display-only, so silently
-    /// substituting the Unicode replacement character for invalid bytes is
-    /// safe there. Here the decoded value becomes a filesystem path and a
-    /// hash input, so silent mangling could route two different worktrees to
+    /// is created or any git output is trusted further. It is the same strict
+    /// decode [`crate::hardened_git::GitProbeOutput::stdout_utf8`] applies to
+    /// every corpus git probe: the decoded value becomes a filesystem path and
+    /// a hash input, so silent mangling could route two different worktrees to
     /// the same (or a bogus) store.
     ///
     /// `field` identifies which resolution input failed to decode as UTF-8:
@@ -568,15 +566,20 @@ fn git_dir_of(dir: &Path) -> Result<Option<PathBuf>, WorktreeContextError> {
     ))))
 }
 
-/// Run a hardened `git` subcommand in `dir` and return its raw stdout, or
-/// `None` on any failure (missing `git`, non-repository, nonzero exit) —
-/// every caller treats that identically: fall back, never error.
+/// Run a hardened, BOUNDED `git` subcommand in `dir` and return its raw stdout,
+/// or `None` on any failure (missing `git`, non-repository, nonzero exit, or —
+/// since clarion-9202f4acec — the probe's deadline or stdout cap) — every
+/// caller treats that identically: fall back, never error.
+///
+/// The strict-UTF-8 decision stays with the caller, in [`decode_git_line`]:
+/// resolution output becomes a filesystem path and a store-routing hash input,
+/// so non-UTF-8 there is a hard [`WorktreeContextError::NonUtf8Path`], not a
+/// silent fallback. That is why this returns bytes rather than
+/// `GitProbeOutput::stdout_utf8`'s `&str`.
 fn run_git_stdout(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = hardened_git_command(dir).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(output.stdout)
+    let mut command = hardened_git_command(dir);
+    command.args(args);
+    Some(run_git_probe_default(command).ok()?.stdout)
 }
 
 /// Strictly decode one line of `git` stdout as UTF-8 (no `from_utf8_lossy` —

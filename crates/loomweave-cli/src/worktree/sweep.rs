@@ -513,19 +513,18 @@ fn hardened_git_command_for_sweep(dir: &Path) -> std::process::Command {
     loomweave_core::hardened_git::hardened_git_command(dir)
 }
 
-/// Resolve `primary_root`'s common Git directory via one hardened `git
-/// rev-parse` — `None` on any failure (missing `git`, not a repository, a
-/// non-zero exit, or non-UTF-8 output), which every caller treats as an
-/// abort signal, never a hard error.
+/// Resolve `primary_root`'s common Git directory via one hardened, bounded
+/// `git rev-parse` — `None` on any failure (missing `git`, not a repository, a
+/// non-zero exit, non-UTF-8 output, or the probe's deadline / stdout cap),
+/// which every caller treats as an abort signal, never a hard error.
 fn git_common_dir(primary_root: &Path) -> Option<PathBuf> {
-    let output = hardened_git_command_for_sweep(primary_root)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = std::str::from_utf8(&output.stdout).ok()?.trim();
+    let mut command = hardened_git_command_for_sweep(primary_root);
+    command.args(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    // Bounded (clarion-9202f4acec): a probe that hangs or floods here would
+    // stall the sweep, and every failure already aborts it rather than deleting
+    // on incomplete evidence.
+    let output = loomweave_core::run_git_probe_default(command).ok()?;
+    let text = output.stdout_utf8().ok()?.trim();
     if text.is_empty() {
         return None;
     }

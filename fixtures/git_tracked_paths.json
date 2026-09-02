@@ -1,0 +1,105 @@
+[
+  {
+    "description": "untracked venv python in a repo",
+    "layout": [{ "file": ".venv/bin/python", "mode": "0755" }],
+    "git": ["init"],
+    "query": ".venv/bin/python",
+    "expected": "untracked"
+  },
+  {
+    "description": "committed venv python",
+    "layout": [{ "file": ".venv/bin/python", "mode": "0755" }],
+    "git": ["init", "add -f .venv/bin/python", "commit"],
+    "query": ".venv/bin/python",
+    "expected": "tracked"
+  },
+  {
+    "description": "staged but not committed counts as tracked",
+    "layout": [{ "file": ".venv/bin/python", "mode": "0755" }],
+    "git": ["init", "add -f .venv/bin/python"],
+    "query": ".venv/bin/python",
+    "expected": "tracked"
+  },
+  {
+    "description": "tracked symlink at an ancestor pointing at an untracked dir",
+    "layout": [
+      { "file": "elsewhere/bin/python", "mode": "0755" },
+      { "symlink": ".venv", "target": "elsewhere" }
+    ],
+    "git": ["init", "add -f .venv", "commit"],
+    "query": ".venv/bin/python",
+    "expected": "tracked"
+  },
+  {
+    "description": "untracked symlink whose target is tracked",
+    "layout": [
+      { "file": "tools/py/bin/python", "mode": "0755" },
+      { "symlink": ".venv", "target": "tools/py" }
+    ],
+    "git": ["init", "add -f tools/py/bin/python", "commit"],
+    "query": ".venv/bin/python",
+    "expected": "tracked"
+  },
+  {
+    "description": "untracked symlink to a target outside the repository",
+    "layout": [{ "symlink": ".venv/bin/python", "target": "/bin/sh" }],
+    "git": ["init"],
+    "query": ".venv/bin/python",
+    "expected": "untracked"
+  },
+  {
+    "description": "directory ancestor with unrelated tracked content is tracked (conservative)",
+    "layout": [
+      { "file": ".venv/.gitkeep", "mode": "0644" },
+      { "file": ".venv/bin/python", "mode": "0755" }
+    ],
+    "git": ["init", "add -f .venv/.gitkeep", "commit"],
+    "query": ".venv/bin/python",
+    "expected": "tracked"
+  },
+  {
+    "description": "absent path in a repo is untracked",
+    "layout": [],
+    "git": ["init"],
+    "query": ".venv/bin/python",
+    "expected": "untracked"
+  },
+  {
+    "description": "not a git work tree",
+    "layout": [{ "file": ".venv/bin/python", "mode": "0755" }],
+    "git": [],
+    "query": ".venv/bin/python",
+    "expected": "not_a_git_work_tree"
+  },
+  {
+    "description": "config file committed at the root",
+    "layout": [{ "file": "loomweave.yaml", "mode": "0644" }],
+    "git": ["init", "add -f loomweave.yaml", "commit"],
+    "query": "loomweave.yaml",
+    "expected": "tracked"
+  },
+  {
+    "description": "config file ignored and untracked",
+    "layout": [
+      { "file": "loomweave.yaml", "mode": "0644" },
+      { "file": ".gitignore", "mode": "0644", "content": "loomweave.yaml\n" }
+    ],
+    "git": ["init", "add -f .gitignore", "commit"],
+    "query": "loomweave.yaml",
+    "expected": "untracked"
+  },
+  {
+    "description": "the repository root itself is tracked when anything is committed",
+    "layout": [{ "file": "a.txt", "mode": "0644" }],
+    "git": ["init", "add -f a.txt", "commit"],
+    "query": ".",
+    "expected": "tracked"
+  },
+  {
+    "description": "the repository root of an empty repository is untracked",
+    "layout": [],
+    "git": ["init"],
+    "query": ".",
+    "expected": "untracked"
+  }
+]

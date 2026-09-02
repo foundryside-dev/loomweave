@@ -313,3 +313,126 @@ fn config_semantic_status_reports_sidecar_absent_without_secret() {
         "{stdout}"
     );
 }
+
+/// ADR-063: a `loomweave.yaml` the repository tracks is corpus content.
+/// `config check` names the verdict and the remedy before anything else, and
+/// `config llm set` refuses to write into it at all.
+#[test]
+fn config_check_reports_a_tracked_config_and_llm_set_refuses_it() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("loomweave.yaml"),
+        "version: 1\nllm_policy:\n  enabled: true\n  provider: codex_cli\n  allow_live_provider: true\n",
+    )
+    .unwrap();
+    for args in [vec!["init", "-q"], vec!["add", "-f", "loomweave.yaml"]] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    let (code, stdout, stderr) = config(dir.path(), &["check"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("config trust: repository_tracked"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("llm_policy"), "{stdout}");
+    assert!(
+        stdout.contains("git rm --cached loomweave.yaml"),
+        "{stdout}"
+    );
+    // The stripped llm_policy must actually take effect, not just be announced.
+    assert!(stdout.contains("LLM enabled:           false"), "{stdout}");
+
+    let (set_code, set_stdout, set_stderr) = config(dir.path(), &["llm", "set", "--enable"]);
+    assert_ne!(set_code, 0, "stdout: {set_stdout}");
+    assert!(
+        set_stderr.contains("tracked by the repository"),
+        "stderr: {set_stderr}"
+    );
+    // The refusal must leave the file byte-identical.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("loomweave.yaml")).unwrap(),
+        "version: 1\nllm_policy:\n  enabled: true\n  provider: codex_cli\n  allow_live_provider: true\n",
+    );
+}
+
+/// Regression: a BARE RELATIVE `--config` path (`--config loomweave.yaml`) has
+/// `Path::parent() == Some("")`, which names no directory. Before the fix the
+/// trust probe short-circuited to a permissive verdict there, so
+/// `serve`/`analyze`/`config … --config loomweave.yaml` run from inside a
+/// corpus repository treated a COMMITTED config as operator-owned: its
+/// `llm_policy` and `integrations` reached live clients and both writer gates
+/// opened. The probe is now rooted at the process cwd.
+///
+/// Deliberately an integration test: the cwd is the subprocess's, so nothing
+/// here mutates this process's state the way `std::env::set_current_dir` would.
+#[test]
+fn a_bare_relative_config_path_is_probed_against_the_cwd_repository() {
+    const ORIGINAL: &str = "version: 1\nllm_policy:\n  enabled: true\n  provider: codex_cli\n  allow_live_provider: true\n";
+
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("loomweave.yaml"), ORIGINAL).unwrap();
+    for args in [vec!["init", "-q"], vec!["add", "-f", "loomweave.yaml"]] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    // The reader: a bare relative --config still sees repository ownership.
+    let (code, stdout, stderr) = config(dir.path(), &["check", "--config", "loomweave.yaml"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("config trust: repository_tracked"),
+        "a bare relative --config must not read as trusted: {stdout}"
+    );
+
+    // The writer: same path, same cwd, refused — and the file untouched.
+    let (set_code, set_stdout, set_stderr) = config(
+        dir.path(),
+        &["llm", "set", "--config", "loomweave.yaml", "--enable"],
+    );
+    assert_ne!(set_code, 0, "stdout: {set_stdout}");
+    assert!(
+        set_stderr.contains("tracked by the repository"),
+        "stderr: {set_stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("loomweave.yaml")).unwrap(),
+        ORIGINAL,
+        "a refused write must leave the file byte-identical"
+    );
+}
