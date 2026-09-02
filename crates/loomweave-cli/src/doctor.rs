@@ -43,7 +43,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 
-use loomweave_core::hardened_git_command;
+use loomweave_core::{hardened_git_command, run_git_probe_default};
 use loomweave_storage::StorageError;
 use loomweave_storage::schema::{
     CURRENT_SCHEMA_VERSION, reject_unmigrated_for_read, verify_user_version,
@@ -1425,6 +1425,11 @@ fn check_index_integrity_json(project_root: &Path, fix: bool) -> DoctorJsonCheck
 /// ADR-005 was reversed (`b7a1b30`) so a fresh `install` gitignores it, but a
 /// template change cannot untrack an already-committed db — this is the detector
 /// for that residual.
+///
+/// Three-valued, not a boolean (clarion-9202f4acec): the probe that answers
+/// this question is bounded, so it can fail in ways that prove neither
+/// `Tracked` nor `Untracked`, and a probe failure must never be reported as the
+/// healthy verdict.
 #[derive(Debug, PartialEq, Eq)]
 enum DbTrackedState {
     /// Healthy: the db is not in the git index (untracked, ignored, absent, the
@@ -1432,28 +1437,42 @@ enum DbTrackedState {
     Untracked,
     /// The db is committed/staged — dirties the tree and blocks signing.
     Tracked,
+    /// The probe could not answer: `git` would not spawn, or it hit the
+    /// runner's deadline or stdout cap, or it exited in a way `ls-files` does
+    /// not document. Carries the diagnostic. Reported as a warning, never as
+    /// [`Self::Untracked`] — an unanswerable probe is not a clean bill of
+    /// health.
+    Unknown(String),
 }
 
 /// Ask git whether `<store_dir>/loomweave.db` is tracked. `ls-files
-/// --error-unmatch` exits 0 only when the pathspec matches a tracked file, so a
-/// non-success exit (untracked, ignored, absent, outside the repo, not a repo,
-/// or git missing) all fold to [`DbTrackedState::Untracked`] — nothing to fix.
+/// --error-unmatch` exits 0 only when the pathspec matches a tracked file; it
+/// exits 1 when the pathspec matches nothing (untracked, ignored, or absent)
+/// and 128 when git cannot operate on the directory at all (not a repository).
+/// Both of those fold to [`DbTrackedState::Untracked`] — nothing to fix. Any
+/// other outcome (spawn failure, deadline, stdout cap, an undocumented exit,
+/// a signal) is [`DbTrackedState::Unknown`], because it proves nothing.
 fn db_tracked_state(project_root: &Path) -> DbTrackedState {
     let db = loomweave_core::store::db_path(project_root);
     let Ok(rel) = db.strip_prefix(project_root) else {
         // Store dir is outside the repo — this repo cannot be tracking it.
         return DbTrackedState::Untracked;
     };
-    let tracked = hardened_git_command(project_root)
-        .args(["ls-files", "--error-unmatch", "--"])
-        .arg(rel)
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if tracked {
-        DbTrackedState::Tracked
-    } else {
-        DbTrackedState::Untracked
+    let mut command = hardened_git_command(project_root);
+    command.args(["ls-files", "--error-unmatch", "--"]).arg(rel);
+    match run_git_probe_default(command) {
+        Ok(_) => DbTrackedState::Tracked,
+        // 1: the pathspec matched no tracked file. 128: not a git repository
+        // (or git refused to operate here at all). Both are "nothing to fix".
+        Err(err) if matches!(err.exit_code(), Some(1 | 128)) => DbTrackedState::Untracked,
+        Err(err) => DbTrackedState::Unknown(err.to_string()),
     }
+}
+
+/// The warning line for [`DbTrackedState::Unknown`], shared by the text and
+/// JSON twins so their wording cannot drift.
+fn db_tracked_unknown_what(err: &str) -> String {
+    format!("could not determine whether the runtime db is git-tracked: {err}")
 }
 
 /// `--fix` self-heal: `git rm --cached` the runtime db (and its WAL/SHM
@@ -1464,17 +1483,18 @@ fn git_untrack_db(project_root: &Path) -> Result<()> {
     let rel = store
         .strip_prefix(project_root)
         .context("store dir is outside the project root; cannot git rm --cached")?;
-    let status = hardened_git_command(project_root)
+    let mut command = hardened_git_command(project_root);
+    command
         .args(["rm", "--cached", "-q", "--ignore-unmatch", "--"])
         .arg(rel.join("loomweave.db"))
         .arg(rel.join("loomweave.db-wal"))
-        .arg(rel.join("loomweave.db-shm"))
-        .status()
-        .context("run git rm --cached")?;
-    if !status.success() {
-        bail!("git rm --cached exited with {status}");
-    }
-    Ok(())
+        .arg(rel.join("loomweave.db-shm"));
+    // Bounded (clarion-9202f4acec). The runner reports a non-zero exit as an
+    // error carrying git's own stderr tail, which is strictly more diagnostic
+    // than the bare exit status this used to print.
+    run_git_probe_default(command)
+        .map(drop)
+        .context("run git rm --cached")
 }
 
 /// JSON-path twin of [`check_db_tracked`].
@@ -1482,6 +1502,12 @@ fn check_db_tracked_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     match db_tracked_state(project_root) {
         DbTrackedState::Untracked => {
             DoctorJsonCheck::ok("db.tracked", "runtime loomweave.db is not git-tracked")
+        }
+        // An unanswerable probe is surfaced, never greened over — but it is not
+        // evidence of the C1 blocker either, so it warns rather than failing the
+        // gate, and `--fix` has nothing to repair.
+        DbTrackedState::Unknown(err) => {
+            DoctorJsonCheck::warning("db.tracked", db_tracked_unknown_what(&err))
         }
         DbTrackedState::Tracked => {
             let what = "loomweave.db is git-tracked — it mutates on every analyze/scan, dirtying \
@@ -3213,6 +3239,10 @@ fn repair_instructions(project_root: &Path, what: &str) -> Tally {
 fn check_db_tracked(project_root: &Path, fix: bool) -> Tally {
     match db_tracked_state(project_root) {
         DbTrackedState::Untracked => ok("runtime loomweave.db is not git-tracked"),
+        // JSON twin's wording, shared verbatim: surfaced as a warning (there is
+        // no evidence of the blocker, so it must not fail the gate) and not
+        // repairable by `--fix`.
+        DbTrackedState::Unknown(err) => warn(&db_tracked_unknown_what(&err), None),
         DbTrackedState::Tracked => {
             let what = "loomweave.db is git-tracked — it mutates on every analyze/scan, dirtying \
                         the work tree and blocking legis signing";

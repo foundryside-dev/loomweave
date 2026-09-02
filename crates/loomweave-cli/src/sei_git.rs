@@ -55,7 +55,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use loomweave_core::hardened_git_command;
+use loomweave_core::{hardened_git_command, run_git_probe_default};
 use loomweave_storage::{GitRename, GitRenameSource};
 
 /// How long to wait on a `legis` HTTP probe/read before giving up and degrading
@@ -100,7 +100,13 @@ impl ShellGitRenameSource {
         // re-analyze still sees it (a plain `mv` without `git add` is not a `-M`
         // rename in any window). `--no-ext-diff`/`--no-textconv` are
         // belt-and-suspenders over the helper's config overrides.
-        let output = hardened_git_command(&self.repo_root)
+        //
+        // Bounded (clarion-9202f4acec). The name-status list is unbounded in
+        // principle, so it keeps the runner's default 32 MiB stdout cap rather
+        // than a tighter one; overflowing it degrades to "no renames this run",
+        // the same fail-soft outcome as every other failure here.
+        let mut command = hardened_git_command(&self.repo_root);
+        command
             .args([
                 "diff",
                 "--cached",
@@ -109,13 +115,9 @@ impl ShellGitRenameSource {
                 "--name-status",
                 "-M",
             ])
-            .arg(base)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        String::from_utf8(output.stdout).ok()
+            .arg(base);
+        let output = run_git_probe_default(command).ok()?;
+        output.stdout_utf8().ok().map(str::to_owned)
     }
 }
 
@@ -445,10 +447,12 @@ pub(crate) fn select_git_rename_source(
 /// True if `path` is inside a git work tree (used to skip the git probe
 /// entirely on non-repo corpora, avoiding a spurious subprocess per run).
 pub(crate) fn is_git_repo(path: &Path) -> bool {
-    hardened_git_command(path)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .is_ok_and(|o| o.status.success())
+    let mut command = hardened_git_command(path);
+    command.args(["rev-parse", "--is-inside-work-tree"]);
+    // A bounded probe reports a non-zero exit as an error, so "did it succeed"
+    // is `is_ok()`. Every failure — including a deadline or an output cap —
+    // answers "not a repo", which only skips the (optional) rename probe.
+    run_git_probe_default(command).is_ok()
 }
 
 /// The current `HEAD` commit SHA, or `None` on any failure (not a repo, git
@@ -457,15 +461,15 @@ pub(crate) fn is_git_repo(path: &Path) -> bool {
 /// SEI §6). Fail-soft like [`is_git_repo`]: an absent SHA simply skips the
 /// committed window, never errors the run.
 pub(crate) fn git_head_sha(repo_root: &Path) -> Option<String> {
-    let output = hardened_git_command(repo_root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    let mut command = hardened_git_command(repo_root);
+    command.args(["rev-parse", "HEAD"]);
+    let output = run_git_probe_default(command).ok()?;
+    let sha = output.stdout_utf8().ok()?.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_owned())
     }
-    let sha = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    if sha.is_empty() { None } else { Some(sha) }
 }
 
 /// The git-rename windows to query, in order (WS9 / SEI §6). Pure — no I/O.

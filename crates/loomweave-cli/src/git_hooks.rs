@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use loomweave_core::{hardened_git_command, run_git_probe_default};
 
 const BLOCK_BEGIN: &str = "# BEGIN LOOMWEAVE MANAGED BLOCK";
 const BLOCK_END: &str = "# END LOOMWEAVE MANAGED BLOCK";
@@ -91,27 +92,31 @@ pub enum GitHookState {
     NoGitDir,
 }
 
+/// The hardened `git rev-parse --git-path hooks` probe for `project_root`.
+///
+/// Split out from [`hooks_dir`] so a unit test can introspect the built
+/// command without spawning git. The hardened builder is what strips the
+/// repository-selector environment: it calls `env_clear()` and rebuilds the
+/// child environment from an explicit allow-list, which is strictly stronger
+/// than the `GIT_*`-prefix loop this replaced (that loop missed every
+/// non-`GIT_`-prefixed vector and had to be kept in sync with each git
+/// release). It matters here because git exports `GIT_DIR` into every hook it
+/// runs, and `install --hooks` can be reached from inside one.
+fn hooks_dir_command(project_root: &Path) -> Command {
+    let mut cmd = hardened_git_command(project_root);
+    cmd.args(["rev-parse", "--git-path", "hooks"]);
+    cmd
+}
+
 /// Where this repository's hook files live: `git rev-parse --git-path hooks`,
 /// which honours `core.hooksPath` and linked-worktree layouts. `None` when the
-/// directory cannot be resolved (not a git repo, no `git` binary).
+/// directory cannot be resolved (not a git repo, no `git` binary, or the probe
+/// hit its deadline / output cap / produced non-UTF-8) — hooks are an
+/// enrichment, so every failure folds to "nowhere to install", never an error.
 #[must_use]
 pub fn hooks_dir(project_root: &Path) -> Option<PathBuf> {
-    let mut cmd = Command::new("git");
-    cmd.arg("rev-parse").arg("--git-path").arg("hooks");
-    cmd.current_dir(project_root);
-    // Strip repository-selector env so a caller's GIT_DIR (e.g. when invoked
-    // from inside another git hook) cannot repoint the resolution.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
-            cmd.env_remove(&key);
-        }
-    }
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8(out.stdout).ok()?;
-    let trimmed = raw.trim();
+    let out = run_git_probe_default(hooks_dir_command(project_root)).ok()?;
+    let trimmed = out.stdout_utf8().ok()?.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -358,8 +363,31 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        GIT_SYNC_HOOKS, GitHookState, git_sync_hook_state, install_git_sync_hooks, managed_block,
+        GIT_SYNC_HOOKS, GitHookState, git_sync_hook_state, hooks_dir_command,
+        install_git_sync_hooks, managed_block,
     };
+
+    /// The hook-directory probe must run on the hardened builder, not a
+    /// hand-rolled `GIT_*` strip. The builder clears the environment and
+    /// rebuilds it from an explicit allow-list, so a repository-selector
+    /// variable inherited from the caller (git itself exports `GIT_DIR` into
+    /// every hook it runs, which is exactly how `install --hooks` can be
+    /// reached) can never repoint `rev-parse --git-path hooks` at a foreign
+    /// repository.
+    ///
+    /// This is a unit test introspecting the built `Command` rather than an
+    /// integration test mutating the real process environment: this workspace
+    /// denies `unsafe_code`, and `std::env::set_var`/`remove_var` are `unsafe
+    /// fn` on this toolchain. Same technique, and same reasoning, as
+    /// `worktree::sweep::git_common_dir_command_keeps_foreign_git_env_out`.
+    #[test]
+    fn hooks_dir_command_keeps_foreign_git_env_out() {
+        let cmd = hooks_dir_command(Path::new("/nonexistent"));
+        let envs: Vec<_> = cmd.get_envs().map(|(k, _)| k.to_os_string()).collect();
+        assert!(envs.iter().any(|k| k == "GIT_CONFIG_NOSYSTEM"), "{envs:?}");
+        assert!(!envs.iter().any(|k| k == "GIT_DIR"));
+        assert!(cmd.get_args().any(|a| a == "--git-path"));
+    }
 
     fn hook_path(dir: &Path, name: &str) -> std::path::PathBuf {
         dir.join(".git/hooks").join(name)

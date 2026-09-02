@@ -30,7 +30,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::SystemTime;
 
-use loomweave_core::hardened_git_command;
+use loomweave_core::{GitProbeError, hardened_git_command, run_git_probe_default};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -73,17 +73,30 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
     // repo-controlled program runs while gathering git facts. `git status` below
     // is the most reliable fsmonitor/clean-filter trigger of all, so the
     // hardening is load-bearing here.
-    let inside = hardened_git_command(project_root)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output();
-    let (available, is_repo, reason) = match inside {
-        Ok(out) if out.status.success() => {
-            let is_repo = String::from_utf8_lossy(&out.stdout).trim() == "true";
-            let reason = (!is_repo).then(|| "not inside a git work tree".to_owned());
-            (true, is_repo, reason)
+    //
+    // Every probe below is BOUNDED (clarion-9202f4acec): `run_git_probe_default`
+    // caps stdout and kills the process tree on deadline, which `Command::output()`
+    // does not. `available` reports whether the git BINARY ran, so only a spawn
+    // failure clears it — a non-zero exit, a deadline, or an output cap all mean
+    // git ran and could not answer, which the `reason` field then explains.
+    let mut probe = hardened_git_command(project_root);
+    probe.args(["rev-parse", "--is-inside-work-tree"]);
+    let (available, is_repo, reason) = match run_git_probe_default(probe) {
+        // Non-UTF-8 stdout is treated exactly like a non-success exit was: this
+        // is not a repo we can answer about.
+        Ok(out) => match out.stdout_utf8() {
+            Ok(text) => {
+                let is_repo = text.trim() == "true";
+                let reason = (!is_repo).then(|| "not inside a git work tree".to_owned());
+                (true, is_repo, reason)
+            }
+            Err(err) => (true, false, Some(format!("git output unusable: {err}"))),
+        },
+        Err(GitProbeError::Spawn(err)) => (false, false, Some(format!("git unavailable: {err}"))),
+        Err(GitProbeError::NonZeroExit { .. }) => {
+            (true, false, Some("not a git repository".to_owned()))
         }
-        Ok(_) => (true, false, Some("not a git repository".to_owned())),
-        Err(err) => (false, false, Some(format!("git unavailable: {err}"))),
+        Err(err) => (true, false, Some(format!("git probe failed: {err}"))),
     };
     if !is_repo {
         return GitFacts {
@@ -96,15 +109,15 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
         };
     }
 
+    // `None` on any probe failure — spawn, non-zero exit, deadline, output cap,
+    // or non-UTF-8 stdout: the fact is simply unavailable, which the caller
+    // already renders as a null field (the module's fail-soft contract).
     let run = |args: &[&str]| -> Option<String> {
-        let out = hardened_git_command(project_root)
-            .args(args)
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-            .filter(|s| !s.is_empty())
+        let mut command = hardened_git_command(project_root);
+        command.args(args);
+        let out = run_git_probe_default(command).ok()?;
+        let text = out.stdout_utf8().ok()?.trim();
+        (!text.is_empty()).then(|| text.to_owned())
     };
 
     // Fetch HEAD's commit id AND committer date in ONE subprocess (L8): a single
@@ -132,12 +145,14 @@ pub(crate) fn gather_git_facts(project_root: &Path) -> GitFacts {
     // files are still caught by the stat-based `compute_file_drift`
     // (`modified_since_analyze`); only never-staged/never-indexed changes go
     // unreported, which the report notes already disclaim.
-    let dirty = hardened_git_command(project_root)
-        .args(["diff", "--cached", "--name-status", "-M", "HEAD"])
-        .output()
+    let mut dirty_probe = hardened_git_command(project_root);
+    dirty_probe.args(["diff", "--cached", "--name-status", "-M", "HEAD"]);
+    // A failed or non-UTF-8 probe yields the empty staged list, exactly as a
+    // non-success exit did before: an unborn HEAD is the ordinary case here, and
+    // the report's own disclaimer already covers an under-reported dirty set.
+    let dirty = run_git_probe_default(dirty_probe)
         .ok()
-        .filter(|out| out.status.success())
-        .map(|out| parse_name_status(&String::from_utf8_lossy(&out.stdout)))
+        .and_then(|out| out.stdout_utf8().map(parse_name_status).ok())
         .unwrap_or_default();
 
     GitFacts {
