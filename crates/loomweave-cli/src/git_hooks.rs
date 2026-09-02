@@ -28,17 +28,17 @@
 //! dead code), replaced in place when a stale Loomweave block exists, and the
 //! whole file is left untouched when the current block is already present.
 //!
-//! Hook files live where git says they live, which takes two probes rather
-//! than one (ADR-063). The hardened `git rev-parse --git-path hooks` answers
-//! for the repository — a repo-local `core.hooksPath`, and the shared common
-//! dir for linked worktrees — but the hardening nulls `GIT_CONFIG_GLOBAL`, so
-//! it is blind to the operator's own `~/.gitconfig`. An operator-global
-//! `core.hooksPath` is therefore read by a second, deliberately unhardened
-//! probe (`loomweave_core::operator_global_git_config_command`) and wins when
-//! set; see [`hooks_dir`] for the precedence and its one deliberate departure
-//! from git's own. The block passes `--path .` because git runs these hooks
-//! from the top of the working tree — so in a linked worktree the sync targets
-//! that worktree's isolated store.
+//! Hook files live where git says they live, which takes more than one probe
+//! (ADR-063). The hardened `git rev-parse --git-path hooks` cannot reproduce
+//! git's `core.hooksPath` precedence on its own, because the hardening nulls
+//! `GIT_CONFIG_GLOBAL` and so is blind to the operator's `~/.gitconfig`.
+//! [`hooks_dir`] therefore asks in git's own order — the repository's
+//! `.git/config` (operator/tool state, never committed content), then the
+//! operator's global file via a deliberately unhardened
+//! `loomweave_core::operator_global_git_config_command`, then the hardened
+//! `--git-path hooks` answer. The block passes `--path .` because git runs
+//! these hooks from the top of the working tree — so in a linked worktree the
+//! sync targets that worktree's isolated store.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -119,31 +119,17 @@ fn hooks_dir_command(project_root: &Path) -> Command {
     cmd
 }
 
-/// The operator's GLOBAL `core.hooksPath`, or `None` when they have not set
-/// one (or it cannot be read).
+/// Turn a configured `core.hooksPath` value into a directory.
 ///
-/// This is the half [`hooks_dir_command`] structurally cannot see: the hardened
-/// builder nulls `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so `rev-parse
-/// --git-path hooks` answers `.git/hooks` even when `~/.gitconfig` says
-/// otherwise — and `install --hooks` then writes hooks git will never run,
-/// while `git_sync_hook_state` cheerfully reports them current. Under ADR-063
-/// the operator's global git config is operator intent, so it is read through
-/// the one sanctioned non-corpus git spawn
-/// (`loomweave_core::operator_global_git_config_command`, which never consults
-/// repository config).
-///
-/// `--path` makes git expand a leading `~` against the forwarded `HOME`. A
-/// relative value is resolved against the WORKTREE TOP LEVEL, which is where
+/// A relative value is resolved against the WORKTREE TOP LEVEL, which is where
 /// git runs hooks from and therefore what git itself resolves it against —
-/// verified empirically, and NOT the same as `project_root`, which may be any
-/// subdirectory the operator pointed a command at. If that probe cannot answer,
+/// verified empirically: with `core.hooksPath = myhooks`, a commit made from
+/// `<top>/sub` fires `<top>/myhooks/post-commit`, not `<top>/sub/myhooks/…`.
+/// That is NOT the same as `project_root`, which may be any subdirectory the
+/// operator pointed a command at; when the top-level probe cannot answer,
 /// `project_root` is the fallback (the common case, where they are equal).
-fn operator_global_hooks_path(project_root: &Path) -> Option<PathBuf> {
-    let mut command = operator_global_git_config_command();
-    command.args(["--path", "core.hooksPath"]);
-    // An unset key exits 1 with no output — not an error, just "not set".
-    let out = run_git_probe_default(command).ok()?;
-    let trimmed = out.stdout_utf8().ok()?.trim();
+fn resolve_configured_hooks_path(project_root: &Path, value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -156,6 +142,50 @@ fn operator_global_hooks_path(project_root: &Path) -> Option<PathBuf> {
             .unwrap_or_else(|| project_root.to_path_buf())
             .join(path),
     )
+}
+
+/// The `core.hooksPath` set in this repository's OWN `.git/config`, or `None`
+/// when it is not set (or cannot be read).
+///
+/// `.git/config` is not committed content — it is operator/tool state, exactly
+/// like `~/.gitconfig` — so it is honoured, and it keeps git's own precedence
+/// over the global file. `--local` restricts the read to that one file, so the
+/// hardened builder's global/system nulling is irrelevant here and no corpus
+/// *content* is consulted.
+///
+/// One fail-soft edge: `--path` expands a leading `~` against `HOME`, which the
+/// hardened environment does not forward, so a repo-local `~/hooks` makes git
+/// exit non-zero and this returns `None` (falling through to the global value
+/// and then to the default). Documented rather than fixed: forwarding `HOME`
+/// into every hardened corpus probe to serve one exotic config shape is the
+/// wrong trade.
+fn repo_local_hooks_path(project_root: &Path) -> Option<PathBuf> {
+    let mut command = hardened_git_command(project_root);
+    command.args(["config", "--local", "--get", "--path", "core.hooksPath"]);
+    // An unset key exits 1 with no output — not an error, just "not set".
+    let out = run_git_probe_default(command).ok()?;
+    resolve_configured_hooks_path(project_root, out.stdout_utf8().ok()?)
+}
+
+/// The operator's GLOBAL `core.hooksPath`, or `None` when they have not set
+/// one (or it cannot be read).
+///
+/// This is the half [`hooks_dir_command`] structurally cannot see: the hardened
+/// builder nulls `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so `rev-parse
+/// --git-path hooks` answers `.git/hooks` even when `~/.gitconfig` says
+/// otherwise — and `install --hooks` then writes hooks git will never run,
+/// while `git_sync_hook_state` cheerfully reports them current. Under ADR-063
+/// the operator's global git config is operator intent, so it is read through
+/// the one sanctioned non-corpus git spawn
+/// (`loomweave_core::operator_global_git_config_command`, which never consults
+/// repository config). `--path` expands a leading `~` against the forwarded
+/// `HOME`.
+fn operator_global_hooks_path(project_root: &Path) -> Option<PathBuf> {
+    let mut command = operator_global_git_config_command();
+    command.args(["--path", "core.hooksPath"]);
+    // An unset key exits 1 with no output — not an error, just "not set".
+    let out = run_git_probe_default(command).ok()?;
+    resolve_configured_hooks_path(project_root, out.stdout_utf8().ok()?)
 }
 
 /// The top of the working tree containing `project_root`, through the hardened
@@ -174,33 +204,34 @@ fn worktree_top_level(project_root: &Path) -> Option<PathBuf> {
 /// output cap / produced non-UTF-8) — hooks are an enrichment, so every failure
 /// folds to "nowhere to install", never an error.
 ///
-/// Two sources. `git rev-parse --git-path hooks` through the hardened builder
-/// is asked first — it honours a **repository-local** `core.hooksPath` and
-/// linked-worktree layouts, and its failure is what tells us there is no
-/// repository here at all. When it answers, the operator's **global**
-/// `core.hooksPath` ([`operator_global_hooks_path`]) overrides it if set:
-/// operator intent under ADR-063, and structurally invisible to the hardened
-/// probe, which nulls `GIT_CONFIG_GLOBAL`.
+/// Resolved in **git's own precedence order**, which the hardened probe alone
+/// cannot reproduce:
 ///
-/// The operator's setting is preferred over the repository's, which inverts
-/// git's own precedence in the one case where both are set. That is deliberate
-/// under ADR-063 — a repo-local `core.hooksPath` is corpus content, and
-/// Loomweave should not merge its managed block into a directory the corpus
-/// chose. The cost is that in that (rare) case git runs the repository's hooks
-/// dir while Loomweave writes into the operator's, so the managed block does
-/// not fire; nothing is written into a corpus-chosen path, which is the safer
-/// half of the trade.
+/// 1. The repository's own `.git/config` `core.hooksPath`
+///    ([`repo_local_hooks_path`]). Not committed content — `.git/config` is
+///    operator/tool state, exactly like `~/.gitconfig` — so it is honoured, and
+///    it keeps the precedence git gives it.
+/// 2. Otherwise the operator's **global** `core.hooksPath`
+///    ([`operator_global_hooks_path`]). This is the half `rev-parse --git-path
+///    hooks` structurally cannot see, because the hardened builder nulls
+///    `GIT_CONFIG_GLOBAL`.
+/// 3. Otherwise the hardened `git rev-parse --git-path hooks` answer, which
+///    resolves the shared common dir for linked worktrees.
+///
+/// The hardened probe is nonetheless *run* first, and its failure is the whole
+/// answer: it is what establishes that `project_root` is a git work tree at
+/// all. Without that gate, an operator with a global `core.hooksPath` would
+/// have Loomweave merge its managed block into their real hooks directory when
+/// pointed at a directory that is not a repository.
 #[must_use]
 pub fn hooks_dir(project_root: &Path) -> Option<PathBuf> {
-    // The hardened probe runs FIRST and its failure is still the whole answer.
-    // It is what establishes that `project_root` is a git work tree at all —
-    // and without that gate, an operator with a global `core.hooksPath` would
-    // have Loomweave merge its managed block into their real hooks directory
-    // when pointed at a directory that is not a repository.
     let out = run_git_probe_default(hooks_dir_command(project_root)).ok()?;
     let trimmed = out.stdout_utf8().ok()?.trim();
     if trimmed.is_empty() {
         return None;
+    }
+    if let Some(local) = repo_local_hooks_path(project_root) {
+        return Some(local);
     }
     if let Some(global) = operator_global_hooks_path(project_root) {
         return Some(global);

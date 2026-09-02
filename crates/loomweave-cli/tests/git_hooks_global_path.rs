@@ -131,6 +131,52 @@ fn a_relative_global_hooks_path_resolves_against_the_worktree_top_level() {
     );
 }
 
+/// git's own precedence: a `core.hooksPath` in the repository's `.git/config`
+/// beats the operator's global one. `.git/config` is not committed content —
+/// it is operator/tool state, exactly like `~/.gitconfig` — so honouring it
+/// keeps Loomweave writing where git will actually look.
+#[test]
+fn a_repository_local_hooks_path_beats_the_operator_global_one() {
+    if !git_available() {
+        eprintln!("skipping: no git available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let local_hooks = dir.path().join("local-hooks");
+    let global_hooks = dir.path().join("global-hooks");
+    fs::create_dir_all(&project).unwrap();
+    git(&project, &["init", "-q"]);
+    // Raw git, straight into `.git/config`.
+    git(
+        &project,
+        &["config", "core.hooksPath", local_hooks.to_str().unwrap()],
+    );
+
+    let gitconfig = dir.path().join("operator-gitconfig");
+    fs::write(
+        &gitconfig,
+        format!("[core]\n\thooksPath = {}\n", global_hooks.display()),
+    )
+    .unwrap();
+
+    loomweave_install_hooks(&project, &gitconfig).success();
+
+    assert!(
+        local_hooks.join("post-merge").exists(),
+        "the repository's own .git/config must win, as it does for git itself ({})",
+        local_hooks.display()
+    );
+    assert!(
+        !global_hooks.exists(),
+        "the operator's global hooks dir must not be touched when .git/config sets the path"
+    );
+    assert!(
+        !project.join(".git/hooks/post-merge").exists(),
+        "neither should the default dir git will not consult"
+    );
+}
+
 /// The global path is honoured only INSIDE a work tree. Without this gate, a
 /// `--path` that is not a repository would merge Loomweave's managed block
 /// into the operator's real, global hooks directory.

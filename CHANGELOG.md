@@ -53,10 +53,12 @@ only when an incompatible change is made to that surface. See
   builder nulled `GIT_CONFIG_GLOBAL`, so `git rev-parse --git-path hooks`
   answered `.git/hooks` even when `~/.gitconfig` pointed elsewhere — the
   managed block landed where git would never run it, and `doctor` reported the
-  hooks present. Your global git config is *operator* intent under ADR-063, so
-  it is now read by a second, deliberately unhardened probe
-  (`git config --global --get`, which cannot reach repository config). A
-  relative value resolves against the worktree top level, as git itself does.
+  hooks present. `hooks_dir` now resolves in git's own precedence order — the
+  repository's `.git/config` (operator/tool state, never committed content),
+  then your global `~/.gitconfig` via a second, deliberately unhardened probe
+  (`git config --global --get`, which cannot reach repository config), then the
+  hardened `--git-path hooks` default. A relative value resolves against the
+  worktree top level, as git itself does.
 - A path that resolves to the repository **root** is no longer reported
   untracked without asking git: the root of a repository holding any tracked
   content is repository content, and only an empty repository answers

@@ -23,6 +23,13 @@ fn loomweave_bin() -> Command {
     let mut cmd = Command::cargo_bin("loomweave").expect("loomweave binary");
     cmd.env_remove("WEFT_TOKEN");
     cmd.env_remove("WEFT_IDENTITY_SECRET");
+    // Hermetic git: `hooks_dir` honours the operator's GLOBAL `core.hooksPath`,
+    // so a developer whose real `~/.gitconfig` sets one would have the hook
+    // tests below resolve OUTSIDE the fixture tempdir — failing, and merging
+    // Loomweave's managed block into their actual hooks directory. Null the
+    // global and system files for every CLI invocation these tests make.
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env(
         "LOOMWEAVE_CODEX_CONFIG",
         std::env::temp_dir().join(format!(
