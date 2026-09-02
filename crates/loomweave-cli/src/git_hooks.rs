@@ -87,8 +87,11 @@ pub enum GitHookState {
     Stale,
     /// No hook file carries a Loomweave block.
     Missing,
-    /// Not a git repository (or `git` itself is unavailable) — the hooks have
-    /// nowhere to live, which is fine: git-sync is an enrichment.
+    /// [`hooks_dir`] could not answer: not a git repository, `git` itself is
+    /// unavailable, or the bounded probe failed (deadline, output cap,
+    /// non-UTF-8). The hooks have nowhere to install, which is fine: git-sync
+    /// is an enrichment, so every one of those folds to the same graceful
+    /// no-op rather than an error.
     NoGitDir,
 }
 

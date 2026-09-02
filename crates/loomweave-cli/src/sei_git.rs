@@ -456,7 +456,8 @@ pub(crate) fn is_git_repo(path: &Path) -> bool {
 }
 
 /// The current `HEAD` commit SHA, or `None` on any failure (not a repo, git
-/// missing, detached/unborn HEAD, non-zero exit). Persisted on the run row so a
+/// missing, detached/unborn HEAD, non-zero exit, or the bounded probe's
+/// deadline / stdout cap / non-UTF-8 output). Persisted on the run row so a
 /// later run can drive the committed rename window `<prior_commit>..HEAD` (WS9 /
 /// SEI §6). Fail-soft like [`is_git_repo`]: an absent SHA simply skips the
 /// committed window, never errors the run.
