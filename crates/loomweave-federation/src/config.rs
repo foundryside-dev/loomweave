@@ -72,6 +72,10 @@ impl McpConfig {
     /// turn the ADR-063 gate into a startup failure — the corpus would get to
     /// choose whether Loomweave runs at all.
     fn parse_unvalidated(raw: &str) -> Result<Self, ConfigError> {
+        // An empty document is the default config, and callers rely on that
+        // default then PASSING `validate()` — `from_yaml_str("")` runs it, as
+        // does `load_trusted` on an empty file. Keep the two in step: a default
+        // that could not validate would turn an empty config into a hard error.
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
@@ -294,15 +298,36 @@ pub struct LoadedConfig {
 /// cost of the narrow form is that a `loomweave.yaml` symlinked to committed
 /// content elsewhere in the tree reads as untracked; do not "fix" this by
 /// widening the root.
+///
+/// A BARE RELATIVE path (`--config loomweave.yaml`) has `parent() ==
+/// Some("")`, which names no directory. It is rooted at the process cwd, NOT
+/// short-circuited: falling through to a permissive verdict there would let
+/// `serve --config loomweave.yaml`, run from inside a corpus repository, treat
+/// a committed config as operator-owned and open both writer gates.
 #[must_use]
 pub fn config_trust_for_path(path: &Path) -> ConfigTrust {
-    let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return ConfigTrust::NotAGitWorkTree;
-    };
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let Some(name) = path.file_name() else {
+        // No file name at all (e.g. `..`): nothing a config could be read from.
         return ConfigTrust::NotAGitWorkTree;
     };
-    match loomweave_core::tracked_state(dir, Path::new(name)) {
+    config_trust_from_state(loomweave_core::tracked_state(dir, Path::new(name)))
+}
+
+/// The [`loomweave_core::TrackedState`] → [`ConfigTrust`] mapping, split from
+/// [`config_trust_for_path`] so every arm is unit-testable without spawning a
+/// real `git` subprocess (and without a test ever touching the process cwd).
+///
+/// `Tracked` and a failed probe (`Unknown`) fail closed; `GitUnavailable` does
+/// not — a missing `git` binary is the operator's environment, not repository
+/// content (`PATH` is real-environment-only, ADR-062) — matching
+/// [`loomweave_core::TrackedState::treat_as_tracked`].
+#[must_use]
+fn config_trust_from_state(state: loomweave_core::TrackedState) -> ConfigTrust {
+    match state {
         loomweave_core::TrackedState::Untracked => ConfigTrust::OperatorOwned,
         loomweave_core::TrackedState::NotAGitWorkTree => ConfigTrust::NotAGitWorkTree,
         loomweave_core::TrackedState::GitUnavailable => ConfigTrust::GitUnavailable,
@@ -2469,10 +2494,91 @@ integrations:
 serve:
   mcp:
     enable_write_tools: false
+  http:
+    enabled: true
+    token_env: AWS_SECRET_ACCESS_KEY
 analysis:
   clustering:
     enabled: true
 ";
+
+    /// Every `TrackedState` arm maps to the right verdict, exercised directly
+    /// so the fail-closed/permissive split is pinned without a git subprocess
+    /// and without any test touching the process cwd.
+    #[test]
+    fn every_tracked_state_maps_to_its_trust_verdict() {
+        use loomweave_core::{GitProbeError, TrackedState};
+
+        assert_eq!(
+            config_trust_from_state(TrackedState::Untracked),
+            ConfigTrust::OperatorOwned
+        );
+        assert!(config_trust_from_state(TrackedState::Untracked).egress_allowed());
+
+        assert_eq!(
+            config_trust_from_state(TrackedState::NotAGitWorkTree),
+            ConfigTrust::NotAGitWorkTree
+        );
+        assert!(config_trust_from_state(TrackedState::NotAGitWorkTree).egress_allowed());
+
+        // A missing `git` binary is the OPERATOR's environment, not repository
+        // content (ADR-062: PATH is real-environment-only), so it stays
+        // permissive — the one exception to the fail-closed default.
+        let unavailable = config_trust_from_state(TrackedState::GitUnavailable);
+        assert_eq!(unavailable, ConfigTrust::GitUnavailable);
+        assert_eq!(unavailable.label(), "git_unavailable");
+        assert!(unavailable.egress_allowed());
+
+        let tracked = config_trust_from_state(TrackedState::Tracked);
+        assert_eq!(
+            tracked,
+            ConfigTrust::RepositoryTracked {
+                stripped: Vec::new()
+            }
+        );
+        assert!(!tracked.egress_allowed(), "tracked fails closed");
+
+        // A probe that failed for any other reason (timeout here) is a
+        // checkout git itself would not read: fail closed.
+        let unknown = config_trust_from_state(TrackedState::Unknown(GitProbeError::Timeout {
+            after: std::time::Duration::from_secs(2),
+        }));
+        assert!(matches!(unknown, ConfigTrust::Unknown { .. }));
+        assert_eq!(unknown.label(), "unknown");
+        assert!(!unknown.egress_allowed(), "a failed probe fails closed");
+        let ConfigTrust::Unknown { reason, stripped } = &unknown else {
+            unreachable!()
+        };
+        assert!(reason.contains("deadline"), "{reason}");
+        assert!(stripped.is_empty(), "config_trust_for_path never strips");
+    }
+
+    #[test]
+    fn to_json_reports_the_state_the_stripped_sections_and_the_remedy() {
+        let path = Path::new("/repo/loomweave.yaml");
+
+        let tracked = ConfigTrust::RepositoryTracked {
+            stripped: vec!["llm_policy"],
+        }
+        .to_json(path);
+        assert_eq!(tracked["state"], "repository_tracked");
+        assert_eq!(tracked["path"], "/repo/loomweave.yaml");
+        assert_eq!(
+            tracked["stripped"],
+            serde_json::json!(["llm_policy"]),
+            "{tracked}"
+        );
+        assert_eq!(tracked["remedy"], CONFIG_TRACKED_REMEDY);
+
+        let owned = ConfigTrust::OperatorOwned.to_json(path);
+        assert_eq!(owned["state"], "operator_owned");
+        assert_eq!(owned["stripped"], serde_json::json!([]));
+        assert_eq!(
+            owned["remedy"],
+            serde_json::Value::Null,
+            "an operator-owned config has nothing to remedy"
+        );
+    }
 
     #[test]
     fn strip_egress_sections_resets_only_the_egress_capable_sections() {
@@ -2480,11 +2586,21 @@ analysis:
         let stripped = cfg.strip_egress_sections();
         assert_eq!(
             stripped,
-            vec!["llm_policy", "semantic_search", "integrations"]
+            vec![
+                "llm_policy",
+                "semantic_search",
+                "integrations",
+                "serve.http"
+            ]
         );
         assert_eq!(cfg.llm, LlmConfig::default());
         assert_eq!(cfg.semantic_search, SemanticSearchConfig::default());
         assert_eq!(cfg.integrations, IntegrationsConfig::default());
+        assert_eq!(
+            cfg.serve.http,
+            HttpReadConfig::default(),
+            "serve.http names a listen interface and a credential env var"
+        );
         assert!(!cfg.serve.mcp.enable_write_tools, "serve.mcp is honoured");
         assert!(
             cfg.analysis.get("clustering").is_some(),
