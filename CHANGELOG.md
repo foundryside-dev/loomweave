@@ -46,6 +46,22 @@ only when an incompatible change is made to that surface. See
   rather than lossily, and `doctor`'s git-tracked-db check gained an `unknown`
   state so a failed probe is never reported as the healthy verdict.
 
+### Fixed
+
+- **`install --hooks` honours your GLOBAL `core.hooksPath` again**
+  (clarion-9202f4acec). Routing the hook-directory probe onto the hardened git
+  builder nulled `GIT_CONFIG_GLOBAL`, so `git rev-parse --git-path hooks`
+  answered `.git/hooks` even when `~/.gitconfig` pointed elsewhere — the
+  managed block landed where git would never run it, and `doctor` reported the
+  hooks present. Your global git config is *operator* intent under ADR-063, so
+  it is now read by a second, deliberately unhardened probe
+  (`git config --global --get`, which cannot reach repository config). A
+  relative value resolves against the worktree top level, as git itself does.
+- A path that resolves to the repository **root** is no longer reported
+  untracked without asking git: the root of a repository holding any tracked
+  content is repository content, and only an empty repository answers
+  `untracked` there.
+
 ### Changed
 
 - A `loomweave.yaml` that your repository tracks now has its `llm_policy`,
@@ -57,6 +73,12 @@ only when an incompatible change is made to that surface. See
   `project_status_get` / `llm_config_get` MCP tools report the same verdict.
 - `loomweave doctor`'s `db.tracked` check can now report `unknown` (a warning,
   not a pass) when the git probe cannot answer.
+- The `config.trust` verdict now carries the remedy that fits it. `unknown`
+  (git refused the checkout — commonly "dubious ownership") tells you to fix
+  ownership rather than to untrack a file git never said was tracked, and
+  `git_unavailable` tells you to install git. The MCP config writers answer an
+  `unknown` verdict with the new `LMWV-CONFIG-TRUST-UNKNOWN` code, in the same
+  invalid-params class as the tracked refusal.
 - `loomweave analyze`'s no-indexed-changes fast path is skipped for a
   repository whose commit range contains a non-UTF-8 path; the run falls back
   to a full analyze rather than trusting a lossily-decoded probe.

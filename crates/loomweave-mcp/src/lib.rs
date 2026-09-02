@@ -1676,13 +1676,17 @@ impl ServerState {
                 active_write_tools,
                 true,
             ))),
-            // ADR-063: a repository-tracked target is a caller-side fault (the
-            // file is corpus content Loomweave refuses to edit), not a storage
-            // failure. Answer in the invalid-params class so an agent does not
-            // read it as retryable; the error's own Display carries the remedy.
-            Ok(Err(err @ ConfigError::RepositoryTrackedConfig { .. })) => {
-                Err(ParamError::new(&err.to_string()))
-            }
+            // ADR-063: a target Loomweave does not own is a caller-side fault
+            // (the file is corpus content Loomweave refuses to edit), not a
+            // storage failure. Answer in the invalid-params class so an agent
+            // does not read it as retryable; each error's own Display carries
+            // the remedy that fits its arm. `ConfigTrustUnknown` is the same
+            // class as the tracked refusal — it is the fail-closed reading of
+            // the same gate, not a different kind of failure.
+            Ok(Err(
+                err @ (ConfigError::RepositoryTrackedConfig { .. }
+                | ConfigError::ConfigTrustUnknown { .. }),
+            )) => Err(ParamError::new(&err.to_string())),
             Ok(Err(err)) => Ok(tool_error_envelope(
                 McpErrorCode::StorageError,
                 &err.to_string(),
@@ -1756,9 +1760,10 @@ impl ServerState {
                 true,
             ))),
             // ADR-063, as in `tool_llm_config_set`: caller-side fault, not storage.
-            Ok(Err(err @ ConfigError::RepositoryTrackedConfig { .. })) => {
-                Err(ParamError::new(&err.to_string()))
-            }
+            Ok(Err(
+                err @ (ConfigError::RepositoryTrackedConfig { .. }
+                | ConfigError::ConfigTrustUnknown { .. }),
+            )) => Err(ParamError::new(&err.to_string())),
             Ok(Err(err)) => Ok(tool_error_envelope(
                 McpErrorCode::StorageError,
                 &err.to_string(),

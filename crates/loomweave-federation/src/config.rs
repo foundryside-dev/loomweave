@@ -190,8 +190,26 @@ impl McpConfig {
 pub const CONFIG_TRACKED_REMEDY: &str =
     "To own this file: git rm --cached loomweave.yaml && echo loomweave.yaml >> .gitignore";
 
+/// Verbatim remedy for the [`ConfigTrust::Unknown`] arm. The tracked remedy is
+/// WRONG here: `git rm --cached` cannot help an operator whose checkout git
+/// refuses to read at all, and telling them to untrack a file git never
+/// admitted was tracked sends them down a dead end.
+pub const CONFIG_UNKNOWN_REMEDY: &str = "Loomweave could not verify who owns loomweave.yaml (git \
+     refused the checkout — commonly 'dubious ownership' in a container or bind mount). Make the \
+     checkout owned by the user running Loomweave, or run Loomweave as its owner; Loomweave does \
+     not consult safe.directory.";
+
+/// Verbatim remedy for the [`ConfigTrust::GitUnavailable`] arm. Permissive, so
+/// nothing is broken — but the verdict is unverified, and the fix is a git
+/// binary, not untracking anything.
+pub const CONFIG_GIT_UNAVAILABLE_REMEDY: &str =
+    "Install git (or put it on PATH) so Loomweave can verify who owns loomweave.yaml.";
+
 /// Stable machine-readable code for [`ConfigError::RepositoryTrackedConfig`].
 const CONFIG_REPOSITORY_TRACKED_CODE: &str = "LMWV-CONFIG-REPOSITORY-TRACKED";
+
+/// Stable machine-readable code for [`ConfigError::ConfigTrustUnknown`].
+const CONFIG_TRUST_UNKNOWN_CODE: &str = "LMWV-CONFIG-TRUST-UNKNOWN";
 
 /// The config sections that can cause network egress or open a listener, in
 /// the order [`McpConfig::strip_egress_sections`] reports them. Named with the
@@ -262,6 +280,25 @@ impl ConfigTrust {
         }
     }
 
+    /// What the operator should DO about this verdict, or `None` when there is
+    /// nothing to fix.
+    ///
+    /// Deliberately an exhaustive per-arm match rather than a
+    /// `egress_allowed()` branch: the two properties are not the same shape.
+    /// `Unknown` is non-permissive AND has its own remedy (untracking a file
+    /// git never said was tracked is a dead end); `GitUnavailable` is
+    /// permissive but still unverified, and its remedy belongs to the surfaces
+    /// that WARN about it, not to this "what is broken" answer — a permissive
+    /// verdict has broken nothing.
+    #[must_use]
+    pub fn remedy(&self) -> Option<&'static str> {
+        match self {
+            Self::RepositoryTracked { .. } => Some(CONFIG_TRACKED_REMEDY),
+            Self::Unknown { .. } => Some(CONFIG_UNKNOWN_REMEDY),
+            Self::OperatorOwned | Self::NotAGitWorkTree | Self::GitUnavailable => None,
+        }
+    }
+
     /// The verdict as a JSON object for MCP/HTTP read surfaces.
     #[must_use]
     pub fn to_json(&self, path: &Path) -> serde_json::Value {
@@ -269,11 +306,9 @@ impl ConfigTrust {
             "state": self.label(),
             "path": path.display().to_string(),
             "stripped": self.stripped(),
-            "remedy": if self.egress_allowed() {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(CONFIG_TRACKED_REMEDY.to_owned())
-            },
+            "remedy": self.remedy().map_or(serde_json::Value::Null, |remedy| {
+                serde_json::Value::String(remedy.to_owned())
+            }),
         })
     }
 }
@@ -400,6 +435,38 @@ impl McpConfig {
         }
         stripped
     }
+}
+
+/// The writer gate (ADR-063): refuse to edit a config the operator does not
+/// own, with the remedy that fits the arm. Split from [`refuse_if_untrusted`]
+/// so every arm is unit-testable from a constructed [`ConfigTrust`], without
+/// spawning git.
+///
+/// Exhaustively matched on purpose: a future `ConfigTrust` arm must make an
+/// explicit refuse-or-allow decision here rather than inheriting one.
+fn refuse_for_trust(trust: &ConfigTrust, path: &Path) -> Result<(), ConfigError> {
+    match trust {
+        ConfigTrust::OperatorOwned | ConfigTrust::NotAGitWorkTree | ConfigTrust::GitUnavailable => {
+            Ok(())
+        }
+        ConfigTrust::RepositoryTracked { .. } => Err(ConfigError::RepositoryTrackedConfig {
+            code: CONFIG_REPOSITORY_TRACKED_CODE,
+            path: path.display().to_string(),
+        }),
+        // NOT `RepositoryTrackedConfig`: git never said the file was tracked,
+        // it said it could not tell. The tracked remedy would send the operator
+        // to `git rm --cached` on a file that may not be in the index at all.
+        ConfigTrust::Unknown { reason, .. } => Err(ConfigError::ConfigTrustUnknown {
+            code: CONFIG_TRUST_UNKNOWN_CODE,
+            path: path.display().to_string(),
+            reason: reason.clone(),
+        }),
+    }
+}
+
+/// [`refuse_for_trust`] against the live verdict for `path`.
+fn refuse_if_untrusted(path: &Path) -> Result<(), ConfigError> {
+    refuse_for_trust(&config_trust_for_path(path), path)
 }
 
 /// Announce the config's ownership exactly once per process: `warn` when
@@ -1140,14 +1207,11 @@ pub fn update_llm_config_file(
     path: &Path,
     patch: &LlmConfigPatch,
 ) -> Result<LlmConfigEditResult, ConfigError> {
-    // ADR-063: a repository-tracked loomweave.yaml is corpus content. Its
-    // egress sections are already ignored on load; refuse to write into it too,
-    // so an edit never lands in a file the repository owns.
-    if path.exists() && !config_trust_for_path(path).egress_allowed() {
-        return Err(ConfigError::RepositoryTrackedConfig {
-            code: CONFIG_REPOSITORY_TRACKED_CODE,
-            path: path.display().to_string(),
-        });
+    // ADR-063: a loomweave.yaml the operator does not own is corpus content.
+    // Its egress sections are already ignored on load; refuse to write into it
+    // too, so an edit never lands in a file the repository owns.
+    if path.exists() {
+        refuse_if_untrusted(path)?;
     }
     let (mut document, created) = if path.exists() {
         let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -1200,14 +1264,11 @@ pub fn update_semantic_config_file(
     path: &Path,
     patch: &SemanticConfigPatch,
 ) -> Result<SemanticConfigEditResult, ConfigError> {
-    // ADR-063: a repository-tracked loomweave.yaml is corpus content. Its
-    // egress sections are already ignored on load; refuse to write into it too,
-    // so an edit never lands in a file the repository owns.
-    if path.exists() && !config_trust_for_path(path).egress_allowed() {
-        return Err(ConfigError::RepositoryTrackedConfig {
-            code: CONFIG_REPOSITORY_TRACKED_CODE,
-            path: path.display().to_string(),
-        });
+    // ADR-063: a loomweave.yaml the operator does not own is corpus content.
+    // Its egress sections are already ignored on load; refuse to write into it
+    // too, so an edit never lands in a file the repository owns.
+    if path.exists() {
+        refuse_if_untrusted(path)?;
     }
     let (mut document, created) = if path.exists() {
         let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -1523,6 +1584,17 @@ pub enum ConfigError {
          and refuses to edit it (ADR-063). {CONFIG_TRACKED_REMEDY}"
     )]
     RepositoryTrackedConfig { code: &'static str, path: String },
+
+    #[error(
+        "{code}: Loomweave could not establish who owns {path}, so it is treated as repository \
+         content (fail closed) and refuses to edit it (ADR-063): {reason}. \
+         {CONFIG_UNKNOWN_REMEDY}"
+    )]
+    ConfigTrustUnknown {
+        code: &'static str,
+        path: String,
+        reason: String,
+    },
 }
 
 /// Reject configs that name both `llm` and `llm_policy` at the top level.
@@ -2578,6 +2650,101 @@ analysis:
             serde_json::Value::Null,
             "an operator-owned config has nothing to remedy"
         );
+    }
+
+    /// Each non-permissive arm carries the remedy that FITS it. `Unknown` is
+    /// the trap: it is non-permissive, so an `egress_allowed()`-shaped branch
+    /// would hand it the untrack remedy — advice that cannot work on a file git
+    /// never said was tracked. `GitUnavailable` is the mirror trap: permissive,
+    /// so `to_json` must report nothing to remedy at all.
+    #[test]
+    fn to_json_remedy_is_per_arm_never_the_tracked_remedy_by_default() {
+        let path = Path::new("/repo/loomweave.yaml");
+
+        let unknown = ConfigTrust::Unknown {
+            reason: "dubious ownership in repository at '/repo'".to_owned(),
+            stripped: vec!["llm_policy", "integrations"],
+        }
+        .to_json(path);
+        assert_eq!(unknown["state"], "unknown");
+        assert_eq!(unknown["remedy"], CONFIG_UNKNOWN_REMEDY, "{unknown}");
+        assert_ne!(
+            unknown["remedy"], CONFIG_TRACKED_REMEDY,
+            "untracking cannot fix a verdict git refused to give: {unknown}"
+        );
+
+        let unavailable = ConfigTrust::GitUnavailable.to_json(path);
+        assert_eq!(unavailable["state"], "git_unavailable");
+        assert_eq!(
+            unavailable["remedy"],
+            serde_json::Value::Null,
+            "a permissive verdict has broken nothing to remedy: {unavailable}"
+        );
+
+        // The accessor the surfaces read, pinned alongside the wire shape.
+        assert_eq!(
+            ConfigTrust::RepositoryTracked {
+                stripped: Vec::new()
+            }
+            .remedy(),
+            Some(CONFIG_TRACKED_REMEDY)
+        );
+        assert_eq!(ConfigTrust::OperatorOwned.remedy(), None);
+        assert_eq!(ConfigTrust::NotAGitWorkTree.remedy(), None);
+        assert_eq!(ConfigTrust::GitUnavailable.remedy(), None);
+    }
+
+    /// The writer gate refuses BOTH non-permissive arms, but with distinct
+    /// typed errors: `Unknown` must not be reported as "tracked by the
+    /// repository", which is a claim git did not make.
+    #[test]
+    fn the_writer_gate_maps_each_arm_to_its_own_refusal() {
+        let path = Path::new("/repo/loomweave.yaml");
+
+        for permissive in [
+            ConfigTrust::OperatorOwned,
+            ConfigTrust::NotAGitWorkTree,
+            ConfigTrust::GitUnavailable,
+        ] {
+            assert!(
+                refuse_for_trust(&permissive, path).is_ok(),
+                "{permissive:?} must not block a write"
+            );
+        }
+
+        let tracked = refuse_for_trust(
+            &ConfigTrust::RepositoryTracked {
+                stripped: Vec::new(),
+            },
+            path,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(tracked, ConfigError::RepositoryTrackedConfig { .. }),
+            "{tracked:?}"
+        );
+        assert!(tracked.to_string().contains(CONFIG_TRACKED_REMEDY));
+
+        let unknown = refuse_for_trust(
+            &ConfigTrust::Unknown {
+                reason: "probe deadline".to_owned(),
+                stripped: Vec::new(),
+            },
+            path,
+        )
+        .unwrap_err();
+        let ConfigError::ConfigTrustUnknown { code, reason, .. } = &unknown else {
+            panic!("an unanswerable probe must not be reported as tracked: {unknown:?}");
+        };
+        assert_eq!(*code, CONFIG_TRUST_UNKNOWN_CODE);
+        assert_eq!(reason, "probe deadline");
+        let rendered = unknown.to_string();
+        assert!(rendered.contains(CONFIG_UNKNOWN_REMEDY), "{rendered}");
+        assert!(
+            !rendered.contains(CONFIG_TRACKED_REMEDY),
+            "the untrack remedy must never appear on the unknown arm: {rendered}"
+        );
+        assert!(rendered.contains("probe deadline"), "{rendered}");
     }
 
     #[test]

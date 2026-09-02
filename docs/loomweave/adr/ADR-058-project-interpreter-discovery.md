@@ -292,6 +292,7 @@ those keys only shape site-packages globbing and never execute a program.
 **What this does not change.** Rungs 1 and 3–6, the `access(2)` executability
 ruling, lexical normalisation, the fingerprint, the host-export guards, and the
 `interpreter_unpinned` semantics are untouched. A skipped rung 2 that lands on
-rung 5/6 is reported through the existing `interpreter_unpinned` token; `doctor`
-names the fix (`git rm --cached .venv` is the wrong fix — the operator should
-create their own venv; the committed one is the repository's business).
+rung 5/6 is surfaced by the once-per-process warning and by the existing
+`interpreter_unpinned` token — there is no `doctor` check for a skipped rung.
+Note that `git rm --cached .venv` is the wrong fix: the operator should create
+their own venv; the committed one is the repository's business.

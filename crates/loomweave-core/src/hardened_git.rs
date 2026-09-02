@@ -156,6 +156,72 @@ const NULL_DEVICE: &str = "NUL";
 #[cfg(not(windows))]
 const NULL_DEVICE: &str = "/dev/null";
 
+/// The ONE sanctioned git spawn in Loomweave that does not harden itself
+/// against corpus content — because it cannot reach any. Returns
+/// `git config --global --get`; the caller appends the key.
+///
+/// `--global` reads the operator's global config file and **nothing else**: not
+/// the repository's `.git/config`, not `.gitattributes`, not the worktree. So
+/// the config-and-attribute vectors [`hardened_git_command`] exists to
+/// neutralize have no path into this probe, and `config --get` executes no
+/// program of its own.
+///
+/// It exists because the hardening is, for one narrow question, *too* strong.
+/// [`hardened_git_command`] nulls `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so a
+/// probe built on it answers as if the operator's `~/.gitconfig` did not exist.
+/// That is exactly right for "what does this repository contain" and exactly
+/// wrong for "what has the operator configured": under ADR-063 the operator's
+/// global git config IS operator intent, and silently ignoring it makes
+/// Loomweave act on a setting the operator never chose. The concrete case is
+/// `core.hooksPath` (see `loomweave-cli`'s `git_hooks::hooks_dir`): read through
+/// the hardened probe, a global `core.hooksPath` vanishes and
+/// `install --hooks` writes hooks into `.git/hooks`, where git will never run
+/// them.
+///
+/// The environment is still cleared and rebuilt — no repository selector may
+/// survive — but three more operator-owned variables are forwarded, because
+/// they are how an operator says *where their global config is*:
+///
+/// * `HOME` — the default location of `~/.gitconfig`.
+/// * `XDG_CONFIG_HOME` — the alternative location (`$XDG_CONFIG_HOME/git/config`).
+/// * `GIT_CONFIG_GLOBAL` — an explicit redirect, how containers and CI point
+///   git at an operator config file. Forwarded VERBATIM and never nulled; that
+///   is the whole point of this builder.
+///
+/// `GIT_CONFIG_SYSTEM` is deliberately not forwarded and `GIT_CONFIG_NOSYSTEM`
+/// deliberately not set: `--global` consults neither, so both would be noise.
+///
+/// Spawn it with [`run_git_probe`] / [`run_git_probe_default`], like every
+/// other git spawn here.
+#[must_use]
+pub fn operator_global_git_config_command() -> Command {
+    operator_global_git_config_command_with(|name| std::env::var_os(name))
+}
+
+/// [`operator_global_git_config_command`] with `getenv` injected, so a test can
+/// pin the environment contract without mutating the process environment.
+fn operator_global_git_config_command_with(
+    getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Command {
+    let mut command = Command::new("git");
+    command.env_clear();
+    apply_operator_env_passthrough(&mut command, &getenv);
+    for name in ["HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"] {
+        if let Some(value) = getenv(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        // Machine-parsed output: pin the locale.
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        // `--global` is baked in, not left to the caller: it is the whole
+        // reason this unhardened spawn is safe.
+        .args(["config", "--global", "--get"]);
+    command
+}
+
 /// Build a `git` [`Command`] hardened for read-only probes against an untrusted
 /// repository at `repo_root` (sets `git -C <repo_root>`). The caller appends the
 /// subcommand and its arguments, e.g.:
@@ -631,6 +697,15 @@ impl TrackedState {
 /// Classify a completed (or failed) bounded git probe into a [`TrackedState`].
 /// Factored out of [`tracked_state`] so each arm is unit-testable directly,
 /// without spawning a real `git` subprocess for every case.
+///
+/// Accepted inconsistency: only `Spawn(NotFound)` reads `GitUnavailable`. A
+/// `Spawn(PermissionDenied)` — a `git` on the operator's `PATH` that is not
+/// executable — is just as much the operator's environment rather than
+/// repository content, yet it reads `Unknown` and therefore fails closed. It is
+/// left that way on purpose: `NotFound` is unambiguous ("there is no git"),
+/// while the other spawn failures are a long tail whose causes are not all
+/// operator-side, and widening the permissive arm to cover them would trade a
+/// rare false-positive for a class of false-negatives on the trust boundary.
 fn classify_probe(result: Result<GitProbeOutput, GitProbeError>) -> TrackedState {
     match result {
         Ok(out) if out.stdout.is_empty() => TrackedState::Untracked,
@@ -651,6 +726,12 @@ fn classify_probe(result: Result<GitProbeOutput, GitProbeError>) -> TrackedState
 /// means tracked. Never hashes working-tree content, so no repo-controlled
 /// `filter` driver can run (see the module docs).
 ///
+/// A `path` that resolves to the repository ROOT itself is probed as `.`, not
+/// short-circuited to `Untracked`: the root of a repository holding any tracked
+/// content is itself repository content, and only an empty repository answers
+/// `Untracked` there. Only a path entirely outside the root (and not resolving
+/// into it) answers `Untracked` without asking git.
+///
 /// `--literal-pathspecs` is set because the specs are *paths*, not patterns:
 /// the canonical branch feeds git a path derived from a corpus-controlled
 /// symlink target, and a component containing `*`, `?`, `[…]` or a leading `:`
@@ -669,14 +750,23 @@ pub fn tracked_state(repo_root: &Path, path: &Path) -> TrackedState {
         repo_root.join(path)
     };
     let mut specs: Vec<PathBuf> = Vec::new();
-    push_self_and_ancestors(&mut specs, &absolute, repo_root);
+    let mut inside = push_self_and_ancestors(&mut specs, &absolute, repo_root);
     if let (Ok(canonical), Ok(canonical_root)) = (absolute.canonicalize(), repo_root.canonicalize())
     {
-        push_self_and_ancestors(&mut specs, &canonical, &canonical_root);
+        inside |= push_self_and_ancestors(&mut specs, &canonical, &canonical_root);
     }
     if specs.is_empty() {
-        // Entirely outside the repository (and not resolving into it).
-        return TrackedState::Untracked;
+        if !inside {
+            // Entirely outside the repository (and not resolving into it).
+            return TrackedState::Untracked;
+        }
+        // The path IS the repository root (`""`, `"."`, or a symlink resolving
+        // onto it). An empty pathspec set would answer `Untracked` without ever
+        // asking git, which is permissive on the trust boundary — the root of a
+        // repository with any tracked content is repository content. Probe `.`
+        // so git answers: non-empty for any tracked file, empty for an empty
+        // repository.
+        specs.push(PathBuf::from("."));
     }
     let mut command = hardened_git_command(repo_root);
     command.args(["--literal-pathspecs", "ls-files", "-z", "--"]);
@@ -688,9 +778,14 @@ pub fn tracked_state(repo_root: &Path, path: &Path) -> TrackedState {
 
 /// Push `path` relative to `root`, then each ancestor down to (excluding) the
 /// root. Paths outside `root` contribute nothing.
-fn push_self_and_ancestors(specs: &mut Vec<PathBuf>, path: &Path, root: &Path) {
+///
+/// Returns whether `path` is *inside* `root` at all — which is NOT the same as
+/// "pushed something": the root itself is inside and pushes nothing, and the
+/// caller must tell that case apart from a path that lies outside entirely
+/// (the first must still be asked about, the second must not).
+fn push_self_and_ancestors(specs: &mut Vec<PathBuf>, path: &Path, root: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(root) else {
-        return;
+        return false;
     };
     let mut cursor = Some(rel);
     while let Some(current) = cursor {
@@ -702,6 +797,7 @@ fn push_self_and_ancestors(specs: &mut Vec<PathBuf>, path: &Path, root: &Path) {
         }
         cursor = current.parent();
     }
+    true
 }
 
 #[cfg(test)]
@@ -1122,6 +1218,98 @@ mod tests {
             stdout: stdout.to_vec(),
             stderr_tail: Vec::new(),
         }
+    }
+
+    /// The operator-global probe's contract is the MIRROR of the hardened
+    /// builder's: `GIT_CONFIG_GLOBAL` must reach the child intact rather than
+    /// being nulled, or the probe answers about a global config file that is
+    /// not the operator's. Assert on "not nulled + forwarded verbatim", not on
+    /// "absent": absent is the correct state only when the operator has not
+    /// redirected their global config, and the second half pins that too.
+    #[test]
+    fn operator_global_probe_never_nulls_the_operators_global_config() {
+        let redirected = operator_global_git_config_command_with(|name| match name {
+            "PATH" => Some("/usr/bin".into()),
+            "HOME" => Some("/home/op".into()),
+            "XDG_CONFIG_HOME" => Some("/home/op/.config".into()),
+            "GIT_CONFIG_GLOBAL" => Some("/home/op/ci-gitconfig".into()),
+            _ => None,
+        });
+
+        let args: Vec<String> = redirected
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["config", "--global", "--get"],
+            "`--global` is what makes this unhardened spawn safe; it must be baked in"
+        );
+
+        let envs: Vec<(String, Option<String>)> = redirected
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&(
+                "GIT_CONFIG_GLOBAL".to_owned(),
+                Some("/home/op/ci-gitconfig".to_owned())
+            )),
+            "the operator's redirect must be forwarded verbatim: {envs:?}"
+        );
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, v)| k == "GIT_CONFIG_GLOBAL" && v.as_deref() == Some(NULL_DEVICE)),
+            "nulling the global config is exactly the bug this builder exists to avoid: {envs:?}"
+        );
+        // `--global` reads neither of these, so setting them would be noise
+        // that implies a protection this probe does not need.
+        assert!(
+            !envs.iter().any(|(k, _)| k == "GIT_CONFIG_SYSTEM"),
+            "{envs:?}"
+        );
+        assert!(
+            !envs.iter().any(|(k, _)| k == "GIT_CONFIG_NOSYSTEM"),
+            "{envs:?}"
+        );
+        // The two variables that locate `~/.gitconfig` when there is no redirect.
+        assert!(envs.contains(&("HOME".to_owned(), Some("/home/op".to_owned()))));
+        assert!(envs.contains(&(
+            "XDG_CONFIG_HOME".to_owned(),
+            Some("/home/op/.config".to_owned())
+        )));
+        // Still a cleared, rebuilt environment: no repository selector survives.
+        let mut keys: Vec<&str> = envs.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "GIT_CONFIG_GLOBAL",
+                "GIT_OPTIONAL_LOCKS",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "PATH",
+                "XDG_CONFIG_HOME",
+            ],
+            "the child sees exactly this key set and nothing else"
+        );
+
+        // An operator who has NOT redirected their global config must not have
+        // one invented for them — git falls back to `$HOME/.gitconfig`.
+        let plain = operator_global_git_config_command_with(|name| {
+            (name == "HOME").then(|| "/home/op".into())
+        });
+        assert!(
+            !plain.get_envs().any(|(k, _)| k == "GIT_CONFIG_GLOBAL"),
+            "an unset GIT_CONFIG_GLOBAL must stay unset, never nulled"
+        );
     }
 
     #[test]

@@ -63,23 +63,40 @@ def _hardened_env() -> dict[str, str]:
     return env
 
 
-def _self_and_ancestors(path: Path, root: Path, specs: list[str]) -> None:
+def _self_and_ancestors(path: Path, root: Path, specs: list[str]) -> bool:
+    """Push ``path`` relative to ``root`` and each ancestor below the root.
+
+    Returns whether ``path`` is *inside* ``root`` at all — which is NOT the
+    same as "pushed something": the root itself is inside and pushes nothing,
+    and the caller must tell that case apart from a path lying outside
+    entirely (the first must still be asked about, the second must not).
+    """
     try:
         rel = path.relative_to(root)
     except ValueError:
-        return
+        return False
     while str(rel) not in ("", "."):
         if str(rel) not in specs:
             specs.append(str(rel))
         rel = rel.parent
+    return True
 
 
 def _pathspecs(repo_root: Path, path: Path) -> list[str]:
     absolute = path if path.is_absolute() else repo_root / path
     specs: list[str] = []
-    _self_and_ancestors(absolute, repo_root, specs)
+    inside = _self_and_ancestors(absolute, repo_root, specs)
     with contextlib.suppress(OSError):
-        _self_and_ancestors(absolute.resolve(strict=True), repo_root.resolve(strict=True), specs)
+        canonical = _self_and_ancestors(
+            absolute.resolve(strict=True), repo_root.resolve(strict=True), specs
+        )
+        inside = canonical or inside
+    if not specs and inside:
+        # The path IS the repository root (``""``, ``"."``, or a symlink
+        # resolving onto it). Answering "untracked" without asking git would be
+        # permissive on the trust boundary — the root of a repository with any
+        # tracked content is repository content. Probe ``.`` so git answers.
+        specs.append(".")
     return specs
 
 

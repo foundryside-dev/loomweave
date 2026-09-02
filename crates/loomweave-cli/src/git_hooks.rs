@@ -28,18 +28,26 @@
 //! dead code), replaced in place when a stale Loomweave block exists, and the
 //! whole file is left untouched when the current block is already present.
 //!
-//! Hook files live where git says they live (`git rev-parse --git-path
-//! hooks`), which respects `core.hooksPath` and resolves to the shared common
-//! dir for linked worktrees. The block passes `--path .` because git runs
-//! these hooks from the top of the working tree — so in a linked worktree the
-//! sync targets that worktree's isolated store.
+//! Hook files live where git says they live, which takes two probes rather
+//! than one (ADR-063). The hardened `git rev-parse --git-path hooks` answers
+//! for the repository — a repo-local `core.hooksPath`, and the shared common
+//! dir for linked worktrees — but the hardening nulls `GIT_CONFIG_GLOBAL`, so
+//! it is blind to the operator's own `~/.gitconfig`. An operator-global
+//! `core.hooksPath` is therefore read by a second, deliberately unhardened
+//! probe (`loomweave_core::operator_global_git_config_command`) and wins when
+//! set; see [`hooks_dir`] for the precedence and its one deliberate departure
+//! from git's own. The block passes `--path .` because git runs these hooks
+//! from the top of the working tree — so in a linked worktree the sync targets
+//! that worktree's isolated store.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use loomweave_core::{hardened_git_command, run_git_probe_default};
+use loomweave_core::{
+    hardened_git_command, operator_global_git_config_command, run_git_probe_default,
+};
 
 const BLOCK_BEGIN: &str = "# BEGIN LOOMWEAVE MANAGED BLOCK";
 const BLOCK_END: &str = "# END LOOMWEAVE MANAGED BLOCK";
@@ -111,17 +119,91 @@ fn hooks_dir_command(project_root: &Path) -> Command {
     cmd
 }
 
-/// Where this repository's hook files live: `git rev-parse --git-path hooks`,
-/// which honours `core.hooksPath` and linked-worktree layouts. `None` when the
-/// directory cannot be resolved (not a git repo, no `git` binary, or the probe
-/// hit its deadline / output cap / produced non-UTF-8) — hooks are an
-/// enrichment, so every failure folds to "nowhere to install", never an error.
+/// The operator's GLOBAL `core.hooksPath`, or `None` when they have not set
+/// one (or it cannot be read).
+///
+/// This is the half [`hooks_dir_command`] structurally cannot see: the hardened
+/// builder nulls `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so `rev-parse
+/// --git-path hooks` answers `.git/hooks` even when `~/.gitconfig` says
+/// otherwise — and `install --hooks` then writes hooks git will never run,
+/// while `git_sync_hook_state` cheerfully reports them current. Under ADR-063
+/// the operator's global git config is operator intent, so it is read through
+/// the one sanctioned non-corpus git spawn
+/// (`loomweave_core::operator_global_git_config_command`, which never consults
+/// repository config).
+///
+/// `--path` makes git expand a leading `~` against the forwarded `HOME`. A
+/// relative value is resolved against the WORKTREE TOP LEVEL, which is where
+/// git runs hooks from and therefore what git itself resolves it against —
+/// verified empirically, and NOT the same as `project_root`, which may be any
+/// subdirectory the operator pointed a command at. If that probe cannot answer,
+/// `project_root` is the fallback (the common case, where they are equal).
+fn operator_global_hooks_path(project_root: &Path) -> Option<PathBuf> {
+    let mut command = operator_global_git_config_command();
+    command.args(["--path", "core.hooksPath"]);
+    // An unset key exits 1 with no output — not an error, just "not set".
+    let out = run_git_probe_default(command).ok()?;
+    let trimmed = out.stdout_utf8().ok()?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    Some(
+        worktree_top_level(project_root)
+            .unwrap_or_else(|| project_root.to_path_buf())
+            .join(path),
+    )
+}
+
+/// The top of the working tree containing `project_root`, through the hardened
+/// probe. Only consulted to resolve a relative operator-global
+/// `core.hooksPath`, which is rare.
+fn worktree_top_level(project_root: &Path) -> Option<PathBuf> {
+    let mut command = hardened_git_command(project_root);
+    command.args(["rev-parse", "--show-toplevel"]);
+    let out = run_git_probe_default(command).ok()?;
+    let trimmed = out.stdout_utf8().ok()?.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Where this repository's hook files live. `None` when the directory cannot be
+/// resolved (not a git repo, no `git` binary, or the probe hit its deadline /
+/// output cap / produced non-UTF-8) — hooks are an enrichment, so every failure
+/// folds to "nowhere to install", never an error.
+///
+/// Two sources. `git rev-parse --git-path hooks` through the hardened builder
+/// is asked first — it honours a **repository-local** `core.hooksPath` and
+/// linked-worktree layouts, and its failure is what tells us there is no
+/// repository here at all. When it answers, the operator's **global**
+/// `core.hooksPath` ([`operator_global_hooks_path`]) overrides it if set:
+/// operator intent under ADR-063, and structurally invisible to the hardened
+/// probe, which nulls `GIT_CONFIG_GLOBAL`.
+///
+/// The operator's setting is preferred over the repository's, which inverts
+/// git's own precedence in the one case where both are set. That is deliberate
+/// under ADR-063 — a repo-local `core.hooksPath` is corpus content, and
+/// Loomweave should not merge its managed block into a directory the corpus
+/// chose. The cost is that in that (rare) case git runs the repository's hooks
+/// dir while Loomweave writes into the operator's, so the managed block does
+/// not fire; nothing is written into a corpus-chosen path, which is the safer
+/// half of the trade.
 #[must_use]
 pub fn hooks_dir(project_root: &Path) -> Option<PathBuf> {
+    // The hardened probe runs FIRST and its failure is still the whole answer.
+    // It is what establishes that `project_root` is a git work tree at all —
+    // and without that gate, an operator with a global `core.hooksPath` would
+    // have Loomweave merge its managed block into their real hooks directory
+    // when pointed at a directory that is not a repository.
     let out = run_git_probe_default(hooks_dir_command(project_root)).ok()?;
     let trimmed = out.stdout_utf8().ok()?.trim();
     if trimmed.is_empty() {
         return None;
+    }
+    if let Some(global) = operator_global_hooks_path(project_root) {
+        return Some(global);
     }
     let path = PathBuf::from(trimmed);
     Some(if path.is_absolute() {
@@ -396,6 +478,25 @@ mod tests {
         dir.join(".git/hooks").join(name)
     }
 
+    /// Skip when the developer running the suite has a GLOBAL
+    /// `core.hooksPath`. These tests write real hook files through
+    /// [`install_git_sync_hooks`], and `hooks_dir` now (correctly) prefers the
+    /// operator's global hooks directory — which is OUTSIDE the fixture
+    /// tempdir, so an unguarded run would both fail the `.git/hooks`
+    /// assertions and merge Loomweave's managed block into the operator's real
+    /// hooks. The environment cannot be neutralised in-process here (this
+    /// workspace denies `unsafe_code`, and `set_var` is `unsafe`), so the
+    /// global arm is covered by the hermetic CLI integration test
+    /// `tests/git_hooks_global_path.rs` instead, which sets the child's
+    /// `GIT_CONFIG_GLOBAL`.
+    fn operator_global_hooks_path_would_redirect() -> bool {
+        if super::operator_global_hooks_path(Path::new(".")).is_some() {
+            eprintln!("skipping: this machine's global core.hooksPath redirects hooks_dir");
+            return true;
+        }
+        false
+    }
+
     fn git_init(dir: &Path) {
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -407,6 +508,9 @@ mod tests {
 
     #[test]
     fn install_creates_executable_hooks_with_block() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         git_init(dir.path());
         assert_eq!(git_sync_hook_state(dir.path()), GitHookState::Missing);
@@ -438,6 +542,9 @@ mod tests {
 
     #[test]
     fn post_checkout_block_is_gated_on_the_branch_switch_flag() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         // clarion-78d75e45c9: `git checkout -- file` (flag 0) must not fire a
         // refresh; only a branch switch (flag 1) does. post-merge has no such
         // flag and runs unconditionally.
@@ -455,6 +562,9 @@ mod tests {
 
     #[test]
     fn install_removes_retired_post_commit_block_preserving_foreign_bytes() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         // The pre-1.6 elspeth layout: our block sits before warpline's trailing
         // `exit 0`. Only Loomweave's bytes go; warpline's block and the exit
         // line survive verbatim, and doctor reads the lingering block as stale
@@ -494,6 +604,9 @@ mod tests {
 
     #[test]
     fn install_deletes_a_retired_hook_that_held_only_our_block() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         git_init(dir.path());
         let hook = hook_path(dir.path(), "post-commit");
@@ -515,6 +628,9 @@ mod tests {
 
     #[test]
     fn install_inserts_before_trailing_exit_preserving_foreign_block() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         // The elspeth layout: warpline's managed hook ends `exit 0`.
         // Appending after it would be dead code; the block must land before it
         // and warpline's bytes must survive verbatim.
@@ -549,6 +665,9 @@ mod tests {
 
     #[test]
     fn install_appends_when_no_trailing_exit() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         // The git-lfs post-checkout layout: last line invokes lfs, no trailing
         // exit — append at the end.
         let dir = tempfile::tempdir().unwrap();
@@ -574,6 +693,9 @@ mod tests {
 
     #[test]
     fn reinstall_is_byte_for_byte_noop() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         git_init(dir.path());
         assert_eq!(install_git_sync_hooks(dir.path()).unwrap(), Some(true));
@@ -595,6 +717,9 @@ mod tests {
 
     #[test]
     fn stale_block_is_replaced_in_place() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         git_init(dir.path());
         let stale = "#!/bin/sh\n\
@@ -625,6 +750,9 @@ mod tests {
 
     #[test]
     fn unbalanced_markers_refuse_to_rewrite() {
+        if operator_global_hooks_path_would_redirect() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         git_init(dir.path());
         let mangled = "#!/bin/sh\n# BEGIN LOOMWEAVE MANAGED BLOCK\nhalf a block\n";

@@ -87,5 +87,19 @@
     "git": ["init", "add -f .gitignore", "commit"],
     "query": "loomweave.yaml",
     "expected": "untracked"
+  },
+  {
+    "description": "the repository root itself is tracked when anything is committed",
+    "layout": [{ "file": "a.txt", "mode": "0644" }],
+    "git": ["init", "add -f a.txt", "commit"],
+    "query": ".",
+    "expected": "tracked"
+  },
+  {
+    "description": "the repository root of an empty repository is untracked",
+    "layout": [],
+    "git": ["init"],
+    "query": ".",
+    "expected": "untracked"
   }
 ]

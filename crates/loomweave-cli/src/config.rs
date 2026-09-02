@@ -4,10 +4,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use loomweave_analysis::ClusterAlgorithm;
 use loomweave_federation::config::{
-    CONFIG_TRACKED_REMEDY, ConfigTrust, LlmConfigEditResult, LlmConfigPatch, LlmProviderKind,
-    McpConfig, ProviderSelection, SemanticConfigEditResult, SemanticConfigPatch,
-    SemanticProviderKind, select_provider_with_env, update_llm_config_file,
-    update_semantic_config_file,
+    ConfigTrust, LlmConfigEditResult, LlmConfigPatch, LlmProviderKind, McpConfig,
+    ProviderSelection, SemanticConfigEditResult, SemanticConfigPatch, SemanticProviderKind,
+    select_provider_with_env, update_llm_config_file, update_semantic_config_file,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -418,15 +417,21 @@ fn run_check(path: &Path, explicit_config: Option<&Path>) -> Result<()> {
         config_path.display()
     );
     if !trust.egress_allowed() {
+        // Label from the verdict itself: an `unknown` verdict strips the same
+        // sections but is NOT evidence the repository tracks the file, and
+        // saying "repository-tracked" there would misreport what git answered.
         println!(
-            "  ignored (repository-tracked): {}",
+            "  ignored ({}): {}",
+            trust.label(),
             if trust.stripped().is_empty() {
                 "none set".to_owned()
             } else {
                 trust.stripped().join(", ")
             }
         );
-        println!("  {CONFIG_TRACKED_REMEDY}");
+    }
+    if let Some(remedy) = trust.remedy() {
+        println!("  {remedy}");
     }
     println!("loomweave.yaml:        {source}");
     println!("LLM enabled:           {}", config.llm.enabled);
@@ -511,15 +516,21 @@ fn run_semantic_status(path: &Path, explicit_config: Option<&Path>) -> Result<()
         config_path.display()
     );
     if !trust.egress_allowed() {
+        // Label from the verdict itself: an `unknown` verdict strips the same
+        // sections but is NOT evidence the repository tracks the file, and
+        // saying "repository-tracked" there would misreport what git answered.
         println!(
-            "  ignored (repository-tracked): {}",
+            "  ignored ({}): {}",
+            trust.label(),
             if trust.stripped().is_empty() {
                 "none set".to_owned()
             } else {
                 trust.stripped().join(", ")
             }
         );
-        println!("  {CONFIG_TRACKED_REMEDY}");
+    }
+    if let Some(remedy) = trust.remedy() {
+        println!("  {remedy}");
     }
     println!("loomweave.yaml:         {source}");
     print_semantic_status_fields(&resolve_effective_embeddings_path(path), &config);

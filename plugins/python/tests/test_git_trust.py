@@ -22,6 +22,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _FIXTURE = _REPO_ROOT / "fixtures" / "git_tracked_paths.json"
 _GIT_ENV = {
     **os.environ,
+    # Hermetic: the operator's ~/.gitconfig and /etc/gitconfig must not shape a
+    # fixture repository (init.defaultBranch, core.hooksPath, core.excludesFile,
+    # a global .gitignore, commit.gpgsign …). Author and committer identity is
+    # supplied explicitly below, so nulling the global file cannot break commit.
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_AUTHOR_NAME": "t",
     "GIT_AUTHOR_EMAIL": "t@t",
     "GIT_COMMITTER_NAME": "t",

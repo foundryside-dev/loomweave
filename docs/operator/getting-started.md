@@ -164,8 +164,13 @@ analyze complete: run <uuid> ok (entities=NNN, edges=MMM)
 
 The first run on a tree of this size completes in well under a minute on
 typical hardware. The result lives at `.weft/loomweave/loomweave.db` (a single SQLite
-file) and is safe to commit to git — see
-[ADR-005](../loomweave/adr/ADR-005-loomweave-dir-tracking.md).
+file) and must **not** be committed to git: it is a regenerable index that
+churns on every analyze, and committing it dirties the tree on every run. The
+store's own `.gitignore` (written by `loomweave install`) already covers it, so
+in a normal install there is nothing to do. If an older layout or a `git add -f`
+put it in the index anyway, `loomweave doctor`'s `db.tracked` check reports it
+and `loomweave doctor --fix` untracks it. (ADR-005 originally said the opposite;
+it was reversed — the `db.tracked` gate is the current rule.)
 
 For full `tests/` → `src/` call resolution, give the project a `.venv` before
 analyzing (or set `LOOMWEAVE_PYTHON_INTERPRETER` to its interpreter) —

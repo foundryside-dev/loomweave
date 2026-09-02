@@ -21,6 +21,13 @@ fn git(root: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
         .current_dir(root)
+        // Hermetic: the operator's ~/.gitconfig and /etc/gitconfig must not
+        // shape a fixture repository (init.defaultBranch, core.hooksPath,
+        // core.excludesFile, a global .gitignore, commit.gpgsign …). Author
+        // and committer identity is supplied explicitly below, so nulling the
+        // global file cannot break `git commit`.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
