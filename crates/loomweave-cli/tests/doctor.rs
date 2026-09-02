@@ -2299,6 +2299,219 @@ fn doctor_flags_git_tracked_db_as_problem_and_fix_untracks_it() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// ADR-063 (clarion-dee44f1a66): `config.trust`
+// ---------------------------------------------------------------------------
+
+/// Hermetic git for the ADR-063 fixtures: no global/system config reaches the
+/// repo, identity is explicit. Returns `false` when git is not installed, so
+/// these tests skip cleanly rather than failing on the environment.
+fn run_git_hermetic(repo: &Path, args: &[&str]) -> bool {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+    else {
+        return false;
+    };
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+/// `install` + a healthy seeded index (so `--fix` never shells out to
+/// `loomweave analyze`) + a real repository with `loomweave.yaml` COMMITTED.
+/// Returns `false` when git is unavailable.
+fn tracked_config_fixture(dir: &Path) -> bool {
+    install(&["install", "--all"], dir);
+    write_healthy_db(dir);
+    seed_completed_classifier_run(dir);
+    if !run_git_hermetic(dir, &["init", "-q", "-b", "main"]) {
+        return false;
+    }
+    run_git_hermetic(dir, &["add", "-f", "--", "loomweave.yaml"]);
+    run_git_hermetic(dir, &["commit", "-qm", "commit the config"]);
+    true
+}
+
+fn config_is_tracked(dir: &Path) -> bool {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["ls-files", "--", "loomweave.yaml"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git ls-files");
+    !output.stdout.is_empty()
+}
+
+/// A repository-tracked `loomweave.yaml` is a gate-failing problem: every
+/// egress section in it is inert, which an operator experiences as "my provider
+/// silently stopped working". `doctor` must name it and print the verbatim
+/// remedy.
+#[test]
+fn doctor_flags_a_repository_tracked_config_as_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    if !tracked_config_fixture(dir.path()) {
+        eprintln!("skipping: no git available");
+        return;
+    }
+
+    let (code, json) = doctor_json(dir.path(), false);
+    let trust = check(&json, "config.trust");
+    assert_eq!(trust["status"], "problem", "{trust}");
+    assert!(
+        trust["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tracked by the repository")),
+        "{trust}"
+    );
+    // `next_action` is `#[serde(skip)]` per check; it surfaces in the report's
+    // aggregated `next_actions` list.
+    assert!(
+        json["next_actions"]
+            .as_array()
+            .expect("next_actions")
+            .iter()
+            .any(|action| action == loomweave_federation::config::CONFIG_TRACKED_REMEDY),
+        "the report must offer the verbatim remedy: {json}"
+    );
+    assert_eq!(code, 1, "a tracked config must fail the gate: {json}");
+
+    let (_, out) = doctor(dir.path(), false);
+    assert!(
+        out.contains("loomweave.yaml is tracked by the repository"),
+        "the text path must name the problem; stdout:\n{out}"
+    );
+    assert!(
+        out.contains(loomweave_federation::config::CONFIG_TRACKED_REMEDY),
+        "the text path must print the verbatim remedy; stdout:\n{out}"
+    );
+}
+
+/// `--fix` takes the file back: `git rm --cached` (the working-tree file
+/// survives) and, because the root `.gitignore` is Loomweave's to touch here
+/// (absent), a `loomweave.yaml` line is added so it cannot be re-committed.
+#[test]
+fn doctor_fix_untracks_the_config_and_covers_it_in_an_untracked_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    if !tracked_config_fixture(dir.path()) {
+        eprintln!("skipping: no git available");
+        return;
+    }
+    // Present but untracked: the append path, not the create path.
+    fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+
+    let (_, json) = doctor_json(dir.path(), true);
+    let trust = check(&json, "config.trust");
+    assert_eq!(trust["status"], "fixed", "{trust}");
+    assert!(
+        trust["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("added to .gitignore")),
+        "{trust}"
+    );
+    assert!(
+        !config_is_tracked(dir.path()),
+        "--fix must remove loomweave.yaml from the index"
+    );
+    assert!(
+        dir.path().join("loomweave.yaml").is_file(),
+        "git rm --cached must keep the working-tree config"
+    );
+    let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(
+        gitignore
+            .lines()
+            .any(|line| line.trim() == "loomweave.yaml"),
+        "the untracked .gitignore should now cover the config: {gitignore:?}"
+    );
+    assert!(
+        gitignore.starts_with("target/\n"),
+        "the append must preserve existing content: {gitignore:?}"
+    );
+
+    // Idempotent: a second --fix must not grow the file.
+    let before = gitignore;
+    doctor_json(dir.path(), true);
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        before,
+        "repeated --fix must not append the same line twice"
+    );
+}
+
+/// Cede discipline: a TRACKED `.gitignore` is the repository's file, not
+/// Loomweave's. `--fix` still untracks the config, but leaves `.gitignore`
+/// byte-identical and tells the operator to finish the job themselves.
+#[test]
+fn doctor_fix_cedes_a_tracked_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    if !tracked_config_fixture(dir.path()) {
+        eprintln!("skipping: no git available");
+        return;
+    }
+    let gitignore_path = dir.path().join(".gitignore");
+    let original = "target/\n";
+    fs::write(&gitignore_path, original).unwrap();
+    run_git_hermetic(dir.path(), &["add", "-f", "--", ".gitignore"]);
+    run_git_hermetic(dir.path(), &["commit", "-qm", "commit gitignore"]);
+
+    let (_, json) = doctor_json(dir.path(), true);
+    let trust = check(&json, "config.trust");
+    assert_eq!(trust["status"], "fixed", "{trust}");
+    assert!(
+        trust["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tracked .gitignore yourself")),
+        "the cede must be reported, not silently skipped: {trust}"
+    );
+    assert!(
+        !config_is_tracked(dir.path()),
+        "--fix must still remove loomweave.yaml from the index"
+    );
+    assert_eq!(
+        fs::read_to_string(&gitignore_path).unwrap(),
+        original,
+        "a tracked .gitignore must not be rewritten"
+    );
+}
+
+/// An operator-owned config is the healthy case and must not warn.
+#[test]
+fn doctor_reports_an_untracked_config_as_operator_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    install(&["install", "--all"], dir.path());
+    write_healthy_db(dir.path());
+    seed_completed_classifier_run(dir.path());
+    if !run_git_hermetic(dir.path(), &["init", "-q", "-b", "main"]) {
+        eprintln!("skipping: no git available");
+        return;
+    }
+
+    let (_, json) = doctor_json(dir.path(), false);
+    let trust = check(&json, "config.trust");
+    assert_eq!(trust["status"], "ok", "{trust}");
+    assert!(
+        trust["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("operator-owned")),
+        "{trust}"
+    );
+}
+
 /// `doctor --fix`'s index-integrity repair deletes entity rows, so it must not
 /// interleave with a concurrent `loomweave analyze` re-linking those same rows.
 /// It takes the same advisory lock `analyze` does (STO-01) and reports busy
@@ -2488,6 +2701,11 @@ fn setup_primary_with_linked_worktree(root: &Path) -> PathBuf {
     fs::create_dir_all(&repo).unwrap();
     install(&["install"], &repo);
     fs::write(repo.join("f.txt"), "hi\n").unwrap();
+    // ADR-063: `loomweave.yaml` is operator-owned. Keep the fixture faithful to
+    // the supported posture — a committed config would have its egress sections
+    // (including `serve.http`) stripped, which is a different scenario from the
+    // one these worktree tests are about.
+    fs::write(repo.join(".gitignore"), "loomweave.yaml\n").unwrap();
 
     git(&repo, &["init", "-q", "-b", "main"]);
     git(&repo, &["config", "user.email", "t@t"]);

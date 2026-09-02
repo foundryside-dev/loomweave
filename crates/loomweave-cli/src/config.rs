@@ -486,16 +486,41 @@ fn run_semantic_status(path: &Path, explicit_config: Option<&Path>) -> Result<()
         None => resolve_default_config_path(path)?,
     };
     let config_path = config_path.as_path();
-    let (config, source) = if config_path.exists() {
-        let config = McpConfig::from_path(config_path)
+    // ADR-063: `load_trusted`, and report the verdict FIRST — same rule and same
+    // rendering as `run_check`, so an operator reading "semantic search enabled:
+    // false" here sees immediately whether the repository, not their config, is
+    // why.
+    let (config, source, trust) = if config_path.exists() {
+        let loaded = McpConfig::load_trusted(config_path)
             .with_context(|| format!("parse {}", config_path.display()))?;
-        (config, config_path.display().to_string())
+        (
+            loaded.config,
+            config_path.display().to_string(),
+            loaded.trust,
+        )
     } else {
         (
             McpConfig::default(),
             "(absent — built-in defaults in effect)".to_owned(),
+            ConfigTrust::OperatorOwned,
         )
     };
+    println!(
+        "config trust: {} ({})",
+        trust.label(),
+        config_path.display()
+    );
+    if !trust.egress_allowed() {
+        println!(
+            "  ignored (repository-tracked): {}",
+            if trust.stripped().is_empty() {
+                "none set".to_owned()
+            } else {
+                trust.stripped().join(", ")
+            }
+        );
+        println!("  {CONFIG_TRACKED_REMEDY}");
+    }
     println!("loomweave.yaml:         {source}");
     print_semantic_status_fields(&resolve_effective_embeddings_path(path), &config);
     Ok(())

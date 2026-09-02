@@ -308,6 +308,44 @@ Run `loomweave config check` after editing to confirm the effective state
 mistakes (a provider left `enabled: false`, a missing key, or a misplaced key,
 which is now a hard parse error rather than a silent drop).
 
+### Who owns `loomweave.yaml`
+
+`loomweave.yaml` is **operator-local**, not project state. Keep it out of
+version control — the first thing to do after `loomweave install` in a
+repository is:
+
+```bash
+echo loomweave.yaml >> .gitignore
+```
+
+Loomweave enforces the same boundary from its side
+([ADR-063](../loomweave/adr/ADR-063-repository-content-is-not-operator-intent.md)):
+when the effective `loomweave.yaml` is **tracked by the repository that
+contains it**, it is treated as repository content rather than as your
+configuration, and its egress-capable sections are replaced with their
+defaults before anything reads them — `llm_policy`, `semantic_search`,
+`integrations` and `serve.http`. A tracked config can still shape *analysis*:
+`version`, the `analysis:` clustering block, and `serve.mcp` are honoured. What
+it cannot do is name a network endpoint, name the environment variable whose
+value is sent as a credential, or open a listener — which is exactly what a
+`loomweave.yaml` committed by someone else's repository would otherwise get to
+choose the moment you opened their checkout.
+
+If your provider is unexpectedly disabled, this is the first thing to check.
+Every surface reports the verdict: `loomweave config check` prints a
+`config trust:` line, `loomweave doctor` runs a `config.trust` check, `serve`
+and `analyze` log it once at startup, and the `project_status_get` /
+`llm_config_get` MCP tools carry a `config_trust` field. The fix is to take the
+file back:
+
+```bash
+git rm --cached loomweave.yaml && echo loomweave.yaml >> .gitignore
+```
+
+`loomweave doctor --fix` does this for you (it will not edit a `.gitignore`
+that the repository tracks — it untracks the config and tells you to add the
+line yourself).
+
 ### The MCP tools
 
 The MCP surface exposes 48 tools. The eighteen core ones are the seventeen in

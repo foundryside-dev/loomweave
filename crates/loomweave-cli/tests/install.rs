@@ -667,3 +667,119 @@ fn install_force_refuses_to_remove_a_populated_worktrees_namespace() {
         "the refused --force must leave the primary store itself untouched too: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR-063 (clarion-dee44f1a66): the `loomweave.yaml` ownership advisory
+// ---------------------------------------------------------------------------
+
+/// Hermetic git for the ADR-063 fixtures. Returns `false` when git is not
+/// installed so these tests skip cleanly rather than failing on the environment.
+fn run_git_hermetic(repo: &std::path::Path, args: &[&str]) -> bool {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+    else {
+        return false;
+    };
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+/// Inside a git work tree with no `.gitignore` coverage, `install` nudges the
+/// operator to keep the config out of version control (ADR-063).
+#[test]
+fn install_notes_config_ownership_inside_a_git_work_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    if !run_git_hermetic(dir.path(), &["init", "-q", "-b", "main"]) {
+        eprintln!("skipping: no git available");
+        return;
+    }
+
+    let assert = loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+    assert!(
+        stdout.contains("loomweave.yaml is operator-owned"),
+        "install should nudge the operator to gitignore the config; stdout:\n{stdout}"
+    );
+
+    // Once `.gitignore` covers it, the nudge stops (a re-install must not nag).
+    fs::write(dir.path().join(".gitignore"), "loomweave.yaml\n").unwrap();
+    let assert = loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+    assert!(
+        !stdout.contains("loomweave.yaml is operator-owned"),
+        "a covered config must not be nagged about; stdout:\n{stdout}"
+    );
+}
+
+/// A COMMITTED `loomweave.yaml` gets the warning plus the verbatim remedy — on
+/// the already-initialised path, which is exactly the operator who committed it
+/// before this gate existed.
+#[test]
+fn install_warns_when_the_config_is_repository_tracked() {
+    let dir = tempfile::tempdir().unwrap();
+    if !run_git_hermetic(dir.path(), &["init", "-q", "-b", "main"]) {
+        eprintln!("skipping: no git available");
+        return;
+    }
+    loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    run_git_hermetic(dir.path(), &["add", "-f", "--", "loomweave.yaml"]);
+    run_git_hermetic(dir.path(), &["commit", "-qm", "commit the config"]);
+
+    let assert = loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+    assert!(
+        stdout.contains("loomweave.yaml is tracked by this repository"),
+        "install should warn about a committed config; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(loomweave_federation::config::CONFIG_TRACKED_REMEDY),
+        "the warning must carry the verbatim remedy; stdout:\n{stdout}"
+    );
+}
+
+/// Outside a git work tree there is no repository to advise about, so `install`
+/// stays silent — no noise for the standalone-directory case.
+#[test]
+fn install_says_nothing_about_config_ownership_outside_a_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let assert = loomweave_bin()
+        .args(["install", "--path"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf8");
+    assert!(
+        !stdout.contains("(ADR-063)"),
+        "no ownership advisory outside a git work tree; stdout:\n{stdout}"
+    );
+}

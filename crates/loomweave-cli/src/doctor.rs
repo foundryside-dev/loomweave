@@ -34,7 +34,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use loomweave_core::{ClassifierCoverage, PluginCoverageStatus};
-use loomweave_federation::config::{McpConfig, ProviderSelection, select_provider_with_env};
+use loomweave_federation::config::{
+    CONFIG_TRACKED_REMEDY, ConfigTrust, McpConfig, ProviderSelection, config_trust_for_path,
+    select_provider_with_env,
+};
 use loomweave_storage::{
     ExternalSqliteCompatibility, ExternalSqliteCompatibilityStatus, LatestClassifierCoverage,
     ResolutionCoverageSummary, external_sqlite_compatibility, latest_classifier_coverage,
@@ -93,6 +96,7 @@ pub fn run(path: &Path, fix: bool, json_output: bool) -> Result<bool> {
     tally += check_instructions(&project_root, fix);
     tally += check_integration_bindings(&project_root, fix);
     tally += check_db_tracked(&project_root, fix);
+    tally += check_config_trust(&project_root, fix);
     tally += check_gitignore_current(&project_root, fix);
     tally += check_loomweave_dir(&project_root);
     tally += emit_json_check_text(&check_external_sqlite_json(&project_root));
@@ -250,6 +254,7 @@ fn json_report(project_root: &Path, fix: bool) -> DoctorJsonReport {
         check_mcp_hygiene_json(),
         check_integration_bindings_json(project_root, fix),
         check_db_tracked_json(project_root, fix),
+        check_config_trust_json(project_root, fix),
         check_gitignore_current_json(project_root, fix),
     ];
     if let Some(check) = check_worktree_stores_json(project_root) {
@@ -294,6 +299,7 @@ fn default_next_action(id: &str) -> String {
                  to stop the regenerable index dirtying the tree."
                     .to_owned()
             }
+            "config.trust" => CONFIG_TRACKED_REMEDY.to_owned(),
             ".weft/loomweave.schema" => {
                 "Run `loomweave install` + `loomweave analyze <project>` to create or \
                  rebuild the index. If the DB is corrupt, remove `.weft/loomweave/loomweave.db` \
@@ -1534,6 +1540,180 @@ fn check_db_tracked_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ADR-063: is `loomweave.yaml` operator-owned, or repository content?
+// ---------------------------------------------------------------------------
+
+const CONFIG_TRUST_ID: &str = "config.trust";
+
+/// The problem headline, shared by the two `config.trust` twins so their
+/// wording cannot drift. Names every section the gate resets, because an
+/// operator whose provider silently stopped working needs to recognise their
+/// own symptom in this line.
+const CONFIG_TRACKED_WHAT: &str = "loomweave.yaml is tracked by the repository; its llm_policy, semantic_search, \
+     integrations and serve.http sections are ignored (ADR-063)";
+
+/// Shared verdict for [`check_config_trust_json`] and its text twin. One
+/// implementation, two thin renderers — the db-tracked pattern, except the
+/// message construction (and the `--fix` orchestration) lives in exactly one
+/// place.
+enum ConfigTrustReport {
+    Ok(String),
+    /// The probe could not answer, or there is no git to ask. Surfaced, never
+    /// greened over, but not gate-failing: neither state is evidence that a
+    /// repository owns the file.
+    Warning(String),
+    /// The file is repository content (or an unanswerable probe, which fails
+    /// closed): the egress sections are inert until the operator takes it back.
+    Problem(String),
+    Fixed(String),
+}
+
+/// `--fix` self-heal: `git rm --cached` the config, then (cede discipline) add
+/// it to `.gitignore` only when that file is Loomweave's to touch.
+///
+/// Rooted at the config file's OWN directory with a bare-filename pathspec —
+/// exactly how `config_trust_for_path` probes it — so the repair and the verdict
+/// can never be talking about different repositories.
+fn git_untrack_config(config_path: &Path) -> Result<()> {
+    let dir = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = config_path
+        .file_name()
+        .context("config path has no file name")?;
+    let mut command = hardened_git_command(dir);
+    command.args(["rm", "--cached", "-q", "--"]).arg(name);
+    run_git_probe_default(command)
+        .map(drop)
+        .context("run git rm --cached")
+}
+
+/// Add `loomweave.yaml` to the sibling `.gitignore`, but only when that file is
+/// absent or untracked.
+///
+/// Returns `false` when the repair ceded: a TRACKED `.gitignore` is the
+/// repository's file, not Loomweave's, and `doctor --fix` does not edit other
+/// people's tracked content (the config-repair cede discipline). An
+/// unanswerable probe cedes for the same reason it fails closed elsewhere.
+fn gitignore_now_covers_config(config_path: &Path) -> bool {
+    let Some(dir) = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    let Some(name) = config_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let gitignore = dir.join(".gitignore");
+    let existing = fs::read_to_string(&gitignore).ok();
+    if existing
+        .as_deref()
+        .is_some_and(|body| body.lines().any(|line| line.trim() == name))
+    {
+        // Already covered — repeated `--fix` must not grow the file.
+        return true;
+    }
+    if existing.is_some()
+        && !matches!(
+            loomweave_core::tracked_state(dir, Path::new(".gitignore")),
+            loomweave_core::TrackedState::Untracked | loomweave_core::TrackedState::NotAGitWorkTree
+        )
+    {
+        return false;
+    }
+    let mut body = existing.unwrap_or_default();
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(name);
+    body.push('\n');
+    // Atomic (temp + rename in the same directory), like every other Loomweave
+    // write: a crash mid-repair must never truncate the operator's .gitignore.
+    crate::atomic_fs::replace_file(&gitignore, ".gitignore.loomweave.tmp-", body.as_bytes()).is_ok()
+}
+
+fn config_trust_report(project_root: &Path, fix: bool) -> ConfigTrustReport {
+    let config_path = doctor_config_path(project_root);
+    if !config_path.exists() {
+        return ConfigTrustReport::Ok(
+            "no loomweave.yaml; the built-in defaults are in effect and no repository content \
+             shaped them"
+                .to_owned(),
+        );
+    }
+    match config_trust_for_path(&config_path) {
+        ConfigTrust::OperatorOwned => ConfigTrustReport::Ok(
+            "loomweave.yaml is operator-owned (not tracked by the repository)".to_owned(),
+        ),
+        ConfigTrust::NotAGitWorkTree => ConfigTrustReport::Ok(
+            "loomweave.yaml is not inside a git work tree; no repository owns it".to_owned(),
+        ),
+        // Permissive by design (ADR-062: `PATH` is real-environment-only, so a
+        // missing git is the OPERATOR's environment) — but unverified is not
+        // verified, so it warns rather than reporting the healthy verdict.
+        ConfigTrust::GitUnavailable => ConfigTrustReport::Warning(
+            "no git binary available, so loomweave.yaml's ownership could not be checked; its \
+             egress sections are honoured (a missing git is the operator's environment, ADR-062)"
+                .to_owned(),
+        ),
+        ConfigTrust::Unknown { reason, .. } => ConfigTrustReport::Problem(format!(
+            "{CONFIG_TRACKED_WHAT} — the tracked-state probe could not answer ({reason}), so the \
+             file is treated as tracked (fail closed) and `--fix` has nothing safe to repair"
+        )),
+        ConfigTrust::RepositoryTracked { .. } => {
+            if !fix {
+                return ConfigTrustReport::Problem(CONFIG_TRACKED_WHAT.to_owned());
+            }
+            match git_untrack_config(&config_path) {
+                Ok(()) if config_trust_for_path(&config_path).egress_allowed() => {
+                    if gitignore_now_covers_config(&config_path) {
+                        ConfigTrustReport::Fixed(format!(
+                            "{CONFIG_TRACKED_WHAT} — untracked (git rm --cached) and added to \
+                             .gitignore"
+                        ))
+                    } else {
+                        ConfigTrustReport::Fixed(format!(
+                            "{CONFIG_TRACKED_WHAT} — fixed index; add `loomweave.yaml` to your \
+                             tracked .gitignore yourself"
+                        ))
+                    }
+                }
+                Ok(()) => ConfigTrustReport::Problem(format!(
+                    "{CONFIG_TRACKED_WHAT} — repair did not converge"
+                )),
+                Err(err) => ConfigTrustReport::Problem(format!(
+                    "{CONFIG_TRACKED_WHAT} — repair failed: {err}"
+                )),
+            }
+        }
+    }
+}
+
+/// JSON-path twin of [`check_config_trust`].
+fn check_config_trust_json(project_root: &Path, fix: bool) -> DoctorJsonCheck {
+    match config_trust_report(project_root, fix) {
+        ConfigTrustReport::Ok(message) => DoctorJsonCheck::ok(CONFIG_TRUST_ID, message),
+        ConfigTrustReport::Warning(message) => DoctorJsonCheck::warning(CONFIG_TRUST_ID, message),
+        ConfigTrustReport::Problem(message) => DoctorJsonCheck::problem(CONFIG_TRUST_ID, message)
+            .with_next_action(CONFIG_TRACKED_REMEDY),
+        ConfigTrustReport::Fixed(message) => DoctorJsonCheck::fixed(CONFIG_TRUST_ID, message),
+    }
+}
+
+/// Text-path twin of [`check_config_trust_json`]: a tracked `loomweave.yaml`
+/// makes every egress setting in it inert, which reads to an operator as "my
+/// provider silently stopped working". Surface it with the verbatim remedy.
+fn check_config_trust(project_root: &Path, fix: bool) -> Tally {
+    match config_trust_report(project_root, fix) {
+        ConfigTrustReport::Ok(message) | ConfigTrustReport::Fixed(message) => ok(&message),
+        ConfigTrustReport::Warning(message) => warn(&message, None),
+        ConfigTrustReport::Problem(message) => problem(&message, Some(CONFIG_TRACKED_REMEDY)),
+    }
+}
+
 /// Health of the Loomweave-owned `.weft/loomweave/.gitignore` relative to the
 /// canonical template. When the template evolves (e.g. C1 reversed ADR-005 to
 /// *ignore* `loomweave.db`), a project initialised by an older binary keeps a
@@ -1964,13 +2144,28 @@ fn check_http_config_json(project_root: &Path) -> DoctorJsonCheck {
     }
 }
 
-fn load_mcp_config_for_doctor(project_root: &Path) -> std::result::Result<McpConfig, String> {
-    let path = loomweave_core::worktree::WorktreeContext::resolve(project_root).map_or_else(
+/// The `loomweave.yaml` `doctor` reports on: the worktree ladder's config path
+/// (so a linked worktree probes the file `serve` would actually load, not a
+/// same-named file in the checkout), falling back to `<root>/loomweave.yaml`
+/// when the ladder cannot resolve. Shared by the config readers and the
+/// ADR-063 `config.trust` check so they cannot disagree about WHICH file.
+fn doctor_config_path(project_root: &Path) -> std::path::PathBuf {
+    loomweave_core::worktree::WorktreeContext::resolve(project_root).map_or_else(
         |_| project_root.join("loomweave.yaml"),
         |ctx| ctx.config_path(),
-    );
+    )
+}
+
+/// ADR-063: load through `load_trusted`, never `from_path` — every `doctor`
+/// verdict derived from the config (HTTP authentication, Filigree URL, the LLM
+/// posture) must describe the config that is actually in effect, not the claims
+/// of a file the repository owns.
+fn load_mcp_config_for_doctor(project_root: &Path) -> std::result::Result<McpConfig, String> {
+    let path = doctor_config_path(project_root);
     if path.exists() {
-        McpConfig::from_path(&path).map_err(|err| err.to_string())
+        McpConfig::load_trusted(&path)
+            .map(|loaded| loaded.config)
+            .map_err(|err| err.to_string())
     } else {
         Ok(McpConfig::default())
     }
@@ -2262,9 +2457,12 @@ enum LlmPosture {
 /// fine (built-in defaults → LLM disabled).
 fn llm_posture(project_root: &Path) -> LlmPosture {
     let config_path = project_root.join("loomweave.yaml");
+    // ADR-063: `load_trusted`, so the posture reported is the one in effect. A
+    // repository-tracked config reports "LLM disabled" here even when the file
+    // says otherwise — which is the truth, and `config.trust` names the reason.
     let config = if config_path.exists() {
-        match McpConfig::from_path(&config_path) {
-            Ok(config) => config,
+        match McpConfig::load_trusted(&config_path) {
+            Ok(loaded) => loaded.config,
             Err(err) => return LlmPosture::Broken(format!("loomweave.yaml: {err}")),
         }
     } else {
