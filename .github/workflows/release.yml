@@ -136,7 +136,7 @@ jobs:
           "$SMOKE_DIR/$STAGE/loomweave" --help >/dev/null
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: loomweave-${{ matrix.target }}
           path: |
@@ -196,7 +196,7 @@ jobs:
           python -m zipfile -l "$WHL" | grep -E 'data/scripts/loomweave' \
             || { echo "::error::wheel $WHL missing data/scripts/loomweave"; exit 1; }
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: loomweave-wheel-${{ matrix.target }}
           path: dist/*.whl
@@ -254,7 +254,7 @@ jobs:
           python -m zipfile -l "$WHL" | grep -E 'data/scripts/loomweave-plugin-rust' \
             || { echo "::error::wheel $WHL missing data/scripts/loomweave-plugin-rust"; exit 1; }
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: loomweave-plugin-rust-wheel-${{ matrix.target }}
           path: dist/*.whl
@@ -325,7 +325,7 @@ jobs:
             sha256sum "$f" > "$f.sha256"
           done
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: loomweave-plugin-python-sdist
           path: |
